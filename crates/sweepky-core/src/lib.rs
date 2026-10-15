@@ -20,6 +20,12 @@
 //!   homeserver's `/events/` feed) and [`Pubky`] (a public key, read in either
 //!   of its two spellings and compared by its bytes). Each accepts only its
 //!   canonical form, so two different strings never name the same thing.
+//! - The names records carry that later become a path segment, a git argument
+//!   or a public label: [`Playbook`], [`TargetId`], [`DeviceId`], [`GitSha`],
+//!   [`Sha256Hex`], [`RepoName`] and [`RepoPath`]. Each is a `String` newtype
+//!   whose every constructor runs its check, so holding one means the value
+//!   passed. Only `Playbook`'s pattern comes from 01; the other limits are
+//!   P1a's choice and are set out on each type.
 //!
 //! The rules that hold for everything here (see "Rust conventions" in
 //! `docs/plan/03-cli-and-skill.md`):
@@ -75,13 +81,16 @@
 
 mod error;
 mod ids;
+mod names;
 mod open_enum;
 mod pubky;
 mod schema;
 mod time;
+mod validated_string;
 
 pub use error::{JsonCategory, RecordError};
 pub use ids::{EventCursor, RecordId};
+pub use names::{DeviceId, GitSha, Playbook, RepoName, RepoPath, Sha256Hex, TargetId};
 pub use pubky::Pubky;
 pub use schema::{MAX_FINDINGS_BYTES, MAX_RECORD_BYTES, SchemaVersion, UnknownFields};
 pub use time::RecordTime;

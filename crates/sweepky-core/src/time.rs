@@ -1,11 +1,9 @@
 //! [`RecordTime`], the timestamp strings records carry.
 
-use std::fmt;
-use std::str::FromStr;
-
 use serde::{Deserialize, Serialize};
 
 use crate::error::RecordError;
+use crate::validated_string::validated_string;
 
 /// The value of a time field in a record: `createdAt`, `startedAt`,
 /// `finishedAt`, `doneAt` or `revokedAt`.
@@ -23,9 +21,9 @@ use crate::error::RecordError;
 /// passes the string in, so tests can use fixed values.
 ///
 /// Serialized as a plain JSON string. Deserializing runs the same check as
-/// [`RecordTime::from_str`] (`try_from = "String"` tells serde to read a
-/// `String`, then call `TryFrom<String>`), so a value of this type is always
-/// valid.
+/// parsing with [`FromStr`](std::str::FromStr) (`try_from = "String"` tells
+/// serde to read a `String`, then call `TryFrom<String>`), so a value of this
+/// type is always valid.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String")]
 pub struct RecordTime(String);
@@ -33,11 +31,6 @@ pub struct RecordTime(String);
 impl RecordTime {
     /// The longest value accepted: 64 characters.
     pub const MAX_LEN: usize = 64;
-
-    /// The value exactly as written.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
 
     fn check(value: &str) -> Result<(), RecordError> {
         let invalid = |reason| RecordError::Invalid {
@@ -63,37 +56,9 @@ impl RecordTime {
     }
 }
 
-/// Checks a `String` and takes ownership of it without copying.
-impl TryFrom<String> for RecordTime {
-    type Error = RecordError;
-
-    fn try_from(value: String) -> Result<Self, RecordError> {
-        Self::check(&value)?;
-        Ok(Self(value))
-    }
-}
-
-/// Checks a `&str` and copies it, so `"…".parse::<RecordTime>()` works.
-impl FromStr for RecordTime {
-    type Err = RecordError;
-
-    fn from_str(value: &str) -> Result<Self, RecordError> {
-        Self::check(value)?;
-        Ok(Self(value.to_owned()))
-    }
-}
-
-impl From<RecordTime> for String {
-    fn from(time: RecordTime) -> Self {
-        time.0
-    }
-}
-
-impl fmt::Display for RecordTime {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
+// `as_str()`, `FromStr`, `TryFrom<String>`, `From<RecordTime> for String`
+// and `Display`, each running `check` where it makes a value.
+validated_string!(RecordTime);
 
 #[cfg(test)]
 mod tests {
