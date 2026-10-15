@@ -10,11 +10,19 @@
 name: CI
 
 on:
-  # Every branch, so the first push of a phase branch runs CI before any PR.
+  # Main only. Other branches are tested through their pull request instead,
+  # so a branch push is not paid for twice (once on `push`, once on
+  # `pull_request`).
   push:
-  # Pushes to a fork never run this repository's workflows, so a PR from a fork
-  # is checked through this event.
+    branches: [main]
+  # Every pull request, from this repository or a fork. GitHub checks out the
+  # PR's merge ref (refs/pull/<n>/merge): the PR's head merged into its base
+  # as the base stood when the PR was opened or last pushed to. That is what
+  # main will hold after the merge, so a branch that passes on its own but
+  # breaks against a newer main fails here. Nothing re-runs when main moves
+  # later: merge main into the branch to test the new result.
   pull_request:
+  # A manual run from the Actions tab, on any branch.
   workflow_dispatch:
 
 # The job token can read the repository and nothing else.
@@ -22,10 +30,13 @@ permissions:
   contents: read
 
 concurrency:
-  # One group per event and ref. `push` and `pull_request` never share a group,
-  # because one would cancel the other and a cancelled check fails the merge
-  # gate. A newer push to a branch cancels the older run; runs on main always
-  # finish, so every merged commit gets a result and saves the caches.
+  # One group per event and ref. The event name keeps a manual run on main
+  # from queueing behind a push run. A pull request's ref is its merge ref,
+  # so each PR has its own group and a newer push to the PR cancels its
+  # older run. A run on main is never cancelled once it starts, so it
+  # finishes and saves the caches. GitHub keeps only one run waiting per
+  # group, though: if merges land faster than CI finishes, the waiting run
+  # is replaced by the newest one.
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
@@ -34,10 +45,6 @@ env:
 
 jobs:
   lint:
-    # Every job carries this guard. A PR from a branch of this repository
-    # already ran on `push`, so its `pull_request` run skips the job rather than
-    # paying twice; a skipped check counts as green. PRs from forks run.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -66,7 +73,6 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     # The CLI's end-to-end test (from P2a) starts an ephemeral pubky-testnet,
@@ -112,7 +118,6 @@ jobs:
   deny:
     # Advisories, licences, bans and sources (deny.toml). It reads Cargo.lock
     # and the RustSec database and compiles nothing, so it needs no build cache.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -129,7 +134,6 @@ jobs:
       - run: cargo deny check
 
   web:
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
