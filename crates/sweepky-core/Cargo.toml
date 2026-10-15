@@ -19,3 +19,11 @@ serde = { workspace = true, features = ["derive"] }
 # limit (128 levels) that stops deeply nested input from overflowing the stack.
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# Record ids. Always with `base32`: that feature is what makes `Timestamp` read
+# and write the 13-character Crockford form. Without it, its `TryFrom<String>`
+# slices `value[11..len - 1]` and panics on a short string. Never `serde`: that
+# feature serializes a timestamp as 8 raw bytes, not as the id string.
+pubky-timestamp = { workspace = true, features = ["base32"] }
+# z-base32, the encoding of a pubky. Its `decode` returns `None` on bad input
+# rather than panicking.
+base32 = { workspace = true }

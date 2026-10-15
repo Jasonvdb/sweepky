@@ -23,6 +23,7 @@ The data half of `sweepky-core`: records, paths, ids, targets, the Cloudflare co
 ## Notes
 
 - The crate must not depend on `tokio`, `reqwest` or `pubky`; it may depend on `pubky-timestamp`. The CLI owns the network.
+- It also depends on `base32` =0.5.1 directly, for z-base32 in `Pubky`: the release `pubky-timestamp`'s `base32` feature already pulls in (see [03](../03-cli-and-skill.md#dependencies)). `Pubky` checks the length and alphabet [01](../01-records-and-discovery.md#compatibility-rules-every-client-follows) asks for, and the canonical form, but not that the bytes are a valid Ed25519 point, since this crate has no Ed25519 code; the CLI's SDK parse does that before it uses a key on the network.
 - Every parser here reads data a stranger may have written. Malformed input returns an error or is skipped; it never panics.
 - Every from-bytes parse checks the input's length before parsing: at most 1 MiB (`MAX_RECORD_BYTES`) for a public record and 16 MiB (`MAX_FINDINGS_BYTES`) for a findings document. These caps are P1a's choice; 01 sets none.
 - [01](../01-records-and-discovery.md) does not say how `createdAt`, `startedAt`, `finishedAt`, `doneAt` and `revokedAt` are encoded, so `RecordTime` keeps them opaque: 1 to 64 printable ASCII characters, no whitespace. Those limits are P1a's choice, not 01's.

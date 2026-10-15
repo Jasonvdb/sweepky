@@ -41,6 +41,10 @@ pubky = { version = "=0.16.2", features = ["json"] }
 pubky-testnet = "=0.16.2"
 # Ids in sweepky-core. It has no default features; P1a adds the ones it needs.
 pubky-timestamp = "=0.4.1"
+# z-base32 for pubkys in sweepky-core (P1a). pubky-timestamp's `base32` feature
+# already pulls in this exact release, so naming it here adds no new code to the
+# build; it is pinned directly because sweepky-core calls it itself.
+base32 = "=0.5.1"
 # age is pre-1.0 and its docs call releases "beta", so it is pinned exactly.
 # Default features only: never `plugin` (the code path behind its one advisory)
 # and never `ssh` (pulls in an `rsa` crate with an unpatched advisory).

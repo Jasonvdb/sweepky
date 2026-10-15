@@ -85,7 +85,8 @@ Exact pins, re-checked against crates.io and npm for P0 on 2026-10-15; each is t
 |---|---|---|
 | `pubky` | =0.16.2 | features `json`; production's homeserver runs 0.16.1, and 0.16.2 changed only the homeserver (the SDK diff is doc comments) |
 | `pubky-testnet` | =0.16.2 | dev-dependency; same version as `pubky` |
-| `pubky-timestamp` | =0.4.1 | ids in `sweepky-core`, which must not depend on `pubky` |
+| `pubky-timestamp` | =0.4.1 | ids in `sweepky-core`, which must not depend on `pubky`; feature `base32` (never `serde`, which writes a timestamp as 8 raw bytes) |
+| `base32` | =0.5.1 | z-base32 for the `Pubky` type in `sweepky-core` (added in P1a); the exact release `pubky-timestamp`'s `base32` feature already pulls in, so it adds no new code. The newest stable release; 1.0.0-rc.1 is a pre-release |
 | `age` | =0.12.1 | default features only; never `plugin`, never `ssh` |
 | `secrecy` | =0.10.3 | use the `age::secrecy` re-export so the two agree |
 | `zeroize` | =1.9.1 | |

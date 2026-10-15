@@ -15,6 +15,11 @@
 //!   an `as_known()` helper, made by a macro inside this crate.
 //! - [`RecordTime`], the opaque timestamp string in `createdAt` and the other
 //!   time fields.
+//! - The ids and keys records point at: [`RecordId`] (the 13-character
+//!   `<id>` in a record's file name), [`EventCursor`] (a position in a
+//!   homeserver's `/events/` feed) and [`Pubky`] (a public key, read in either
+//!   of its two spellings and compared by its bytes). Each accepts only its
+//!   canonical form, so two different strings never name the same thing.
 //!
 //! The rules that hold for everything here (see "Rust conventions" in
 //! `docs/plan/03-cli-and-skill.md`):
@@ -69,13 +74,24 @@
 )]
 
 mod error;
+mod ids;
 mod open_enum;
+mod pubky;
 mod schema;
 mod time;
 
 pub use error::{JsonCategory, RecordError};
+pub use ids::{EventCursor, RecordId};
+pub use pubky::Pubky;
 pub use schema::{MAX_FINDINGS_BYTES, MAX_RECORD_BYTES, SchemaVersion, UnknownFields};
 pub use time::RecordTime;
+// Re-exported because `RecordId::from_timestamp` takes one: the CLI names it
+// as `sweepky_core::Timestamp` and is sure to get the same crate version this
+// crate was built against. `no_inline` lists it in these docs as a re-export
+// with a link, instead of copying pubky-timestamp's own pages in. Its `now()`
+// reads the clock; the CLI may call it, this crate never does.
+#[doc(no_inline)]
+pub use pubky_timestamp::Timestamp;
 
 /// This crate's version, `version` from Cargo.toml.
 ///
