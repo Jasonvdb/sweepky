@@ -7,13 +7,14 @@ All records live under `/pub/sweepky/` on the **writer's own** homeserver. IDs a
 | Path | Writer | Shape |
 |---|---|---|
 | `circle.json` | admin | `{name, admin, members: [{pubky, label?}]}` — the roster; the default trust set and the default discovery set |
-| `keys/<deviceId>.json` | each user, per device | `{alg: "age-x25519", recipient: "age1…", label, createdAt, revokedAt: null}` — strangers publish these too, so an owner can encrypt to anyone |
-| `bounties/<id>.json` | owner | see [The bounty post](#the-bounty-post) |
-| `sweeps/<id>.json` | sweeper | `{bounty: "pubky://<owner>/pub/sweepky/bounties/<id>.json", targets: ["t1", "t2"], playbook: "<open string>", status: "running"\|"done"\|"aborted", startedAt, finishedAt?, access: {kind: "circle"\|"owner"}, sha256?}` |
+| `keys/<deviceId>.json` | each CLI install, at `login` | `{alg: "age-x25519", recipient: "age1…", label, createdAt, revokedAt: null}` — a sweeper's CLI encrypts to the bounty owner's unrevoked keys |
+| `bounties/<id>.json` | owner | see [The bounty post](#the-bounty-post); rewritten by `sweepky done` |
+| `sweeps/<id>.json` | sweeper | `{bounty: "pubky://<owner>/pub/sweepky/bounties/<id>.json", targets: ["t1", "t2"], playbook: "<open string>", status: "running"\|"done"\|"aborted", startedAt, finishedAt?, sha256?}` |
 | `sweeps/<id>.age` | sweeper | the encrypted sweep package; see [The sweep package](#the-sweep-package) |
-| `attestations/<sweeper>/<findingId>.json` | owner | `{bounty, sweep, sweeper, severity, resolvedAt}` — public credit; written by `sweepky resolve` once a confirmed finding is fixed or the owner judges it safe to disclose |
 
-The **trust label** is computed client-side, never stored: `circle` if the sweeper is in the roster, else `known` with counts from trusted owners' `attestations/`, else `unknown`.
+Five record kinds. There is no per-finding public record: credit lives on the bounty.
+
+The **trust label** is computed client-side, never stored: `circle` if the sweeper is in the roster; else `known: N` where N is the number of `done` bounties from trusted owners whose `credits` include the sweeper; else `unknown`.
 
 Reserved and empty in v1: `payouts/`, `received/`, `disclosures/`, `tags/`, `triage/`.
 
@@ -31,17 +32,19 @@ A fixed envelope that tools act on, with a freeform brief inside for humans and 
   "brief": "Markdown. What to look for, context, what is out of scope, how to report. No secrets: this is public.",
   "playbook": { "suggested": "cloudflare/security-audit@c1c8a8c", "required": false },
   "targets": [ { "id": "t1", "kind": "repo", "repo": "github.com/org/name", "rev": "<sha>", "paths": ["src/auth/"] } ],
-  "readers": "circle",
   "open": false,
   "reward": null,
   "status": "open",
-  "createdAt": "<timestamp>"
+  "credits": [],
+  "createdAt": "<timestamp>",
+  "doneAt": null
 }
 ```
 
-- **Fixed:** `title`, `targets` (pinned), `readers`, `open`, `status`, dates, `reward` (reserved).
+- **Fixed:** `title`, `targets` (pinned), `open`, `status`, `credits`, dates, `reward` (reserved).
 - **Freeform:** `brief` (markdown), `focus` (open label; `security` is the first use case, `bugs`, `perf`, anything else is valid), `playbook.suggested` (an open string naming a skill, URL or procedure; `required` is always `false` in v1 and exists only so the field has an obvious shape).
-- The post is public. The brief must not contain anything the owner would not put in a public issue.
+- **Status and credits.** `status` is `open` or `done`. `sweepky done` sets `done`, `doneAt`, and `credits`: the pubkys of every sweeper whose sweep helped. Several sweepers who reported the same issue before it was fixed are all credited. An abandoned bounty is `done` with an empty `credits`. The owner can rewrite the record later to adjust credits; it is theirs.
+- The post is public. The brief must not contain anything the owner would not put in a public issue. Credits reveal only "this sweeper helped on this bounty", never which finding or how severe.
 
 ## The sweep package
 
@@ -53,7 +56,7 @@ The encrypted `.age` payload is a `tar.zst` containing:
 | `findings.json` | yes | the common Sweepky findings format below |
 | `attachments/…` | no | anything the playbook produced: full reports, coverage ledgers, logs. Freeform |
 
-**Common findings format.** Small on purpose, so any playbook can emit it and the board can render it:
+**Common findings format.** Small on purpose, so any playbook can emit it and owner tooling can merge it:
 
 ```json
 {
@@ -77,6 +80,8 @@ The encrypted `.age` payload is a `tar.zst` containing:
 
 `id` is the dedupe key across sweeps. The CLI ships a converter from Cloudflare's `findings.json` (its `fingerprint` becomes `id`, its verdict branches become `status`); a sweeper using another playbook has their agent write this format directly, and the `/sweepky` skill carries the schema. `extra` preserves anything playbook-specific.
 
+When the owner's CLI merges sweeps it keeps, locally and never published, `reportedBy: [sweeper, …]` for each `id` in upload order. That list is what `sweepky done` uses to propose credits.
+
 ## Target kinds and how a sweep is scoped
 
 | Kind | Fields | Scope handed to the playbook |
@@ -90,7 +95,7 @@ The CLI writes the scope as a small `scope.json` in the sweep directory; the `/s
 
 ## Discovery
 
-**Circle.** Poll each roster member's `/pub/sweepky/` (`bounties/`, `sweeps/`, `keys/`, `attestations/`) every 30–60 s. For a circle of under ~30 this is a handful of requests, and a sweep takes an hour, so 30 s is live. Event streams are deferred: the SDK has no auto-reconnect, a 50-user cap per stream, and returns 404 if any listed user moved homeserver.
+**Circle.** Poll each roster member's `/pub/sweepky/` (`bounties/`, `sweeps/`, `keys/`) every 30–60 s. Credits ride on the bounty records, so reputation needs no extra fetch. For a circle of under ~30 this is a handful of requests, and a sweep takes an hour, so 30 s is live. Event streams are deferred: the SDK has no auto-reconnect, a 50-user cap per stream, and returns 404 if any listed user moved homeserver.
 
 **Open bounties.** Follow the homeserver's all-users public events feed for each homeserver on a small **watch list** (default: the production homeserver; in dev, the local testnet homeserver).
 
@@ -104,7 +109,7 @@ The CLI writes the scope as a small `scope.json` in the sweep directory; the `/s
 ## Compatibility rules every client follows
 
 - `schemaVersion` on every record; reject only when the major is greater than supported.
-- Open-string enums (`kind`, `status`, `alg`, `access.kind`, `method`, `proof.kind`): plain strings with an `as_known()` helper, never closed serde enums.
-- Unknown top-level fields: ignore, and preserve on rewrite.
+- Open-string enums (`kind`, `status`, `alg`, `method`, `proof.kind`): plain strings with an `as_known()` helper, never closed serde enums.
+- Unknown top-level fields: ignore, and preserve on rewrite. `sweepky done` rewrites the bounty, so this rule is exercised from day one.
 - Unknown `kind`: skip that record and show a placeholder; never reject the whole feed.
 - `keys/*.json` always carries `alg` and `revokedAt` so post-quantum keys can be added later without a migration.

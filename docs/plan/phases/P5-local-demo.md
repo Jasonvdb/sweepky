@@ -16,22 +16,22 @@ The demo report may describe unpatched findings in a real repository. It is read
 ## `scripts/demo-local.sh`
 
 1. Start the testnet (`TEST_PUBKY_CONNECTION_STRING` against local Postgres).
-2. `sweepky dev identity new owner`, `new sweeper`, `new stranger`.
+2. `sweepky dev identity new owner`, `new sweeper`, `new stranger`; each `login` publishes a device key.
 3. `sweepky circle create` as owner; add `sweeper`.
 4. `sweepky post --open` the bounty from `SWEEPKY_DEMO_TARGETS` as owner.
 5. `sweepky run --as sweeper` then `sweepky submit --run-dir "$SWEEPKY_DEMO_RUN_DIR"`.
-6. `sweepky run --as stranger` then `sweepky submit` a synthetic run dir.
-7. `sweepky pull --as owner`; show the merged findings and the `untrusted/` summary.
-8. `sweepky confirm` then `sweepky resolve` one of the stranger's findings as owner.
-9. `pnpm --dir web dev` with `VITE_PUBKY_TESTNET=1`; print the board URL and the `sweepky dev approve` line for the sign-in QR.
+6. `sweepky run --as stranger` then `sweepky submit` a synthetic run dir that shares one finding `id` with the real one.
+7. `sweepky pull --as owner`; show the merged findings (the shared finding lists both reporters) and the `untrusted/` summary.
+8. `sweepky done --as owner`: the proposal is {sweeper, stranger}; accept.
+9. `pnpm --dir web dev` with `VITE_PUBKY_TESTNET=1`; print the board URL.
 
 ## Done when
 
-- The board at `http://localhost:5173` shows the bounty, both sweeps landing, and (signed in as owner) every finding from the demo report with GitHub links at the pinned SHA.
-- The stranger's sweep shows as `unknown`, then `known: 1` after the resolve (and not after the confirm alone).
+- `sweepky pull` as the owner prints every finding from the demo report with GitHub links at the pinned SHA.
+- The board at `http://localhost:5173` shows the bounty, both sweeps landing, the stranger's sweep as `unknown`, then the bounty done with both credits and the stranger as `known 1`.
 - `sweepky watch` in a terminal shows the same state.
 - Jason approves the look and the flow.
 
 ## After approval (not part of this phase)
 
-Production one-write check under `/pub/sweepky/`, static hosting, `vibe/vibe.json` (`pubkyAppFork: false`, `stack.target: "production"`, `capabilities: ["/pub/sweepky/keys/:rw"]`) and the PR to `pubky/vibes`, then the extensions in [05-extensions.md](../05-extensions.md).
+Production one-write check under `/pub/sweepky/`, static hosting, `vibe/vibe.json` (`pubkyAppFork: false`, `stack.target: "production"`, `capabilities: []` since the board writes nothing) and the PR to `pubky/vibes`, then the extensions in [05-extensions.md](../05-extensions.md).

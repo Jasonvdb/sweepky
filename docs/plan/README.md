@@ -6,10 +6,10 @@ Design docs first, then one file per build phase. Read them in order the first t
 |---|---|
 | [00-overview.md](00-overview.md) | The concept, the locked decisions, the core loop, the trust model |
 | [01-records-and-discovery.md](01-records-and-discovery.md) | Every record and path, target kinds, how clients find sweeps, compatibility rules |
-| [02-encryption-and-safety.md](02-encryption-and-safety.md) | age encryption and device keys, authorship, sweeper sandboxing |
+| [02-encryption-and-safety.md](02-encryption-and-safety.md) | What Pubky provides, owner-only encryption and keys, authorship, sweeper sandboxing |
 | [03-cli-and-skill.md](03-cli-and-skill.md) | Repo layout, the `sweepky` CLI, the `/sweepky` skill, Rust conventions |
-| [04-board.md](04-board.md) | The web board: stack, sign-in, views, live-ness, visual direction |
-| [05-extensions.md](05-extensions.md) | Reserved extension points: sats bounties (Paykit), Locks, badges, tags |
+| [04-board.md](04-board.md) | The public web board: stack, views, live-ness, visual direction |
+| [05-extensions.md](05-extensions.md) | Reserved extension points: sats bounties (Paykit), Locks, badges, tags, reading in the browser |
 | [06-verification-and-limits.md](06-verification-and-limits.md) | How the whole thing is verified, known limits, source references |
 
 ## Phases
@@ -20,7 +20,7 @@ Design docs first, then one file per build phase. Read them in order the first t
 | [P1 sweepky-core](phases/P1-sweepky-core.md) | Records, ids, paths, trust labels, feed parser, encryption, packing |
 | [P2 sweepky-cli](phases/P2-sweepky-cli.md) | The `sweepky` binary and the testnet end-to-end test |
 | [P3 skill and sandbox](phases/P3-skill-and-sandbox.md) | The `/sweepky` skill and the sweeper sandbox template |
-| [P4 board](phases/P4-board.md) | The web board |
+| [P4 board](phases/P4-board.md) | The public web board |
 | [P5 local demo](phases/P5-local-demo.md) | The reproducible local demo that gates everything after it |
 
 ## Vocabulary
@@ -30,11 +30,11 @@ Design docs first, then one file per build phase. Read them in order the first t
 | **Bounty** | A request to sweep one or more pinned targets, posted by an **owner**: a fixed envelope plus a freeform brief |
 | **Focus** | What a bounty is looking for: `security` first, but `bugs`, `perf` or anything else |
 | **Playbook** | The skill or procedure a sweeper's agent follows. A bounty may suggest one; none is required |
-| **Sweep** | One run against a bounty by a **sweeper**'s agent; the encrypted result |
+| **Sweep** | One run against a bounty by a **sweeper**'s agent; the result, encrypted so only the owner can read it |
 | **Circle** | The roster an admin maintains; the default trust and discovery set |
-| **Trust label** | `circle` / `known` / `unknown`, computed per sweep from the roster and attestations |
-| **Attestation** | A public credit record an owner writes when a finding is **resolved** (not when it is merely confirmed); the reputation source |
-| **Board** | The web app where owners and visitors watch sweeps and owners read findings |
+| **Trust label** | `circle` / `known` / `unknown`, computed per sweep from the roster and credits |
+| **Credit** | A sweeper's pubky listed in `credits` on a bounty the owner marked **done**; the reputation source. Every sweeper whose sweep helped is credited, including several who found the same issue |
+| **Board** | The public web page where anyone watches bounties and sweeps. Findings are read through the owner's agent, never on the board |
 
 ## Ground rules for the build
 
