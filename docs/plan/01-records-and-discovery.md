@@ -48,13 +48,30 @@ A fixed envelope that tools act on, with a freeform brief inside for humans and 
 
 ## The sweep package
 
-The encrypted `.age` payload is a `tar.zst` containing:
+The encrypted `.age` payload is **one JSON document**. No archive format and no compression: the CLI builds the document, encrypts it, pads it.
 
-| Entry | Required | Contents |
+```json
+{
+  "schemaVersion": 1,
+  "manifest": {
+    "sweeper": "<pubky>",
+    "bounty": "pubky://<owner>/pub/sweepky/bounties/<id>.json",
+    "targets": ["t1"],
+    "targetShas": { "t1": "<sha>" },
+    "playbook": "cloudflare/security-audit@c1c8a8c",
+    "startedAt": "<timestamp>",
+    "finishedAt": "<timestamp>"
+  },
+  "findings": { "…": "the common findings format below" },
+  "attachments": { "REPORT.md": "…", "coverage-ledger.json": "…" }
+}
+```
+
+| Field | Required | Contents |
 |---|---|---|
-| `manifest.json` | yes | `{sweeper, bounty, targets, targetShas, playbook, startedAt, finishedAt}` — binds the package to its record |
-| `findings.json` | yes | the common Sweepky findings format below |
-| `attachments/…` | no | anything the playbook produced: full reports, coverage ledgers, logs. Freeform |
+| `manifest` | yes | binds the package to its record: sweeper, bounty, targets and their SHAs, playbook, timestamps |
+| `findings` | yes | the common Sweepky findings format below |
+| `attachments` | no | relative file name → UTF-8 text, for whatever else the playbook produced: full reports, coverage ledgers, logs. The CLI skips anything that is not text and says so |
 
 **Common findings format.** Small on purpose, so any playbook can emit it and owner tooling can merge it:
 
@@ -89,7 +106,8 @@ When the owner's CLI merges sweeps it keeps, locally and never published, `repor
 | `pr` | `{repo, number, base, head}` | diff `base..head` on the `head` checkout |
 | `commit` | `{repo, rev}` | diff `rev^..rev` |
 | `repo` | `{repo, rev, paths?}` | the whole tree narrowed to `paths`; the CLI warns if a whole repo has no `paths`, because a long run can outlast a 5-hour plan window |
-| `crate` | `{name, version, sha256}` | the published tarball, checksum-verified against the crates.io index: sweep what ships, not what is on GitHub |
+
+Three kinds, all fetched with git. A `crate` kind (the published tarball, checksum-verified against the crates.io index, to sweep what ships rather than what is on GitHub) is deferred: it would be the only kind with a non-git fetch path. See [05](05-extensions.md#deferred-with-the-trigger-that-justifies-each).
 
 The CLI writes the scope as a small `scope.json` in the sweep directory; the `/sweepky` skill tells the agent to pass it to whichever playbook it uses. Cloudflare's skill, for reference, supports scoping to "named paths, one subsystem, one companion domain, or the diff between two source refs".
 
@@ -104,7 +122,7 @@ The CLI writes the scope as a small `scope.json` in the sweep directory; the `/s
 - Endpoint: `GET <homeserver>/events/?cursor=<c>&limit=<n>`. Plain text, one `PUT|DEL pubky://<user>/<path>` per line, then a `cursor: <next>` line. Public paths only. No SDK wrapper exists, so `sweepky-core` parses it and the CLI and board fetch it over HTTP.
 - Filter for `/pub/sweepky/sweeps/*.json` PUTs, fetch the record, keep those whose `bounty` URL is one of ours and whose sweeper is not in the roster.
 - Persist the cursor per homeserver. The default cursor `0` is the beginning of history, so P2 must find a cheap "current cursor" (inspect the homeserver's `EventsService::parse_cursor` / `EventCursor`; fallback: page once with a large `limit` and persist).
-- Known gap: a sweeper on a homeserver not on the watch list is not seen. That is the credible-exit trade-off; `sweepky watch --add-homeserver <pk>` extends the list.
+- Known gap: a sweeper on a homeserver not on the watch list is not seen. That is the credible-exit trade-off; the watch list is a config entry the owner can extend.
 
 **Never an indexer of our own.** Nexus cross-app tags (`/pub/sweepky/tags/<id>` tagging the bounty URL; Nexus ingests cross-app tags with any URL as `uri`) are the later addition for cross-homeserver coverage, once the Nexus query side is verified live.
 

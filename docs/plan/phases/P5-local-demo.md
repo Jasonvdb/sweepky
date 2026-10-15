@@ -31,7 +31,6 @@ Three identities run side by side, each with its own `SWEEPKY_HOME`; below, `as 
 
 - `sweepky pull` as the owner prints every finding from the demo report with GitHub links at the pinned SHA.
 - The board at `http://localhost:5173` shows the bounty, both sweeps landing, the stranger's sweep as `unknown`, then the bounty done with both credits and the stranger as `known 1`.
-- `sweepky watch` in a terminal shows the same state.
 - Jason approves the look and the flow.
 
 ## After approval (not part of this phase)

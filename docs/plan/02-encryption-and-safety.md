@@ -15,7 +15,7 @@ So "only the owner can read findings" is the one requirement Pubky cannot meet n
 
 | Public (anyone can read) | Sealed (only the owner can open) |
 |---|---|
-| The bounty post, including its brief | The whole sweep package: `manifest.json`, `findings.json`, attachments |
+| The bounty post, including its brief | The whole sweep package: manifest, findings, attachments |
 | Sweep records: who swept which bounty, when, with which playbook, status | |
 | Every CLI's public encryption key (`keys/`) | |
 | The roster (`circle.json`) | |
@@ -50,7 +50,7 @@ Why age: it encrypts to several recipients natively (an owner with two laptops, 
 age has no sender authentication, and Pubky Ring cannot sign arbitrary data. Authorship therefore rests on two facts:
 
 1. The record sits at the writer's own path on their own homeserver, which only their session can write.
-2. The `manifest.json` inside the ciphertext echoes sweeper, bounty and targets, so a copied report does not check out anywhere else.
+2. The manifest inside the ciphertext echoes sweeper, bounty and targets, so a copied report does not check out anywhere else.
 
 Clients reject records whose path owner does not match the sweeper named inside, and, for closed bounties, records from pubkys outside the roster.
 

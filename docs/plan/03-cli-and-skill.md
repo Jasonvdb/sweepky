@@ -6,7 +6,7 @@
 sweepky/
   Cargo.toml              workspace
   crates/sweepky-core/    records, paths, ids, target pinning, trust labels, feed parser,
-                          age wrap/unwrap, pack/unpack, manifest — no network or file I/O
+                          age wrap/unwrap, package envelope, manifest — no network or file I/O
   crates/sweepky-cli/     the `sweepky` binary (clap, tokio)
   skill/sweepky/          SKILL.md + the .claude/settings.json sandbox template
   web/                    the board (Vite + React + TS, read-only)
@@ -24,16 +24,15 @@ sweepky/
 | `init <dir>` | Writes the sandbox settings and a `CLAUDE.md` for a sweeper project |
 | `circle create\|add\|remove\|show` | Roster admin |
 | `keys list\|revoke` | This identity's published device keys |
-| `post [--open]` | Pins SHAs via `git ls-remote`/`gh`, crate sha256 from the index; refuses non-public repos |
+| `post [--open]` | Pins SHAs via `git ls-remote`/`gh`; refuses non-public repos |
 | `run` | Picks the target with the fewest sweeps, writes `running`, fetches the target, writes `scope.json` and the bounty's brief into the sweep directory |
-| `submit --run-dir <dir> [--playbook <name>]` | Builds the package (manifest, `findings.json`, attachments), converting Cloudflare output when detected; encrypts to the bounty owner's unrevoked keys plus its own; uploads `.age`; flips to `done` (or `aborted`) |
+| `submit --run-dir <dir> [--playbook <name>]` | Builds the package (one JSON document: manifest, findings, text attachments), converting Cloudflare output when detected; encrypts to the bounty owner's unrevoked keys plus its own; uploads `.age`; flips to `done` (or `aborted`) |
 | `pull` | Roster polling plus the events-feed watcher for open bounties (persisted cursors); prints each sweep's trust label; decrypts to `~/.local/share/sweepky/<bounty>/`; merges trusted findings by `id`, recording every sweeper that reported each one; untrusted into `untrusted/` |
 | `done <bounty> [--credit <pubky>]… [--no-credit <pubky>]…` | Rewrites the bounty with `status: "done"`, `doneAt` and `credits`. With no flags it proposes every sweeper whose sweep contributed at least one finding and asks for confirmation; the flags add or drop names. Two sweepers who reported the same finding are both proposed |
-| `watch [--add-homeserver <pk>]` | Terminal live view |
 
-Ten commands. There is no `dev` group: `login --identity` doubles as the testnet stand-in for Ring, and `SWEEPKY_HOME` points the CLI at a different config and state directory so a script can run several identities side by side. There is no `confirm`, `resolve` or `close`: triage is local, and `done` is the only public write after `post`.
+Nine commands. There is no `watch`: the board is the live view, `pull` prints the state it finds, and the open-bounty homeserver watch list is a config entry. There is no `dev` group: `login --identity` doubles as the testnet stand-in for Ring, and `SWEEPKY_HOME` points the CLI at a different config and state directory so a script can run several identities side by side. There is no `confirm`, `resolve` or `close`: triage is local, and `done` is the only public write after `post`.
 
-`submit` packages whatever is in the sweep directory: `findings.json` (required; converted from Cloudflare's format when that is what it finds), and everything else as `attachments/`. The sweeper's agent is told to keep scratch files out of the sweep directory.
+`submit` packages whatever is in the sweep directory into one JSON document: `findings.json` (required; converted from Cloudflare's format when that is what it finds) becomes `findings`, and every other UTF-8 text file becomes an `attachments` entry keyed by its relative path. Non-text files are skipped with a warning. The sweeper's agent is told to keep scratch files out of the sweep directory.
 
 ## Two ways to log in
 
@@ -74,7 +73,7 @@ One skill, four roles: `run` (default), `post`, `pull`, `done`. Only `run` requi
 
 ## Dependencies
 
-`pubky` 0.14 · `age` 0.12.x (no `plugin`) · `clap` · `tokio` · `serde` / `serde_json` · `secrecy` + `zeroize` · `qrcode` · `thiserror` (core) / `anyhow` (CLI) · `zstd` + `tar`. Tooling: stable toolchain, `cargo nextest`, `cargo-deny`, clippy with `-D warnings`, exact version pins.
+`pubky` 0.14 · `age` 0.12.x (no `plugin`) · `clap` · `tokio` · `serde` / `serde_json` · `secrecy` + `zeroize` · `qrcode` · `thiserror` (core) / `anyhow` (CLI). Tooling: stable toolchain, `cargo nextest`, `cargo-deny`, clippy with `-D warnings`, exact version pins.
 
 No `paykit` or `locks` crates in v1: they pin `pubky` 0.15 and 0.11 respectively.
 

@@ -11,12 +11,11 @@ The `sweepky` binary, end to end against a local testnet, including open-bounty 
 - Shared tail of `login`: age key generated and published, backup reminder printed. Recovery files and raw secrets of existing identities are rejected with a one-line reason.
 - `logout`: revoke the grant or forget the identity; mark the device key revoked.
 - `circle create|add|remove|show`; `keys list|revoke`.
-- `post [--open]`: pins SHAs via `git ls-remote` / `gh`, crate sha256 from the crates.io index; refuses non-public repos.
+- `post [--open]`: pins SHAs via `git ls-remote` / `gh`; refuses non-public repos.
 - `run`: picks the target with the fewest sweeps, writes `running`, fetches the target into the sweeper project, writes `scope.json` and the brief.
-- `submit --run-dir [--playbook]`: build the package (manifest, `findings.json`, attachments), converting Cloudflare output when detected → read the bounty, list the owner's unrevoked `keys/` → encrypt to those plus this install's key → upload `.age` → flip to `done` (or `aborted` on failure).
-- `pull`: roster polling plus the events-feed watcher for open bounties with persisted cursors; trust labels from roster plus credits; decrypt to `~/.local/share/sweepky/<bounty>/`; merge trusted findings by `id` keeping `reportedBy`; untrusted into `untrusted/`.
+- `submit --run-dir [--playbook]`: build the one-document package (manifest, findings, text attachments), converting Cloudflare output when detected → read the bounty, list the owner's unrevoked `keys/` → encrypt to those plus this install's key → upload `.age` → flip to `done` (or `aborted` on failure).
+- `pull`: roster polling plus the events-feed watcher for open bounties (homeserver watch list from config, persisted cursors); trust labels from roster plus credits; decrypt to `~/.local/share/sweepky/<bounty>/`; merge trusted findings by `id` keeping `reportedBy`; untrusted into `untrusted/`.
 - `done <bounty> [--credit] [--no-credit]`: proposes credits from the merged findings, confirms interactively unless flags settle it, rewrites the bounty with `status: "done"`, `doneAt`, `credits`, preserving unknown fields.
-- `watch [--add-homeserver <pk>]` (terminal live view).
 - Config and state under `~/.config/sweepky/` (secrets, 0600) and `~/.local/share/sweepky/` (pulled sweeps, merged findings, cursors); `SWEEPKY_HOME` overrides both so a script can run several identities side by side.
 
 ## Done when

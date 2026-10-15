@@ -55,5 +55,7 @@ No record changes: sweepers' CLIs already encrypt to every unrevoked owner key t
 | Leaderboard from credits | Two or more members ask who helped most |
 | Quota-aware auto mode | Sweepers say they forget to run it, and Claude Code exposes stable usage data |
 | Multi-circle | Someone asks |
+| `crate` target kind (published tarball, checksum-verified against the crates.io index) | Someone wants to sweep what ships on crates.io rather than the repo |
+| Terminal live view (`sweepky watch`) | Someone wants to follow sweeps without a browser |
 | Nexus tags for discovery | First open bounty with sweepers on homeservers outside the watch list |
 | E2 Locks | Locks leaves alpha |

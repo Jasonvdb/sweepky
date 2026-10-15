@@ -2,7 +2,7 @@
 
 ## What it is
 
-Developers throw their unused AI plan capacity at bounties on other people's code. An **owner** posts a bounty: a repo, a PR, a commit or a crate, each pinned to an exact SHA or checksum, plus a brief saying what to look for. A **sweeper** runs `/sweepky` in their own Claude Code, on their own plan; their agent follows a **playbook** against the pinned target and uploads the findings to the sweeper's own Pubky homeserver under `/pub/sweepky/`, encrypted so that only the bounty's owner can read them. The owner's agent collects, dedupes and summarises the findings locally. The **board** is the public window: anyone can watch bounties appear, sweeps land and bounties get marked done, but findings are never shown there. The board is also the listing on vibes.pubky.app.
+Developers throw their unused AI plan capacity at bounties on other people's code. An **owner** posts a bounty: a repo, a PR or a commit, each pinned to an exact SHA, plus a brief saying what to look for. A **sweeper** runs `/sweepky` in their own Claude Code, on their own plan; their agent follows a **playbook** against the pinned target and uploads the findings to the sweeper's own Pubky homeserver under `/pub/sweepky/`, encrypted so that only the bounty's owner can read them. The owner's agent collects, dedupes and summarises the findings locally. The **board** is the public window: anyone can watch bounties appear, sweeps land and bounties get marked done, but findings are never shown there. The board is also the listing on vibes.pubky.app.
 
 **Playbook-agnostic, focus-agnostic.** A bounty may *suggest* a playbook (the default suggestion is Cloudflare's `security-audit` skill) but never requires one; sweepers use whatever skill they have and declare it in the sweep record. Security review is the first focus; a bounty's `focus` can equally be general bugs, performance or anything else. What every sweep must share is one small common findings format (see [01](01-records-and-discovery.md#the-sweep-package)) so owner tooling works regardless of playbook.
 
@@ -29,10 +29,10 @@ A **circle** (a roster) is the default trust set, but the protocol is open: a bo
 
 ## The loop
 
-1. **Post.** Owner, in Claude Code: "post a bounty for repo X at main, scope the auth module." The agent runs `sweepky post`. The CLI pins SHAs and checksums and refuses non-public repos.
+1. **Post.** Owner, in Claude Code: "post a bounty for repo X at main, scope the auth module." The agent runs `sweepky post`. The CLI pins SHAs and refuses non-public repos.
 2. **Run.** A sweeper runs `/sweepky`. `sweepky run` picks the target with the fewest sweeps, writes `sweeps/<id>.json` with `status: "running"`, and fetches the pinned target into the sandboxed sweeper project.
 3. **Sweep.** The agent follows the playbook (the bounty's suggestion or the sweeper's own), scoped by target kind, writing into `./sweeps/<id>/` inside the sweeper project, and produces the common `findings.json` (directly, or via the CLI's converter for Cloudflare's format).
-4. **Submit.** `sweepky submit` builds the package (manifest, `findings.json`, attachments), encrypts it to the owner's published keys plus the sweeper's own, uploads `sweeps/<id>.age`, and flips the record to `done` (or `aborted`).
+4. **Submit.** `sweepky submit` builds the package (one JSON document: manifest, findings, text attachments), encrypts it to the owner's published keys plus the sweeper's own, uploads `sweeps/<id>.age`, and flips the record to `done` (or `aborted`).
 5. **Pull.** Owner: "anything new?" `sweepky pull` decrypts new sweeps locally. The agent merges findings by `id`, keeping every sweeper who reported each one, summarises, and drafts fixes. Triage stays local.
 6. **Done.** When the owner is finished with the bounty, `sweepky done <bounty>` rewrites it with `status: "done"` and `credits`: every sweeper whose sweep helped. The CLI proposes the list from the merged findings and the owner trims it. Two sweepers who found the same issue are both credited. A bounty nobody helped with is done with an empty list.
 
