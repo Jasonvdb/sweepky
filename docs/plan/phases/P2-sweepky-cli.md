@@ -6,9 +6,9 @@ The `sweepky` binary, end to end against a local testnet, including open-bounty 
 
 ## Build
 
-- `login --ring` (option A): Ring QR via `PubkyGrantAuthFlow`, grant to a 0600 file, expiry shown and warned about ahead of time.
+- `login` (option A, default): `PubkyGrantAuthFlow` for `/pub/sweepky/:rw`; a one-page loopback site (random port and path, one flow, timeout) with the QR, a copy-link button and live status, opened in the default browser; the same URL and a terminal QR as fallback; grant to a 0600 file; expiry shown and warned about ahead of time. The page is a static HTML string with the QR rendered server-side as SVG by the `qrcode` crate, no JS framework.
 - `login --identity <name> [--homeserver <pk>] [--signup-token <code>]` (option B): local keypair under that name (created or reused), `PubkySigner::signup` then `signin`, secret to a 0600 file, optional passphrase wrap. Homeserver defaults to the testnet's in testnet mode, else `homeserver.pubky.app`.
-- Shared tail of `login`: age key generated and published, backup reminder printed. Interactive `login` with no flag asks A or B; non-interactive without a flag errors with the two choices. Recovery files and raw secrets of existing identities are rejected with a one-line reason.
+- Shared tail of `login`: age key generated and published, backup reminder printed. Recovery files and raw secrets of existing identities are rejected with a one-line reason.
 - `logout`: revoke the grant or forget the identity; mark the device key revoked.
 - `circle create|add|remove|show`; `keys list|revoke`.
 - `post [--open]`: pins SHAs via `git ls-remote` / `gh`, crate sha256 from the crates.io index; refuses non-public repos.
@@ -22,12 +22,13 @@ The `sweepky` binary, end to end against a local testnet, including open-bounty 
 ## Done when
 
 - `#[pubky_testnet::test]` end-to-end: identities A (admin/owner), B (circle sweeper), C (stranger); circle = {A, B}; A posts an `open` bounty with two targets; B submits a synthetic sweep; C submits another sharing one finding `id` with B's; A pulls: B's sweep is `circle` and merged, C's is discovered via the testnet homeserver's `/events/` feed, labelled `unknown`, and lands in `untrusted/`; the merged finding lists reporters {B, C}; A runs `done`, the proposal is {B, C}, A accepts, the bounty is `done` with both credits, and C's label is `known: 1` on the next pull; one of the two synthetic sweeps uses Cloudflare-format output and the other a hand-written common-format `findings.json`, and both decrypt and merge; a device key published after a sweep cannot decrypt it; a second install of A logged in before a third sweep decrypts that third sweep; `logout` invalidates the grant; the events cursor survives a restart.
-- Both login options are covered in the same test: A logs in with `--ring`, the test approves the printed `pubkyauth` URL in-process with `PubkySigner::approve_auth`, and the resulting grant writes a record. B and C use `--identity`. A recovery file passed to `login` is rejected.
+- Both login options are covered in the same test: A logs in with the default Ring flow, the test fetches the loopback page (QR and link present, status "waiting"), approves the `pubkyauth` URL in-process with `PubkySigner::approve_auth`, sees the status flip to "approved", and the resulting grant writes a record. B and C use `--identity`. A recovery file passed to `login` is rejected. A request to the loopback server with the wrong path gets 404.
 - Clippy, deny, nextest clean.
 
 ## Open questions to resolve in this phase
 
 - The `/events/` feed's default cursor is the beginning of history. Find a cheap way to obtain the current cursor (inspect `EventsService::parse_cursor` / `EventCursor` in the homeserver); fallback: page once with a large `limit` and persist. Document whichever works.
+- The `client_id` string. Ring shows it to the user when approving, and the SDK expects a domain-like identifier; pick one we control and use it for the CLI (and later the board).
 - ~~How a person obtains a raw signup token for option B on production.~~ Resolved 2026-10-15, see [06](../06-verification-and-limits.md#production-homeserver-as-deployed-on-2026-10-15): the token is plain text in three places, and Homegate's HTTP API returns it as JSON, so the CLI can fetch it itself. v1 accepts `--signup-token` and prints the three ways to get one; a `login --identity … --pay` helper that drives Homegate's Lightning flow from the terminal is a cheap later addition, not v1.
 
 ## Notes

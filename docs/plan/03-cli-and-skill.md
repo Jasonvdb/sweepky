@@ -19,7 +19,7 @@ sweepky/
 
 | Command | Does |
 |---|---|
-| `login [--ring \| --identity <name>] [--homeserver <pk>] [--signup-token <code>]` | Two ways in, see [Two ways to log in](#two-ways-to-log-in). Either way it generates this install's age key, publishes `keys/<deviceId>.json`, and reminds the user to back up `~/.config/sweepky/` |
+| `login [--identity <name>] [--homeserver <pk>] [--signup-token <code>]` | Default: Pubky Ring, via a sign-in page the CLI opens in the browser. `--identity` creates a dedicated identity instead. See [Two ways to log in](#two-ways-to-log-in). Either way it generates this install's age key, publishes `keys/<deviceId>.json`, and reminds the user to back up `~/.config/sweepky/` |
 | `logout` | Revokes the grant and marks this device key revoked |
 | `init <dir>` | Writes the sandbox settings and a `CLAUDE.md` for a sweeper project |
 | `circle create\|add\|remove\|show` | Roster admin |
@@ -37,9 +37,11 @@ Ten commands. There is no `dev` group: `login --identity` doubles as the testnet
 
 ## Two ways to log in
 
-| | A. Pubky Ring | B. CLI-held identity |
+Most people will use the pubky they already have in Ring, so that is the default. The dedicated identity exists for agents, CI, the testnet, and anyone who prefers one.
+
+| | A. Pubky Ring (default) | B. CLI-held identity |
 |---|---|---|
-| Flag | `--ring` | `--identity <name>` |
+| Flag | none | `--identity <name>` |
 | Whose identity | the one already in Ring | a new pubky the CLI creates, or one it created earlier under that name |
 | Human steps | scan one QR, once | none |
 | What is stored (0600, in `~/.config/sweepky/`) | a grant scoped to `/pub/sweepky/:rw` plus the CLI's client key | the identity secret, optionally passphrase-wrapped |
@@ -47,7 +49,15 @@ Ten commands. There is no `dev` group: `login --identity` doubles as the testnet
 | If the file leaks | someone can write Sweepky records as you until you revoke; nothing else | that identity is theirs; your main identity is untouched |
 | Homeserver | wherever the Ring identity lives | `--homeserver <pubkey>`; defaults to the testnet homeserver in testnet mode, else to `homeserver.pubky.app`, which needs `--signup-token` |
 
-An interactive `login` with no flag asks which in two lines. Non-interactive runs (agents, scripts, CI) must pass a flag. Credits accrue to whichever pubky is used; a dedicated identity can be mentioned from a pubky.app profile if its owner wants the two linked. The official `pubky-cli` already creates identities from a recovery file and signs up with a code, so B is an established pattern, not a Sweepky invention.
+Credits accrue to whichever pubky is used; a dedicated identity can be mentioned from a pubky.app profile if its owner wants the two linked. The official `pubky-cli` already creates identities from a recovery file and signs up with a code, so B is an established pattern, not a Sweepky invention.
+
+**How the Ring sign-in looks.** `sweepky login` starts the SDK's grant flow (`PubkyGrantAuthFlow`), which yields a `pubkyauth://` URL, then:
+
+- Serves a single page on `127.0.0.1:<random port>/<random path>` and opens it in the default browser. The page shows a large QR of that URL, a "copy link" button (Ring accepts a pasted link too), what is being requested (`/pub/sweepky/:rw` and the client id Ring will display), and a live status that flips to "approved, you can close this tab" when `await_approval()` returns.
+- Prints the same URL and a small QR in the terminal as the fallback for SSH sessions and machines without a browser.
+- Hygiene: loopback only, random path so no other local page or process can guess it, serves exactly one flow, exits on approval or after a timeout. The URL carries the relay channel secret, so it is never logged or written to disk.
+
+An agent can run `sweepky login` on a human's laptop: the page opens, the human scans, the agent carries on. Fully unattended setups use `--identity`.
 
 **Refused:** importing an existing identity's secret or recovery file into the CLI. That secret controls the identity forever, including moving it to another homeserver, and this CLI runs under agents that read untrusted code. Ring exists to keep that secret off the laptop; `login` rejects recovery files and says why.
 

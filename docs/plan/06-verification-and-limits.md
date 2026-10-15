@@ -8,7 +8,7 @@
 - **Sweeper safety:** inside an `init` project, the agent cannot `curl` out, cannot read `~/.config/sweepky/`, and `sweepky submit` still succeeds.
 - **Local demo acceptance (P5):** `scripts/demo-local.sh` reproduces the whole flow from a clean testnet; `sweepky pull` as the owner prints every finding from the demo report; the board at `localhost:5173` shows the public state including the done bounty and its credits; the terminal `watch` shows the same. Jason approves before anything is deployed.
 - **Hygiene after each session:** drop leaked `pubky_test_*` databases created during the session; confirm `git status` is clean and nothing from the local demo report is tracked.
-- **Later (post-approval):** the production one-write check under `/pub/sweepky/`; `pubky/vibes` CI validates `vibe.json` and reaches `hosted.url`.
+- **Later (post-approval):** the first real Ring sign-in through the browser page, against staging before production; the production one-write check under `/pub/sweepky/`; `pubky/vibes` CI validates `vibe.json` and reaches `hosted.url`.
 
 ## Known limits (say them in the README)
 
