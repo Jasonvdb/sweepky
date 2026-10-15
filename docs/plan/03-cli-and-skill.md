@@ -5,34 +5,37 @@
 ```
 sweepky/
   Cargo.toml              workspace
-  crates/sweepky-core/    records, paths, ids, target pinning, trust labels, feed parser,
-                          age wrap/unwrap, package envelope, manifest — no network or file I/O
-  crates/sweepky-cli/     the `sweepky` binary (clap, tokio)
-  skill/sweepky/          SKILL.md + the .claude/settings.json sandbox template
+  crates/sweepky-core/    records, paths, ids, target pinning, trust labels, finding groups,
+                          feed parser, age wrap/unwrap, package envelope, manifest — no network or file I/O
+  crates/sweepky-cli/     the `sweepky` binary (clap, tokio); a library entry point takes the network
+                          client, relay URL and default homeserver so tests can inject a testnet
+  skills/sweepky/         SKILL.md + the .claude/settings.json sandbox template; `init` copies it into a project
   web/                    the board (Vite + React + TS, read-only)
-  fixtures/               synthetic records and run directories for tests
+  fixtures/               synthetic records, run directories and a small bare git repo for tests
   vibe/                   vibe.json + cover for the pubky/vibes PR (post-approval)
   docs/plan/              these docs
 ```
 
 ## The `sweepky` CLI (v1)
 
+A global `--testnet` flag (or `SWEEPKY_TESTNET=1`) selects the testnet client, the testnet HTTP relay (`http://localhost:15412/inbox`), the testnet homeserver as the default for `--identity` and as the default watch list. Without it the CLI talks to production. `SWEEPKY_HOME=<dir>` overrides the config and state directories so a script can run several identities side by side.
+
 | Command | Does |
 |---|---|
-| `login [--identity <name>] [--homeserver <pk>] [--signup-token <code>]` | Default: Pubky Ring, via a sign-in page the CLI opens in the browser. `--identity` creates a dedicated identity instead. See [Two ways to log in](#two-ways-to-log-in). Either way it generates this install's age key, publishes `keys/<deviceId>.json`, and reminds the user to back up `~/.config/sweepky/` |
-| `logout` | Revokes the grant and marks this device key revoked |
-| `init <dir>` | Writes the sandbox settings and a `CLAUDE.md` for a sweeper project |
+| `login [--identity <name>] [--homeserver <pk>] [--signup-token <code>]` | Default: Pubky Ring, via a sign-in page the CLI opens in the browser. `--identity` creates a dedicated identity instead. See [Two ways to log in](#two-ways-to-log-in). Either way it generates this install's age key and publishes `keys/<deviceId>.json`. That first write is the check that this identity may write under `/pub/sweepky/` on its homeserver: a 403 means its signup token forbids the path (production's free IP-verified tokens allow only Paykit and Bitkit paths), a 507 means its quota is full; both abort with that explanation and suggest a dedicated identity. Then it reminds the user to back up `~/.config/sweepky/` |
+| `logout` | Marks this device key revoked, then revokes the grant (or forgets the identity), then deletes the local files |
+| `init <dir>` | Writes the sandbox settings and a `CLAUDE.md` for a sweeper project, a `.gitignore` with `sweeps/`, copies the `/sweepky` skill into `.claude/skills/`, and offers to install the Cloudflare playbook project-local at the pinned commit |
 | `circle create\|add\|remove\|show` | Roster admin |
-| `keys list\|revoke` | This identity's published device keys |
-| `post [--open]` | Pins SHAs via `git ls-remote`/`gh`; refuses non-public repos |
-| `run` | Picks the target with the fewest sweeps, writes `running`, fetches the target, writes `scope.json` and the bounty's brief into the sweep directory |
-| `submit --run-dir <dir> [--playbook <name>]` | Builds the package (one JSON document: manifest, findings, text attachments), converting Cloudflare output when detected; encrypts to the bounty owner's unrevoked keys plus its own; uploads `.age`; flips to `done` (or `aborted`) |
-| `pull` | Roster polling plus the events-feed watcher for open bounties (persisted cursors); prints each sweep's trust label; decrypts to `~/.local/share/sweepky/<bounty>/`; merges trusted findings by `id`, recording every sweeper that reported each one; untrusted into `untrusted/` |
-| `done <bounty> [--credit <pubky>]… [--no-credit <pubky>]…` | Rewrites the bounty with `status: "done"`, `doneAt` and `credits`. With no flags it proposes every sweeper whose sweep contributed at least one finding and asks for confirmation; the flags add or drop names. Two sweepers who reported the same finding are both proposed. The owner's own pubky is never proposed, and `--credit` refuses it |
+| `keys list\|revoke` | This identity's published device keys; `list` alarms on ids this owner's installs did not create |
+| `post [--open]` | Pins SHAs with an anonymous `git ls-remote` (every credential helper disabled, so a private repo fails instead of passing through saved credentials); for a PR, reads head and base from GitHub's unauthenticated API and stores the merge base; refuses non-public repos; for an open bounty, finds the starting feed cursors and writes `bounties/<id>.discovered.json` |
+| `run [<bounty-url>] [--target <tid>]` | Terminal command, before the agent. Without arguments picks a target from the circle's open bounties with the fewest sweeps; with a URL, checks the bounty is from the circle or marked `open`. Writes `running`, fetches the pinned target into `./sweeps/<id>/target/<tid>/` (https only, exact SHA, depth 2, no submodules, no LFS), strips the repo's agent-instruction files, writes `scope.json`, the brief and the `.sweepky/sweep.json` marker |
+| `submit [--run-dir <dir>] [--playbook <name>]` | Terminal command, after the agent. Reads the marker to know which sweep it completes; walks the sweep directory under the rules in [02](02-encryption-and-safety.md#sweeper-safety); builds the package (one JSON document: manifest, findings, text attachments), converting Cloudflare output in `audit/` when detected; checks the owner's key set against the pinned one; encrypts to the owner's unrevoked keys plus its own; uploads `.age`; flips to `done` (or `aborted`) |
+| `pull` | Roster polling (reverse listings paged by cursor, 404 as empty, conditional re-GET of open bounties and `running` sweeps) plus the events-feed watcher for open bounties; prints each sweep's trust label and alarms on unknown keys under this owner's `keys/`; decrypts to `~/.local/share/sweepky/<bounty>/`; groups findings by location, recording every sweeper per group; untrusted content into `untrusted/`; appends discovered sweeps to `bounties/<id>.discovered.json` |
+| `done <bounty> [--credit <pubky>]… [--no-credit <pubky>]…` | Rewrites the bounty with `status: "done"`, `doneAt` and `credits`. With no flags it proposes every sweeper who contributed to at least one finding group and asks for confirmation; the flags add or drop names. Two sweepers in the same group are both proposed. The owner's own pubky is never proposed, and `--credit` refuses it |
 
-Nine commands. There is no `watch`: the board is the live view, `pull` prints the state it finds, and the open-bounty homeserver watch list is a config entry. There is no `dev` group: `login --identity` doubles as the testnet stand-in for Ring, and `SWEEPKY_HOME` points the CLI at a different config and state directory so a script can run several identities side by side. There is no `confirm`, `resolve` or `close`: triage is local, and `done` is the only public write after `post`.
+Nine commands. There is no `watch`: the board is the live view, `pull` prints the state it finds, and the open-bounty homeserver watch list is a config entry. There is no `dev` group: `login --identity` doubles as the testnet stand-in for Ring. There is no `confirm`, `resolve` or `close`: triage is local. The public writes after `post` are `done` and the discovered-sweeps file.
 
-`submit` packages whatever is in the sweep directory into one JSON document: `findings.json` (required; converted from Cloudflare's format when that is what it finds) becomes `findings`, and every other UTF-8 text file becomes an `attachments` entry keyed by its relative path. Non-text files are skipped with a warning. The sweeper's agent is told to keep scratch files out of the sweep directory.
+`run` and `submit` are deliberately not for the agent. Both touch the network and the CLI's secrets, and the sweep directory is written by an agent that has read untrusted code, so `submit` treats it as hostile: canonical path under `<init dir>/sweeps/`, marker present, no symlinks or hard links followed, regular files only, `agents/*/scratch/` and `target/` skipped, size caps, file list printed before encryption. `findings.json` (required; converted from Cloudflare's format when that is what `audit/` holds) becomes `findings`, and every other UTF-8 text file becomes an `attachments` entry keyed by its relative path. Non-text files are skipped with a warning.
 
 ## Two ways to log in
 
@@ -43,45 +46,66 @@ Most people will use the pubky they already have in Ring, so that is the default
 | Flag | none | `--identity <name>` |
 | Whose identity | the one already in Ring | a new pubky the CLI creates, or one it created earlier under that name |
 | Human steps | scan one QR, once | none |
-| What is stored (0600, in `~/.config/sweepky/`) | a grant scoped to `/pub/sweepky/:rw` plus the CLI's client key | the identity secret, optionally passphrase-wrapped |
-| Lifetime | until the grant expires (Ring sets it; the CLI warns ahead) or is revoked, from Ring or by `logout` | until the file is deleted |
-| If the file leaks | someone can write Sweepky records as you until you revoke; nothing else | that identity is theirs; your main identity is untouched |
-| Homeserver | wherever the Ring identity lives | `--homeserver <pubkey>`; defaults to the testnet homeserver in testnet mode, else to `homeserver.pubky.app`, which needs `--signup-token` |
+| What is stored (0600, in `~/.config/sweepky/`) | the SDK's exported grant token: the grant scoped to `/pub/sweepky/:rw` plus the CLI's client key | the identity secret, optionally passphrase-wrapped, in a Sweepky file (not a Pubky recovery file) |
+| Lifetime | two years from approval, fixed by the SDK (neither Ring nor the user chooses), or until revoked from Ring or by `logout`. `login` shows the expiry and the CLI warns within 30 days of it | until the file is deleted |
+| If the file leaks | someone can write Sweepky records as you for up to two years unless you revoke, including a key record that lets them read later sweeps; `pull` alarms on that | that identity is theirs; your main identity is untouched |
+| Homeserver | wherever the Ring identity lives | `--homeserver <pubkey>`; defaults to the testnet homeserver under `--testnet`, else to `homeserver.pubky.app`, which needs `--signup-token` |
+| Session per command | restored from the token; writers serialise through a lock file because each restore replaces the previous bearer | a fresh sign-in per command, signed out on exit so two-year root grants do not pile up |
 
-Credits accrue to whichever pubky is used; a dedicated identity can be mentioned from a pubky.app profile if its owner wants the two linked. The official `pubky-cli` already creates identities from a recovery file and signs up with a code, so B is an established pattern, not a Sweepky invention.
+Credits accrue to whichever pubky is used; a dedicated identity can be mentioned from a pubky.app profile if its owner wants the two linked. B is the SDK's intended path for a key holder, not a Sweepky invention: its own signup example and end-to-end tests do exactly this. On production the CLI warns that `--identity` creates a separate public pubky and uses up a signup token.
 
-**How the Ring sign-in looks.** `sweepky login` starts the SDK's grant flow (`PubkyGrantAuthFlow`), which yields a `pubkyauth://` URL, then:
+**How the Ring sign-in looks.** `sweepky login` builds the SDK's grant flow (`PubkyGrantAuthFlow::builder`) with the relay URL from the network config, the default grant format and no encryption scopes, so today's Ring can approve it. The SDK's convenience constructor is not used: it never sets a relay, so a testnet login would post its approval through the production relay. The flow yields a `pubkyauth://` URL, then the CLI:
 
-- Serves a single page on `127.0.0.1:<random port>/<random path>` and opens it in the default browser. The page shows a large QR of that URL, a "copy link" button (Ring accepts a pasted link too), what is being requested (`/pub/sweepky/:rw` and the client id Ring will display), and a live status that flips to "approved, you can close this tab" when `await_approval()` returns.
+- Serves a single page on `127.0.0.1:<random port>/<random path>` and opens it in the default browser. The page shows a large QR of that URL, a "copy link" button worded "paste into Ring on your phone" (Ring reads the clipboard), what is being requested (`/pub/sweepky/:rw` and the client id `sweepky-cli`, which Ring displays as the app name), and a live status that flips to "approved, you can close this tab" when `await_approval()` returns.
 - Prints the same URL and a small QR in the terminal as the fallback for SSH sessions and machines without a browser.
-- Hygiene: loopback only, random path so no other local page or process can guess it, serves exactly one flow, exits on approval or after a timeout. The URL carries the relay channel secret, so it is never logged or written to disk.
+- After approval, checks that the granted capabilities include write on `/pub/sweepky/`. A future Ring may narrow what it approves; if so the CLI signs out and says what it needed.
+- Hygiene: loopback only, random path so no other local page or process can guess it, serves exactly one flow, exits on approval or after a timeout. The URL carries the relay channel secret, so it is never logged or written to disk. The client id never changes between releases, because saved sessions are compared against it.
 
 An agent can run `sweepky login` on a human's laptop: the page opens, the human scans, the agent carries on. Fully unattended setups use `--identity`.
 
-**Refused:** importing an existing identity's secret or recovery file into the CLI. That secret controls the identity forever, including moving it to another homeserver, and this CLI runs under agents that read untrusted code. Ring exists to keep that secret off the laptop; `login` rejects recovery files and says why.
+**Refused:** importing an existing identity's secret or recovery file into the CLI. That secret controls the identity forever, including moving it to another homeserver, and this CLI runs under agents that read untrusted code. Ring exists to keep that secret off the laptop; `login` rejects recovery files (their first line is a fixed spec marker) and anything that looks like a raw key or mnemonic, and says why.
 
 ## The `/sweepky` skill
 
-One skill, four roles: `run` (default), `post`, `pull`, `done`. Only `run` requires an `init` project.
+One skill, four roles: `run` (default), `post`, `pull`, `done`. `run` requires an `init` project; owners who pull open-bounty sweeps should summarise `untrusted/` in one too. The skill sets `disable-model-invocation: true`, because `post` and `done` make public writes and a human should type the command.
 
-- Playbook-agnostic. In `run` it reads the bounty's `brief`, `focus` and `playbook.suggested`, then follows the suggested playbook if the agent has it installed, otherwise whatever playbook the sweeper has configured, otherwise a plain careful review guided by the brief. It records which one it used.
-- Carries the common findings schema and tells the agent to produce `findings.json` in it (or to leave Cloudflare's output for the CLI to convert).
-- References `cloudflare/security-audit-skill` at commit `c1c8a8c` as the default suggestion for `security` bounties, with its install line (`npx skills add https://github.com/cloudflare/security-audit-skill --skill security-audit --global`). It does not vendor it and does not require it.
-- Run flow: `sweepky run` → follow the playbook with the per-kind scope, output dir `./sweeps/<id>/` → `sweepky submit`.
-- Tells the agent the trust rule: untrusted sweeps are summarised, never merged.
-- In `done`, tells the agent to show the proposed credits with the findings each sweeper contributed, and to let the human decide.
+- Playbook-agnostic. In `run` it reads `./sweeps/<id>/scope.json` and the brief written by `sweepky run`, then follows the bounty's suggested playbook if installed in the project, otherwise whatever playbook the sweeper has configured, otherwise a plain careful review guided by the brief. It records which one it used.
+- The request to the playbook is explicit, because Cloudflare's skill defaults to a guidance mode that writes no files and asks a question when the request is ambiguous: "full audit mode with report artifacts of `<absolute>/sweeps/<id>/target/<tid>/`, scoped to <paths or diff from scope.json>, profile <quick|standard>, output to the new directory `<absolute>/sweeps/<id>/audit/`; no prior runs, do not read other `sweeps/` directories". The output directory is new and outside the target, as the playbook requires; `sweeps/` is git-ignored.
+- Carries the common findings schema and tells the agent to produce `findings.json` in it (or to leave Cloudflare's output in `audit/` for the CLI to convert).
+- References `cloudflare/security-audit-skill` at commit `c1c8a8c1471069fb0e188eeaff69b8e8db6564a8` as the default suggestion for `security` bounties. The pinned, project-local install line is `npx skills@1.7.2 add https://github.com/cloudflare/security-audit-skill#c1c8a8c1471069fb0e188eeaff69b8e8db6564a8 --skill security-audit --agent claude-code --copy -y` run inside the init project with `DISABLE_TELEMETRY=1`; the plain `--global` form installs HEAD, pins nothing, and lands under `~/.agents`, which the sandbox cannot read. `init` records the installed commit so `submit` can write it into `manifest.playbook`. The skill is referenced, not vendored, and not required.
+- Run flow: `sweepky run` in a terminal → `claude --setting-sources project,local` in the init dir → `/sweepky` → the agent exits → `sweepky submit` in the terminal. The agent never calls the CLI.
+- Tells the agent the trust rule: untrusted sweeps count for attribution; their content is summarised, never merged, and their fixes are never applied without a human.
+- In `done`, tells the agent to show the proposed credits with the finding groups each sweeper contributed to, and to let the human decide.
 
 ## Dependencies
 
-`pubky` 0.14 · `age` 0.12.x (no `plugin`) · `clap` · `tokio` · `serde` / `serde_json` · `secrecy` + `zeroize` · `qrcode` · `thiserror` (core) / `anyhow` (CLI). Tooling: stable toolchain, `cargo nextest`, `cargo-deny`, clippy with `-D warnings`, exact version pins.
+Exact pins, all the latest published version on 2026-10-15; re-check before P0.
 
-No `paykit` or `locks` crates in v1: they pin `pubky` 0.15 and 0.11 respectively.
+| Crate | Version | Note |
+|---|---|---|
+| `pubky` | =0.16.1 | features `json`; the version production runs |
+| `pubky-testnet` | =0.16.1 | dev-dependency; same version as `pubky` |
+| `pubky-timestamp` | =0.4.1 | ids in `sweepky-core`, which must not depend on `pubky` |
+| `age` | =0.12.1 | default features only; never `plugin`, never `ssh` |
+| `secrecy` | =0.10.3 | use the `age::secrecy` re-export so the two agree |
+| `zeroize` | =1.9.1 | |
+| `qrcode` | =0.14.1 | `default-features = false, features = ["svg"]`, so the image stack stays out |
+| `fd-lock` | =4.0.4 | the writers' lock file |
+| `clap` | =4.6.7 | |
+| `tokio` | =1.53.3 | |
+| `serde` / `serde_json` | =1.0.229 / =1.0.154 | |
+| `thiserror` (core) / `anyhow` (CLI) | =2.0.21 / =1.0.104 | |
+
+Web: `@synonymdev/pubky` 0.16.1, `react` and `react-dom` 19.3.1, `react-router` 8.4.0, `zustand` 5.0.15, `vite` 8.3.4, `typescript` 7.0.2. Cloudflare skill: commit `c1c8a8c1471069fb0e188eeaff69b8e8db6564a8` (still HEAD). Claude Code 2.1.285 or newer for the sandbox settings the template relies on. Tooling: stable toolchain, `cargo nextest`, `cargo-deny`, clippy with `-D warnings`.
+
+No `paykit` or `locks` crates in v1: they pin `pubky` 0.15 and 0.11 (a git rev) respectively, and neither interoperates with 0.16.
 
 ## Rust conventions (teaching notes, keep in code comments)
 
-- `sweepky-core` does no network or file I/O, so it is unit-testable and could compile to WASM later.
+- `sweepky-core` does no network or file I/O, so it is unit-testable and could compile to WASM later. The package envelope is built from an in-memory list of files; the directory walk and its safety rules live in the CLI.
 - Typed errors with `thiserror` in the library; `anyhow` only in the binary, which only needs a good message.
-- Secrets live in `secrecy::SecretString` / `Zeroizing<[u8; 32]>`: wiped on drop, unprintable via `Debug`.
+- Secrets: `age::x25519::Identity` wipes itself on drop and has no `Debug`, so hold it directly; it does not implement `Zeroize`, so wrapping it in `SecretBox` would not compile. `SecretString` for the bech32 identity string, passphrases and the grant token (which the SDK hands back as a plain `String`, so move it in at once); `Zeroizing<Vec<u8>>` for file buffers.
 - Open enums (`kind`, `status`, `alg`) are newtype `String`s with `as_known() -> Option<Known>` helpers, never closed serde enums, so unknown values from newer clients are skipped rather than failing the whole feed.
 - Unknown top-level fields are preserved with `#[serde(flatten)] extra: Map` so rewrites do not drop them. `done` is a rewrite, so this is tested from the start.
-- Pin `age` exactly: it is pre-1.0 and its docs call releases "beta". Leaving out `plugin` avoids the code path behind its one security advisory.
+- Pin `age` exactly: it is pre-1.0 and its docs call releases "beta". Leaving out `plugin` removes the code path behind its one security advisory (already patched in 0.12.1, so this is defence in depth).
+- Pubkys are a newtype that parses both `pubky<z32>` and raw z32 and compares by bytes ([01](01-records-and-discovery.md#compatibility-rules-every-client-follows)).

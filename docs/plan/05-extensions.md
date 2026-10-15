@@ -1,6 +1,6 @@
 # 05 — Extension points (reserved in v1, built later)
 
-v1 touches only path strings and JSON. No `paykit` or `locks` crates in v1: they pin `pubky` 0.15 and 0.11, and we are on 0.14.
+v1 touches only path strings and JSON. No `paykit` or `locks` crates in v1: they pin `pubky` 0.15 and 0.11 (a git rev), we are on 0.16.1, and on 0.x every minor is a breaking change.
 
 ## E1. Sats bounties (Paykit)
 
@@ -21,7 +21,7 @@ Wording: "double-attested", never "proven". Paykit receipts are unsigned and enc
 
 Locks is a trusted plaintext proxy: the Lock Server reads guarded bytes from `/priv/locks.app/content/` with a creator-granted session and forwards them to viewers who satisfy criteria. Today the only production criterion is `paykit-payment` (recipient must be the creator); locks are immutable; it pins `pubky` 0.11 and has a default `max_resources: 10`.
 
-The one honest use is a sweeper selling the full depth of an **already-disclosed** report. Reserve `access: {kind: "lock", lock: "pubky://<sweeper>/pub/locks.app/<id>.json"}` on sweep records (absent in v1, where every sweep is owner-only); a client that sees it renders "paid, not available". Build only if Locks leaves alpha and ships on `pubky` ≥ 0.14. "Pay to unlock a finding inside the circle" contradicts pooled capacity and is not planned.
+The one honest use is a sweeper selling the full depth of an **already-disclosed** report. Reserve `access: {kind: "lock", lock: "pubky://<sweeper>/pub/locks.app/<id>.json"}` on sweep records (absent in v1, where every sweep is owner-only); a client that sees it renders "paid, not available". Build only if Locks reaches a non-rc release and ships on the same `pubky` minor as Sweepky. "Pay to unlock a finding inside the circle" contradicts pooled capacity and is not planned.
 
 ## E3. Other showcases, ranked useful → gimmick
 

@@ -5,9 +5,9 @@
 Checked against the homeserver, Ring and Paykit source (paths in [06](06-verification-and-limits.md#key-references)):
 
 - **Two access tiers only.** `/pub/` is readable by everyone. `/priv/` is readable and writable only by sessions of the path's owner (`has_read_permission` rejects any session whose user is not the tenant). There is no "share this file with user X".
-- **Writes are always owner-only**, scoped by the grant path. Marking a bounty done is a rewrite of the owner's own record and needs nothing extra.
-- **Pubky Ring approves auth requests and nothing else.** It cannot sign or decrypt for an app, and an app signed in through Ring never holds the identity secret.
-- **pubky-noise is a live two-party channel**: a handshake, then 1000-byte frames. Paykit can use it because Bitkit holds the identity secret and derives the Noise key from it (`paykit-lib/src/noise_key.rs`). A Ring-authenticated CLI has no such secret, so it would have to generate and publish a key anyway, and a sweeper would still need the owner online for the handshake.
+- **Writes are always owner-only**, scoped by the grant path. Marking a bounty done is a rewrite of the owner's own record and needs nothing extra. Whether an identity may write a given `/pub/` path at all is decided by its signup token (`allowed_write_paths`, enforced per user), see [06](06-verification-and-limits.md#production-homeserver-as-deployed-on-2026-10-15).
+- **Pubky Ring signs grants and nothing else.** It cannot decrypt for an app, and an app signed in through Ring never holds the identity secret. From SDK 0.16 a grant holder can sign JSON with its own client key (custom grant proofs), but those proofs stop verifying when the grant expires and ignore revocation, so they are no good for a permanent public record. 0.16 also adds scoped encryption keys: symmetric, derived from the user's own identity, for the user's own data. They cannot encrypt to another user and today's Ring does not issue them.
+- **pubky-noise is a live two-party channel**: a handshake, then 1000-byte frames. Paykit can use it because Bitkit holds the identity secret and derives the Noise key from it (`paykit-lib/src/noise_key.rs`). A Ring-authenticated CLI has no such secret, so it would have to generate and publish a key anyway, and the owner would have to answer the handshake before a sweeper could send anything.
 
 So "only the owner can read findings" is the one requirement Pubky cannot meet natively, and all of Sweepky's cryptography is the smallest fix for it: the owner's CLI generates one encryption key and publishes the public half; sweepers encrypt to it. Everything else is plain public JSON.
 
@@ -19,13 +19,18 @@ So "only the owner can read findings" is the one requirement Pubky cannot meet n
 | Sweep records: who swept which bounty, when, with which playbook, status | |
 | Every CLI's public encryption key (`keys/`) | |
 | The roster (`circle.json`) | |
-| Done bounties and their `credits` | |
+| Done bounties and their `credits`; the discovered-sweeps list of an open bounty | |
 
-Timing and sizes of uploads are visible too; payloads are padded to blunt the sizes.
+Timing and sizes of uploads are visible too; payloads are padded before encryption to blunt the sizes.
 
 ## Who can read a sweep
 
-The owner of the bounty, on any CLI install whose key was published before the sweep was uploaded, and the sweeper who wrote it. Nobody else: not the circle, not the homeserver operator, not someone who downloads the file.
+The owner of the bounty, on any CLI install whose key was published before the sweep was uploaded, and the sweeper who wrote it. Not the circle, not someone who downloads the file, and not a homeserver operator who only reads.
+
+The honest caveat: `keys/*.json` are plain JSON that sweepers trust, and a homeserver operator can write any tenant's files through the admin API. An **active** operator of the owner's homeserver, or anyone holding the owner's leaked grant (its scope covers `keys/`), can publish an extra key under the owner's `keys/` and read every sweep uploaded after that. Two cheap defences, both in v1:
+
+- The owner's CLI keeps the list of device ids its own installs created and **alarms** on `pull`, `keys list` and `login` when `keys/` holds one it does not know. Recovery: `keys revoke` the injected id, and if a grant leaked, revoke it in Ring and `login` again.
+- A sweeper's CLI **pins** each owner's key set on first use and warns, asking before it continues, when a new key appears. It also refuses to encrypt when an owner has no unrevoked key, accepts only `alg: "age-x25519"` with a strictly parsed recipient, and caps how many recipients it will take from one owner.
 
 How it works: at `sweepky login` the CLI generates an age key pair, keeps the private half in a 0600 file, and publishes the public half at `keys/<deviceId>.json`. At `sweepky submit` the sweeper's CLI reads the bounty, lists the owner's unrevoked keys, and encrypts the package to all of them plus its own key. The homeserver stores opaque bytes.
 
@@ -37,28 +42,30 @@ Three consequences to state plainly in the CLI:
 
 ## Encryption
 
-- **Format:** age v1 with X25519 recipients, stored as binary (no armor). Rust `age` 0.12.x without the `plugin` feature. No browser implementation in v1.
+- **Format:** age v1 with X25519 recipients, stored as binary (no armor). Rust `age` 0.12.1 with default features; never `plugin` (removes that attack surface) and never `ssh` (pulls in an `rsa` crate with an unpatched advisory). No browser implementation in v1.
 - **Recipients at upload time:** every unrevoked `keys/*.json` of the bounty's owner, plus the sweeper's own device key.
 - **Sweeps are never re-encrypted.**
-- **Padding:** `.age` payloads are padded to size buckets (for example 64 KiB steps) to blunt size metadata.
-- **Test vectors:** the Rust tests run the C2SP CCTV age vectors.
+- **Padding:** the plaintext JSON is padded with trailing whitespace to the next size bucket (64 KiB steps) before encryption. age rejects bytes after its payload, so the ciphertext itself is never padded; the test asserts on the final ciphertext length.
+- **Test vectors:** the Rust tests run the C2SP CCTV age vectors (skipping the hybrid post-quantum ones, which Rust age cannot run yet).
 
 Why age: it encrypts to several recipients natively (an owner with two laptops, plus the sweeper), has a maintained Rust implementation, and has a browser implementation (typage) for the day the board learns to read. HPKE and sealed boxes are single-recipient, so multi-recipient would mean hand-rolling the key wrapping age already defines. `/priv/` cannot be shared with another user, and pubky-noise is the wrong shape (above).
 
 ## Authorship without signatures
 
-age has no sender authentication, and Pubky Ring cannot sign arbitrary data. Authorship therefore rests on two facts:
+age has no sender authentication, and Pubky Ring signs nothing for apps. Authorship therefore rests on two facts:
 
-1. The record sits at the writer's own path on their own homeserver, which only their session can write.
+1. The record sits at the writer's own path on their own homeserver, which only their session can write, as reported by that homeserver. The homeserver operator is trusted for integrity and availability; confidentiality survives a passive operator, not an active one (above).
 2. The manifest inside the ciphertext echoes sweeper, bounty and targets, so a copied report does not check out anywhere else.
 
 Clients reject records whose path owner does not match the sweeper named inside, and, for closed bounties, records from pubkys outside the roster.
 
-A CLI-held identity could also sign the manifest, which a Ring grant cannot. v1 does not use this, so both login options behave identically; it is a door left open for signed sweeps later.
+A CLI-held identity could sign the manifest with its root key, and a 0.16 grant holder could attach a custom grant proof; v1 uses neither, so both login options behave identically. Signed sweeps are a door left open, with the proof-expiry caveat above.
 
 ## Device keys
 
-- **CLI:** the age identity and the Pubky credential live in `~/.config/sweepky/` as 0600 files (the SSH model); either may be passphrase-wrapped with `age::EncryptedIdentity`. Not the OS keychain, because headless sweepers have no unlocked keychain. The credential is one of two ([03](03-cli-and-skill.md#two-ways-to-log-in)): a Ring grant scoped to `/pub/sweepky/:rw`, whose leak bounds to forging bounties and sweeps as that user until revoked; or the secret of a dedicated identity the CLI created, whose leak loses that identity and nothing else. An existing identity's secret is never imported. `sweepky logout` revokes the grant (or forgets the identity) and marks the device key revoked.
+- **CLI:** the age identity and the Pubky credential live in `~/.config/sweepky/` as 0600 files (the SSH model). Either may be passphrase-wrapped with age's scrypt recipient (`age::Encryptor::with_user_passphrase` to write, `age::scrypt::Identity` to read); `age::encrypted::EncryptedIdentity` wraps only age identity files and is not used. Not the OS keychain, because headless sweepers have no unlocked keychain.
+- The credential is one of two ([03](03-cli-and-skill.md#two-ways-to-log-in)). **Ring:** the SDK's exported grant token (`export_local_secret`, restored with `restore_session`), scoped to `/pub/sweepky/:rw` and valid for two years from approval unless revoked. Its leak lets someone write Sweepky records as that user for that long, including a key record that reads later sweeps (above); `pull` alarms on it. Each restore mints a fresh bearer and invalidates the previous one, so commands that write hold a lock file in `~/.config/sweepky/` and run one at a time; `pull` reads public data and needs no session. **Dedicated identity:** its secret in a Sweepky file, never in Pubky's recovery-file format, so `login` can keep refusing recovery files without ambiguity; its leak loses that identity and nothing else. An existing identity's secret is never imported.
+- `sweepky logout` runs in this order: mark this device key revoked (a write, so it needs the live session), then revoke the grant or forget the identity, then delete the local files. A device that is already locked out, because Ring revoked first or the grant expired, is revoked from another install with `keys revoke`.
 - Every CLI install publishes its own `keys/<deviceId>.json`. An owner with two laptops has two keys and sweepers encrypt to both. `keys list|revoke` manages them.
 - **Browser:** not in v1. When the board learns to read ([05](05-extensions.md#e4-reading-findings-in-the-browser)) it generates a non-extractable WebCrypto X25519 key and publishes it the same way. Sweepers' CLIs already encrypt to every published owner key, so no record changes; the board will only ever open sweeps uploaded after its key existed.
 
@@ -66,12 +73,33 @@ A CLI-held identity could also sign the manifest, which a Ring grant cannot. v1 
 
 The sweeper's agent reads untrusted code, and the owner's agent reads untrusted reports. Defences:
 
-- **The CLI does all network I/O.** It fetches the target before the agent starts and uploads after the agent stops.
-- **Sandbox template.** `sweepky init <dir>` writes `.claude/settings.json` with the sandbox enabled, `failIfUnavailable: true`, `allowUnsandboxedCommands: false`, `network.allowedDomains: []`, `filesystem.denyRead: ["~/"]`, `allowRead: ["."]`, `permissions.blockReadsOutsideWorkingDirectories`, `WebFetch` and `WebSearch` denied, and `sandbox.excludedCommands: ["sweepky"]` so `sweepky submit` can reach the network. P3 verifies how `excludedCommands` actually matches; the fallback is the human running `sweepky submit` after the audit.
-- **Static review only in v1.** The skill refuses to execute target code without a full OS sandbox (no network, empty environment, resource limits), which Claude Code's Bash-only sandbox does not meet. Expect many `needs_validation` records; that is honest. A Docker runner that meets the skill's bar is deferred.
-- **Only Bash is sandboxed.** File tools, MCP servers and hooks are not, so the sweeper project directory should be the only thing on disk the agent can read.
-- **Untrusted reports are data.** On open bounties, sweeps from unknown sweepers are decrypted into a separate `untrusted/` directory; the owner's agent summarises them but never applies their suggested fixes without a human.
+- **The agent only audits.** The human runs `sweepky run` in a terminal before opening Claude Code and `sweepky submit` after it exits. Both need the network and the CLI's secrets, so neither runs inside the agent, and the sandbox never has to make an exception for the CLI. Inside the project the agent has the fetched target, `scope.json`, the brief and the playbook, and writes its output to `./sweeps/<id>/audit/`.
+- **Sandbox template.** `sweepky init <dir>` writes `.claude/settings.json`:
+
+  ```json
+  {
+    "sandbox": {
+      "enabled": true,
+      "failIfUnavailable": true,
+      "allowUnsandboxedCommands": false,
+      "filesystem": { "denyRead": ["~/.config/sweepky", "~/.local/share/sweepky"] }
+    },
+    "permissions": {
+      "blockReadsOutsideWorkingDirectories": true,
+      "deny": ["WebFetch", "WebFetch(domain:*)", "WebSearch", "mcp__*", "Artifact"]
+    },
+    "claudeMdExcludes": ["<absolute init dir>/sweeps/**/target/**"]
+  }
+  ```
+
+  One read-blocking mechanism: `blockReadsOutsideWorkingDirectories` covers file tools and sandboxed commands in every permission mode, and while it is on, `allowRead` entries from a project file do not count anyway. The two `denyRead` entries are defence in depth for the one directory that matters. `WebFetch(domain:*)` is what makes the network deny hold in every mode: an empty `allowedDomains` only decides what happens to a new host in manual mode, and bypass mode would allow it. `mcp__*` and `Artifact` close the other channels out of the session. No `excludedCommands`: nothing inside the agent needs the network, and the bare entry the plan used to have would not have matched `sweepky submit` anyway.
+- **The target is not inert.** A fetched repo's `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`, `.claude/` and `.mcp.json` would load as instructions once the agent reads a file next to them. `run` strips them from the copy and records that in `scope.json`; `init`'s `claudeMdExcludes` is the second line.
+- **What the sandbox cannot read.** Sandboxed commands cannot read the home directory, so Node and any toolchain installed there (nvm, rustup) are unavailable to them, and the Cloudflare skill's validators need Node. Install Node from Homebrew or another location outside `$HOME`, and keep the playbook project-local (`init` installs it into the project) so its files are inside the working directory.
+- **How to launch.** `claude --setting-sources project,local` inside the init project, so user-level hooks, MCP servers and sandbox arrays do not merge in. Never run a sweep in bypass mode. Anthropic's own guidance is that the Bash sandbox is not the boundary for unattended work on untrusted repositories: sweepers who automate open-bounty sweeps should run the whole `claude` process in a VM or under `@anthropic-ai/sandbox-runtime`.
+- **`submit` trusts nothing in the sweep directory.** The agent wrote it. The CLI canonicalises the path and requires a direct child of `<init dir>/sweeps/` carrying the marker `run` wrote; walks without following links; accepts regular files only (no symlinks, hard links, devices or FIFOs); skips `agents/*/scratch/` and `target/`; caps per-file and total size; prints the file list before encrypting. A planted link to `~/.config/sweepky/` is refused, not packaged.
+- **Static review only in v1.** The skill refuses to execute target code without an empty environment and resource limits, which Claude Code's sandbox does not provide: it restricts files and network, inherits the environment, and lets commands write the working directory. Under the skill's own rules a `confirmed` record needs an observed local result, so static-only sweeps yield almost no `confirmed` records and almost no severities. That is honest. A Docker runner that meets the skill's bar is deferred.
+- **Untrusted reports are data.** On open bounties, sweeps from unknown sweepers are decrypted into a separate `untrusted/` directory. They count for attribution, but their content never enters the merged report, and the owner's agent summarises them without applying their suggested fixes. Owners who accept open-bounty sweeps should do that summarising inside an `init`-style project with the same deny rules: it is the same threat, pointed at the owner.
 
 ## Plan-usage rules
 
-Each developer runs their own unmodified Claude Code on their own plan. The tool never reads, stores or proxies Claude credentials, and never pools usage across accounts. Advertised plan limits assume ordinary individual use; a quota-aware auto mode is deferred until sweepers ask for it.
+Each developer runs their own unmodified Claude Code on their own plan. The tool never reads, stores or proxies Claude credentials, and never pools usage across accounts. Advertised plan limits assume ordinary individual use; a quota-aware auto mode is deferred until sweepers ask for it, and the terms get re-read then, because scheduled headless runs sit closer to the automated-access clause.

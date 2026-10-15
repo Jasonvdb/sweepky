@@ -17,7 +17,7 @@ Design docs first, then one file per build phase. Read them in order the first t
 | Phase | Builds |
 |---|---|
 | [P0 bootstrap](phases/P0-bootstrap.md) | Workspace skeleton, CI, tooling |
-| [P1 sweepky-core](phases/P1-sweepky-core.md) | Records, ids, paths, trust labels, feed parser, encryption, packing |
+| [P1 sweepky-core](phases/P1-sweepky-core.md) | Records, ids, paths, trust labels, finding groups, feed parser, encryption, package envelope |
 | [P2 sweepky-cli](phases/P2-sweepky-cli.md) | The `sweepky` binary and the testnet end-to-end test |
 | [P3 skill and sandbox](phases/P3-skill-and-sandbox.md) | The `/sweepky` skill and the sweeper sandbox template |
 | [P4 board](phases/P4-board.md) | The public web board |
@@ -38,11 +38,11 @@ Design docs first, then one file per build phase. Read them in order the first t
 
 ## Ground rules for the build
 
-- **Local first.** Everything runs against a local `pubky-testnet`. No staging or production writes, no hosting, no Vibes listing until the local demo (P5) is approved.
+- **Local first, then production.** Everything runs against a local `pubky-testnet` pinned to the same version as the SDK. No production writes, no hosting, no Vibes listing until the local demo (P5) is approved; after that we go straight to the production homeserver. There is no staging step.
 - **One phase, one commit set.** Each phase ends validated, simplified, and committed. Commit messages describe the change only.
 - **Orchestrate, don't hand-code.** Each phase runs as a multi-agent workflow: implementation workers, then an independent fresh-context verifier that runs the phase's "Done when" checks and reads the diff, then a simplification pass, then the commit. Load the workflow-authoring guidance before writing the first workflow script.
 - **Nothing sensitive in the repo.** Committed fixtures are synthetic. The demo uses a real local audit report by path from an environment variable; its content is never committed or uploaded anywhere but the local testnet.
-- **Pin everything.** Exact versions for Rust crates and npm packages; the Cloudflare skill by commit.
+- **Pin everything.** Exact versions for Rust crates and npm packages, listed in [03](03-cli-and-skill.md#dependencies); the Cloudflare skill by its full commit hash. Re-check against the registries before P0 starts.
 
 ## Status
 
