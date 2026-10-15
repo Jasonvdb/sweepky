@@ -2,7 +2,7 @@
 
 ## Goal
 
-The first part of the `sweepky` binary: the network config and library entry point, `login --identity` with the shared tail of `login`, `keys`, `logout`, the circle, the writers' lock, the config and state directories, and a minimal `init`. It builds on the records, the `Pubky` newtype and the path builders from [P1a](P1a-core-records.md), and on the age keys and secret types from [P1b](P1b-core-crypto.md). The Ring login (option A) follows in P2d.
+The first part of the `sweepky` binary: the network config and library entry point, `login --identity` with the shared tail of `login`, `keys`, `logout`, the circle, the writers' lock, the config and state directories, and a minimal `init`. It builds on the records, the `Pubky` newtype and the path builders from [P1a](P1a-core-records.md), and on the age keys and secret types from [P1b](P1b-core-crypto.md). The Ring login (option A) follows in [P2d](P2d-cli-ring-login.md).
 
 ## Build
 
@@ -28,6 +28,6 @@ The first part of the `sweepky` binary: the network config and library entry poi
 ## Notes
 
 - `anyhow` in the binary; typed errors stay in core.
-- A unit test pins the requested capability string to exactly `/pub/sweepky/:rw`; without the trailing slash it would be a file scope. The constant and its test land here, but the first code that requests the capability is P2d's grant flow, because `--identity` signs in with the root signer.
-- The testnet test is the start of the end-to-end test from [06](../06-verification-and-limits.md#verification). P2b and P2c extend this same test and P2d completes it, so no phase adds a second one. Restoring a saved token after `logout` is checked in P2d, the first phase that saves one.
+- A unit test pins the requested capability string to exactly `/pub/sweepky/:rw`; without the trailing slash it would be a file scope. The constant and its test land here, but the first code that requests the capability is [P2d](P2d-cli-ring-login.md)'s grant flow, because `--identity` signs in with the root signer.
+- The testnet test is the start of the end-to-end test from [06](../06-verification-and-limits.md#verification). [P2b](P2b-cli-sweep.md) and [P2c](P2c-cli-pull-done.md) extend this same test and [P2d](P2d-cli-ring-login.md) completes it, so no phase adds a second one. Restoring a saved token after `logout` is checked in P2d, the first phase that saves one.
 - Never call the deprecated cookie sign-in; add a clippy `disallowed-methods` entry for it.

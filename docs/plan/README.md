@@ -21,10 +21,13 @@ Design docs first, then one file per build phase. Read them in order the first t
 | [P1b core: crypto](phases/P1b-core-crypto.md) | Encryption, padding, manifest binding, package envelope, secrets, finding groups |
 | [P2a CLI: identity](phases/P2a-cli-identity.md) | Network config, `login --identity`, device keys, `logout`, the circle, the writers' lock, config dirs, a minimal `init` |
 | [P2b CLI: sweep](phases/P2b-cli-sweep.md) | `post` for closed bounties, `run` and `submit` with the sweep-directory checks |
-| [P2 sweepky-cli](phases/P2-sweepky-cli.md) | The `sweepky` binary and the testnet end-to-end test |
+| [P2c CLI: pull and done](phases/P2c-cli-pull-done.md) | `post --open`, `pull`, `done` with credits, and the testnet end-to-end test except the Ring login |
+| [P2d CLI: Ring login](phases/P2d-cli-ring-login.md) | `login` through Pubky Ring (loopback page, QR, granted-capability check) and the 401 check after `logout` |
 | [P3 skill and sandbox](phases/P3-skill-and-sandbox.md) | The `/sweepky` skill and the sweeper sandbox template |
 | [P4 board](phases/P4-board.md) | The landing page and the public web board |
 | [P5 local demo](phases/P5-local-demo.md) | The reproducible local demo that gates everything after it |
+
+P2d and P4 may be built in parallel because neither depends on the other. Both build on P2c: P2d extends its test, and P4's testnet checks need its `pull` and `done`.
 
 ## Vocabulary
 

@@ -2,7 +2,7 @@
 
 ## Goal
 
-`post` for closed bounties, `run` and `submit`, so a circle member can sweep a closed bounty end to end on the testnet. It builds on [P2a](P2a-cli-identity.md) for the network config, the `--identity` login, the circle, the writers' lock, the config directories, the minimal `init` with its marker, and the testnet test; on [P1a](P1a-core-records.md) for targets, the Cloudflare converter and the bare fixture repo; and on [P1b](P1b-core-crypto.md) for the package envelope, padding and encryption. `post --open`, `pull` and `done` follow in P2c.
+`post` for closed bounties, `run` and `submit`, so a circle member can sweep a closed bounty end to end on the testnet. It builds on [P2a](P2a-cli-identity.md) for the network config, the `--identity` login, the circle, the writers' lock, the config directories, the minimal `init` with its marker, and the testnet test; on [P1a](P1a-core-records.md) for targets, the Cloudflare converter and the bare fixture repo; and on [P1b](P1b-core-crypto.md) for the package envelope, padding and encryption. `post --open`, `pull` and `done` follow in [P2c](P2c-cli-pull-done.md).
 
 ## Build
 
@@ -22,4 +22,4 @@
 
 - The per-sweep marker `sweeps/<id>/.sweepky/sweep.json` that `run` writes is separate from the project's `.sweepky` marker that the minimal `init` writes.
 - Until [P3](P3-skill-and-sandbox.md)'s `init` records a playbook, the playbook comes from `submit --playbook`.
-- Under `--identity` each command signs in afresh ([03](../03-cli-and-skill.md#two-ways-to-log-in), "Session per command"), so the two concurrent `submit`s hold separate sessions and this check shows that the lock lets both finish; the lock unit test in [P2a](P2a-cli-identity.md) is what shows it serialises them. One shared bearer, the case the lock exists for, needs a restored Ring token, which arrives in P2d.
+- Under `--identity` each command signs in afresh ([03](../03-cli-and-skill.md#two-ways-to-log-in), "Session per command"), so the two concurrent `submit`s hold separate sessions and this check shows that the lock lets both finish; the lock unit test in [P2a](P2a-cli-identity.md) is what shows it serialises them. One shared bearer, the case the lock exists for, needs a restored Ring token, which arrives in [P2d](P2d-cli-ring-login.md).

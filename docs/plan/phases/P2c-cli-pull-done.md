@@ -1,0 +1,27 @@
+# P2c — `sweepky-cli`: pull, open bounties and done
+
+## Goal
+
+`post --open`, `pull` and `done`, so an owner finds strangers' sweeps on an open bounty, reads every sweep and credits the sweepers who helped. This phase also lands the end-to-end test from [06](../06-verification-and-limits.md#verification), all but its Ring login parts. It builds on [P2a](P2a-cli-identity.md) for the network config and its watch list, the `--identity` login, the device-id list behind the unknown-key alarm, the writers' lock and the state directories; on [P2b](P2b-cli-sweep.md) for `post`, `run`, `submit` and the testnet test as P2b left it; on [P1a](P1a-core-records.md) for the feed parser, trust labels and `Bounty::mark_done`; and on [P1b](P1b-core-crypto.md) for decryption, manifest binding, finding groups and `propose_credits`. The Ring login follows in [P2d](P2d-cli-ring-login.md).
+
+## Build
+
+- **`post --open`:** finds the starting cursor on the owner's homeserver (non-live event stream, `reverse`, `limit 1` after the bounty PUT) and on every other watched homeserver (exponential then binary search with `limit=1`), and writes `bounties/<id>.discovered.json`.
+- **`pull`:** roster polling with reverse paged listings, 404 as empty, conditional re-GETs of open bounties and `running` sweeps, cached homeserver resolution; the `/events/` watcher over the watch list through the SDK's HTTP client, 1000 per page, URI dedupe, DEL handling, re-fetch through pkarr-resolved storage, cursor advanced after each batch and persisted; trust labels from roster plus credits; unknown-key alarm; decrypt to `~/.local/share/sweepky/<bounty>/`; group findings by location keeping `reportedBy`; untrusted content into `untrusted/`; append accepted strangers' sweeps to `bounties/<id>.discovered.json`.
+- **`done <bounty> [--credit] [--no-credit]`:** proposes credits from the groups, never including the owner (`--credit <own pubky>` is refused with a one-line reason), confirms interactively unless flags settle it, rewrites the bounty with `status: "done"`, `doneAt`, `credits`, preserving unknown fields. Last writer wins, deliberately.
+
+## Done when
+
+- The end-to-end test in [06](../06-verification-and-limits.md#verification) passes: identities A (owner), B (circle sweeper), C (stranger); the open bounty with its `discovered.json`; B and C running `run <bounty>` and `submit`; C found through `/events/`, labelled `unknown`, attributed but kept in `untrusted/`, and appended to `discovered.json`; the shared location grouped with `reportedBy` {B, C} and the shared-id pair kept apart; the injected unknown key making `pull` alarm; `done --credit <A>` refused; `done` proposing {B, C}; C at `known: 1` afterwards; Cloudflare-format and common-format sweeps both grouping; the later device key unable to decrypt; the second install of A decrypting the third sweep; the cursor surviving a restart.
+- Logins in this test use `--identity` for B and C. Until [P2d](P2d-cli-ring-login.md), A also logs in with `--identity`; the final test in 06 has A on the Ring flow.
+- This test extends the one [P2a](P2a-cli-identity.md) started and [P2b](P2b-cli-sweep.md) grew. [P2d](P2d-cli-ring-login.md) extends this same test with the Ring login parts rather than adding a second one.
+- `cargo clippy -- -D warnings`, `cargo deny check` and `cargo nextest run` clean.
+
+## Resolved questions
+
+- **Starting cursor.** `/events/` has no "latest" shortcut: `reverse` is parsed and ignored, a timestamp cursor must match a row exactly, `limit` caps at 1000, and there is no max-id endpoint, so paging from zero on production is not viable. Resolution above: the owner's own event stream gives the event id of the bounty PUT; other homeservers are binary-searched once with `limit=1`.
+
+## Notes
+
+- `done` is the only command that rewrites an existing bounty record; test that a bounty posted by a newer client with extra fields survives it intact. `pull` rewrites only `discovered.json`.
+- While A is on `--identity` (until [P2d](P2d-cli-ring-login.md)), the test makes A's second install by copying A's Sweepky identity file into a second `SWEEPKY_HOME` and running `login --identity` there, which reuses it ([03](../03-cli-and-skill.md#two-ways-to-log-in): "one it created earlier under that name"). This is test setup, not an import path: `login` still refuses recovery files and raw keys ([03](../03-cli-and-skill.md#two-ways-to-log-in), "Refused"). P2d replaces it with a second Ring approval.
