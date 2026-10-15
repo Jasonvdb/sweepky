@@ -7,7 +7,7 @@ The `sweepky` binary, end to end against a local testnet, including open-bounty 
 ## Build
 
 - `login` (Ring QR via `PubkyGrantAuthFlow`, grant to a 0600 file, age key generated and published, backup reminder printed), `logout` (revoke grant, mark key revoked).
-- `dev identity new|list`, `dev approve <url> --as <name>` (testnet only, via `PubkySigner::approve_auth`).
+- `login --signer <name>` (testnet only, hidden otherwise): local keypair under that name, `PubkySigner::signup` on the testnet homeserver, session held directly; the rest of `login` (age key, publish, reminder) is shared with the Ring path.
 - `circle create|add|remove|show`; `keys list|revoke`.
 - `post [--open]`: pins SHAs via `git ls-remote` / `gh`, crate sha256 from the crates.io index; refuses non-public repos.
 - `run`: picks the target with the fewest sweeps, writes `running`, fetches the target into the sweeper project, writes `scope.json` and the brief.
@@ -15,12 +15,12 @@ The `sweepky` binary, end to end against a local testnet, including open-bounty 
 - `pull`: roster polling plus the events-feed watcher for open bounties with persisted cursors; trust labels from roster plus credits; decrypt to `~/.local/share/sweepky/<bounty>/`; merge trusted findings by `id` keeping `reportedBy`; untrusted into `untrusted/`.
 - `done <bounty> [--credit] [--no-credit]`: proposes credits from the merged findings, confirms interactively unless flags settle it, rewrites the bounty with `status: "done"`, `doneAt`, `credits`, preserving unknown fields.
 - `watch [--add-homeserver <pk>]` (terminal live view).
-- Config and state under `~/.config/sweepky/` (secrets, 0600) and `~/.local/share/sweepky/` (pulled sweeps, merged findings, cursors).
+- Config and state under `~/.config/sweepky/` (secrets, 0600) and `~/.local/share/sweepky/` (pulled sweeps, merged findings, cursors); `SWEEPKY_HOME` overrides both so a script can run several identities side by side.
 
 ## Done when
 
 - `#[pubky_testnet::test]` end-to-end: identities A (admin/owner), B (circle sweeper), C (stranger); circle = {A, B}; A posts an `open` bounty with two targets; B submits a synthetic sweep; C submits another sharing one finding `id` with B's; A pulls: B's sweep is `circle` and merged, C's is discovered via the testnet homeserver's `/events/` feed, labelled `unknown`, and lands in `untrusted/`; the merged finding lists reporters {B, C}; A runs `done`, the proposal is {B, C}, A accepts, the bounty is `done` with both credits, and C's label is `known: 1` on the next pull; one of the two synthetic sweeps uses Cloudflare-format output and the other a hand-written common-format `findings.json`, and both decrypt and merge; a device key published after a sweep cannot decrypt it; a second install of A logged in before a third sweep decrypts that third sweep; `logout` invalidates the grant; the events cursor survives a restart.
-- Manual: QR login against the testnet approved with `sweepky dev approve`.
+- The Ring path is covered in the same test: A logs in with the QR flow, the test approves the printed `pubkyauth` URL in-process with `PubkySigner::approve_auth`, and the resulting grant writes a record. B and C use `login --signer`.
 - Clippy, deny, nextest clean.
 
 ## Open question to resolve in this phase

@@ -28,7 +28,8 @@
 
 - Testnet: `TEST_PUBKY_CONNECTION_STRING='postgres://jason@localhost:5432/postgres' cargo run -p pubky-testnet` from the `pubky-homeserver` checkout (brew `postgresql@18`; no Docker needed). Ports: pkarr relay `15411`, HTTP relay `15412`, homeserver `6286`; homeserver key `8pinxxgqs41n4aididenw5apqp1urfmzdztr8jt4abrkdn435ewo`. Ephemeral DB per run.
 - Rust: `Pubky::testnet()`. JS: `Pubky.testnet()`.
-- Ring stand-in: `sweepky dev identity new <name>` (keypair + signup on the testnet homeserver) and `sweepky dev approve <pubkyauth-url> --as <name>` (wraps `PubkySigner::approve_auth`). The Pubky Ring Simulator (`simulator.pubkyring.app`, Shortcut mode) is a zero-code alternative.
+- Ring stand-in: `sweepky login --signer <name>` (testnet only) makes a local keypair, signs up on the testnet homeserver (open signup mode) and holds the session directly via `PubkySigner`. The Ring QR flow itself is exercised only in the automated end-to-end test, which approves the printed auth URL in-process with `PubkySigner::approve_auth`, and manually against real Pubky Ring once a production homeserver is in play. The Ring repo has a simulator, but it is unverified against a local testnet and the plan does not depend on it.
+- Several identities in one script: `SWEEPKY_HOME=<dir>` overrides `~/.config/sweepky/` and `~/.local/share/sweepky/`.
 - Toolchain: rustc/cargo 1.96, node 24, pnpm 10, psql 18.
 
 ## Key references

@@ -19,7 +19,7 @@ sweepky/
 
 | Command | Does |
 |---|---|
-| `login` | Ring QR via the grant auth flow; grant `/pub/sweepky/:rw` saved to a 0600 file; generates this install's age key and publishes `keys/<deviceId>.json`; reminds the user to back up `~/.config/sweepky/` |
+| `login [--signer <name>]` | Ring QR via the grant auth flow; grant `/pub/sweepky/:rw` saved to a 0600 file; generates this install's age key and publishes `keys/<deviceId>.json`; reminds the user to back up `~/.config/sweepky/`. `--signer` (testnet only, hidden elsewhere) skips the QR: the CLI makes or reuses a local keypair under that name, signs up on the testnet homeserver and holds the session itself |
 | `logout` | Revokes the grant and marks this device key revoked |
 | `init <dir>` | Writes the sandbox settings and a `CLAUDE.md` for a sweeper project |
 | `circle create\|add\|remove\|show` | Roster admin |
@@ -30,9 +30,8 @@ sweepky/
 | `pull` | Roster polling plus the events-feed watcher for open bounties (persisted cursors); prints each sweep's trust label; decrypts to `~/.local/share/sweepky/<bounty>/`; merges trusted findings by `id`, recording every sweeper that reported each one; untrusted into `untrusted/` |
 | `done <bounty> [--credit <pubky>]… [--no-credit <pubky>]…` | Rewrites the bounty with `status: "done"`, `doneAt` and `credits`. With no flags it proposes every sweeper whose sweep contributed at least one finding and asks for confirmation; the flags add or drop names. Two sweepers who reported the same finding are both proposed |
 | `watch [--add-homeserver <pk>]` | Terminal live view |
-| `dev identity\|approve` | Testnet only: create identities, play Ring's part by approving an auth URL (`PubkySigner::approve_auth`) |
 
-Eleven commands plus the hidden `dev` group, which only appears in testnet mode. There is no `confirm`, `resolve` or `close`: triage is local, and `done` is the only public write after `post`.
+Ten commands. There is no `dev` group: the testnet-only `--signer` flag on `login` is the whole Ring stand-in, and `SWEEPKY_HOME` points the CLI at a different config and state directory so a script can run several identities side by side. There is no `confirm`, `resolve` or `close`: triage is local, and `done` is the only public write after `post`.
 
 `submit` packages whatever is in the sweep directory: `findings.json` (required; converted from Cloudflare's format when that is what it finds), and everything else as `attachments/`. The sweeper's agent is told to keep scratch files out of the sweep directory.
 
