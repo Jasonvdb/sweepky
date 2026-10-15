@@ -20,5 +20,5 @@ A workspace skeleton that passes every quality gate while doing nothing, so late
 
 ## Notes
 
-- Pin exact crate versions from the start, from the list in [03](../03-cli-and-skill.md#dependencies). `cargo-deny` is configured with advisories enabled and the licence allowlist as SPDX ids: MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC, Unicode-3.0, Zlib, and CDLA-Permissive-2.0 (webpki-roots, a direct dependency of `pubky`); a per-crate exception for `option-ext` (MPL-2.0, pulled in through `pubky-testnet`) rather than allowing MPL-2.0 globally. Re-run `cargo deny check licenses` once `pubky` is added in P1.
+- Pin exact crate versions from the start, from the list in [03](../03-cli-and-skill.md#dependencies). `cargo-deny` is configured with advisories enabled and the licence allowlist as SPDX ids: MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC, Unicode-3.0, Zlib, and CDLA-Permissive-2.0 (webpki-roots, a direct dependency of `pubky`); a per-crate exception for `option-ext` (MPL-2.0, pulled in through `pubky-testnet`) rather than allowing MPL-2.0 globally. Re-run `cargo deny check licenses` once `pubky` is added to `sweepky-cli` in P2 (`sweepky-core` never depends on it).
 - No application code in this phase.

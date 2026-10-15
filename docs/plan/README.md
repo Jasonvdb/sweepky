@@ -17,7 +17,8 @@ Design docs first, then one file per build phase. Read them in order the first t
 | Phase | Builds |
 |---|---|
 | [P0 bootstrap](phases/P0-bootstrap.md) | Workspace skeleton, CI, tooling |
-| [P1 sweepky-core](phases/P1-sweepky-core.md) | Records, ids, paths, trust labels, finding groups, feed parser, encryption, package envelope |
+| [P1a core: records](phases/P1a-core-records.md) | Records, ids, paths, targets, Cloudflare converter, trust labels, feed parser |
+| [P1b core: crypto](phases/P1b-core-crypto.md) | Encryption, padding, manifest binding, package envelope, secrets, finding groups |
 | [P2 sweepky-cli](phases/P2-sweepky-cli.md) | The `sweepky` binary and the testnet end-to-end test |
 | [P3 skill and sandbox](phases/P3-skill-and-sandbox.md) | The `/sweepky` skill and the sweeper sandbox template |
 | [P4 board](phases/P4-board.md) | The landing page and the public web board |
