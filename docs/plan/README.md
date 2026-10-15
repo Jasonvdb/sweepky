@@ -27,11 +27,13 @@ Design docs first, then one file per build phase. Read them in order the first t
 
 | Term | Meaning |
 |---|---|
-| **Bounty** | A request to sweep one or more pinned targets, posted by an **owner** |
-| **Sweep** | One audit run against a bounty by a **sweeper**'s agent; the encrypted result |
+| **Bounty** | A request to sweep one or more pinned targets, posted by an **owner**: a fixed envelope plus a freeform brief |
+| **Focus** | What a bounty is looking for: `security` first, but `bugs`, `perf` or anything else |
+| **Playbook** | The skill or procedure a sweeper's agent follows. A bounty may suggest one; none is required |
+| **Sweep** | One run against a bounty by a **sweeper**'s agent; the encrypted result |
 | **Circle** | The roster an admin maintains; the default trust and discovery set |
 | **Trust label** | `circle` / `known` / `unknown`, computed per sweep from the roster and attestations |
-| **Attestation** | A public record an owner writes when confirming a finding; the reputation source |
+| **Attestation** | A public credit record an owner writes when a finding is **resolved** (not when it is merely confirmed); the reputation source |
 | **Board** | The web app where owners and visitors watch sweeps and owners read findings |
 
 ## Ground rules for the build

@@ -1,5 +1,27 @@
 # 02 — Encryption, keys and sweeper safety
 
+## What is sealed and what is public
+
+| Public (anyone can read) | Sealed (only the chosen readers can open) |
+|---|---|
+| The bounty post, including its brief | The whole sweep package: `manifest.json`, `findings.json`, attachments |
+| Sweep records: who swept which bounty, when, with which playbook, status | |
+| Everyone's device public keys (`keys/`) | |
+| The roster (`circle.json`) | |
+| Attestations: sweeper, bounty, severity, resolved date (published only at resolution) | |
+
+Timing and sizes of uploads are visible too; payloads are padded to blunt the sizes.
+
+## How an owner chooses who can read
+
+The owner sets `readers` when posting: `"circle"`, `"owner"`, or an explicit list of pubkys. Control is purely cryptographic. Every reader publishes one public key per device (`keys/<deviceId>.json`); when a sweeper submits, their CLI encrypts the package to all of those keys at once, plus the sweeper's own. Anyone can download the ciphertext; only a device holding one of those private keys can open it. The homeserver stores opaque bytes and cannot read them either.
+
+Three consequences to state in the UI:
+
+- Readers are fixed per sweep at upload time. Widening `readers` later applies only to later sweeps; nothing is re-encrypted.
+- The sweeper can always read their own sweep.
+- A reader's new device can only open sweeps uploaded after that device published its key.
+
 ## Encryption
 
 - **Format:** age v1 with X25519 recipients, stored as binary (no armor). Rust `age` 0.12.x (without the `plugin` feature) in the CLI; `age-encryption` (typage 0.3.x) in the board.

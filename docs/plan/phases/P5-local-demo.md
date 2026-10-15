@@ -22,13 +22,13 @@ The demo report may describe unpatched findings in a real repository. It is read
 5. `sweepky run --as sweeper` then `sweepky submit --run-dir "$SWEEPKY_DEMO_RUN_DIR"`.
 6. `sweepky run --as stranger` then `sweepky submit` a synthetic run dir.
 7. `sweepky pull --as owner`; show the merged findings and the `untrusted/` summary.
-8. `sweepky confirm` one of the stranger's findings as owner.
+8. `sweepky confirm` then `sweepky resolve` one of the stranger's findings as owner.
 9. `pnpm --dir web dev` with `VITE_PUBKY_TESTNET=1`; print the board URL and the `sweepky dev approve` line for the sign-in QR.
 
 ## Done when
 
 - The board at `http://localhost:5173` shows the bounty, both sweeps landing, and (signed in as owner) every finding from the demo report with GitHub links at the pinned SHA.
-- The stranger's sweep shows as `unknown`, then `known: 1` after the confirm.
+- The stranger's sweep shows as `unknown`, then `known: 1` after the resolve (and not after the confirm alone).
 - `sweepky watch` in a terminal shows the same state.
 - Jason approves the look and the flow.
 

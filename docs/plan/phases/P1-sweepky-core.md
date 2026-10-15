@@ -6,7 +6,8 @@ Everything that can be tested without a network: records, paths, ids, trust labe
 
 ## Build
 
-- **Records:** `Circle`, `DeviceKey`, `Bounty { readers, open, reward }`, `Target { kind }`, `Sweep { targets[] }`, `Attestation`, `Manifest`. Every record has `schemaVersion`; open-string enums with `as_known()`; `#[serde(flatten)] extra` to preserve unknown fields.
+- **Records:** `Circle`, `DeviceKey`, `Bounty { focus, brief, playbook, readers, open, reward }`, `Target { kind }`, `Sweep { targets[], playbook }`, `Attestation`, `Manifest`, and the common `Findings` format. Every record has `schemaVersion`; open-string enums with `as_known()`; `#[serde(flatten)] extra` to preserve unknown fields.
+- **Converters:** Cloudflare `findings.json` → common `Findings` (`fingerprint` → `id`, verdict branches → `status`), with a round-trip test on a synthetic Cloudflare-shaped fixture.
 - **Ids and paths:** timestamp-sortable ids; builders for every path under `/pub/sweepky/`; `pubky://` URL parsing for bounty and sweep references.
 - **Targets:** types for `pr`, `commit`, `repo`, `crate`; the per-kind scope description handed to the skill.
 - **Trust labels:** `circle` / `known { confirmed, owners }` / `unknown`, computed from a roster plus a set of attestations.

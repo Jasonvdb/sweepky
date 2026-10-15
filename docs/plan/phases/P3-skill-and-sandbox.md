@@ -6,7 +6,7 @@ The `/sweepky` skill an agent follows, and the sandboxed project a sweep runs in
 
 ## Build
 
-- `skill/sweepky/SKILL.md`: roles `run` (default), `post`, `pull`, `confirm`, `close`. References `cloudflare/security-audit-skill` at `c1c8a8c` with its install line; per-kind scoping text; output dir `./sweeps/<id>/`; the trust rule for untrusted sweeps.
+- `skill/sweepky/SKILL.md`: roles `run` (default), `post`, `pull`, `confirm`, `resolve`, `close`. Playbook-agnostic: reads the bounty's `brief`, `focus` and suggested playbook; follows the suggestion if installed, else the sweeper's configured playbook, else a careful review guided by the brief; records which was used. Carries the common findings schema. References `cloudflare/security-audit-skill` at `c1c8a8c` as the default suggestion for `security` bounties, with its install line; per-kind scoping via `scope.json`; output dir `./sweeps/<id>/`; the trust rule for untrusted sweeps.
 - `sweepky init <dir>`: writes `.claude/settings.json` (sandbox enabled, `failIfUnavailable: true`, `allowUnsandboxedCommands: false`, `network.allowedDomains: []`, `filesystem.denyRead: ["~/"]`, `allowRead: ["."]`, `permissions.blockReadsOutsideWorkingDirectories`, `WebFetch`/`WebSearch` denied, `sandbox.excludedCommands: ["sweepky"]`), a `CLAUDE.md` for the project, and a `.gitignore` that excludes `sweeps/`.
 
 ## Done when

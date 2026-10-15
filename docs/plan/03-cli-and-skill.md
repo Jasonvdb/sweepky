@@ -25,24 +25,27 @@ sweepky/
 | `circle create\|add\|remove\|show` | Roster admin |
 | `keys add\|list\|revoke` | Device keys |
 | `post [--open] [--readers circle\|owner\|<pubky>…]` | Pins SHAs via `git ls-remote`/`gh`, crate sha256 from the index; refuses non-public repos |
-| `run` | Picks the target with the fewest sweeps, writes `running`, fetches the target |
-| `submit --run-dir <dir>` | Packs canonical files, encrypts to readers' unrevoked keys, uploads `.age`, flips to `done` (or `aborted`) |
-| `pull` | Roster polling plus the events-feed watcher for open bounties (persisted cursors); prints each sweep's trust label; decrypts to `~/.local/share/sweepky/<bounty>/`; merges trusted `findings.json` by `fingerprint`, untrusted into `untrusted/` |
-| `confirm <sweep> <fingerprint>` | Writes the attestation record |
+| `run` | Picks the target with the fewest sweeps, writes `running`, fetches the target, writes `scope.json` and the bounty's brief into the sweep directory |
+| `submit --run-dir <dir> [--playbook <name>]` | Builds the package (manifest, `findings.json`, attachments), converting Cloudflare output when detected; encrypts to readers' unrevoked keys; uploads `.age`; flips to `done` (or `aborted`) |
+| `pull` | Roster polling plus the events-feed watcher for open bounties (persisted cursors); prints each sweep's trust label; decrypts to `~/.local/share/sweepky/<bounty>/`; merges trusted findings by `id`, untrusted into `untrusted/` |
+| `confirm <sweep> <finding>` | Marks a finding confirmed in local triage state |
+| `resolve <sweep> <finding>` | Writes the public attestation for a confirmed finding (fixed, or safe to disclose) |
 | `close <bounty>` | Closes a bounty |
 | `watch [--add-homeserver <pk>]` | Terminal live view |
 | `dev identity\|approve` | Testnet only: create identities, play Ring's part by approving an auth URL (`PubkySigner::approve_auth`) |
 
-Twelve commands plus the hidden `dev` group, which only appears in testnet mode.
+Thirteen commands plus the hidden `dev` group, which only appears in testnet mode.
 
-Canonical run files that `submit` packs: `findings.json`, `REPORT.md`, `FINDINGS-DETAIL.md`, `NEEDS-VALIDATION.md`, `coverage-ledger.json`, `run-metadata.json`, `architecture.md`. Working directories, scripts and inboxes are excluded.
+`submit` packages whatever is in the sweep directory: `findings.json` (required; converted from Cloudflare's format when that is what it finds), and everything else as `attachments/`. The sweeper's agent is told to keep scratch files out of the sweep directory.
 
 ## The `/sweepky` skill
 
-One skill, five roles: `run` (default), `post`, `pull`, `confirm`, `close`. Only `run` loads `security-audit` and requires an `init` project.
+One skill, six roles: `run` (default), `post`, `pull`, `confirm`, `resolve`, `close`. Only `run` requires an `init` project.
 
-- References `cloudflare/security-audit-skill` pinned at commit `c1c8a8c` with its install line (`npx skills add https://github.com/cloudflare/security-audit-skill --skill security-audit --global`). It does not vendor the skill.
-- Run flow: `sweepky run` → run the audit with the bounty's profile and the per-kind scope, output dir `./sweeps/<id>/` → `sweepky submit`.
+- Playbook-agnostic. In `run` it reads the bounty's `brief`, `focus` and `playbook.suggested`, then follows the suggested playbook if the agent has it installed, otherwise whatever playbook the sweeper has configured, otherwise a plain careful review guided by the brief. It records which one it used.
+- Carries the common findings schema and tells the agent to produce `findings.json` in it (or to leave Cloudflare's output for the CLI to convert).
+- References `cloudflare/security-audit-skill` at commit `c1c8a8c` as the default suggestion for `security` bounties, with its install line (`npx skills add https://github.com/cloudflare/security-audit-skill --skill security-audit --global`). It does not vendor it and does not require it.
+- Run flow: `sweepky run` → follow the playbook with the per-kind scope, output dir `./sweeps/<id>/` → `sweepky submit`.
 - Tells the agent the trust rule: untrusted sweeps are summarised, never merged.
 
 ## Dependencies

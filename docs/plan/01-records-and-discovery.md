@@ -8,27 +8,85 @@ All records live under `/pub/sweepky/` on the **writer's own** homeserver. IDs a
 |---|---|---|
 | `circle.json` | admin | `{name, admin, members: [{pubky, label?}]}` — the roster; the default trust set and the default discovery set |
 | `keys/<deviceId>.json` | each user, per device | `{alg: "age-x25519", recipient: "age1…", label, createdAt, revokedAt: null}` — strangers publish these too, so an owner can encrypt to anyone |
-| `bounties/<id>.json` | owner | `{title, targets: […], profile: "quick"\|"standard"\|"deep", readers: "circle"\|"owner"\|[pubky…], open: false, reward: null, status: "open"\|"closed", createdAt}` |
-| `sweeps/<id>.json` | sweeper | `{bounty: "pubky://<owner>/pub/sweepky/bounties/<id>.json", targets: ["t1", "t2"], status: "running"\|"done"\|"aborted", startedAt, finishedAt?, profile, access: {kind: "circle"\|"owner"}, sha256?}` |
-| `sweeps/<id>.age` | sweeper | age-encrypted `tar.zst` of the canonical run files; the plaintext starts with `manifest.json` `{sweeper, bounty, targets, targetShas, startedAt, finishedAt}` to bind authorship |
-| `attestations/<sweeper>/<fingerprint>.json` | owner | `{bounty, sweep, sweeper, severity, confirmedAt}` — public; written by `sweepky confirm` for a finding the owner has confirmed and acknowledged |
+| `bounties/<id>.json` | owner | see [The bounty post](#the-bounty-post) |
+| `sweeps/<id>.json` | sweeper | `{bounty: "pubky://<owner>/pub/sweepky/bounties/<id>.json", targets: ["t1", "t2"], playbook: "<open string>", status: "running"\|"done"\|"aborted", startedAt, finishedAt?, access: {kind: "circle"\|"owner"}, sha256?}` |
+| `sweeps/<id>.age` | sweeper | the encrypted sweep package; see [The sweep package](#the-sweep-package) |
+| `attestations/<sweeper>/<findingId>.json` | owner | `{bounty, sweep, sweeper, severity, resolvedAt}` — public credit; written by `sweepky resolve` once a confirmed finding is fixed or the owner judges it safe to disclose |
 
 The **trust label** is computed client-side, never stored: `circle` if the sweeper is in the roster, else `known` with counts from trusted owners' `attestations/`, else `unknown`.
 
 Reserved and empty in v1: `payouts/`, `received/`, `disclosures/`, `tags/`, `triage/`.
 
-Sweep records carry `targets` as an array because one audit run can cover a primary target plus companions, matching the skill's own `companion_targets`.
+Sweep records carry `targets` as an array because one run can cover a primary target plus companions.
 
-## Target kinds and how the skill is scoped
+## The bounty post
 
-| Kind | Fields | Scope passed to the skill |
+A fixed envelope that tools act on, with a freeform brief inside for humans and agents:
+
+```json
+{
+  "schemaVersion": 1,
+  "title": "Auth and session handling before the 0.15 release",
+  "focus": "security",
+  "brief": "Markdown. What to look for, context, what is out of scope, how to report. No secrets: this is public.",
+  "playbook": { "suggested": "cloudflare/security-audit@c1c8a8c", "required": false },
+  "targets": [ { "id": "t1", "kind": "repo", "repo": "github.com/org/name", "rev": "<sha>", "paths": ["src/auth/"] } ],
+  "readers": "circle",
+  "open": false,
+  "reward": null,
+  "status": "open",
+  "createdAt": "<timestamp>"
+}
+```
+
+- **Fixed:** `title`, `targets` (pinned), `readers`, `open`, `status`, dates, `reward` (reserved).
+- **Freeform:** `brief` (markdown), `focus` (open label; `security` is the first use case, `bugs`, `perf`, anything else is valid), `playbook.suggested` (an open string naming a skill, URL or procedure; `required` is always `false` in v1 and exists only so the field has an obvious shape).
+- The post is public. The brief must not contain anything the owner would not put in a public issue.
+
+## The sweep package
+
+The encrypted `.age` payload is a `tar.zst` containing:
+
+| Entry | Required | Contents |
+|---|---|---|
+| `manifest.json` | yes | `{sweeper, bounty, targets, targetShas, playbook, startedAt, finishedAt}` — binds the package to its record |
+| `findings.json` | yes | the common Sweepky findings format below |
+| `attachments/…` | no | anything the playbook produced: full reports, coverage ledgers, logs. Freeform |
+
+**Common findings format.** Small on purpose, so any playbook can emit it and the board can render it:
+
+```json
+{
+  "schemaVersion": 1,
+  "playbook": "cloudflare/security-audit@c1c8a8c",
+  "findings": [
+    {
+      "id": "stable-fingerprint-for-dedupe",
+      "title": "…",
+      "severity": "critical|high|medium|low|info",
+      "confidence": "high|medium|low",
+      "status": "confirmed|needs_validation|rejected",
+      "locations": [ { "file": "src/auth/session.rs", "line": 120 } ],
+      "description": "Markdown",
+      "fix": "Markdown or a diff, optional",
+      "extra": { }
+    }
+  ]
+}
+```
+
+`id` is the dedupe key across sweeps. The CLI ships a converter from Cloudflare's `findings.json` (its `fingerprint` becomes `id`, its verdict branches become `status`); a sweeper using another playbook has their agent write this format directly, and the `/sweepky` skill carries the schema. `extra` preserves anything playbook-specific.
+
+## Target kinds and how a sweep is scoped
+
+| Kind | Fields | Scope handed to the playbook |
 |---|---|---|
 | `pr` | `{repo, number, base, head}` | diff `base..head` on the `head` checkout |
 | `commit` | `{repo, rev}` | diff `rev^..rev` |
-| `repo` | `{repo, rev, paths?}` | full audit narrowed to `paths`; the CLI warns if a whole repo has no `paths`, because a `standard` run can outlast a 5-hour plan window |
-| `crate` | `{name, version, sha256}` | the published tarball, checksum-verified against the crates.io index: audit what ships, not what is on GitHub |
+| `repo` | `{repo, rev, paths?}` | the whole tree narrowed to `paths`; the CLI warns if a whole repo has no `paths`, because a long run can outlast a 5-hour plan window |
+| `crate` | `{name, version, sha256}` | the published tarball, checksum-verified against the crates.io index: sweep what ships, not what is on GitHub |
 
-The skill supports scoping to "named paths, one subsystem, one companion domain, or the diff between two source refs" and lets the output directory be an explicitly chosen path inside the target when that directory is gitignored.
+The CLI writes the scope as a small `scope.json` in the sweep directory; the `/sweepky` skill tells the agent to pass it to whichever playbook it uses. Cloudflare's skill, for reference, supports scoping to "named paths, one subsystem, one companion domain, or the diff between two source refs".
 
 ## Discovery
 
