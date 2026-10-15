@@ -30,13 +30,13 @@ Pubkys are random Ed25519 public keys in raw z-base32, generated for this file w
 
 ### The rule
 
-The rule comes from [01](../docs/plan/01-records-and-discovery.md#records-v1), plus the owner count that [00](../docs/plan/00-overview.md#trust-model-the-circle-is-a-default-not-the-protocol) adds to the `known` label. For each pubky:
+The rule comes from [01](../docs/plan/01-records-and-discovery.md#records-v1), plus the owner count that [00](../docs/plan/00-overview.md#trust-model-the-circle-is-a-default-not-the-protocol) adds to the `known` label. Only credits from trusted owners count, and in v1 the trusted owners are the roster's members. For each pubky:
 
-- `bounties` is the number of `done` bounties whose `credits` name the pubky and whose owner is someone else. A credit that names the bounty's own owner counts for nothing.
+- `bounties` is the number of `done` bounties whose owner is a roster member and whose `credits` name the pubky. A credit that names the bounty's own owner counts for nothing.
 - `owners` is the number of distinct owners among those bounties.
 - `label` is `circle` if the pubky is in the roster, else `known` if `bounties` > 0, else `unknown`.
 
-Every owner is a roster member, because in v1 the trusted owners are the circle's owners. The file therefore has no case with an untrusted owner.
+The status and owner filters belong in the trust-label function, not in its caller: each test passes the function the whole `bounties` list, including the open bounties and the bounty from an owner outside the roster.
 
 ### Who is who
 
@@ -45,10 +45,11 @@ Every owner is a roster member, because in v1 the trusted owners are the circle'
 | `ybymzxgk` A | admin, also a member | `circle`, 0 / 0 |
 | `btyoe954` B | member | `circle`, 1 / 1 |
 | `5ymaqd61` D | member | `circle`, 1 / 1 (2 / 2 would mean the self-credit counted) |
-| `a8fyof86` S1 | sweeper | `known`, 2 / 2 |
+| `z5quft98` X | owner outside the roster | `unknown`, 0 / 0 |
+| `a8fyof86` S1 | sweeper | `known`, 2 / 2 (3 / 3 would mean X's credit counted) |
 | `kmjs3ec6` S2 | sweeper | `known`, 2 / 2 |
-| `qwujy4ep` S3 | sweeper | `unknown`, 0 / 0 |
-| `3rus98p3` S4 | sweeper | `known`, 2 / 1 |
+| `qwujy4ep` S3 | sweeper | `unknown`, 0 / 0 (`known`, 1 / 1 would mean X's credit counted) |
+| `3rus98p3` S4 | sweeper | `known`, 2 / 1 (3 / 1 would mean the duplicate credit counted) |
 
 ### Cases covered
 
@@ -56,7 +57,9 @@ Every owner is a roster member, because in v1 the trusted owners are the circle'
 |---|---|---|
 | Self-credit | D's done bounty `0035JREYBXX7T` credits D and S2 | D's tally gets nothing from it; S2's does |
 | Credits from two owners | S1 credited by A and B; S2 by D and A | `owners` counts distinct owners |
-| One owner, two bounties | S4 credited twice by A | `bounties` > `owners`, so reputation from one owner reads as `owners: 1` ([06](../docs/plan/06-verification-and-limits.md#known-limits-say-them-in-the-readme)) |
+| One owner, two bounties | S4 credited by A on two bounties | `bounties` > `owners`, so reputation from one owner reads as `owners: 1` ([06](../docs/plan/06-verification-and-limits.md#known-limits-say-them-in-the-readme)) |
+| Duplicate credit | A's done bounty `0035G87EK4XFE` names S4 twice | the tally counts bounties, not credit entries, so S4 stays at 2 / 1 |
 | Open bounty with credits | A's open bounty `0035Q0RCGQAHP` credits S3 | credits on a bounty that is not `done` do not count, so S3 stays `unknown` |
+| Owner outside the roster | X's done bounty `0035TR7XPGKP0` credits S3 and S1 | a done bounty from an owner who is not a roster member counts for nothing, so S3 stays `unknown` and S1 stays at 2 / 2 |
 | Done bounty with no credits | D's `0035R9NS7T33M` | a done bounty with an empty `credits` list adds nothing |
 | Circle members credited | B by A, D by B | a roster member is `circle` whatever its tally, and the tally is still counted |

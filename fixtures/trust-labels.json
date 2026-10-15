@@ -25,6 +25,7 @@
       "status": "done",
       "credits": [
         "a8fyof86uespzzjc3hiryromqy6hgw1gem5htj76jn6sto4jokhy",
+        "3rus98p3q6naiqxckzo676jeewj1whf6ai8911mxacshks18eq3y",
         "3rus98p3q6naiqxckzo676jeewj1whf6ai8911mxacshks18eq3y"
       ]
     },
@@ -82,6 +83,15 @@
       "owner": "btyoe954e99wb6sp7csdipt9ki8ca3iyus1tfi3171zqdixb5csy",
       "status": "open",
       "credits": []
+    },
+    {
+      "id": "0035TR7XPGKP0",
+      "owner": "z5quft985i4g55uz4ccsxn9r8qnmmk48kmmn6byyyoacu4u37rny",
+      "status": "done",
+      "credits": [
+        "qwujy4epafpmfei7bxn8fccfm1shzqp516sbenxi7qr6gua4n77o",
+        "a8fyof86uespzzjc3hiryromqy6hgw1gem5htj76jn6sto4jokhy"
+      ]
     }
   ],
   "expected": {
@@ -119,6 +129,11 @@
       "label": "known",
       "bounties": 2,
       "owners": 1
+    },
+    "z5quft985i4g55uz4ccsxn9r8qnmmk48kmmn6byyyoacu4u37rny": {
+      "label": "unknown",
+      "bounties": 0,
+      "owners": 0
     }
   }
 }
