@@ -1,20 +1,81 @@
 //! Sweepky's core library: records, ids, paths, target pinning, trust labels,
 //! the events-feed parser, finding groups, age encryption, the package envelope
-//! and the manifest. None of it exists yet; P1a and P1b add it.
+//! and the manifest. P1a adds the records and parsing, P1b the encryption.
 //!
-//! Two rules hold for everything that lands here (see "Rust conventions" in
+//! So far it holds the machinery every record shares:
+//!
+//! - [`RecordError`], the error every parse here returns.
+//! - [`SchemaVersion`] and the parse every record goes through: check the
+//!   input's length against a cap ([`MAX_RECORD_BYTES`] or
+//!   [`MAX_FINDINGS_BYTES`]) before parsing anything, read `schemaVersion` on
+//!   its own, then read the whole record.
+//! - [`UnknownFields`], which a record keeps with `#[serde(flatten)]` so that
+//!   rewriting it keeps the fields a newer client added.
+//! - Open-string enums (`kind`, `status`, `alg`, …): a `String` newtype with
+//!   an `as_known()` helper, made by a macro inside this crate.
+//! - [`RecordTime`], the opaque timestamp string in `createdAt` and the other
+//!   time fields.
+//!
+//! The rules that hold for everything here (see "Rust conventions" in
 //! `docs/plan/03-cli-and-skill.md`):
 //!
-//! - **No network or file I/O.** Functions take values and return values. That
-//!   keeps the crate unit-testable without a network or a temp directory, and
-//!   lets it compile to WASM later. The CLI owns the network and the disk: for
-//!   example, the package envelope is built here from an in-memory list of
-//!   files, while the directory walk and its safety rules live in `sweepky-cli`.
+//! - **No network or file I/O, and no clock.** Functions take values and return
+//!   values. That keeps the crate unit-testable without a network or a temp
+//!   directory, and lets it compile to WASM later. The CLI owns the network,
+//!   the disk and the clock: for example, the package envelope is built here
+//!   from an in-memory list of files, while the directory walk and its safety
+//!   rules live in `sweepky-cli`, and a record's `createdAt` is a value the CLI
+//!   passes in.
 //! - **Typed errors with `thiserror`.** A fallible function returns
 //!   `Result<T, E>` where `E` is an error enum the caller can `match` on, so the
 //!   CLI can react to one case (say, an unknown key) differently from another.
 //!   `anyhow` turns every error into a message and loses that, which is fine in
 //!   the binary, so it is used only there.
+//! - **Never panic on someone else's data.** Every record was written by
+//!   another person and served by a homeserver we do not control. A panic
+//!   abandons whatever the program was doing, so one malformed sweep record
+//!   would stop `pull` for every other sweep. Malformed input comes back as an
+//!   `Err` instead; the lints at the top of this file forbid the usual ways to
+//!   panic outside tests.
+//! - **Bounded reads.** Every function that parses bytes checks their length
+//!   against a documented cap first, and serde_json's recursion limit stays on.
+//! - **Errors never quote the input.** A [`RecordError`] holds numbers and
+//!   fixed text only, so a stranger's record cannot put its own words into the
+//!   CLI's output.
+
+// `forbid` is `deny` that nothing further down can switch back off: no
+// `unsafe` anywhere in this crate, with no exceptions.
+#![forbid(unsafe_code)]
+// Every public item needs a `///` doc comment. CI runs clippy with
+// `-D warnings`, which turns this warning into an error.
+#![warn(missing_docs)]
+// Outside tests, refuse the calls that panic on bad input: `.unwrap()`,
+// `.expect()`, `panic!`, `v[i]` and `&s[a..b]`, and the placeholder macros
+// `todo!`, `unimplemented!` and `unreachable!`, which panic when reached. Use
+// `?`, `.get(i)` or a match instead. Tests may use them, because a panic is how
+// a test reports a failure.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::string_slice,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::unreachable
+    )
+)]
+
+mod error;
+mod open_enum;
+mod schema;
+mod time;
+
+pub use error::{JsonCategory, RecordError};
+pub use schema::{MAX_FINDINGS_BYTES, MAX_RECORD_BYTES, SchemaVersion, UnknownFields};
+pub use time::RecordTime;
 
 /// This crate's version, `version` from Cargo.toml.
 ///

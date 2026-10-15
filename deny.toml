@@ -25,12 +25,14 @@ include-dev = true
 # SPDX ids. A crate passes when its licence expression is satisfied by these:
 # `MIT OR Apache-2.0` passes with either, `MIT AND X` needs both.
 #
-# Only MIT (our own crates) is in use until P2a adds `pubky` and
-# `pubky-testnet`, so until then cargo-deny warns that the other entries and the
-# `option-ext` exception are not encountered. Leave those warnings be: after
-# P2a, `cargo deny check licenses` shows which entries are really needed. (A
-# probe on 2026-10-15 with every pin in 03 in use needed all eight entries and
-# the exception, and nothing else.)
+# From P1a, sweepky-core's serde, serde_json and thiserror (and the crates they
+# pull in) use MIT, Apache-2.0 and Unicode-3.0 (unicode-ident's
+# `(MIT OR Apache-2.0) AND Unicode-3.0`). The other entries and the
+# `option-ext` exception are not in use until P2a adds `pubky` and
+# `pubky-testnet`, so until then cargo-deny warns that they are not
+# encountered. Leave those warnings be: after P2a, `cargo deny check licenses`
+# shows which entries are really needed. (A probe on 2026-10-15 with every pin
+# in 03 in use needed all eight entries and the exception, and nothing else.)
 allow = [
     "MIT",
     "Apache-2.0",

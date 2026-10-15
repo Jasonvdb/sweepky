@@ -24,3 +24,5 @@ The data half of `sweepky-core`: records, paths, ids, targets, the Cloudflare co
 
 - The crate must not depend on `tokio`, `reqwest` or `pubky`; it may depend on `pubky-timestamp`. The CLI owns the network.
 - Every parser here reads data a stranger may have written. Malformed input returns an error or is skipped; it never panics.
+- Every from-bytes parse checks the input's length before parsing: at most 1 MiB (`MAX_RECORD_BYTES`) for a public record and 16 MiB (`MAX_FINDINGS_BYTES`) for a findings document. These caps are P1a's choice; 01 sets none.
+- [01](../01-records-and-discovery.md) does not say how `createdAt`, `startedAt`, `finishedAt`, `doneAt` and `revokedAt` are encoded, so `RecordTime` keeps them opaque: 1 to 64 printable ASCII characters, no whitespace. Those limits are P1a's choice, not 01's.
