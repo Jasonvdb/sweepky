@@ -10,7 +10,7 @@
 
 ## Done when
 
-- Both login options covered in the same test, as in [06](../06-verification-and-limits.md#verification): loopback page fetched (QR and link present, status "waiting"), relay host asserted local (the authorization URL's relay is the testnet relay), in-process approval (`PubkySigner::approve_auth`), status flip (to "approved"), the resulting grant writing a record (its `keys/<deviceId>.json`), a narrowed approval refused (read-only through `approve_auth_with_capabilities`, with the expected message), wrong loopback path 404.
+- Both login options covered in the same test, as in [06](../06-verification-and-limits.md#verification): loopback page fetched (QR and link present, status "waiting"), relay host asserted local (the authorization URL's relay is the testnet relay), in-process approval (`PubkySigner::approve_auth`), status flip (to "approved"), the resulting grant writing a record (its `keys/<deviceId>.json`), a narrowed approval refused (read-only through `approve_auth_with_capabilities`, with the expected message), a recovery file passed to `login` rejected, wrong loopback path 404.
 - These parts run in the test that [P2c](P2c-cli-pull-done.md) landed, with A and A's second install switched to the default Ring flow; B and C stay on `--identity`.
 - In A's first install, which holds one saved Ring token, two writer commands run concurrently and both succeed: `circle add` of a synthetic pubky the test uses nowhere else, and `keys revoke` of the key the test injected under A's `keys/`. The writers' lock runs them one at a time, so neither loses its bearer to the other's restore ([02](../02-encryption-and-safety.md#device-keys)). Afterwards `circle.json` lists the new member and the injected key has `revokedAt` set. Both commands run after the checks P2c landed and before `logout`, so they change no group, credit or label the test asserts.
 - After `logout`, restoring the Ring token that A saved at login returns 401.
@@ -24,4 +24,5 @@
 
 - The SDK's convenience constructor sets no relay, so a testnet login through it would post its approval through the production relay ([03](../03-cli-and-skill.md#two-ways-to-log-in)).
 - The authorization URL carries the relay channel secret, so it is never logged or written to disk ([03](../03-cli-and-skill.md#two-ways-to-log-in)).
+- [P2a](P2a-cli-identity.md) unit-tests the recovery-file rejection. The end-to-end check here passes a recovery file to `login` itself, because [06](../06-verification-and-limits.md#verification) lists that check with the login options.
 - The SDK hands the grant token back as a plain `String`; move it into a `SecretString` at once and write the 0600 file from that ([03](../03-cli-and-skill.md#rust-conventions-teaching-notes-keep-in-code-comments)).
