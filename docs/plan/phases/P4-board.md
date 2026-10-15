@@ -11,7 +11,7 @@ A static, read-only SPA: a landing page that explains Sweepky and invites owners
 - Routes: `/` (landing), `/board`, `/b/:owner/:id`, `/s/:sweeper/:id`, `/circle`.
 - Tokens, type, buttons and section pattern from the pubky-app design reference in [04](../04-board.md#design-reference-pubky-app), copied by hand into the app's CSS from the pinned commit. One accent (`--brand`); `--destructive` only for `aborted` and "unreachable".
 - Polling store (30 s) per [04](../04-board.md#live-ness): cached homeserver resolution, reverse paged listings with 404 as empty, conditional re-GET of non-terminal records, open bounties through `bounties/<id>.discovered.json`, every request with `credentials: 'omit'`.
-- Trust badge per sweep (`circle` / `known N` / `unknown`) computed from the roster plus `credits` on done bounties, ignoring a credit that names the bounty's owner; `open` marker on bounties; done bounties show their credited sweepers; credits received on the Circle page; "not browser-reachable" for members whose homeserver has no ICANN HTTPS endpoint.
+- Trust badge per sweep (`circle` / `known N` / `unknown`) computed from the roster plus `credits` on done bounties from trusted owners (roster members in v1), ignoring a credit that names the bounty's owner; `open` marker on bounties; done bounties show their credited sweepers; credits received on the Circle page; "not browser-reachable" for members whose homeserver has no ICANN HTTPS endpoint. The trust-badge unit test loads [`fixtures/trust-labels.json`](../../../fixtures/trust-labels.json), the file [P1a](P1a-core-records.md)'s Rust test loads. It passes the badge function the whole `bounties` list, so the function itself, not its caller, drops open bounties and bounties from owners outside the roster. For every `expected` entry the test asserts the label, and the `bounties` and `owners` counts behind "credits received" on the Circle page.
 - Visual direction from [04-board.md](../04-board.md#visual-direction): floor plan, detectors, swept rooms, rooms going dark when done, hollow unknown sweepers; the board's intro strip and empty state.
 - Landing page per [04](../04-board.md#landing-page-): six sections, the hero showing the live floor plan (or the empty state) from the board's store, `#post` and `#sweep` anchors, Open Graph tags in `index.html`, the install block linking to the README until a release channel exists.
 - All motion stops under `prefers-reduced-motion: reduce`.
@@ -19,7 +19,7 @@ A static, read-only SPA: a landing page that explains Sweepky and invites owners
 
 ## Done when
 
-- `pnpm build` and `pnpm test` clean (unit tests for the trust-badge rule, the listing pager and the record reducer).
+- `pnpm build` and `pnpm test` clean (unit tests for the trust-badge rule against `fixtures/trust-labels.json`, the listing pager and the record reducer).
 - Playwright or manual against the testnet: the public view shows a `running` → `done` sweep transition within one poll, a stranger's sweep appearing with the `unknown` badge after the owner's `pull` has published it to `discovered.json`, and the bounty flipping to done with its credits and the stranger's badge becoming `known 1`.
 - The network log shows every request sent without credentials and nothing written; the board never requests `/events/`; apart from the font, the landing page requests nothing but what its hero's store reads.
 - Against an empty testnet, `/board` and the landing hero both show the empty state, with no sample rooms.
