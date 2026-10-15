@@ -96,7 +96,7 @@ Exact pins, re-checked against crates.io and npm for P0 on 2026-10-15; each is t
 | `serde` / `serde_json` | =1.0.229 / =1.0.154 | |
 | `thiserror` (core) / `anyhow` (CLI) | =2.0.21 / =1.0.104 | |
 
-Web: `@synonymdev/pubky` 0.16.2, `react` and `react-dom` 19.3.1, `react-router` 8.4.0, `zustand` 5.0.15, `vite` 8.3.4, `typescript` 7.0.2. Cloudflare skill: commit `c1c8a8c1471069fb0e188eeaff69b8e8db6564a8` (still HEAD). Claude Code 2.1.285 or newer for the sandbox settings the template relies on. Tooling: stable toolchain, `cargo nextest`, `cargo-deny`, clippy with `-D warnings`.
+Web: `@synonymdev/pubky` 0.16.2, `react` and `react-dom` 19.3.1, `react-router` 8.4.0, `zustand` 5.0.15, `vite` 8.3.4, `typescript` 7.0.2. Cloudflare skill: commit `c1c8a8c1471069fb0e188eeaff69b8e8db6564a8` (still HEAD). Claude Code 2.1.285 or newer for the sandbox settings the template relies on. Tooling: stable toolchain, `cargo-nextest` 0.9.137 and `cargo-deny` 0.19.9, clippy with `-D warnings`. CI installs those two tools as prebuilt binaries and also pins Node 24.15.0, pnpm 10.33.0 (the `packageManager` in `web/package.json`), the `postgres:18.4` image and every action by commit SHA. These tool versions are the ones on this machine ([06](06-verification-and-limits.md#local-environment-this-machine)) rather than the newest releases, so CI and local runs agree; upgrade a tool on this machine and in CI at the same time.
 
 No `paykit` or `locks` crates in v1: they pin `pubky` 0.15 and 0.11 (a git rev) respectively, and neither interoperates with 0.16.
 
