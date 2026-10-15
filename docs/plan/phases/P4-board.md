@@ -6,7 +6,7 @@ A static, read-only SPA: a landing page that explains Sweepky and invites owners
 
 ## Build
 
-- Scaffold: `pnpm create vite web --template react-ts`; add `@synonymdev/pubky` 0.16.1, `react-router`, `zustand` at the exact versions in [03](../03-cli-and-skill.md#dependencies); `tsconfig` `lib` includes `esnext`. Load Inter Tight in the page.
+- Scaffold: `pnpm create vite web --template react-ts`; add `@synonymdev/pubky`, `react-router`, `zustand` at the exact versions in [03](../03-cli-and-skill.md#dependencies); `tsconfig` `lib` includes `esnext`. Load Inter Tight in the page.
 - `VITE_PUBKY_TESTNET=1` → `Pubky.testnet()`, opt-in only; the production build asserts it is unset.
 - Routes: `/` (landing), `/board`, `/b/:owner/:id`, `/s/:sweeper/:id`, `/circle`.
 - Tokens, type, buttons and section pattern from the pubky-app design reference in [04](../04-board.md#design-reference-pubky-app), copied by hand into the app's CSS from the pinned commit. One accent (`--brand`); `--destructive` only for `aborted` and "unreachable".

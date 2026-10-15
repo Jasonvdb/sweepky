@@ -79,12 +79,12 @@ One skill, four roles: `run` (default), `post`, `pull`, `done`. `run` requires a
 
 ## Dependencies
 
-Exact pins, all the latest published version on 2026-10-15; re-check before P0.
+Exact pins, re-checked against crates.io and npm for P0 on 2026-10-15; each is the latest published version.
 
 | Crate | Version | Note |
 |---|---|---|
-| `pubky` | =0.16.1 | features `json`; the version production runs |
-| `pubky-testnet` | =0.16.1 | dev-dependency; same version as `pubky` |
+| `pubky` | =0.16.2 | features `json`; production's homeserver runs 0.16.1, and 0.16.2 changed only the homeserver (the SDK diff is doc comments) |
+| `pubky-testnet` | =0.16.2 | dev-dependency; same version as `pubky` |
 | `pubky-timestamp` | =0.4.1 | ids in `sweepky-core`, which must not depend on `pubky` |
 | `age` | =0.12.1 | default features only; never `plugin`, never `ssh` |
 | `secrecy` | =0.10.3 | use the `age::secrecy` re-export so the two agree |
@@ -96,7 +96,7 @@ Exact pins, all the latest published version on 2026-10-15; re-check before P0.
 | `serde` / `serde_json` | =1.0.229 / =1.0.154 | |
 | `thiserror` (core) / `anyhow` (CLI) | =2.0.21 / =1.0.104 | |
 
-Web: `@synonymdev/pubky` 0.16.1, `react` and `react-dom` 19.3.1, `react-router` 8.4.0, `zustand` 5.0.15, `vite` 8.3.4, `typescript` 7.0.2. Cloudflare skill: commit `c1c8a8c1471069fb0e188eeaff69b8e8db6564a8` (still HEAD). Claude Code 2.1.285 or newer for the sandbox settings the template relies on. Tooling: stable toolchain, `cargo nextest`, `cargo-deny`, clippy with `-D warnings`.
+Web: `@synonymdev/pubky` 0.16.2, `react` and `react-dom` 19.3.1, `react-router` 8.4.0, `zustand` 5.0.15, `vite` 8.3.4, `typescript` 7.0.2. Cloudflare skill: commit `c1c8a8c1471069fb0e188eeaff69b8e8db6564a8` (still HEAD). Claude Code 2.1.285 or newer for the sandbox settings the template relies on. Tooling: stable toolchain, `cargo nextest`, `cargo-deny`, clippy with `-D warnings`.
 
 No `paykit` or `locks` crates in v1: they pin `pubky` 0.15 and 0.11 (a git rev) respectively, and neither interoperates with 0.16.
 

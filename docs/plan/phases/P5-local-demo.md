@@ -17,7 +17,7 @@ The demo report may describe unpatched findings in a real repository. It is read
 
 Three identities run side by side, each with its own `SWEEPKY_HOME`; below, `as owner` means `SWEEPKY_HOME=$DEMO/owner sweepky --testnet …`.
 
-1. Start the pinned testnet binary (`pubky-testnet` 0.16.1, `TEST_PUBKY_CONNECTION_STRING` against local Postgres). The script stops it with `kill -INT` at the end so it drops its database.
+1. Start the pinned testnet binary with the install and run commands in [06](../06-verification-and-limits.md#local-environment-this-machine) (`TEST_PUBKY_CONNECTION_STRING` against local Postgres). The script stops it with `kill -INT` at the end, then drops the testnet's database itself if the testnet left it behind.
 2. `sweepky --testnet login --identity owner`, `--identity sweeper`, `--identity stranger`, each under its own home; each login publishes a device key, which is also the write check. No QR codes anywhere in the demo.
 3. `sweepky circle create` as owner; add `sweeper`.
 4. `sweepky post --open` the bounty from `SWEEPKY_DEMO_TARGETS` as owner; this also writes `bounties/<id>.discovered.json` with the testnet homeserver's starting cursor.
