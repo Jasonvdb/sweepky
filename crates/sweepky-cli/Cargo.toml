@@ -1,0 +1,16 @@
+[package]
+name = "sweepky-cli"
+description = "The sweepky command-line tool"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# The package is `sweepky-cli`, but the binary people run is `sweepky`.
+[[bin]]
+name = "sweepky"
+path = "src/main.rs"
+
+# No dependencies yet. P2a adds `pubky`, `clap`, `tokio`, `anyhow` and the path
+# dependency on sweepky-core, together with the library entry point.
+[dependencies]

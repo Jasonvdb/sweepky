@@ -1,0 +1,8 @@
+# Stable rustfmt options only. Nightly-only keys (imports_granularity,
+# group_imports, ...) print a warning on stable and are not applied.
+#
+# `edition` is the Rust edition rustfmt parses with, and by default the style
+# edition it formats with. `cargo fmt` already passes each crate's edition from
+# Cargo.toml; this line covers rustfmt run directly on a file, as editors do.
+# Keep it in step with [workspace.package] in Cargo.toml.
+edition = "2024"
