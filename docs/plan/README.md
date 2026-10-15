@@ -8,7 +8,7 @@ Design docs first, then one file per build phase. Read them in order the first t
 | [01-records-and-discovery.md](01-records-and-discovery.md) | Every record and path, target kinds, how clients find sweeps, compatibility rules |
 | [02-encryption-and-safety.md](02-encryption-and-safety.md) | What Pubky provides, owner-only encryption and keys, authorship, sweeper sandboxing |
 | [03-cli-and-skill.md](03-cli-and-skill.md) | Repo layout, the `sweepky` CLI, the `/sweepky` skill, Rust conventions |
-| [04-board.md](04-board.md) | The public web board: stack, views, live-ness, visual direction |
+| [04-board.md](04-board.md) | The public web app: landing page and board, stack, views, live-ness, the pubky-app design reference, visual direction |
 | [05-extensions.md](05-extensions.md) | Reserved extension points: sats bounties (Paykit), Locks, badges, tags, reading in the browser |
 | [06-verification-and-limits.md](06-verification-and-limits.md) | How the whole thing is verified, known limits, source references |
 
@@ -20,7 +20,7 @@ Design docs first, then one file per build phase. Read them in order the first t
 | [P1 sweepky-core](phases/P1-sweepky-core.md) | Records, ids, paths, trust labels, finding groups, feed parser, encryption, package envelope |
 | [P2 sweepky-cli](phases/P2-sweepky-cli.md) | The `sweepky` binary and the testnet end-to-end test |
 | [P3 skill and sandbox](phases/P3-skill-and-sandbox.md) | The `/sweepky` skill and the sweeper sandbox template |
-| [P4 board](phases/P4-board.md) | The public web board |
+| [P4 board](phases/P4-board.md) | The landing page and the public web board |
 | [P5 local demo](phases/P5-local-demo.md) | The reproducible local demo that gates everything after it |
 
 ## Vocabulary

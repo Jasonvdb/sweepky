@@ -25,14 +25,15 @@ Three identities run side by side, each with its own `SWEEPKY_HOME`; below, `as 
 6. As stranger, in another `init` project: `sweepky run <bounty-url>`, then a synthetic `audit/` whose one finding points at the same file and scope as one real finding under a different id, then `sweepky submit`.
 7. `sweepky pull` as owner; show the groups (the shared location lists both reporters), the `untrusted/` directory holding the stranger's content, and the updated `discovered.json`.
 8. `sweepky done` as owner: the proposal is {sweeper, stranger}; accept.
-9. `pnpm --dir web dev` with `VITE_PUBKY_TESTNET=1`; print the board URL.
+9. `pnpm --dir web dev` with `VITE_PUBKY_TESTNET=1`; print the landing and board URLs.
 
 ## Done when
 
 - `sweepky pull` as the owner prints every finding from the demo report with GitHub links at the pinned SHA.
-- The board at `http://localhost:5173` shows the bounty, both sweeps landing, the stranger's sweep as `unknown` once the owner's pull has published it, then the bounty done with both credits and the stranger as `known 1`.
-- Jason approves the look and the flow.
+- The board at `http://localhost:5173/board` shows the bounty, both sweeps landing, the stranger's sweep as `unknown` once the owner's pull has published it, then the bounty done with both credits and the stranger as `known 1`.
+- The landing page at `http://localhost:5173/` shows the same bounty live in its hero.
+- Jason approves the look, the landing copy and the flow.
 
 ## After approval (not part of this phase)
 
-`sweepky login` against `homeserver.pubky.app`, where the key write is the per-identity check and a 403 means that identity's token forbids the path; static hosting with the SPA fallback; `vibe/vibe.json` (`pubkyAppFork: false`, `stack.target: "production"`, `capabilities: ["homeserver.read"]`, plus the required `authors`, `tags`, `category`, `covers`, `license`, `version`, `repo.url`, `schemaVersion`, a directory named after the id) and the PR to `pubky/vibes`, then the extensions in [05-extensions.md](../05-extensions.md).
+`sweepky login` against `homeserver.pubky.app`, where the key write is the per-identity check and a 403 means that identity's token forbids the path; static hosting with the SPA fallback; `vibe/vibe.json` (`hosted.url` pointing at `/board`, `hosted.healthPath` `/health.json`, `pubkyAppFork: false`, `stack.target: "production"`, `capabilities: ["homeserver.read"]`, plus the required `authors`, `tags`, `category`, `covers`, `license`, `version`, `repo.url`, `schemaVersion`, a directory named after the id) and the PR to `pubky/vibes`, then the extensions in [05-extensions.md](../05-extensions.md).

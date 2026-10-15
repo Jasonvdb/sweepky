@@ -16,7 +16,7 @@ Security review is the first use case; the design is focus-agnostic.
 crates/sweepky-core/   records, paths, ids, target pinning, encryption, manifest — no I/O
 crates/sweepky-cli/    the `sweepky` binary
 skills/sweepky/        the /sweepky agent skill + sweeper sandbox template (`sweepky init` copies it into a project)
-web/                   the board (static, read-only SPA)
+web/                   the landing page and the board (static, read-only SPA)
 fixtures/              synthetic test data
 vibe/                  listing for vibes.pubky.app
 docs/plan/             design docs and phase plans

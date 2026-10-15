@@ -10,7 +10,7 @@ sweepky/
   crates/sweepky-cli/     the `sweepky` binary (clap, tokio); a library entry point takes the network
                           client, relay URL and default homeserver so tests can inject a testnet
   skills/sweepky/         SKILL.md + the .claude/settings.json sandbox template; `init` copies it into a project
-  web/                    the board (Vite + React + TS, read-only)
+  web/                    the landing page and the board (Vite + React + TS, read-only)
   fixtures/               synthetic records, run directories and a small bare git repo for tests
   vibe/                   vibe.json + cover for the pubky/vibes PR (post-approval)
   docs/plan/              these docs
