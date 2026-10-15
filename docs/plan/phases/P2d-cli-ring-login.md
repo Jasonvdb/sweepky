@@ -2,7 +2,7 @@
 
 ## Goal
 
-`login` option A, the default: the Pubky Ring sign-in through a loopback page. This phase also completes the end-to-end test from [06](../06-verification-and-limits.md#verification) with its login-option parts and its check that `logout` leaves the saved token unable to restore. It builds on [P2a](P2a-cli-identity.md) for the network config with the relay URL, the shared tail of `login`, `logout`, the config directories, the writers' lock and the capability constant, and on [P2c](P2c-cli-pull-done.md) for the end-to-end test.
+`login` option A, the default: the Pubky Ring sign-in through a loopback page. This phase also completes the end-to-end test from [06](../06-verification-and-limits.md#verification) with its login-option parts, its check that two writers can share one saved Ring token, and its check that `logout` leaves the saved token unable to restore. It builds on [P2a](P2a-cli-identity.md) for the network config with the relay URL, the shared tail of `login`, `logout`, the config directories, the writers' lock and the capability constant, and on [P2c](P2c-cli-pull-done.md) for the end-to-end test.
 
 ## Build
 
@@ -12,6 +12,7 @@
 
 - Both login options covered in the same test, as in [06](../06-verification-and-limits.md#verification): loopback page fetched (QR and link present, status "waiting"), relay host asserted local (the authorization URL's relay is the testnet relay), in-process approval (`PubkySigner::approve_auth`), status flip (to "approved"), the resulting grant writing a record (its `keys/<deviceId>.json`), a narrowed approval refused (read-only through `approve_auth_with_capabilities`, with the expected message), wrong loopback path 404.
 - These parts run in the test that [P2c](P2c-cli-pull-done.md) landed, with A and A's second install switched to the default Ring flow; B and C stay on `--identity`.
+- In A's first install, which holds one saved Ring token, two writer commands run concurrently and both succeed: `circle add` of a synthetic pubky the test uses nowhere else, and `keys revoke` of the key the test injected under A's `keys/`. The writers' lock runs them one at a time, so neither loses its bearer to the other's restore ([02](../02-encryption-and-safety.md#device-keys)). Afterwards `circle.json` lists the new member and the injected key has `revokedAt` set. Both commands run after the checks P2c landed and before `logout`, so they change no group, credit or label the test asserts.
 - After `logout`, restoring the Ring token that A saved at login returns 401.
 - `cargo clippy -- -D warnings`, `cargo deny check` and `cargo nextest run` clean.
 

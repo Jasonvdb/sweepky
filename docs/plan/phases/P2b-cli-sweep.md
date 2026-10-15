@@ -15,11 +15,11 @@
 - The testnet test from [P2a](P2a-cli-identity.md) continues, with targets from the fixture repo: A, the owner, creates a circle with B in it and posts a closed bounty; B, a circle member, runs it inside a minimal `init` project and submits a Cloudflare-format sweep.
 - `submit` refuses a run directory holding a planted symlink and a hard link to `~/.config/sweepky/*`, as in [06](../06-verification-and-limits.md#verification).
 - B's first `submit` pins A's key set, and a key the test then adds under A's `keys/` makes B's next `submit` warn.
-- Two `submit`s run concurrently under one grant both succeed (the lock serialises them).
+- Two `submit`s by B, of two separate runs, run concurrently and both succeed, each taking the writers' lock in turn.
 - `cargo clippy -- -D warnings`, `cargo deny check` and `cargo nextest run` clean.
 
 ## Notes
 
 - The per-sweep marker `sweeps/<id>/.sweepky/sweep.json` that `run` writes is separate from the project's `.sweepky` marker that the minimal `init` writes.
 - Until [P3](P3-skill-and-sandbox.md)'s `init` records a playbook, the playbook comes from `submit --playbook`.
-- Under `--identity` each command signs in afresh ([03](../03-cli-and-skill.md#two-ways-to-log-in), "Session per command"), so the two concurrent `submit`s hold separate sessions and this check shows that the lock lets both finish; the lock unit test in [P2a](P2a-cli-identity.md) is what shows it serialises them. One shared bearer, the case the lock exists for, needs a restored Ring token, which arrives in [P2d](P2d-cli-ring-login.md).
+- Under `--identity` each command signs in afresh ([03](../03-cli-and-skill.md#two-ways-to-log-in), "Session per command"), so the two concurrent `submit`s hold separate sessions. This check shows only that the lock lets both finish; the lock unit test in [P2a](P2a-cli-identity.md) shows that it serialises them. The case the lock exists for, two commands sharing one bearer, needs a restored Ring token, so [P2d](P2d-cli-ring-login.md#done-when) checks it. That is why this check rewords the former P2 item "Two `submit`s run concurrently under one grant both succeed (the lock serialises them)".
