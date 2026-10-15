@@ -10,7 +10,7 @@ A workspace skeleton that passes every quality gate while doing nothing, so late
 - `rust-toolchain.toml` (stable), `deny.toml`, `rustfmt.toml`.
 - `web/` placeholder (`package.json` with a `test` script that passes; the real scaffold lands in P4).
 - `.github/workflows/ci.yml`: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo nextest run`, `cargo deny check`, `pnpm --dir web test`. A Postgres service container with `TEST_PUBKY_CONNECTION_STRING` set, because the P2 end-to-end test's ephemeral testnet needs it.
-- `fixtures/` and `skills/sweepky/` directories with a `README.md` each stating what will live there.
+- `skills/sweepky/` directory with a `README.md` stating what will live there. [`fixtures/`](../../../fixtures/README.md) already exists, with its `README.md` and `trust-labels.json`.
 - `PLAN.md` at the root pointing at `docs/plan/`.
 
 ## Done when

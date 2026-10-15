@@ -1,0 +1,124 @@
+{
+  "roster": {
+    "schemaVersion": 1,
+    "name": "Trust-label fixture circle",
+    "admin": "ybymzxgk1zd3a7dm3i15gcuq7ewqkbimft6r1n8oc9o6uay8mqfo",
+    "members": [
+      {
+        "pubky": "ybymzxgk1zd3a7dm3i15gcuq7ewqkbimft6r1n8oc9o6uay8mqfo",
+        "label": "A"
+      },
+      {
+        "pubky": "btyoe954e99wb6sp7csdipt9ki8ca3iyus1tfi3171zqdixb5csy",
+        "label": "B"
+      },
+      {
+        "pubky": "5ymaqd61szab6j1qmry9jfo6ft81echtzscdbfs9sq8p3temcyco",
+        "label": "D"
+      }
+    ]
+  },
+  "bounties": [
+    {
+      "id": "0035G87EK4XFE",
+      "owner": "ybymzxgk1zd3a7dm3i15gcuq7ewqkbimft6r1n8oc9o6uay8mqfo",
+      "status": "done",
+      "credits": [
+        "a8fyof86uespzzjc3hiryromqy6hgw1gem5htj76jn6sto4jokhy",
+        "3rus98p3q6naiqxckzo676jeewj1whf6ai8911mxacshks18eq3y"
+      ]
+    },
+    {
+      "id": "0035HHKN24QMC",
+      "owner": "btyoe954e99wb6sp7csdipt9ki8ca3iyus1tfi3171zqdixb5csy",
+      "status": "done",
+      "credits": [
+        "a8fyof86uespzzjc3hiryromqy6hgw1gem5htj76jn6sto4jokhy"
+      ]
+    },
+    {
+      "id": "0035JREYBXX7T",
+      "owner": "5ymaqd61szab6j1qmry9jfo6ft81echtzscdbfs9sq8p3temcyco",
+      "status": "done",
+      "credits": [
+        "5ymaqd61szab6j1qmry9jfo6ft81echtzscdbfs9sq8p3temcyco",
+        "kmjs3ec6imcijf5wknsbfrh1bk4ariso7en8tteestniygu159xo"
+      ]
+    },
+    {
+      "id": "0035M2DX3Q44W",
+      "owner": "ybymzxgk1zd3a7dm3i15gcuq7ewqkbimft6r1n8oc9o6uay8mqfo",
+      "status": "done",
+      "credits": [
+        "kmjs3ec6imcijf5wknsbfrh1bk4ariso7en8tteestniygu159xo",
+        "3rus98p3q6naiqxckzo676jeewj1whf6ai8911mxacshks18eq3y",
+        "btyoe954e99wb6sp7csdipt9ki8ca3iyus1tfi3171zqdixb5csy"
+      ]
+    },
+    {
+      "id": "0035N9QXF25NG",
+      "owner": "btyoe954e99wb6sp7csdipt9ki8ca3iyus1tfi3171zqdixb5csy",
+      "status": "done",
+      "credits": [
+        "5ymaqd61szab6j1qmry9jfo6ft81echtzscdbfs9sq8p3temcyco"
+      ]
+    },
+    {
+      "id": "0035Q0RCGQAHP",
+      "owner": "ybymzxgk1zd3a7dm3i15gcuq7ewqkbimft6r1n8oc9o6uay8mqfo",
+      "status": "open",
+      "credits": [
+        "qwujy4epafpmfei7bxn8fccfm1shzqp516sbenxi7qr6gua4n77o"
+      ]
+    },
+    {
+      "id": "0035R9NS7T33M",
+      "owner": "5ymaqd61szab6j1qmry9jfo6ft81echtzscdbfs9sq8p3temcyco",
+      "status": "done",
+      "credits": []
+    },
+    {
+      "id": "0035SGHY7YWRP",
+      "owner": "btyoe954e99wb6sp7csdipt9ki8ca3iyus1tfi3171zqdixb5csy",
+      "status": "open",
+      "credits": []
+    }
+  ],
+  "expected": {
+    "ybymzxgk1zd3a7dm3i15gcuq7ewqkbimft6r1n8oc9o6uay8mqfo": {
+      "label": "circle",
+      "bounties": 0,
+      "owners": 0
+    },
+    "btyoe954e99wb6sp7csdipt9ki8ca3iyus1tfi3171zqdixb5csy": {
+      "label": "circle",
+      "bounties": 1,
+      "owners": 1
+    },
+    "5ymaqd61szab6j1qmry9jfo6ft81echtzscdbfs9sq8p3temcyco": {
+      "label": "circle",
+      "bounties": 1,
+      "owners": 1
+    },
+    "a8fyof86uespzzjc3hiryromqy6hgw1gem5htj76jn6sto4jokhy": {
+      "label": "known",
+      "bounties": 2,
+      "owners": 2
+    },
+    "kmjs3ec6imcijf5wknsbfrh1bk4ariso7en8tteestniygu159xo": {
+      "label": "known",
+      "bounties": 2,
+      "owners": 2
+    },
+    "qwujy4epafpmfei7bxn8fccfm1shzqp516sbenxi7qr6gua4n77o": {
+      "label": "unknown",
+      "bounties": 0,
+      "owners": 0
+    },
+    "3rus98p3q6naiqxckzo676jeewj1whf6ai8911mxacshks18eq3y": {
+      "label": "known",
+      "bounties": 2,
+      "owners": 1
+    }
+  }
+}
