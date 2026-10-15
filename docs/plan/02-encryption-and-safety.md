@@ -54,9 +54,11 @@ age has no sender authentication, and Pubky Ring cannot sign arbitrary data. Aut
 
 Clients reject records whose path owner does not match the sweeper named inside, and, for closed bounties, records from pubkys outside the roster.
 
+A CLI-held identity could also sign the manifest, which a Ring grant cannot. v1 does not use this, so both login options behave identically; it is a door left open for signed sweeps later.
+
 ## Device keys
 
-- **CLI:** the age identity and the Pubky grant live in `~/.config/sweepky/` as 0600 files (the SSH model); the identity may be passphrase-wrapped with `age::EncryptedIdentity`. Not the OS keychain, because headless sweepers have no unlocked keychain. The grant is scoped to `/pub/sweepky/:rw`, so a leak bounds to forging bounties and sweeps as that user; `sweepky logout` revokes it and marks the device key revoked.
+- **CLI:** the age identity and the Pubky credential live in `~/.config/sweepky/` as 0600 files (the SSH model); either may be passphrase-wrapped with `age::EncryptedIdentity`. Not the OS keychain, because headless sweepers have no unlocked keychain. The credential is one of two ([03](03-cli-and-skill.md#two-ways-to-log-in)): a Ring grant scoped to `/pub/sweepky/:rw`, whose leak bounds to forging bounties and sweeps as that user until revoked; or the secret of a dedicated identity the CLI created, whose leak loses that identity and nothing else. An existing identity's secret is never imported. `sweepky logout` revokes the grant (or forgets the identity) and marks the device key revoked.
 - Every CLI install publishes its own `keys/<deviceId>.json`. An owner with two laptops has two keys and sweepers encrypt to both. `keys list|revoke` manages them.
 - **Browser:** not in v1. When the board learns to read ([05](05-extensions.md#e4-reading-findings-in-the-browser)) it generates a non-extractable WebCrypto X25519 key and publishes it the same way. Sweepers' CLIs already encrypt to every published owner key, so no record changes; the board will only ever open sweeps uploaded after its key existed.
 

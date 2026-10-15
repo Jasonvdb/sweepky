@@ -18,7 +18,8 @@ A **circle** (a roster) is the default trust set, but the protocol is open: a bo
 - Rust CLI (`sweepky`) + TypeScript board.
 - Public repos only in v1.
 - Production homeservers once a one-write check confirms `/pub/sweepky/` is allowed there; develop on a local `pubky-testnet`.
-- One age key per CLI install: a 0600 file whose public half is published. Never a pasted identity.
+- Two ways to log in: a Pubky Ring grant for an identity you already have (one scan, then the agent runs unattended until the grant expires or is revoked), or a dedicated identity the CLI creates with the SDK (no human steps). Importing an existing identity's secret into the CLI is refused. One age key per CLI install either way.
+- Nobody has to share a homeserver. Each pubky's record names its own; clients resolve and fetch. Only open-bounty discovery is per homeserver.
 - The circle is the **default** trust and discovery set, not the protocol. Bounties carry `open`; sweeps get a client-computed trust label. Open bounties accept sweeps from anyone, labelled untrusted.
 - Discovery for open bounties uses the homeserver's public events feed with a homeserver watch list. No indexer of our own; Nexus tags are a later addition.
 - No claims, no locks, no relay of prior sweeps between sweepers. Sweeps are non-exclusive; the owner's agent dedupes by finding `id` at read time.

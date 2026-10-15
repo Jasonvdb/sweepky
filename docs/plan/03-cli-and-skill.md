@@ -19,7 +19,7 @@ sweepky/
 
 | Command | Does |
 |---|---|
-| `login [--signer <name>]` | Ring QR via the grant auth flow; grant `/pub/sweepky/:rw` saved to a 0600 file; generates this install's age key and publishes `keys/<deviceId>.json`; reminds the user to back up `~/.config/sweepky/`. `--signer` (testnet only, hidden elsewhere) skips the QR: the CLI makes or reuses a local keypair under that name, signs up on the testnet homeserver and holds the session itself |
+| `login [--ring \| --identity <name>] [--homeserver <pk>] [--signup-token <code>]` | Two ways in, see [Two ways to log in](#two-ways-to-log-in). Either way it generates this install's age key, publishes `keys/<deviceId>.json`, and reminds the user to back up `~/.config/sweepky/` |
 | `logout` | Revokes the grant and marks this device key revoked |
 | `init <dir>` | Writes the sandbox settings and a `CLAUDE.md` for a sweeper project |
 | `circle create\|add\|remove\|show` | Roster admin |
@@ -31,9 +31,25 @@ sweepky/
 | `done <bounty> [--credit <pubky>]… [--no-credit <pubky>]…` | Rewrites the bounty with `status: "done"`, `doneAt` and `credits`. With no flags it proposes every sweeper whose sweep contributed at least one finding and asks for confirmation; the flags add or drop names. Two sweepers who reported the same finding are both proposed |
 | `watch [--add-homeserver <pk>]` | Terminal live view |
 
-Ten commands. There is no `dev` group: the testnet-only `--signer` flag on `login` is the whole Ring stand-in, and `SWEEPKY_HOME` points the CLI at a different config and state directory so a script can run several identities side by side. There is no `confirm`, `resolve` or `close`: triage is local, and `done` is the only public write after `post`.
+Ten commands. There is no `dev` group: `login --identity` doubles as the testnet stand-in for Ring, and `SWEEPKY_HOME` points the CLI at a different config and state directory so a script can run several identities side by side. There is no `confirm`, `resolve` or `close`: triage is local, and `done` is the only public write after `post`.
 
 `submit` packages whatever is in the sweep directory: `findings.json` (required; converted from Cloudflare's format when that is what it finds), and everything else as `attachments/`. The sweeper's agent is told to keep scratch files out of the sweep directory.
+
+## Two ways to log in
+
+| | A. Pubky Ring | B. CLI-held identity |
+|---|---|---|
+| Flag | `--ring` | `--identity <name>` |
+| Whose identity | the one already in Ring | a new pubky the CLI creates, or one it created earlier under that name |
+| Human steps | scan one QR, once | none |
+| What is stored (0600, in `~/.config/sweepky/`) | a grant scoped to `/pub/sweepky/:rw` plus the CLI's client key | the identity secret, optionally passphrase-wrapped |
+| Lifetime | until the grant expires (Ring sets it; the CLI warns ahead) or is revoked, from Ring or by `logout` | until the file is deleted |
+| If the file leaks | someone can write Sweepky records as you until you revoke; nothing else | that identity is theirs; your main identity is untouched |
+| Homeserver | wherever the Ring identity lives | `--homeserver <pubkey>`; defaults to the testnet homeserver in testnet mode, else to `homeserver.pubky.app`, which needs `--signup-token` |
+
+An interactive `login` with no flag asks which in two lines. Non-interactive runs (agents, scripts, CI) must pass a flag. Credits accrue to whichever pubky is used; a dedicated identity can be mentioned from a pubky.app profile if its owner wants the two linked. The official `pubky-cli` already creates identities from a recovery file and signs up with a code, so B is an established pattern, not a Sweepky invention.
+
+**Refused:** importing an existing identity's secret or recovery file into the CLI. That secret controls the identity forever, including moving it to another homeserver, and this CLI runs under agents that read untrusted code. Ring exists to keep that secret off the laptop; `login` rejects recovery files and says why.
 
 ## The `/sweepky` skill
 

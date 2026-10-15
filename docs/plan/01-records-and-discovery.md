@@ -95,6 +95,8 @@ The CLI writes the scope as a small `scope.json` in the sweep directory; the `/s
 
 ## Discovery
 
+**Homeservers.** Nobody needs to share one. Every pubky's pkarr record names its homeserver; a client resolves the key, finds the homeserver, and fetches. Writes always go to the writer's own homeserver. An owner on `homeserver.pubky.app`, one sweeper on the same server and another self-hosting all interoperate: the sweeper reads the bounty and the owner's keys from the owner's server and uploads to their own; the owner's `pull` resolves each sweeper and fetches from wherever they live. The only place the homeserver matters is the open-bounty feed below.
+
 **Circle.** Poll each roster member's `/pub/sweepky/` (`bounties/`, `sweeps/`, `keys/`) every 30–60 s. Credits ride on the bounty records, so reputation needs no extra fetch. For a circle of under ~30 this is a handful of requests, and a sweep takes an hour, so 30 s is live. Event streams are deferred: the SDK has no auto-reconnect, a 50-user cap per stream, and returns 404 if any listed user moved homeserver.
 
 **Open bounties.** Follow the homeserver's all-users public events feed for each homeserver on a small **watch list** (default: the production homeserver; in dev, the local testnet homeserver).

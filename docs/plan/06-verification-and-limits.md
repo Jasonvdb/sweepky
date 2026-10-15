@@ -20,7 +20,8 @@
 - Production writes are permanent in practice (event history, backups).
 - Static review only → many `needs_validation` findings until a sandboxed runner exists.
 - Pro/Max 5-hour windows: a `standard` whole-repo sweep can die mid-phase and lose unvalidated candidates; scope with `paths` or use `quick`.
-- Open-bounty discovery sees only homeservers on the watch list.
+- Open-bounty discovery sees only homeservers on the watch list. Circle members can live on any homeserver.
+- A dedicated CLI identity on the production homeserver needs a signup token from Pubky's gate, like any other identity.
 - Credits are per bounty, not per finding, so a sweeper's public record says how many bounties they helped on and nothing about severity.
 - Each developer runs their own unmodified Claude Code on their own plan. The tool never reads or proxies Claude credentials.
 
@@ -28,13 +29,30 @@
 
 - Testnet: `TEST_PUBKY_CONNECTION_STRING='postgres://jason@localhost:5432/postgres' cargo run -p pubky-testnet` from the `pubky-homeserver` checkout (brew `postgresql@18`; no Docker needed). Ports: pkarr relay `15411`, HTTP relay `15412`, homeserver `6286`; homeserver key `8pinxxgqs41n4aididenw5apqp1urfmzdztr8jt4abrkdn435ewo`. Ephemeral DB per run.
 - Rust: `Pubky::testnet()`. JS: `Pubky.testnet()`.
-- Ring stand-in: `sweepky login --signer <name>` (testnet only) makes a local keypair, signs up on the testnet homeserver (open signup mode) and holds the session directly via `PubkySigner`. The Ring QR flow itself is exercised only in the automated end-to-end test, which approves the printed auth URL in-process with `PubkySigner::approve_auth`, and manually against real Pubky Ring once a production homeserver is in play. The Ring repo has a simulator, but it is unverified against a local testnet and the plan does not depend on it.
+- Testnet identities: `sweepky login --identity <name>` (login option B) makes a local keypair and signs up on the testnet homeserver, which runs in open signup mode. The Ring QR flow (option A) is exercised in the automated end-to-end test, which approves the printed auth URL in-process with `PubkySigner::approve_auth`, and manually against real Pubky Ring once a production homeserver is in play. The Ring repo has a simulator, but it is unverified against a local testnet and the plan does not depend on it.
 - Several identities in one script: `SWEEPKY_HOME=<dir>` overrides `~/.config/sweepky/` and `~/.local/share/sweepky/`.
+
+## Production homeserver (as deployed on 2026-10-15)
+
+Read from the `pubky/pubky-stack` deployment workflow, which writes the live `config.toml` for `homeserver.pubky.app` (staging is identical on `homeserver.staging.pubky.app`). Re-read it before relying on any value; it changes.
+
+| Setting | Value | Effect on Sweepky |
+|---|---|---|
+| Signup | token required | Option B on production needs `--signup-token`; Ring users already passed the gate |
+| Storage per user | 1024 MB | None in practice; a padded sweep package is tens of KB to a few MB |
+| Write rate per user | 1 MB/s, burst 20 | None |
+| Sign-in | 20/min per IP | None; session refresh is hourly |
+| `/events/` reads | 3/s per IP, burst 10 | None; we poll every 30–60 s |
+| Deletes under `/pub/` | 5/s per user | None |
+
+Signup tokens come from Pubky's gate service (Homegate): an invite code, SMS verification, or a small Lightning payment, depending on region. There is no separate smaller free tier; every token carries the default quota unless an operator overrides it.
 - Toolchain: rustc/cargo 1.96, node 24, pnpm 10, psql 18.
 
 ## Key references
 
 - Cloudflare skill (local install `~/.claude/skills/security-audit/`, upstream `c1c8a8c`): `SKILL.md` output dir (line 51), profiles and scoped runs (111–116), sandbox requirements (33–40), prior-run rules we deliberately don't use (92–105); `report-schema.json` (`fingerprint` is the dedupe key).
+- Deployed homeserver: `pubky/pubky-stack` → `.github/workflows/pubky-homeserver-cicd.yml` (the live config); knowledge base pages `explore/technologies/homegate.md` (signup gate) and `explore/technologies/pubky-cli.md` (official CLI that creates identities from a recovery file and signs up with a code).
+- Pubky identities without Ring: `pubky-sdk/src/actors/signer/session.rs` (`PubkySigner::signup` publishes the pkarr record; `signin` returns a session); `pubky-homeserver/src/shared/signup_mode.rs` (`Open` vs `TokenRequired`).
 - Pubky access model: `pubky-homeserver/pubky-homeserver/src/client_server/auth/authorization.rs` (`has_read_permission`: `/pub/` world-readable, `/priv/` owner-session only); `pubky-homeserver/examples/rust/2-auth_flow/client.rs` (CLI grant auth); `pubky-sdk/src/actors/signer/auth.rs` (`approve_auth`); `pubky-sdk/bindings/js/src/pubky.rs` (`Pubky.testnet`); `pubky-homeserver/src/client_server/routes/events.rs` (the `/events/` feed); `agent-skills/skills/pubky/references/{auth.md,sdk-rust.md,sdk-js.md,reference-apps.md}`.
 - Why not Noise: `paykit-rs/paykit-lib/src/noise_key.rs` (Noise key derived from the identity secret, which Ring never hands to apps); `pubky-noise/README.md` (handshake-then-transport channel).
 - Frontend: `pubky/pubky-app-templates/basic-pubky-app`; `vibes/apps/web/src/app/globals.css`, `vibes/SKILL-vibe-self-host.md`, `vibes/packages/schema/src/vibe.ts`. For E4 later: `pubky-marketplace/src/hooks/useStepUpReauth/useStepUpReauth.ts` (QR/deeplink).
