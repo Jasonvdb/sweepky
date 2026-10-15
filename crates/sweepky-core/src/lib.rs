@@ -26,6 +26,13 @@
 //!   whose every constructor runs its check, so holding one means the value
 //!   passed. Only `Playbook`'s pattern comes from 01; the other limits are
 //!   P1a's choice and are set out on each type.
+//! - Where records live and how they point at each other. The [`paths`]
+//!   module builds every path under `/pub/sweepky/` from a [`RecordId`] or a
+//!   [`DeviceId`], so no builder can leave that directory, and
+//!   [`paths::SweepkyPath`] classifies a path back strictly. [`PubkyUrl`]
+//!   reads a `pubky://` URL of any app's file, as the events feed carries
+//!   them, and [`BountyRef`] and [`SweepRef`] are the references records hold,
+//!   written as `pubky://` URLs with the key in raw form.
 //!
 //! The rules that hold for everything here (see "Rust conventions" in
 //! `docs/plan/03-cli-and-skill.md`):
@@ -83,9 +90,14 @@ mod error;
 mod ids;
 mod names;
 mod open_enum;
+// A public module, unlike the rest, so callers write `paths::bounty(id)`: the
+// builders' short names (`key`, `bounty`) would say too little at the crate
+// root.
+pub mod paths;
 mod pubky;
 mod schema;
 mod time;
+mod url;
 mod validated_string;
 
 pub use error::{JsonCategory, RecordError};
@@ -94,6 +106,7 @@ pub use names::{DeviceId, GitSha, Playbook, RepoName, RepoPath, Sha256Hex, Targe
 pub use pubky::Pubky;
 pub use schema::{MAX_FINDINGS_BYTES, MAX_RECORD_BYTES, SchemaVersion, UnknownFields};
 pub use time::RecordTime;
+pub use url::{BountyRef, PubkyUrl, SweepRef};
 // Re-exported because `RecordId::from_timestamp` takes one: the CLI names it
 // as `sweepky_core::Timestamp` and is sure to get the same crate version this
 // crate was built against. `no_inline` lists it in these docs as a re-export

@@ -518,21 +518,21 @@ validated_string!(RepoPath);
 /// Whether `c` may not appear in a [`RepoPath`].
 fn is_forbidden_in_path(c: char) -> bool {
     // `is_control` is Unicode's Cc category: U+0000 to U+001F, U+007F, and
-    // U+0080 to U+009F. The rest are the bidirectional controls behind
-    // "Trojan Source" text, which can make a path print as a different one,
-    // and the line and paragraph separators, which print as a line break.
-    c == '\\'
-        || c.is_control()
-        || matches!(
-            c,
-            '\u{061C}'
-                | '\u{200E}'
-                | '\u{200F}'
-                | '\u{202A}'..='\u{202E}'
-                | '\u{2066}'..='\u{2069}'
-                | '\u{2028}'
-                | '\u{2029}'
-        )
+    // U+0080 to U+009F. U+2028 and U+2029, the line and paragraph
+    // separators, print as a line break.
+    c == '\\' || c.is_control() || reorders_text(c) || matches!(c, '\u{2028}' | '\u{2029}')
+}
+
+/// Whether `c` is one of the bidirectional controls that reorder printed
+/// text: U+061C, U+200E, U+200F, U+202A to U+202E and U+2066 to U+2069.
+/// They are behind "Trojan Source" text, which can make a path or a URL
+/// print as a different one. [`RepoPath`] and [`PubkyUrl`](crate::PubkyUrl)
+/// both refuse them, through this one list.
+pub(crate) fn reorders_text(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+    )
 }
 
 #[cfg(test)]
