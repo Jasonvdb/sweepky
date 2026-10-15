@@ -13,7 +13,7 @@ The `/sweepky` skill an agent follows, and the sandboxed project a sweep runs in
 
 - In an `init` project launched with `claude --setting-sources project,local`, in manual mode and in auto mode: a Bash `curl` to the internet fails; `cat ~/.config/sweepky/*` fails; `cat ./sweeps/<id>/scope.json` works; a `CLAUDE.md`, an `AGENTS.md` and a `.claude/settings.json` planted in a fixture target are gone from `sweeps/<id>/target/` after `run` and listed in `scope.json`; the project-local playbook files are readable from a sandboxed command.
 - `sweepky submit` run from a terminal afterwards succeeds on the fixture sweep and refuses one with a planted symlink.
-- Skill text reviewed against the Cloudflare `SKILL.md` lines 12–17 (modes), 51 (output dir) and 107–117 (profiles and scoped runs).
+- Skill text reviewed against the Cloudflare `SKILL.md` fetched at the pinned commit (not any install on the machine), lines 12–17 (modes), 51 (output dir) and 107–117 (profiles and scoped runs).
 
 ## Notes
 

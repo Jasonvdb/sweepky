@@ -43,6 +43,7 @@ Design docs first, then one file per build phase. Read them in order the first t
 - **Orchestrate, don't hand-code.** Each phase runs as a multi-agent workflow: implementation workers, then an independent fresh-context verifier that runs the phase's "Done when" checks and reads the diff, then a simplification pass, then the commit. Load the workflow-authoring guidance before writing the first workflow script.
 - **Nothing sensitive in the repo.** Committed fixtures are synthetic. The demo uses a real local audit report by path from an environment variable; its content is never committed or uploaded anywhere but the local testnet.
 - **Pin everything.** Exact versions for Rust crates and npm packages, listed in [03](03-cli-and-skill.md#dependencies); the Cloudflare skill by its full commit hash. Re-check against the registries before P0 starts.
+- **No local checkouts.** Nothing in the build, the tests or the demo reads another repository that happens to be checked out on this machine. Everything is pulled at its pinned version when it is needed: the testnet binary from crates.io, the SDK from the registry, the playbook from its pinned commit, sweep targets from the fixture repo inside this repo or from the pinned SHA upstream. Source references in these docs name upstream tags and commits; fetch them to read them.
 
 ## Status
 
