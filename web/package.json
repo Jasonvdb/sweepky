@@ -1,0 +1,10 @@
+{
+  "name": "sweepky-web",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Placeholder for the Sweepky landing page and board; the real Vite scaffold lands in P4 (docs/plan/phases/P4-board.md).",
+  "packageManager": "pnpm@10.33.0",
+  "scripts": {
+    "test": "node -e \"console.log('web/: placeholder until P4, no tests yet')\""
+  }
+}

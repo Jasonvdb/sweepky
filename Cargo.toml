@@ -1,0 +1,66 @@
+# The Sweepky workspace.
+#
+# This is a *virtual* workspace: there is no `[package]` here, so the root is
+# not a crate itself. It only groups the member crates under one Cargo.lock and
+# one `target/` directory, and holds the settings they share.
+[workspace]
+# Resolver 3 is the default for edition 2024 crates, but a virtual workspace has
+# no edition of its own, so it must be named here. When Cargo picks versions for
+# Cargo.lock, it prefers ones whose `rust-version` our toolchain supports.
+resolver = "3"
+members = ["crates/sweepky-core", "crates/sweepky-cli"]
+
+# Package fields every member inherits with `field.workspace = true`, so they
+# are written once and cannot drift between crates.
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+# Matches LICENSE. cargo-deny checks our own crates' licence too.
+license = "MIT"
+# Nothing here goes to crates.io; `publish = false` makes an accidental
+# `cargo publish` fail.
+publish = false
+
+# Every dependency the plan pins, from the Dependencies table in
+# docs/plan/03-cli-and-skill.md. Update that table and this list together.
+#
+# `=` makes each one an exact pin. A bare `"1.2.3"` in Cargo means `^1.2.3`,
+# which lets `cargo update` move to any semver-compatible release; for crypto and
+# 0.x crates we want to pick each upgrade by hand.
+#
+# Cargo resolves only the entries a member actually uses, so this list adds
+# nothing to Cargo.lock or the build until a crate opts in with
+# `name = { workspace = true }` (a member may add `features = [...]` on top;
+# features only ever add up).
+[workspace.dependencies]
+# The Pubky SDK. CLI only: sweepky-core never depends on it (P1a).
+pubky = { version = "=0.16.2", features = ["json"] }
+# CLI dev-dependency, same version as `pubky`. No features (its default set is
+# empty): never `docker-postgres` or `embedded-postgres`; the tests use a local
+# Postgres through TEST_PUBKY_CONNECTION_STRING.
+pubky-testnet = "=0.16.2"
+# Ids in sweepky-core. It has no default features; P1a adds the ones it needs.
+pubky-timestamp = "=0.4.1"
+# age is pre-1.0 and its docs call releases "beta", so it is pinned exactly.
+# Default features only: never `plugin` (the code path behind its one advisory)
+# and never `ssh` (pulls in an `rsa` crate with an unpatched advisory).
+age = "=0.12.1"
+# Use it through the `age::secrecy` re-export so the two always agree.
+secrecy = "=0.10.3"
+zeroize = "=1.9.1"
+# `default-features = false` has to live here, on the workspace entry. A member
+# cannot turn defaults off by itself: with edition 2024 its own
+# `default-features = false` is an error when the workspace entry leaves
+# defaults on (older editions only warned and ignored it). Keeping defaults off
+# keeps qrcode's image stack out.
+qrcode = { version = "=0.14.1", default-features = false, features = ["svg"] }
+# The writers' lock file (P2a).
+fd-lock = "=4.0.4"
+clap = "=4.6.7"
+tokio = "=1.53.3"
+serde = "=1.0.229"
+serde_json = "=1.0.154"
+# Typed errors, for sweepky-core.
+thiserror = "=2.0.21"
+# Message-only errors, for the binary only.
+anyhow = "=1.0.104"

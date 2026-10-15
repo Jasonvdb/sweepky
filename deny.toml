@@ -1,0 +1,65 @@
+# cargo-deny configuration, checked by `cargo deny check` locally and in CI.
+# Written for cargo-deny 0.19.9; any key left out takes the tool's default.
+# Reference: https://embarkstudios.github.io/cargo-deny/
+
+# `cargo deny check advisories`: fail on crates with a RustSec advisory.
+# The database is fetched read-only from github.com/rustsec/advisory-db.
+[advisories]
+# With the defaults kept here, a vulnerability advisory always fails the check,
+# an unmaintained one fails for any crate in the graph, and an unsound one fails
+# for our direct dependencies. To accept one, list it here with a reason:
+# { id = "RUSTSEC-0000-0000", reason = "..." }. Never ignore without a reason.
+ignore = []
+# A yanked release was withdrawn by its author, often for a bug, so depending on
+# one fails the check instead of only warning (the default).
+yanked = "deny"
+
+# `cargo deny check licenses`: every crate in the graph, our own included, must
+# carry a licence on this list.
+[licenses]
+# Check dev-dependencies too. cargo-deny skips them by default because they are
+# not part of the shipped binary, but we still download, build and run them on
+# our machines and in CI. `option-ext` below arrives only through the
+# pubky-testnet dev-dependency, so without this its exception would never apply.
+include-dev = true
+# SPDX ids. A crate passes when its licence expression is satisfied by these:
+# `MIT OR Apache-2.0` passes with either, `MIT AND X` needs both.
+#
+# Only MIT (our own crates) is in use until P2a adds `pubky` and
+# `pubky-testnet`, so until then cargo-deny warns that the other entries and the
+# `option-ext` exception are not encountered. Leave those warnings be: after
+# P2a, `cargo deny check licenses` shows which entries are really needed. (A
+# probe on 2026-10-15 with every pin in 03 in use needed all eight entries and
+# the exception, and nothing else.)
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    # webpki-roots (Mozilla's root certificates), a direct dependency of pubky.
+    "CDLA-Permissive-2.0",
+]
+# Per-crate exceptions, so a licence is accepted for one crate only rather than
+# for everything that might arrive later.
+exceptions = [
+    # Pulled in through pubky-testnet. MPL-2.0 is copyleft per file, so it is
+    # allowed for this crate alone and never added to `allow` above.
+    { crate = "option-ext", allow = ["MPL-2.0"] },
+]
+
+# `cargo deny check bans`: rules on which crates and versions may appear.
+[bans]
+# Two versions of one crate in the graph cost build time and binary size but are
+# common in a large tree, so they warn instead of failing.
+multiple-versions = "warn"
+
+# `cargo deny check sources`: where crates may come from.
+[sources]
+# crates.io only (cargo-deny's default `allow-registry`). Any other registry or
+# any `git = "..."` dependency fails the check, so every crate is a published
+# crates.io release: one the advisory and yanked checks above can see.
+unknown-registry = "deny"
+unknown-git = "deny"

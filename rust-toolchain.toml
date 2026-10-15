@@ -1,0 +1,11 @@
+# rustup reads this file and uses the toolchain it names for every cargo and
+# rustc command run inside the repository, locally and in CI.
+[toolchain]
+# Plain `stable`, not a pinned release: rustup uses the stable toolchain the
+# machine has installed (`rustup update` moves it to the newest release), or
+# installs the current one if there is none. Edition 2024 needs 1.85 or later.
+channel = "stable"
+# `minimal` installs only rustc, cargo and rust-std; rustfmt and clippy, which
+# the fmt and clippy gates run, are added by name.
+profile = "minimal"
+components = ["rustfmt", "clippy"]

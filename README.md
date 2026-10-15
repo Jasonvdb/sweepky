@@ -8,7 +8,7 @@ Log in once: the CLI opens a page in your browser, you scan it with Pubky Ring, 
 
 Security review is the first use case; the design is focus-agnostic.
 
-**Status: planning.** Nothing is implemented yet. The design and the phased build plan live in [`docs/plan/`](docs/plan/README.md).
+**Status: the build has started.** Nothing is usable yet. The design and the phased build plan live in [`docs/plan/`](docs/plan/README.md); its [phase table](docs/plan/README.md#phases) lists what each phase adds.
 
 ## Layout (planned)
 

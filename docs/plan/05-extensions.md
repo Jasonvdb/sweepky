@@ -1,6 +1,6 @@
 # 05 — Extension points (reserved in v1, built later)
 
-v1 touches only path strings and JSON. No `paykit` or `locks` crates in v1: they pin `pubky` 0.15 and 0.11 (a git rev), we are on 0.16.1, and on 0.x every minor is a breaking change.
+v1 touches only path strings and JSON. No `paykit` or `locks` crates in v1: they pin `pubky` 0.15 and 0.11 (a git rev), we are on 0.16, and on 0.x every minor is a breaking change.
 
 ## E1. Sats bounties (Paykit)
 

@@ -1,0 +1,160 @@
+# CI: the quality gates from docs/plan/phases/P0-bootstrap.md. To check a change
+# before pushing, run each job's `run:` commands from the repository root.
+#
+# Every action is pinned to a full commit SHA, with its release tag in the
+# trailing comment. A tag can be moved to point at different code; a commit SHA
+# cannot, so re-tagging an action, or taking over its repository, cannot change
+# the action code that runs here. To upgrade one, look up the commit the new tag
+# points at (`gh api repos/<owner>/<repo>/commits/<tag> --jq .sha` follows
+# annotated tags through to it) and replace both the SHA and the comment.
+name: CI
+
+on:
+  # Main only. Other branches are tested through their pull request instead,
+  # so a branch push is not paid for twice (once on `push`, once on
+  # `pull_request`).
+  push:
+    branches: [main]
+  # Every pull request, from this repository or a fork. GitHub checks out the
+  # PR's merge ref (refs/pull/<n>/merge): the PR's head merged into its base
+  # as the base stood when the PR was opened or last pushed to. That is what
+  # main will hold after the merge, so a branch that passes on its own but
+  # breaks against a newer main fails here. Nothing re-runs when main moves
+  # later: merge main into the branch to test the new result.
+  pull_request:
+  # A manual run from the Actions tab, on any branch.
+  workflow_dispatch:
+
+# The job token can read the repository and nothing else.
+permissions:
+  contents: read
+
+concurrency:
+  # One group per event and ref. The event name keeps a manual run on main
+  # from queueing behind a push run. A pull request's ref is its merge ref,
+  # so each PR has its own group and a newer push to the PR cancels its
+  # older run. A run on main is never cancelled once it starts, so it
+  # finishes and saves the caches. GitHub keeps only one run waiting per
+  # group, though: if merges land faster than CI finishes, the waiting run
+  # is replaced by the newest one.
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Do not leave the job token in .git/config, where later steps could read it.
+          persist-credentials: false
+      # With no argument, rustup installs (or updates) the toolchain and the
+      # components that rust-toolchain.toml names. It runs before rust-cache,
+      # which keys its cache on the rustc version.
+      - run: rustup toolchain install --no-self-update
+      # rust-cache adds the job id to its cache key, so `lint` and `test` keep
+      # separate caches: clippy and the test build compile different things.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Only main's runs save the cache; other runs restore main's copy, so
+          # branch builds never crowd main's caches out of the repository's
+          # storage.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          # Leave ~/.cargo/bin out of the cache: CI installs each cargo tool at
+          # its pinned version with install-action, never from a cached copy
+          # that could be older.
+          cache-bin: "false"
+      - run: cargo fmt --check
+      # --locked: fail if Cargo.lock is out of date instead of silently updating it.
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    # The CLI's end-to-end test (from P2a) starts an ephemeral pubky-testnet,
+    # whose homeserver creates a throwaway database through
+    # TEST_PUBKY_CONNECTION_STRING (when it is unset, pubky-testnet 0.16.2
+    # tries postgres://localhost:5432/postgres with no user). No P0 test starts
+    # a testnet, so until P2a a missing service or variable fails nothing.
+    services:
+      postgres:
+        image: postgres:18.4
+        env:
+          # No password: the database lives only inside this job's container,
+          # and no credential has to be written into the repository.
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - "5432:5432"
+        # The job waits until Postgres accepts connections before any step runs.
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_PUBKY_CONNECTION_STRING: postgres://postgres@localhost:5432/postgres
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install --no-self-update
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-bin: "false"
+      # A prebuilt, checksum-verified binary instead of compiling the tool.
+      # `fallback: none` makes a missing prebuilt fail the job rather than
+      # quietly building from source.
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: cargo-nextest@0.9.137
+          fallback: none
+      - run: cargo nextest run --locked
+
+  deny:
+    # Advisories, licences, bans and sources (deny.toml). It reads Cargo.lock
+    # and the RustSec database and compiles nothing, so it needs no build cache.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # cargo-deny runs `cargo metadata`, so install the toolchain that
+      # rust-toolchain.toml names up front rather than on first use.
+      - run: rustup toolchain install --no-self-update
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: cargo-deny@0.19.9
+          fallback: none
+      - run: cargo deny check
+
+  web:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Installs the pnpm version that web/package.json names in `packageManager`.
+      # It must come before setup-node, which asks pnpm where its store is.
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          package_json_file: web/package.json
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24.15.0"
+          # Restores the pnpm store now and saves it when the job ends, keyed
+          # on the lockfile.
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      # --frozen-lockfile fails if the lockfile does not match package.json
+      # instead of rewriting it. Keep this step even while web/ has no
+      # dependencies: it creates the pnpm store that setup-node's post step
+      # saves, and a missing store fails the job.
+      - run: pnpm --dir web install --frozen-lockfile
+      - run: pnpm --dir web test
