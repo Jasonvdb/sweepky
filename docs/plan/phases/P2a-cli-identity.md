@@ -18,7 +18,7 @@ The first part of the `sweepky` binary: the network config and library entry poi
 ## Done when
 
 - Unit tests pass for: the requested capability string; the lock serialising two writers; the 403 and 507 mapping to their messages; a recovery file rejected.
-- A testnet test logs in with `--identity`, publishes a key, lists it, revokes it and logs out; after `logout` this install's key record has `revokedAt` set, and the identity and its local files are gone. The test runs as `#[tokio::test]` + `#[pubky_testnet::test]` over an `EphemeralTestnet` with the HTTP relay, the client injected.
+- A testnet test logs in a throwaway identity with `--identity`, publishes a key, lists it, revokes it and logs out; after `logout` this install's key record has `revokedAt` set, and the identity and its local files are gone. The throwaway identity is not one of A, B or C from the end-to-end test in [06](../06-verification-and-limits.md#verification). The test runs as `#[tokio::test]` + `#[pubky_testnet::test]` over an `EphemeralTestnet` with the HTTP relay, the client injected.
 - `cargo clippy -- -D warnings`, `cargo deny check` and `cargo nextest run` clean.
 
 ## Resolved questions
@@ -29,5 +29,5 @@ The first part of the `sweepky` binary: the network config and library entry poi
 
 - `anyhow` in the binary; typed errors stay in core.
 - A unit test pins the requested capability string to exactly `/pub/sweepky/:rw`; without the trailing slash it would be a file scope. The constant and its test land here, but the first code that requests the capability is [P2d](P2d-cli-ring-login.md)'s grant flow, because `--identity` signs in with the root signer.
-- The testnet test is the start of the end-to-end test from [06](../06-verification-and-limits.md#verification). [P2b](P2b-cli-sweep.md) and [P2c](P2c-cli-pull-done.md) extend this same test and [P2d](P2d-cli-ring-login.md) completes it, so no phase adds a second one. Restoring a saved token after `logout` is checked in P2d, the first phase that saves one.
+- The testnet test is the start of the end-to-end test from [06](../06-verification-and-limits.md#verification). [P2b](P2b-cli-sweep.md) and [P2c](P2c-cli-pull-done.md) extend this same test and [P2d](P2d-cli-ring-login.md) completes it, so no phase adds a second one. P2a's own steps use the throwaway identity rather than A, B or C because `logout` deletes the identity it runs on, and B's `submit` in P2b needs A to hold an unrevoked key. No later phase uses the throwaway identity, so P2b–P2d extend the test without reordering these steps. Restoring a saved token after `logout` is checked in P2d, the first phase that saves one.
 - Never call the deprecated cookie sign-in; add a clippy `disallowed-methods` entry for it.
