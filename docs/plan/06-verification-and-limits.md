@@ -45,13 +45,22 @@ Read from the `pubky/pubky-stack` deployment workflow, which writes the live `co
 | `/events/` reads | 3/s per IP, burst 10 | None; we poll every 30–60 s |
 | Deletes under `/pub/` | 5/s per user | None |
 
-Signup tokens come from Pubky's gate service (Homegate): an invite code, SMS verification, or a small Lightning payment, depending on region. There is no separate smaller free tier; every token carries the default quota unless an operator overrides it.
+Signup tokens come from Pubky's gate service, Homegate (`homegate.pubky.app`, staging `homegate.staging.pubky.app`): an invite code, SMS verification, or a Lightning payment (1000 sats on production, 10 on staging, per its public `/ln_verification/info`). There is no separate smaller free tier; every token carries the default quota unless an operator overrides it.
+
+**The token is obtainable as text, confirmed 2026-10-15 from the pubky.app source and live endpoints.** It is never only inside a QR code:
+
+1. **Homegate's API returns it as JSON.** SMS: `POST /sms_verification/send_code` then `POST /sms_verification/validate_code` → `{valid, signupCode, homeserverPubky}`. Lightning: `POST /ln_verification` → a BOLT11 invoice, then `GET /ln_verification/<id>/await` → `{isPaid, signupCode, homeserverPubky}`. A CLI can drive either flow directly; Homegate has no published OpenAPI document, so the shapes come from the pubky.app client code.
+2. **The web signup page has a "copy sign-up link" button.** The link is the SDK's signup deep link and carries the token as the plain `st` query parameter.
+3. **Invite links** have the form `pubky.app/invite/<code>`; the code is in the URL.
+
+Pubky Ring also has a plain text field for a signup token when adding a pubky to a homeserver, so users already handle these as text.
 - Toolchain: rustc/cargo 1.96, node 24, pnpm 10, psql 18.
 
 ## Key references
 
 - Cloudflare skill (local install `~/.claude/skills/security-audit/`, upstream `c1c8a8c`): `SKILL.md` output dir (line 51), profiles and scoped runs (111–116), sandbox requirements (33–40), prior-run rules we deliberately don't use (92–105); `report-schema.json` (`fingerprint` is the dedupe key).
 - Deployed homeserver: `pubky/pubky-stack` → `.github/workflows/pubky-homeserver-cicd.yml` (the live config); knowledge base pages `explore/technologies/homegate.md` (signup gate) and `explore/technologies/pubky-cli.md` (official CLI that creates identities from a recovery file and signs up with a code).
+- Signup token as text: pubky.app client `src/core/services/homegate/homegate.api.ts` and `homegate.types.ts` (endpoints and the `signupCode` fields), `src/components/organisms/Scan/Scan.tsx` (copy sign-up link), `src/app/invite/[inviteCode]/page.tsx`; SDK `pubky-sdk/src/actors/auth/deep_links/signup_grant.rs` (`st` query parameter); Ring `src/sheets/EditPubkySheet.tsx` (manual token field).
 - Pubky identities without Ring: `pubky-sdk/src/actors/signer/session.rs` (`PubkySigner::signup` publishes the pkarr record; `signin` returns a session); `pubky-homeserver/src/shared/signup_mode.rs` (`Open` vs `TokenRequired`).
 - Pubky access model: `pubky-homeserver/pubky-homeserver/src/client_server/auth/authorization.rs` (`has_read_permission`: `/pub/` world-readable, `/priv/` owner-session only); `pubky-homeserver/examples/rust/2-auth_flow/client.rs` (CLI grant auth); `pubky-sdk/src/actors/signer/auth.rs` (`approve_auth`); `pubky-sdk/bindings/js/src/pubky.rs` (`Pubky.testnet`); `pubky-homeserver/src/client_server/routes/events.rs` (the `/events/` feed); `agent-skills/skills/pubky/references/{auth.md,sdk-rust.md,sdk-js.md,reference-apps.md}`.
 - Why not Noise: `paykit-rs/paykit-lib/src/noise_key.rs` (Noise key derived from the identity secret, which Ring never hands to apps); `pubky-noise/README.md` (handshake-then-transport channel).

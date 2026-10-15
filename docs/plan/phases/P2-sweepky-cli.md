@@ -28,7 +28,7 @@ The `sweepky` binary, end to end against a local testnet, including open-bounty 
 ## Open questions to resolve in this phase
 
 - The `/events/` feed's default cursor is the beginning of history. Find a cheap way to obtain the current cursor (inspect `EventsService::parse_cursor` / `EventCursor` in the homeserver); fallback: page once with a large `limit` and persist. Document whichever works.
-- How a person obtains a raw signup token for option B on the production homeserver. Today the web signup flow hands the token to Ring inside a QR code; find out whether it can be copied, or whether Homegate's API can be driven from the CLI. Until answered, option B on production is documented as "bring a token".
+- ~~How a person obtains a raw signup token for option B on production.~~ Resolved 2026-10-15, see [06](../06-verification-and-limits.md#production-homeserver-as-deployed-on-2026-10-15): the token is plain text in three places, and Homegate's HTTP API returns it as JSON, so the CLI can fetch it itself. v1 accepts `--signup-token` and prints the three ways to get one; a `login --identity … --pay` helper that drives Homegate's Lightning flow from the terminal is a cheap later addition, not v1.
 
 ## Notes
 
