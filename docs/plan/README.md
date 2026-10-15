@@ -19,6 +19,8 @@ Design docs first, then one file per build phase. Read them in order the first t
 | [P0 bootstrap](phases/P0-bootstrap.md) | Workspace skeleton, CI, tooling |
 | [P1a core: records](phases/P1a-core-records.md) | Records, ids, paths, targets, Cloudflare converter, trust labels, feed parser |
 | [P1b core: crypto](phases/P1b-core-crypto.md) | Encryption, padding, manifest binding, package envelope, secrets, finding groups |
+| [P2a CLI: identity](phases/P2a-cli-identity.md) | Network config, `login --identity`, device keys, `logout`, the circle, the writers' lock, config dirs, a minimal `init` |
+| [P2b CLI: sweep](phases/P2b-cli-sweep.md) | `post` for closed bounties, `run` and `submit` with the sweep-directory checks |
 | [P2 sweepky-cli](phases/P2-sweepky-cli.md) | The `sweepky` binary and the testnet end-to-end test |
 | [P3 skill and sandbox](phases/P3-skill-and-sandbox.md) | The `/sweepky` skill and the sweeper sandbox template |
 | [P4 board](phases/P4-board.md) | The landing page and the public web board |
