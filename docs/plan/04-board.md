@@ -23,7 +23,7 @@ Dev mode (`VITE_PUBKY_TESTNET=1`): `Pubky.testnet()`.
 
 ## Live-ness
 
-Poll: roster → `getHomeserverOf(pk)` per member (undefined = no record, throw = lookup failure; show "unreachable", retry hourly) → `publicStorage.list` of `bounties/` and `sweeps/` per member every 30 s → Zustand reducer → derived views. Open bounties add the events-feed watcher with the same cursor logic as the CLI (cursor in `localStorage`). Trust badges are computed from the roster plus the `credits` on done bounties, the same rule as the CLI.
+Poll: roster → `getHomeserverOf(pk)` per member (undefined = no record, throw = lookup failure; show "unreachable", retry hourly) → `publicStorage.list` of `bounties/` and `sweeps/` per member every 30 s → Zustand reducer → derived views. Open bounties add the events-feed watcher with the same cursor logic as the CLI (cursor in `localStorage`). Trust badges and credits received are computed from the roster plus the `credits` on done bounties, the same rule as the CLI, including ignoring self-credits.
 
 Signals are honest: a sweeper arrives (`running` PUT), a sweep is in progress (pulsing while `running` and younger than 6 h; older fades to "left"), a sweep completes (`done`), aborted (struck), a bounty is marked done (credits appear). Nothing is faked; a closed tab misses nothing because the next poll catches up.
 

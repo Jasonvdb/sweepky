@@ -33,7 +33,7 @@ Design docs first, then one file per build phase. Read them in order the first t
 | **Sweep** | One run against a bounty by a **sweeper**'s agent; the result, encrypted so only the owner can read it |
 | **Circle** | The roster an admin maintains; the default trust and discovery set |
 | **Trust label** | `circle` / `known` / `unknown`, computed per sweep from the roster and credits |
-| **Credit** | A sweeper's pubky listed in `credits` on a bounty the owner marked **done**; the reputation source. Every sweeper whose sweep helped is credited, including several who found the same issue |
+| **Credit** | A sweeper's pubky listed in `credits` on a bounty the owner marked **done**; the reputation source. Every sweeper whose sweep helped is credited, including several who found the same issue, but never the bounty's own owner |
 | **Board** | The public web page where anyone watches bounties and sweeps. Findings are read through the owner's agent, never on the board |
 
 ## Ground rules for the build

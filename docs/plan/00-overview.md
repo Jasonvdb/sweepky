@@ -34,7 +34,7 @@ A **circle** (a roster) is the default trust set, but the protocol is open: a bo
 3. **Sweep.** The agent follows the playbook (the bounty's suggestion or the sweeper's own), scoped by target kind, writing into `./sweeps/<id>/` inside the sweeper project, and produces the common `findings.json` (directly, or via the CLI's converter for Cloudflare's format).
 4. **Submit.** `sweepky submit` builds the package (one JSON document: manifest, findings, text attachments), encrypts it to the owner's published keys plus the sweeper's own, uploads `sweeps/<id>.age`, and flips the record to `done` (or `aborted`).
 5. **Pull.** Owner: "anything new?" `sweepky pull` decrypts new sweeps locally. The agent merges findings by `id`, keeping every sweeper who reported each one, summarises, and drafts fixes. Triage stays local.
-6. **Done.** When the owner is finished with the bounty, `sweepky done <bounty>` rewrites it with `status: "done"` and `credits`: every sweeper whose sweep helped. The CLI proposes the list from the merged findings and the owner trims it. Two sweepers who found the same issue are both credited. A bounty nobody helped with is done with an empty list.
+6. **Done.** When the owner is finished with the bounty, `sweepky done <bounty>` rewrites it with `status: "done"` and `credits`: every sweeper whose sweep helped. The CLI proposes the list from the merged findings and the owner trims it. Two sweepers who found the same issue are both credited. The owner is never credited on their own bounty, even if they swept it. A bounty nobody else helped with is done with an empty list.
 
 "The owner's agent manages everything" means the owner never touches JSON, age or Pubky. The board is the spectator surface; the agent is the control surface.
 

@@ -14,7 +14,7 @@ All records live under `/pub/sweepky/` on the **writer's own** homeserver. IDs a
 
 Five record kinds. There is no per-finding public record: credit lives on the bounty.
 
-The **trust label** is computed client-side, never stored: `circle` if the sweeper is in the roster; else `known: N` where N is the number of `done` bounties from trusted owners whose `credits` include the sweeper; else `unknown`.
+The **trust label** is computed client-side, never stored: `circle` if the sweeper is in the roster; else `known: N` where N is the number of `done` bounties from trusted owners whose `credits` include the sweeper; else `unknown`. A credit that names the bounty's own owner counts for nothing.
 
 Reserved and empty in v1: `payouts/`, `received/`, `disclosures/`, `tags/`, `triage/`.
 
@@ -44,6 +44,7 @@ A fixed envelope that tools act on, with a freeform brief inside for humans and 
 - **Fixed:** `title`, `targets` (pinned), `open`, `status`, `credits`, dates, `reward` (reserved).
 - **Freeform:** `brief` (markdown), `focus` (open label; `security` is the first use case, `bugs`, `perf`, anything else is valid), `playbook.suggested` (an open string naming a skill, URL or procedure; `required` is always `false` in v1 and exists only so the field has an obvious shape).
 - **Status and credits.** `status` is `open` or `done`. `sweepky done` sets `done`, `doneAt`, and `credits`: the pubkys of every sweeper whose sweep helped. Several sweepers who reported the same issue before it was fixed are all credited. An abandoned bounty is `done` with an empty `credits`. The owner can rewrite the record later to adjust credits; it is theirs.
+- **No self-credit.** An owner may sweep their own bounty, and their findings merge like anyone's, but `done` never credits them: they resolve the bounty and credit only the other sweepers who helped. The CLI refuses to write the owner's pubky into `credits`. Because anyone can hand-write their own records, the rule that matters is on the read side: the trust label and the board ignore any credit naming the bounty's owner. This stops the trivial case only; see [06](06-verification-and-limits.md#known-limits-say-them-in-the-readme) for alternate identities.
 - The post is public. The brief must not contain anything the owner would not put in a public issue. Credits reveal only "this sweeper helped on this bounty", never which finding or how severe.
 
 ## The sweep package
