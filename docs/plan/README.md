@@ -53,4 +53,4 @@ P2d and P4 may be built in parallel because neither depends on the other. Both b
 
 ## Status
 
-Planning. No code yet. The plan may still change; treat these docs as the source of truth and update them before changing direction.
+The build has started at [P0](phases/P0-bootstrap.md) and follows the [table above](#phases). The plan may still change; treat these docs as the source of truth and update them before changing direction.
