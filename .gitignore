@@ -1,0 +1,19 @@
+# Rust
+/target/
+**/target/
+
+# Node
+node_modules/
+dist/
+.vite/
+
+# Local secrets and state (never commit)
+.env
+.env.local
+sweeps/
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
