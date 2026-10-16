@@ -67,6 +67,13 @@
 //!   in `extra.cloudflare`, and [`to_cloudflare`] rebuilds the array from
 //!   there. Its errors are [`ConvertError`]s, which name a record by index
 //!   and a field by its [`CloudflareField`] path, never the content.
+//! - Trust labels: [`trust_labels`] gives every pubky named in a [`Circle`]
+//!   or in a list of [`CreditedBounty`]s its [`Trust`], a [`TrustLabel`]
+//!   (`circle`, `known` or `unknown`) and a [`CreditTally`] of the bounties
+//!   and distinct owners whose credits counted, in a [`TrustTable`]. It
+//!   applies every filter itself (only `done` bounties from roster members
+//!   count, and a credit naming the bounty's own owner is skipped), so the
+//!   caller passes every bounty it has.
 //!
 //! The rules that hold for everything here (see "Rust conventions" in
 //! `docs/plan/03-cli-and-skill.md`):
@@ -135,6 +142,7 @@ mod schema;
 mod scope;
 mod target;
 mod time;
+mod trust;
 mod url;
 mod validated_string;
 
@@ -159,6 +167,7 @@ pub use target::{
     TargetKind,
 };
 pub use time::RecordTime;
+pub use trust::{CreditTally, CreditedBounty, Trust, TrustLabel, TrustTable, trust_labels};
 pub use url::{BountyRef, PubkyUrl, SweepRef};
 // Re-exported because `RecordId::from_timestamp` takes one: the CLI names it
 // as `sweepky_core::Timestamp` and is sure to get the same crate version this
