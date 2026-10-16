@@ -109,13 +109,6 @@ struct VersionProbe {
 /// `T: DeserializeOwned` means `T` owns all of its data (`String`, not a `&str`
 /// borrowed from `input`), so the result does not borrow `input` and the
 /// caller can drop the bytes afterwards.
-// Until a record type calls this, only the tests do, and the build warns that
-// it is unused. `expect` (rather than `allow`) warns once it is used, so
-// remove this attribute at that point.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the record types later in P1a call it")
-)]
 pub(crate) fn parse_record<T: DeserializeOwned>(
     input: &[u8],
     limit: usize,

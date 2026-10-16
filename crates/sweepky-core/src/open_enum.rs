@@ -49,13 +49,6 @@
 /// public items. Matching in `as_known()` is exact and case-sensitive. Listing
 /// one string twice makes the compiler warn about an unreachable pattern,
 /// which CI's `-D warnings` turns into an error.
-// Until a record type uses the macro, only the tests do, and the build warns
-// that it is unused. `expect` (rather than `allow`) warns once it is used, so
-// remove this attribute and the one on the `use` below at that point.
-#[cfg_attr(
-    not(test),
-    expect(unused_macros, reason = "the record types later in P1a use it")
-)]
 macro_rules! open_enum {
     (
         $(#[$open_meta:meta])*
@@ -130,17 +123,13 @@ macro_rules! open_enum {
 // re-exported. This `use` gives it a path, `crate::open_enum::open_enum`, that
 // the record modules import like any other item; `pub(crate)` keeps it out of
 // the public API.
-#[cfg_attr(
-    not(test),
-    expect(unused_imports, reason = "the record types later in P1a use it")
-)]
 pub(crate) use open_enum;
 
 #[cfg(test)]
 mod tests {
-    // Called by its path, which goes through the `pub(crate) use` above as
-    // the record modules will. (Inside this file the bare name would also
-    // work, and would leave that `use` unused in the test build.)
+    // Called by its path, through the `pub(crate) use` above, the way the
+    // record modules call it, so the test checks that path works. (Inside
+    // this file the bare name would work too.)
     crate::open_enum::open_enum! {
         /// A test-only open enum.
         pub struct Fruit;

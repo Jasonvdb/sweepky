@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "sweeps": [
+    "pubky://a8fyof86uespzzjc3hiryromqy6hgw1gem5htj76jn6sto4jokhy/pub/sweepky/sweeps/0035SQ1Y8CJ7T.json",
+    "pubky://qwujy4epafpmfei7bxn8fccfm1shzqp516sbenxi7qr6gua4n77o/pub/sweepky/sweeps/0035TS37CP92Y.json"
+  ],
+  "cursors": {
+    "1nepshaq7wqc3ddb7361kz1mf6yum4k6qgtpyuy8zt1n5pzpue9o": "583029",
+    "iod35orpq5tx7ntebmra8k98m5bua41dq7ys9g5rgosyf8aq9m6o": "1207"
+  }
+}

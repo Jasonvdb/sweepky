@@ -2,7 +2,7 @@
 //! the events-feed parser, finding groups, age encryption, the package envelope
 //! and the manifest. P1a adds the records and parsing, P1b the encryption.
 //!
-//! So far it holds the machinery every record shares:
+//! So far it holds the machinery every record shares, and the first records:
 //!
 //! - [`RecordError`], the error every parse here returns.
 //! - [`SchemaVersion`] and the parse every record goes through: check the
@@ -33,6 +33,11 @@
 //!   reads a `pubky://` URL of any app's file, as the events feed carries
 //!   them, and [`BountyRef`] and [`SweepRef`] are the references records hold,
 //!   written as `pubky://` URLs with the key in raw form.
+//! - The first records: [`Circle`], the roster in `circle.json`;
+//!   [`DeviceKey`], an install's public key in `keys/<deviceId>.json`, with
+//!   its open-string [`KeyAlg`]; and [`Discovered`], an open bounty's
+//!   `bounties/<id>.discovered.json`. Each reads bytes with `from_json`, the
+//!   size-capped, version-first parse above.
 //!
 //! The rules that hold for everything here (see "Rust conventions" in
 //! `docs/plan/03-cli-and-skill.md`):
@@ -95,6 +100,7 @@ mod open_enum;
 // root.
 pub mod paths;
 mod pubky;
+mod records;
 mod schema;
 mod time;
 mod url;
@@ -104,6 +110,7 @@ pub use error::{JsonCategory, RecordError};
 pub use ids::{EventCursor, RecordId};
 pub use names::{DeviceId, GitSha, Playbook, RepoName, RepoPath, Sha256Hex, TargetId};
 pub use pubky::Pubky;
+pub use records::{Circle, CircleMember, DeviceKey, Discovered, KeyAlg, KnownKeyAlg};
 pub use schema::{MAX_FINDINGS_BYTES, MAX_RECORD_BYTES, SchemaVersion, UnknownFields};
 pub use time::RecordTime;
 pub use url::{BountyRef, PubkyUrl, SweepRef};

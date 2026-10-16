@@ -1,12 +1,13 @@
 # Fixtures
 
-Synthetic test data for the Rust tests in `crates/` and the TypeScript tests in `web/`. For now it holds only `trust-labels.json`. [P1a](../docs/plan/phases/P1a-core-records.md) and [P1b](../docs/plan/phases/P1b-core-crypto.md) add the rest when they land: the Cloudflare-shaped `findings.json`, a `discovered.json`, the synthetic run directories and the small bare git repository the CLI's target tests fetch from.
+Synthetic test data for the Rust tests in `crates/` and the TypeScript tests in `web/`. So far it holds `trust-labels.json` and `discovered.json`. The rest of [P1a](../docs/plan/phases/P1a-core-records.md) adds the Cloudflare-shaped `findings.json` and the small bare git repository the CLI's target tests fetch from, and [P1b](../docs/plan/phases/P1b-core-crypto.md) adds the synthetic run directories.
 
 Nothing real lands here. Every pubky, id and finding is made up for the test that uses it. The local demo's audit report is read from a path in an environment variable and is never committed ([P5](../docs/plan/phases/P5-local-demo.md#inputs-environment-never-committed)).
 
 | File | What it is | Loaded by |
 |---|---|---|
 | [`trust-labels.json`](trust-labels.json) | A roster, bounties with credits, and the trust label and credit tally every pubky in it should get | P1a's trust-label test (Rust), P4's trust-badge test (TypeScript) |
+| [`discovered.json`](discovered.json) | An open bounty's discovered-sweeps file: two strangers' sweeps and the feed cursors of two homeservers | P1a's `Discovered` round-trip test (Rust) |
 
 ## `trust-labels.json`
 
@@ -36,6 +37,8 @@ The rule comes from [01](../docs/plan/01-records-and-discovery.md#records-v1), p
 - `owners` is the number of distinct owners among those bounties.
 - `label` is `circle` if the pubky is in the roster, else `known` if `bounties` > 0, else `unknown`.
 
+"In the roster" and "roster member" mean listed in `members`: `admin` alone does not make a pubky a member, for the label or for counting an owner as trusted. `Circle::is_member` in `sweepky-core` applies this rule and P4's TypeScript badge must apply the same one; this file lists its admin in `members`, so it cannot catch the two disagreeing.
+
 The status and owner filters belong in the trust-label function, not in its caller: each test passes the function the whole `bounties` list, including the open bounties and the bounty from an owner outside the roster.
 
 ### Who is who
@@ -63,3 +66,12 @@ The status and owner filters belong in the trust-label function, not in its call
 | Owner outside the roster | X's done bounty `0035TR7XPGKP0` credits S3 and S1 | a done bounty from an owner who is not a roster member counts for nothing, so S3 stays `unknown` and S1 stays at 2 / 2 |
 | Done bounty with no credits | D's `0035R9NS7T33M` | a done bounty with an empty `credits` list adds nothing |
 | Circle members credited | B by A, D by B | a roster member is `circle` whatever its tally, and the tally is still counted |
+
+## `discovered.json`
+
+A `bounties/<id>.discovered.json` record as [01](../docs/plan/01-records-and-discovery.md#records-v1) defines it, with the `schemaVersion` that 01 gives every record. It has no bounty id of its own, because on a homeserver the id is in the file's path.
+
+The file is in the form `sweepky-core` writes: keys in raw z-base32 in the sweep URLs and as the `cursors` keys, and each cursor a decimal string. So the Rust test can parse it and check that writing it back gives the same JSON. A test that needs an unknown field adds it in code, which keeps this file in that form.
+
+- The two sweepers are S1 (`a8fyof86`) and S3 (`qwujy4ep`) from `trust-labels.json`: sweepers outside the roster, the only kind discovery adds. The sweep ids are synthetic `pubky-timestamp` values from October 2026.
+- The two homeserver keys (`1nepshaq` and `iod35orp`) are random Ed25519 public keys generated for this file with the private keys discarded. Neither is a real homeserver or the testnet homeserver's key. The event ids are made up.
