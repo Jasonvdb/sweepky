@@ -74,6 +74,15 @@
 //!   applies every filter itself (only `done` bounties from roster members
 //!   count, and a credit naming the bounty's own owner is skipped), so the
 //!   caller passes every bounty it has.
+//! - The events feed: [`parse_feed`] reads one page of a homeserver's public
+//!   `/events/` feed into a [`FeedPage`] of [`FeedEvent`]s (a [`FeedOp`] and
+//!   a [`PubkyUrl`]) and the page's [`EventCursor`], skipping and counting
+//!   every malformed line. [`FeedPage::deduped`] keeps each URL's last event,
+//!   and [`FeedPage::sweep_records`] picks out the sweep records `pull`
+//!   re-fetches. The feed is only a hint from that homeserver, so the parse
+//!   is bounded: a body over [`MAX_FEED_BODY_BYTES`] is a
+//!   [`FeedError::TooLarge`], and a line over [`MAX_FEED_LINE_BYTES`] is
+//!   malformed.
 //!
 //! The rules that hold for everything here (see "Rust conventions" in
 //! `docs/plan/03-cli-and-skill.md`):
@@ -128,6 +137,7 @@
 )]
 
 mod error;
+mod feed;
 mod findings;
 mod ids;
 mod names;
@@ -147,6 +157,9 @@ mod url;
 mod validated_string;
 
 pub use error::{JsonCategory, RecordError};
+pub use feed::{
+    FeedError, FeedEvent, FeedOp, FeedPage, MAX_FEED_BODY_BYTES, MAX_FEED_LINE_BYTES, parse_feed,
+};
 pub use findings::{
     CloudflareField, Confidence, ConvertError, Finding, FindingStatus, Findings, FindingsSource,
     KnownConfidence, KnownFindingStatus, KnownLocationKind, KnownSeverity, Location, LocationKind,
