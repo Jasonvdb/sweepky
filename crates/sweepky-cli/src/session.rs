@@ -38,8 +38,10 @@ use crate::{Context, Dirs};
 const WAITING_FOR_LOCK: &str =
     "waiting for another sweepky command on this install to finish (it holds the writers' lock)";
 
-/// What a command that needs a session says when this install has no login.
-const NOT_LOGGED_IN: &str =
+/// What a command that needs a login says when this install has none:
+/// every writing command here, and `keys list`, which needs to know whose
+/// `keys/` to read.
+pub(crate) const NOT_LOGGED_IN: &str =
     "this install is not logged in; run `sweepky login --identity <name>` first";
 
 /// Takes the writers' lock, runs `work` while holding it, then releases it.

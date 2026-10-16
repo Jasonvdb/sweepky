@@ -24,7 +24,7 @@ use sweepky_core::{DeviceId, Pubky, Zeroizing};
 use tempfile::TempDir;
 
 use crate::Dirs;
-use crate::device::{KeyIds, KeyStore};
+use crate::device::{KeyIds, KeyStore, PublicKeys};
 
 /// A fresh private directory to work in, created 0700 (`tempfile` passes
 /// `permissions` to the `mkdir` itself; its default would follow the
@@ -60,13 +60,17 @@ pub(crate) enum KeyStoreCall {
     GetOwnKey(DeviceId),
     /// [`KeyStore::put_key`] of this id, refused or not.
     PutKey(DeviceId),
-    /// [`KeyStore::list_key_ids`] of this owner.
+    /// [`PublicKeys::list_key_ids`] of this owner.
     ListKeyIds(PublicKey),
+    /// [`PublicKeys::get_key`] of this id. The owner is not logged: the
+    /// fake holds one owner's records.
+    GetKey(DeviceId),
 }
 
-/// A [`KeyStore`] in memory, in place of a homeserver: one owner's `keys/`
-/// records by device id, every call it was asked to make, in order, and, if
-/// set, the status it refuses every write with.
+/// A [`KeyStore`] (and so a [`PublicKeys`]) in memory, in place of a
+/// homeserver: one owner's `keys/` records by device id, every call it was
+/// asked to make, in order, and, if set, the status it refuses every write
+/// with. Its listing holds every record's id, in id order, and skips none.
 ///
 /// The methods take `&self`, as the trait's do, yet the fake has to change
 /// what it holds. A `Mutex` gives that "interior mutability": it hands out
@@ -113,6 +117,26 @@ impl FakeKeyStore {
     }
 }
 
+impl PublicKeys for FakeKeyStore {
+    async fn list_key_ids(&self, owner: &PublicKey) -> anyhow::Result<KeyIds> {
+        self.log(KeyStoreCall::ListKeyIds(owner.clone()));
+        let records = self.records.lock().expect("lock");
+        Ok(KeyIds {
+            ids: records.keys().cloned().collect(),
+            skipped: 0,
+        })
+    }
+
+    async fn get_key(
+        &self,
+        _owner: &PublicKey,
+        id: &DeviceId,
+    ) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
+        self.log(KeyStoreCall::GetKey(id.clone()));
+        Ok(self.record(id).map(Zeroizing::new))
+    }
+}
+
 impl KeyStore for FakeKeyStore {
     async fn get_own_key(&self, id: &DeviceId) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
         self.log(KeyStoreCall::GetOwnKey(id.clone()));
@@ -129,15 +153,6 @@ impl KeyStore for FakeKeyStore {
         }
         self.set_record(id, record);
         Ok(())
-    }
-
-    async fn list_key_ids(&self, owner: &PublicKey) -> anyhow::Result<KeyIds> {
-        self.log(KeyStoreCall::ListKeyIds(owner.clone()));
-        let records = self.records.lock().expect("lock");
-        Ok(KeyIds {
-            ids: records.keys().cloned().collect(),
-            skipped: 0,
-        })
     }
 }
 

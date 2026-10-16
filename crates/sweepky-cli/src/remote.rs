@@ -8,6 +8,9 @@
 //! - [`write_refusal`] turns the two answers a homeserver gives a write it
 //!   will not take, 403 and 507, into the message `login` aborts with, and
 //!   [`request_error`] turns every other SDK error into a message.
+//! - [`pubky_of`] and [`public_key_of`] convert between core's `Pubky` and
+//!   the SDK's `PublicKey`, the owner these helpers take, so the commands
+//!   share one conversion.
 //!
 //! The rules, and why:
 //!
@@ -316,6 +319,21 @@ fn absent_on_not_found<T>(result: pubky::Result<T>) -> pubky::Result<Option<T>> 
     }
 }
 
+/// The SDK's key as core's `Pubky`: the same 32 bytes.
+//
+// Core's `Pubky` is written out in full in these two functions: in this
+// module the bare name `Pubky` is the SDK's client, imported above.
+pub(crate) fn pubky_of(key: &PublicKey) -> sweepky_core::Pubky {
+    sweepky_core::Pubky::from_bytes(key.to_bytes())
+}
+
+/// Core's `Pubky` as the SDK's key, the owner every helper here takes; the
+/// SDK checks it is a valid Ed25519 point.
+pub(crate) fn public_key_of(pubky: &sweepky_core::Pubky) -> anyhow::Result<PublicKey> {
+    PublicKey::try_from_z32(&pubky.to_string())
+        .map_err(|_| anyhow!("{pubky} is not a valid public key"))
+}
+
 /// Reads `path` of `owner`'s public storage, at most `cap` bytes, or `None`
 /// when there is no such file.
 ///
@@ -327,15 +345,6 @@ fn absent_on_not_found<T>(result: pubky::Result<T>) -> pubky::Result<Option<T>> 
 ///
 /// `path` appears in the error message, so pass one built by
 /// [`sweepky_core::paths`], never a stranger's text.
-// No unit test reaches the network, so a test build has no caller for this
-// yet either; the testnet test is the first. `expect` warns once one exists.
-#[cfg_attr(
-    test,
-    expect(
-        dead_code,
-        reason = "only the testnet test calls it, and it has no caller yet"
-    )
-)]
 pub(crate) async fn get_public(
     pubky: &Pubky,
     owner: &PublicKey,

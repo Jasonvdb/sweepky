@@ -39,6 +39,11 @@
 //!    sign out again: every later command signs in and out on its own
 //!    ([`crate::session`]). The report ends with the reminder to back up the
 //!    config directory when a new key was made.
+//! 8. **Check `keys/`** (before the sign-out, [`check_key_ids`]): list the
+//!    identity's `keys/` and raise 02's alarm for every id this owner's
+//!    installs did not create and whose record is not revoked, the same
+//!    check `keys list` makes (`keys::unknown_key_alarms`). A listing that
+//!    fails is a warning in the report; login has done its work by then.
 //!
 //! **The signup token is never printed.** The SDK puts it in the signup
 //! request's URL (`?signup_token=…`), and a transport error's `Display`
@@ -55,13 +60,14 @@ use sweepky_core::{
 
 use crate::clock;
 use crate::device::{
-    KeyStore, SessionKeyStore, create_device_key, device_key_bytes, device_key_record,
+    KeyStore, PublicKeys, SessionKeyStore, create_device_key, device_key_bytes, device_key_record,
     new_device_id, read_device_key, remove_device_key,
 };
 use crate::identity::{IdentityMeta, IdentityName, IdentitySecret, read_argument_file};
-use crate::installs::{forget_install, record_install};
+use crate::installs::{forget_install, read_installs, record_install, unknown_key_alarm};
+use crate::keys::unknown_key_alarms;
 use crate::network::{NetworkKind, client_id};
-use crate::remote::{request_error, status_of, write_error};
+use crate::remote::{pubky_of, public_key_of, request_error, status_of, write_error};
 use crate::session::{sign_out, with_writers_lock};
 use crate::state::{
     LoginState, StoredIdentity, create_identity, read_identity, read_login_state,
@@ -373,6 +379,66 @@ enum DeviceKeyOutcome {
     /// `login.json` already records this install's key under this id, but
     /// the record was gone, so this run published it again.
     Republished(DeviceId),
+}
+
+/// What the shared tail did, and what the check of `keys/` after it found.
+#[derive(Debug)]
+struct TailOutcome {
+    /// What [`record_login`] did about this install's device key.
+    device: DeviceKeyOutcome,
+    /// The report's lines from the check of `keys/` ([`check_key_ids`]): an
+    /// alarm per unknown id, or a warning that the check could not run.
+    /// Empty when all is well.
+    key_check: String,
+}
+
+/// The shared tail ([`record_login`]) and then the check of the identity's
+/// `keys/` for ids this owner's installs did not create
+/// ([`check_key_ids`]), on the first login and on every later one alike.
+/// The check runs only once the tail has succeeded, so this install's own
+/// key is published and recorded in `installs.json` by then, and never
+/// reads as unknown.
+async fn record_login_and_check_keys(
+    dirs: &Dirs,
+    keys: &impl KeyStore,
+    state: LoginState,
+) -> anyhow::Result<TailOutcome> {
+    // `Pubky` is `Copy` (32 bytes), so this keeps a copy while `state`
+    // moves into `record_login`.
+    let owner = state.pubky;
+    let device = record_login(dirs, keys, state).await?;
+    let key_check = check_key_ids(dirs, keys, owner).await;
+    Ok(TailOutcome { device, key_check })
+}
+
+/// The alarm of 02 at `login`: one line per id under `owner`'s `keys/` that
+/// none of this owner's installs here created and whose record is not
+/// revoked ([`unknown_key_alarms`]), each with what to do about it.
+///
+/// Never an error: by now the key is published and `login.json` written,
+/// so a check that cannot run (the listing fails, `installs.json` cannot be
+/// read) becomes a warning in the report that points at `keys list`,
+/// rather than a failed login.
+///
+/// It only reads, so it takes the read-only [`PublicKeys`]; the tail's
+/// `&impl KeyStore` is one, because `PublicKeys` is its supertrait.
+async fn check_key_ids(dirs: &Dirs, keys: &impl PublicKeys, owner: Pubky) -> String {
+    // An `async` block whose `?`s return from the block, so every failure
+    // ends up in the one `Err` below. Its last line spells out the error
+    // type (`anyhow::Ok`), which the compiler cannot infer for a block.
+    let checked = async {
+        let created = read_installs(dirs)?.ids_of(&owner).to_vec();
+        let alarms = unknown_key_alarms(keys, &public_key_of(&owner)?, &created).await?;
+        anyhow::Ok(alarms)
+    }
+    .await;
+    match checked {
+        Ok(alarms) => alarms.iter().map(unknown_key_alarm).collect(),
+        Err(error) => format!(
+            "warning: could not check keys/ for device keys this owner's installs did not create \
+             ({error:#}); run `sweepky keys list` to check.\n"
+        ),
+    }
 }
 
 /// Writes `login.json` for `state`, running the shared tail of `login` first.
@@ -781,14 +847,15 @@ async fn login_locked(
         ));
     }
 
-    // 5. to 7. Sign in, publish this install's device key on its first
-    // login, record the login, sign out.
-    let device = sign_in_and_record(ctx, &signer, &meta, current).await?;
+    // 5. to 8. Sign in, publish this install's device key on its first
+    // login, record the login, check keys/, sign out.
+    let tail = sign_in_and_record(ctx, &signer, &meta, current).await?;
     report.push_str(&format!(
         "Logged in as {name}, pubky {}, on homeserver {}.\n",
         meta.pubky, meta.homeserver
     ));
-    report.push_str(&device_key_report(&ctx.dirs, &device));
+    report.push_str(&device_key_report(&ctx.dirs, &tail.device));
+    report.push_str(&tail.key_check);
     Ok(Report::new(report))
 }
 
@@ -833,8 +900,9 @@ async fn resolve_homeserver(ctx: &Context, user: &PublicKey) -> anyhow::Result<O
 /// Signs in, publishes this install's device key if `login.json` records
 /// none for this pubky or checks the one it records ([`record_login`]),
 /// writes `login.json` for the identity `meta` describes
-/// ([`login_state_for`], which `current` is moved into), and signs out
-/// again.
+/// ([`login_state_for`], which `current` is moved into), checks `keys/` for
+/// keys this owner's installs did not create ([`check_key_ids`]), and signs
+/// out again.
 ///
 /// The sign-out runs whether that worked or not; the error is returned
 /// after it.
@@ -843,18 +911,18 @@ async fn sign_in_and_record(
     signer: &PubkySigner,
     meta: &IdentityMeta,
     current: Option<LoginState>,
-) -> anyhow::Result<DeviceKeyOutcome> {
+) -> anyhow::Result<TailOutcome> {
     let session = signer
         .signin_blocking(client_id()?)
         .await
         .map_err(|err| request_error(&err))
         .context("could not sign in to the homeserver")?;
     let state = login_state_for(meta, current);
-    // The store borrows the session. That borrow ends when `record_login`'s
+    // The store borrows the session. That borrow ends when the tail's
     // future is done, so the session can then be moved into `sign_out`,
     // which consumes it.
     let keys = SessionKeyStore::new(&session, ctx.network.pubky());
-    let recorded = record_login(&ctx.dirs, &keys, state).await;
+    let recorded = record_login_and_check_keys(&ctx.dirs, &keys, state).await;
     sign_out(ctx, session).await;
     recorded
 }
@@ -885,17 +953,6 @@ fn parse_homeserver(value: &str) -> anyhow::Result<Pubky> {
         .map_err(|_| anyhow!(NOT_A_HOMESERVER))
 }
 
-/// The SDK's key as core's `Pubky`: the same 32 bytes.
-fn pubky_of(key: &PublicKey) -> Pubky {
-    Pubky::from_bytes(key.to_bytes())
-}
-
-/// Core's `Pubky` as the SDK's key, which checks it is a valid Ed25519 point.
-fn public_key_of(pubky: &Pubky) -> anyhow::Result<PublicKey> {
-    PublicKey::try_from_z32(&pubky.to_string())
-        .map_err(|_| anyhow!("{pubky} is not a valid public key"))
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -908,13 +965,13 @@ mod tests {
 
     use super::{
         DeviceKeyOutcome, Found, LoginPlan, PlanInput, ProductionWarning, SignupOutcome,
-        plan_login, record_login, signup_error, signup_outcome,
+        plan_login, record_login, record_login_and_check_keys, signup_error, signup_outcome,
     };
     use crate::device::{create_device_key, device_key_bytes, device_key_record, read_device_key};
     use crate::identity::{IdentityMeta, IdentityName, IdentitySecret};
     use crate::installs::{read_installs, record_install};
     use crate::network::{NetworkKind, PRODUCTION_HOMESERVER, TESTNET_HOMESERVER};
-    use crate::remote::{QUOTA_FULL, WRITE_FORBIDDEN};
+    use crate::remote::{QUOTA_FULL, WRITE_FORBIDDEN, public_key_of};
     use crate::state::{
         LoginState, StoredIdentity, create_identity, read_identity, read_login_state,
         write_login_state,
@@ -1578,6 +1635,99 @@ mod tests {
             assert_eq!(keys.calls().len(), calls_before, "{case}");
             assert_eq!(device_state(&dirs), before, "{case}");
         }
+    }
+
+    /// A `keys/<id>.json` this install did not write, as an operator of the
+    /// homeserver or a holder of a leaked grant could put there: a usable
+    /// key, revoked or not.
+    fn injected_record(revoked: bool) -> Vec<u8> {
+        let mut record = device_key_record(
+            &DeviceIdentity::generate().recipient(),
+            clock::now().expect("a time"),
+        );
+        if revoked {
+            record.revoked_at = Some(clock::now().expect("a time"));
+        }
+        device_key_bytes(&record).expect("JSON")
+    }
+
+    /// The device id of the record [`injected_record`] is put under.
+    fn injected_id() -> DeviceId {
+        "injected-key".parse().expect("valid")
+    }
+
+    /// Asserts that `report` raises the alarm for [`injected_id`], with
+    /// both of its fixes.
+    fn assert_alarms_on_injected(report: &str) {
+        for part in [
+            "alarm: keys/injected-key.json",
+            "`sweepky keys revoke injected-key`",
+            "revoke it in Pubky Ring and log in again",
+        ] {
+            assert!(report.contains(part), "{part:?} missing from: {report}");
+        }
+    }
+
+    #[tokio::test]
+    async fn login_alarms_on_unknown_key_ids() {
+        // The first login: the key it publishes is this owner's, the one
+        // already there is not.
+        let (_temp, dirs, state, _earlier) = before_the_tail();
+        let keys = FakeKeyStore::default();
+        keys.set_record(&injected_id(), injected_record(false));
+        let tail = record_login_and_check_keys(&dirs, &keys, state.clone())
+            .await
+            .expect("the first login");
+        let DeviceKeyOutcome::Published(own) = &tail.device else {
+            panic!("expected a new key, got {:?}", tail.device);
+        };
+        assert_alarms_on_injected(&tail.key_check);
+        assert!(!tail.key_check.contains(&format!("keys/{own}.json")));
+        // The check listed keys/ after the key was published, and read the
+        // unknown record to see whether it is revoked.
+        let calls = keys.calls();
+        assert!(
+            calls.ends_with(&[
+                KeyStoreCall::ListKeyIds(public_key_of(&state.pubky).expect("a key")),
+                KeyStoreCall::GetKey(injected_id()),
+            ]),
+            "{calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn later_login_alarms_until_the_unknown_key_is_revoked() {
+        // A later login that reuses this install's key: the same alarm.
+        let keys = FakeKeyStore::default();
+        let (_temp, dirs, state, own) = after_a_first_login(&keys).await;
+        keys.set_record(&injected_id(), injected_record(false));
+        let tail = record_login_and_check_keys(&dirs, &keys, state.clone())
+            .await
+            .expect("the second login");
+        assert!(
+            matches!(&tail.device, DeviceKeyOutcome::Reused(reused) if reused == &own),
+            "{:?}",
+            tail.device
+        );
+        assert_alarms_on_injected(&tail.key_check);
+
+        // Once the injected key is revoked, the fix is in, and login says
+        // nothing more about it.
+        keys.set_record(&injected_id(), injected_record(true));
+        let tail = record_login_and_check_keys(&dirs, &keys, state)
+            .await
+            .expect("a third login");
+        assert_eq!(tail.key_check, "");
+    }
+
+    #[tokio::test]
+    async fn login_with_only_its_own_key_raises_no_alarm() {
+        let keys = FakeKeyStore::default();
+        let (_temp, dirs, state, _own) = after_a_first_login(&keys).await;
+        let tail = record_login_and_check_keys(&dirs, &keys, state)
+            .await
+            .expect("the second login");
+        assert_eq!(tail.key_check, "");
     }
 
     #[tokio::test]

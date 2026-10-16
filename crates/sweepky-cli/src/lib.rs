@@ -42,7 +42,8 @@
 //!   (a 404 is an empty directory), every body capped before it is buffered
 //!   and every listing capped by line, page and total; and the messages for
 //!   a refused write (403 and 507) and every other SDK error, which never
-//!   quote the server or the request URL.
+//!   quote the server or the request URL; and the conversions between core's
+//!   `Pubky` and the SDK's `PublicKey`.
 //! - `display`, the terminal sanitiser: a stranger's text with its control,
 //!   bidi and invisible characters written as visible `\u{..}` escapes, cut
 //!   to a length.
@@ -56,11 +57,18 @@
 //!   other) removes what the tail made and aborts.
 //! - `device`, this install's device key: its secret in `device.key` (the
 //!   age identity string alone, 0600, never written over an existing key),
-//!   its public record, and `KeyStore`, the seam `keys/<deviceId>.json` is
+//!   its public record, and `PublicKeys` and `KeyStore`, the seams anyone's
+//!   `keys/` is read through and this user's own `keys/<deviceId>.json` is
 //!   read and written through, with a fake for the unit tests.
 //! - `installs`, `installs.json`: per owner, the device ids this owner's
-//!   installs created here, which `keys list` and `pull` compare `keys/`
-//!   against.
+//!   installs created here, which `login`, `keys list` and `pull` compare
+//!   `keys/` against, and the alarm for an id it does not hold.
+//! - `keys list` and `keys revoke <deviceId>` (`keys`): the identity's
+//!   published device keys, read from public storage with no session, each
+//!   unknown id alarmed on, each key this build cannot encrypt to flagged by
+//!   its device id, and every string from a record sanitised; and the
+//!   revoke, which sets `revokedAt` under the writers' lock and keeps every
+//!   other field. `login` runs the same unknown-id check after its tail.
 //! - `state`, this install's own state files: `login.json` and a dedicated
 //!   identity's key and details files, read and written together.
 //! - `session`, the per-command session every writing command runs in: the
@@ -112,60 +120,34 @@
 mod cli;
 mod clock;
 // This install's device key: its secret in `device.key`, its public record
-// `keys/<deviceId>.json`, and the `KeyStore` seam that record is read and
-// written through.
+// `keys/<deviceId>.json`, and the `PublicKeys` and `KeyStore` seams such
+// records are read and written through.
 mod device;
 mod dirs;
 // The identity name, secret file, details file and refusal rules of
 // `login --identity`.
 mod identity;
-// The terminal sanitiser. Nothing outside its tests calls it yet, so the same
-// `expect(dead_code)` as `private_fs` below applies.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "keys list and circle show, the next P2a steps, are the first callers"
-    )
-)]
+// The terminal sanitiser.
 mod display;
 mod init;
 // `installs.json`: the device ids this owner's own installs created.
 mod installs;
+// `keys list` and `keys revoke`.
+mod keys;
 mod lock;
 mod login;
 mod network;
 // Owner-only files and directories, which every secret and state file goes
 // through.
 mod private_fs;
-// Bounded reads of remote records and listings, and the write-error mapping.
-// `login` uses the write errors, and its key store the reads of the user's
-// own records and the listing; `get_public`, for other owners' records, has
-// no caller outside its tests yet, so a build without tests would warn that
-// it is unused, which CI's `-D warnings` turns into an error. `expect`
-// (rather than `allow`) says that warning is wanted for now and warns in
-// turn once every item has a caller, so whoever adds the last one has to
-// delete this line. On a `mod`, the attribute covers everything inside it.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "get_public, for other owners' records, has no caller yet"
-    )
-)]
+// Bounded reads of remote records and listings, the write-error mapping and
+// the key conversions. `login` and `keys` use the write errors and the
+// conversions, and the key stores the reads of the user's own records, of
+// anyone's public records and the listing.
 mod remote;
-// The per-command session. `login` already uses its lock and sign-out
-// helpers; `with_writer_session` has no caller outside its test until the
-// first writing command lands, so the same `expect(dead_code)` as `remote`
-// above applies. On a module, `expect` is fulfilled while any item inside is
-// unused, and the used ones are unaffected.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "keys, circle and logout, the next P2a steps, are the first callers"
-    )
-)]
+// The per-command session: the writers' lock, a fresh sign-in and a sign-out
+// that is always attempted. `login` holds its lock; `keys revoke` is the
+// first command to run in a whole session.
 mod session;
 mod state;
 // Fixtures the unit tests of several modules share. `cfg(test)` compiles it
@@ -176,7 +158,7 @@ mod test_support;
 use std::io::Write;
 use std::sync::{Mutex, PoisonError};
 
-pub use cli::{Cli, Command};
+pub use cli::{Cli, Command, KeysCommand};
 pub use dirs::Dirs;
 pub use identity::IdentityName;
 pub use network::{
@@ -295,6 +277,10 @@ pub async fn run(cli: Cli, ctx: &Context) -> anyhow::Result<Report> {
             )
             .await
         }
+        Command::Keys { command } => match command {
+            KeysCommand::List => keys::list(ctx).await,
+            KeysCommand::Revoke { device_id } => keys::revoke(ctx, &device_id).await,
+        },
     }
 }
 

@@ -19,10 +19,10 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use clap::Parser;
-use pubky::PublicKey;
+use pubky::{ClientId, Keypair, PublicKey};
 use pubky_testnet::EphemeralTestnet;
 use serde_json::{Value, json};
-use sweepky_cli::{Cli, Context, Dirs, Network, Report, StderrWriter, run};
+use sweepky_cli::{CLIENT_ID, Cli, Context, Dirs, Network, Report, StderrWriter, run};
 use sweepky_core::{DeviceIdentity, DeviceKey, MAX_RECORD_BYTES, SecretString, Zeroizing};
 
 /// What the context writes to standard error, kept where the test can read
@@ -114,6 +114,54 @@ async fn list_keys(testnet: &EphemeralTestnet, user: &PublicKey) -> Vec<String> 
         .filter(|line| !line.trim().is_empty())
         .map(str::to_owned)
         .collect()
+}
+
+/// Signs in as the identity whose Sweepky key file is `key_file`, with its
+/// root key, writes `record` at `path`, and signs out: what another install
+/// of the same identity, an operator of its homeserver or anyone holding its
+/// credentials can do behind this install's back.
+async fn publish_as(testnet: &EphemeralTestnet, key_file: &Path, path: &str, record: &Value) {
+    let signer = testnet
+        .sdk()
+        .expect("client")
+        .signer(Keypair::from_secret(&identity_seed(key_file)));
+    let session = signer
+        .signin(ClientId::new(CLIENT_ID).expect("a valid client id"))
+        .await
+        .expect("signs in");
+    session
+        .storage()
+        .put(path, serde_json::to_vec(record).expect("JSON"))
+        .await
+        .expect("writes");
+    // `signout` hands the session back with the error; only the error is
+    // kept, so a failure never prints the session.
+    session
+        .signout()
+        .await
+        .map_err(|(error, _session)| error)
+        .expect("signs out");
+}
+
+/// The 32-byte root seed in the Sweepky key file `key_file`.
+///
+/// The library keeps its reader of that file private, so the test reads
+/// Sweepky's documented format itself: the line `sweepky-identity/v1`, then
+/// the seed as 64 lower-case hex digits and a newline. The bytes stay in
+/// buffers that wipe themselves.
+fn identity_seed(key_file: &Path) -> Zeroizing<[u8; 32]> {
+    let file = Zeroizing::new(fs::read(key_file).expect("readable"));
+    let hex = file
+        .strip_prefix(b"sweepky-identity/v1\n")
+        .and_then(|rest| rest.strip_suffix(b"\n"))
+        .expect("a v1 identity file");
+    assert_eq!(hex.len(), 64, "a 32-byte seed");
+    let mut seed = Zeroizing::new([0_u8; 32]);
+    for (byte, pair) in seed.iter_mut().zip(hex.chunks_exact(2)) {
+        let digits = std::str::from_utf8(pair).expect("hex digits");
+        *byte = u8::from_str_radix(digits, 16).expect("hex digits");
+    }
+    seed
 }
 
 /// A signup token in a form the homeserver rejects (400) before it looks at
@@ -309,4 +357,105 @@ async fn end_to_end() {
         json(&dirs.installs_file())["owners"][pubky.as_str()],
         json!([device_id])
     );
+
+    // `keys list` lists this install's key, in use, and raises no alarm.
+    let own_line = format!("keys/{device_id}.json: this install; in use");
+    let report = sweepky(&ctx, &["keys", "list"]).await.expect("keys list");
+    let text = report.text();
+    assert!(text.contains(&own_line), "{text}");
+    assert!(!text.contains("alarm"), "{text}");
+
+    // A second key under the throwaway's keys/, written with the identity's
+    // own root key, standing in for another install or an operator. It
+    // carries a field this build does not know, which `keys revoke` keeps.
+    let other_id = "another-install";
+    let other_path = format!("/pub/sweepky/keys/{other_id}.json");
+    let other_key = DeviceIdentity::generate();
+    let other_record = json!({
+        "schemaVersion": 1,
+        "alg": "age-x25519",
+        "recipient": other_key.recipient().to_string(),
+        "label": "another install",
+        "createdAt": "2026-10-16T09:41:07Z",
+        "revokedAt": null,
+        "addedLater": { "kept": true },
+    });
+    publish_as(&testnet, &key_file, &other_path, &other_record).await;
+
+    // Logging in again keeps this install's key and id, and the report
+    // raises the alarm for the new id, with the fix.
+    let report = sweepky(&ctx, &["login", "--identity", "throwaway"])
+        .await
+        .expect("a login with an unknown key under keys/");
+    let text = report.text();
+    assert!(text.contains("Reusing this install's device key"), "{text}");
+    assert!(
+        text.contains(&format!("alarm: keys/{other_id}.json")),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("`sweepky keys revoke {other_id}`")),
+        "{text}"
+    );
+    assert!(
+        !text.contains(&format!("alarm: keys/{device_id}.json")),
+        "{text}"
+    );
+    assert_eq!(json(&dirs.login_file())["deviceId"], device_id.as_str());
+
+    // `keys list` lists both and flags the new one as unknown, without ever
+    // printing a recipient.
+    let report = sweepky(&ctx, &["keys", "list"]).await.expect("keys list");
+    let text = report.text();
+    assert!(text.contains(&own_line), "{text}");
+    assert!(
+        text.contains(&format!("keys/{other_id}.json: UNKNOWN")),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("alarm: keys/{other_id}.json")),
+        "{text}"
+    );
+    for recipient in [other_key.recipient(), device.recipient()] {
+        assert!(!text.contains(&recipient.to_string()), "{text}");
+    }
+
+    // `keys revoke` sets the new key's revokedAt and keeps every other
+    // field, the unknown one included; this install's key stays in use.
+    let report = sweepky(&ctx, &["keys", "revoke", other_id])
+        .await
+        .expect("keys revoke");
+    let text = report.text();
+    assert!(
+        text.contains(&format!("Revoked keys/{other_id}.json")),
+        "{text}"
+    );
+    let revoked_bytes = get_capped(&testnet, &user, &other_path, MAX_RECORD_BYTES).await;
+    let revoked = DeviceKey::from_json(&revoked_bytes).expect("a device key record");
+    let revoked_at = revoked.revoked_at.expect("revokedAt is set");
+    let mut expected = other_record;
+    expected["revokedAt"] = json!(revoked_at.as_str());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&revoked_bytes).expect("JSON"),
+        expected
+    );
+    let own = get_capped(&testnet, &user, &path, MAX_RECORD_BYTES).await;
+    let own = DeviceKey::from_json(&own).expect("a device key record");
+    assert_eq!(
+        own.revoked_at, None,
+        "this install's key is left for logout"
+    );
+
+    // Revoked, the unknown key is settled: still marked unknown, no alarm.
+    let report = sweepky(&ctx, &["keys", "list"]).await.expect("keys list");
+    let text = report.text();
+    assert!(
+        text.contains(&format!(
+            "keys/{other_id}.json: UNKNOWN: not created by this owner's installs here; revoked {}",
+            revoked_at.as_str()
+        )),
+        "{text}"
+    );
+    assert!(!text.contains("alarm"), "{text}");
+    assert_eq!(stderr.text(), "", "nothing on standard error");
 }

@@ -12,10 +12,12 @@
 //! - [`create_device_key`] writes the secret to `device.key`, never over a
 //!   key that is already there; [`read_device_key`] reads it back and
 //!   [`remove_device_key`] deletes it.
-//! - [`KeyStore`] reads and writes `keys/<deviceId>.json` records.
-//!   [`SessionKeyStore`] is the real one, on a signed-in session and the
-//!   public storage; the unit tests use a fake in memory
-//!   (`test_support::FakeKeyStore`) that can be told to refuse a write.
+//! - [`PublicKeys`] reads anyone's `keys/`, the listing and each record,
+//!   from public storage with no session; [`KeyStore`] adds reading and
+//!   writing the signed-in user's own records. [`PublicKeyReader`] and
+//!   [`SessionKeyStore`] are the real ones; the unit tests use a fake in
+//!   memory (`test_support::FakeKeyStore`) that can be told to refuse a
+//!   write.
 //!
 //! **Why the label is fixed.** `keys/` is world-readable, so a label such as
 //! the machine's host name would tell everyone what the owner's machines are
@@ -41,7 +43,7 @@ use crate::clock;
 use crate::private_fs::{
     ensure_private_dir, lstat, read_private_file, remove_private_file, write_private_file,
 };
-use crate::remote::{ListLimits, Listing, get_own, list_dir};
+use crate::remote::{ListLimits, Listing, get_own, get_public, list_dir};
 
 /// The `label` of every key this CLI publishes. Fixed, because `keys/` is
 /// public and a host name there would leak (see the module docs).
@@ -174,7 +176,7 @@ pub(crate) struct KeyIds {
 
 impl KeyIds {
     /// The device ids of a `keys/` listing.
-    fn from_listing(listing: Listing) -> Self {
+    pub(crate) fn from_listing(listing: Listing) -> Self {
         let mut ids = Vec::new();
         let mut skipped = listing.skipped;
         for entry in listing.entries {
@@ -189,22 +191,49 @@ impl KeyIds {
     }
 }
 
-/// Where `keys/<deviceId>.json` records are read and written: the seam
-/// between the commands that manage device keys (`login` now; `keys` and
-/// `logout` next) and the homeserver.
+/// Where anyone's `keys/<deviceId>.json` records are read from: public
+/// storage, with no session, so `keys list` (and later `pull`) can read
+/// them without signing in or taking the writers' lock.
 ///
-/// A trait so that those commands can be tested without a network: the unit
-/// tests pass a fake that keeps records in memory, remembers every call and
-/// can refuse a write with any status. [`SessionKeyStore`] is the real one.
+/// A trait so that the commands can be tested without a network: the unit
+/// tests pass a fake that keeps records in memory and remembers every call.
+/// [`PublicKeyReader`] is the real one, and [`SessionKeyStore`] reads
+/// through it too.
 ///
 /// The methods are `async fn`s, so each returns a future. A trait like this
-/// cannot be used as `dyn KeyStore` (each implementation's futures are a
-/// different type), so callers take `&impl KeyStore`, and the compiler makes
-/// one copy of the caller per implementation: the real one in the binary,
-/// the fake in the tests. `pub(crate)`, so the warning about `Send` bounds
-/// on public async traits does not apply: nothing here moves these futures
-/// to another thread.
-pub(crate) trait KeyStore {
+/// cannot be used as `dyn PublicKeys` (each implementation's futures are a
+/// different type), so callers take `&impl PublicKeys`, and the compiler
+/// makes one copy of the caller per implementation: the real one in the
+/// binary, the fake in the tests. `pub(crate)`, so the warning about `Send`
+/// bounds on public async traits does not apply: nothing here moves these
+/// futures to another thread.
+pub(crate) trait PublicKeys {
+    /// The device ids under `owner`'s `keys/`, from public storage, read
+    /// with [`ListLimits::DEFAULT`]: names that are not a valid
+    /// `keys/<deviceId>.json` are counted in [`KeyIds::skipped`], not
+    /// returned.
+    async fn list_key_ids(&self, owner: &PublicKey) -> anyhow::Result<KeyIds>;
+
+    /// `owner`'s `keys/<id>.json` from public storage, at most
+    /// [`MAX_RECORD_BYTES`], or `None` when there is no such record. The
+    /// bytes are the homeserver's: parse them with `DeviceKey::from_json`.
+    async fn get_key(
+        &self,
+        owner: &PublicKey,
+        id: &DeviceId,
+    ) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>>;
+}
+
+/// Where the signed-in user's own `keys/<deviceId>.json` records are read
+/// and written: the seam between the commands that manage device keys
+/// (`login`, `keys revoke`, and `logout` next) and the homeserver.
+///
+/// `KeyStore: PublicKeys` makes [`PublicKeys`] a *supertrait*: every key
+/// store can also read public storage, so a command holding a `&impl
+/// KeyStore` can call `list_key_ids` and `get_key` on it as well. The fake
+/// in the tests can refuse a write with any status. [`SessionKeyStore`] is
+/// the real one. The notes on [`PublicKeys`] about `async fn` apply here.
+pub(crate) trait KeyStore: PublicKeys {
     /// The signed-in user's own `keys/<id>.json`, at most
     /// [`MAX_RECORD_BYTES`], or `None` when there is no such record. The
     /// bytes are the homeserver's: parse them with `DeviceKey::from_json`.
@@ -217,10 +246,35 @@ pub(crate) trait KeyStore {
     /// [`crate::remote::write_error`]. Never print the error itself: its
     /// `Display` holds the server's text, or the request URL.
     async fn put_key(&self, id: &DeviceId, record: Vec<u8>) -> pubky::Result<()>;
+}
 
-    /// The device ids under `owner`'s `keys/`, from public storage.
-    #[expect(dead_code, reason = "keys list, a later P2a step, is the first caller")]
-    async fn list_key_ids(&self, owner: &PublicKey) -> anyhow::Result<KeyIds>;
+/// The real [`PublicKeys`]: anyone's `keys/` through the client's public
+/// storage, which finds the owner's homeserver through pkarr and asks it
+/// anonymously. It borrows the client, as [`SessionKeyStore`] does.
+pub(crate) struct PublicKeyReader<'a> {
+    client: &'a pubky::Pubky,
+}
+
+impl<'a> PublicKeyReader<'a> {
+    /// A reader on `client`.
+    pub(crate) fn new(client: &'a pubky::Pubky) -> Self {
+        Self { client }
+    }
+}
+
+impl PublicKeys for PublicKeyReader<'_> {
+    async fn list_key_ids(&self, owner: &PublicKey) -> anyhow::Result<KeyIds> {
+        let listing = list_dir(self.client, owner, paths::KEYS_DIR, ListLimits::DEFAULT).await?;
+        Ok(KeyIds::from_listing(listing))
+    }
+
+    async fn get_key(
+        &self,
+        owner: &PublicKey,
+        id: &DeviceId,
+    ) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
+        get_public(self.client, owner, &paths::key(id), MAX_RECORD_BYTES).await
+    }
 }
 
 /// The real [`KeyStore`]: the user's own records through a signed-in
@@ -241,6 +295,22 @@ impl<'a> SessionKeyStore<'a> {
     }
 }
 
+/// Public reads go through a [`PublicKeyReader`] on the same client, made on
+/// the spot: it is only a borrowed reference, so making one costs nothing.
+impl PublicKeys for SessionKeyStore<'_> {
+    async fn list_key_ids(&self, owner: &PublicKey) -> anyhow::Result<KeyIds> {
+        PublicKeyReader::new(self.client).list_key_ids(owner).await
+    }
+
+    async fn get_key(
+        &self,
+        owner: &PublicKey,
+        id: &DeviceId,
+    ) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
+        PublicKeyReader::new(self.client).get_key(owner, id).await
+    }
+}
+
 impl KeyStore for SessionKeyStore<'_> {
     async fn get_own_key(&self, id: &DeviceId) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
         get_own(self.session, &paths::key(id), MAX_RECORD_BYTES).await
@@ -254,11 +324,6 @@ impl KeyStore for SessionKeyStore<'_> {
             .put(paths::key(id), record)
             .await
             .map(drop)
-    }
-
-    async fn list_key_ids(&self, owner: &PublicKey) -> anyhow::Result<KeyIds> {
-        let listing = list_dir(self.client, owner, paths::KEYS_DIR, ListLimits::DEFAULT).await?;
-        Ok(KeyIds::from_listing(listing))
     }
 }
 

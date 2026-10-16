@@ -15,6 +15,10 @@
 //! config directory made, not the ones another machine made. P2c's second
 //! install of the same owner will therefore see the first install's key as
 //! unknown, and alarm on it, until the two lists are joined.
+//!
+//! [`unknown_key_ids`] is the comparison `login` and `keys list` make (and
+//! P2c's `pull` will), and [`unknown_key_alarm`] the alarm they raise for
+//! each id it finds.
 
 use std::collections::BTreeMap;
 
@@ -60,13 +64,8 @@ impl InstallList {
     }
 
     /// The ids `owner`'s installs created here, oldest first; empty when
-    /// there are none.
-    // `keys list` and `pull`, which compare `keys/` against it, are the
-    // first callers outside the tests.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "keys list, a later P2a step, is the first caller")
-    )]
+    /// there are none. `owner` is found by its key bytes (core's `Pubky`
+    /// orders and compares by them), never by how it is spelled.
     pub(crate) fn ids_of(&self, owner: &Pubky) -> &[DeviceId] {
         // `map_or` gives the empty slice for an owner with no entry, and
         // `Vec::as_slice` borrows the ids of one that has.
@@ -111,6 +110,46 @@ impl InstallList {
             .map_err(RecordError::from)
             .context("installs.json is not valid")
     }
+}
+
+/// The ids of `listed`, the entries of an owner's `keys/`, that are not in
+/// `created`, the ids this owner's installs created: the ones to alarm on.
+/// In the order they were listed, each once.
+///
+/// Ids compare as [`DeviceId`] values, exactly, so `Laptop` and `laptop` are
+/// two ids, as they are two files on the homeserver. Both lists are public
+/// ids, so a plain comparison is fine; nothing secret is matched here.
+///
+/// A plain function of two slices rather than a method on
+/// [`InstallList`], so a caller can add an id the file does not hold yet,
+/// such as `login.json`'s own device id.
+pub(crate) fn unknown_key_ids(created: &[DeviceId], listed: &[DeviceId]) -> Vec<DeviceId> {
+    let mut unknown: Vec<DeviceId> = Vec::new();
+    for id in listed {
+        // A linear search: an owner has a handful of installs, and a
+        // listing is capped at 1000 entries.
+        if !created.contains(id) && !unknown.contains(id) {
+            unknown.push(id.clone());
+        }
+    }
+    unknown
+}
+
+/// The alarm for `id`, a key under this owner's `keys/` that none of this
+/// owner's installs here created, with what to do about it (02, "Who can
+/// read a sweep"), as one line of a report, ending in its newline. Fixed
+/// text and the id, which a [`DeviceId`] keeps to `A-Z`, `a-z`, `0-9`, `-`
+/// and `_`, so it is safe to print as it is.
+pub(crate) fn unknown_key_alarm(id: &DeviceId) -> String {
+    format!(
+        "alarm: keys/{id}.json is a device key that this owner's installs here did not create. \
+         It may be a key an operator of the homeserver put there, or one written with a leaked \
+         grant, and whoever holds its secret can read the sweeps encrypted to it. If you did not \
+         publish it from another install, run `sweepky keys revoke {id}`; if a grant may have \
+         leaked, also revoke it in Pubky Ring and log in again. (This install knows only the \
+         installs that share its config directory, so a key you published from another machine \
+         shows up here too.)\n"
+    )
 }
 
 /// Reads `installs.json`, or an empty list when there is no such file.

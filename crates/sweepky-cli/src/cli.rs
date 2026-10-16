@@ -88,6 +88,39 @@ pub enum Command {
         #[arg(long, value_name = "CODE", value_parser = secret_arg)]
         signup_token: Option<SecretString>,
     },
+
+    /// This identity's published device keys, keys/DEVICE_ID.json, one per
+    /// install: list them, or revoke one.
+    Keys {
+        /// What to do with them.
+        //
+        // `#[command(subcommand)]` makes the field a nested command line:
+        // `sweepky keys list`, `sweepky keys revoke <DEVICE_ID>`.
+        #[command(subcommand)]
+        command: KeysCommand,
+    },
+}
+
+/// The `keys` commands.
+#[derive(Debug, Subcommand)]
+pub enum KeysCommand {
+    /// List the device keys published under this identity's keys/, and
+    /// raise an alarm for any that this owner's installs did not create.
+    /// Keys this build cannot encrypt to are flagged too. Reads public data
+    /// only.
+    List,
+
+    /// Revoke the device key keys/DEVICE_ID.json: set its revokedAt, so
+    /// sweeps are no longer encrypted to it. Any other field is kept.
+    Revoke {
+        /// The device id, as `sweepky keys list` shows it.
+        //
+        // A plain `String`, checked by `keys revoke` with core's
+        // `DeviceId`, for the same reason as `--homeserver` above: clap's
+        // own parse error would quote the value.
+        #[arg(value_name = "DEVICE_ID")]
+        device_id: String,
+    },
 }
 
 /// Wraps a secret argument the moment clap reads it.
