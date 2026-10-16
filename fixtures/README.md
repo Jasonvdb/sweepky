@@ -2,7 +2,7 @@
 
 Synthetic test data for the Rust tests in `crates/` and the TypeScript tests in `web/`. The table below lists every file here and the tests that load it. [P1b](../docs/plan/phases/P1b-core-crypto.md) adds the synthetic run directories.
 
-Nothing real lands here. Every pubky, id, finding and commit is made up for the test that uses it. The local demo's audit report is read from a path in an environment variable and is never committed ([P5](../docs/plan/phases/P5-local-demo.md#inputs-environment-never-committed)).
+Nothing real lands here. Every pubky, id, finding and commit is made up for the test that uses it. The one set not made up here is [`cctv-age/`](#cctv-age): public test vectors copied from C2SP, whose keys are published test keys. The local demo's audit report is read from a path in an environment variable and is never committed ([P5](../docs/plan/phases/P5-local-demo.md#inputs-environment-never-committed)).
 
 | File | What it is | Loaded by |
 |---|---|---|
@@ -11,6 +11,8 @@ Nothing real lands here. Every pubky, id, finding and commit is made up for the 
 | [`cloudflare/findings.json`](cloudflare/findings.json) | A `findings.json` in the shape Cloudflare's `security-audit` skill writes: a `confirmed`, a `needs_validation` and a `rejected` record, sorted by fingerprint | P1a's Cloudflare converter tests (Rust) |
 | [`target-repo.git/`](target-repo.git) | A tiny bare git repository (`HEAD`, `config`, four loose refs and one pack): a root commit with planted agent files, a normal commit with an annotated tag, a merge commit on `main`, and a PR head whose merge base is not the base tip | P1a's fixture check (Rust); P2b's fixture `TargetResolver` and the target tests of P2b and P3 |
 | [`make-target-repo.sh`](make-target-repo.sh) | The script that regenerates `target-repo.git/` | Run by hand ([Regenerating](#regenerating)) |
+| [`cctv-age/`](cctv-age) | The 147 age test vectors of C2SP's CCTV at commit `50a8ecf2a220f4c8bdc4f085789b8e85c26829e7`, byte for byte | P1b's CCTV test, [`cctv_age.rs`](../crates/sweepky-core/tests/cctv_age.rs) (Rust) |
+| [`fetch-cctv-age.sh`](fetch-cctv-age.sh) | The script that re-vendors `cctv-age/` from that commit | Run by hand ([Re-vendoring](#re-vendoring)) |
 
 ## `trust-labels.json`
 
@@ -149,3 +151,35 @@ The root commit holds `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`, `.claude/sett
 Run `fixtures/make-target-repo.sh`, from any directory, with git 2.45 or later. It builds the repository in a temporary directory, checks it (the file list, the config, the lines `cloudflare/findings.json` names, and `git fsck --strict`), and only then replaces `target-repo.git/` and prints the SHAs.
 
 The commit and tag SHAs come out the same on every run, because the script fixes every name, email, date, message and file. The pack's name and bytes depend on the git version that compressed it, so regenerate only after changing what the script writes. Then copy the printed SHAs into the tables above, stage the new `.pack` and `.idx` by name, remove the old pair with `git rm`, and run `cargo nextest run -p sweepky-cli`.
+
+## `cctv-age`
+
+The age test vectors from C2SP's [CCTV](https://github.com/C2SP/CCTV) (Community Cryptography Test Vectors): every file of `age/testdata` at commit `50a8ecf2a220f4c8bdc4f085789b8e85c26829e7`, the `main` commit of 25 September 2026, copied byte for byte. That is 147 files, about 160 KB. [`crates/sweepky-core/tests/cctv_age.rs`](../crates/sweepky-core/tests/cctv_age.rs) reads them at run time. It is the one sweepky-core test that reads files; the library itself reads none.
+
+- **Licence.** CCTV's `age/README.md` offers the vectors under the Zero-Clause BSD licence (0BSD), CC0 1.0 or the Unlicense, at the user's choice. None of the three asks for attribution or a copy of its text, so nothing else is vendored with them.
+- **Format.** Each file is a few `key: value` lines, an empty line, then an age file, zlib-compressed when the file says `compressed: zlib`. CCTV's `age/README.md` at the pinned commit defines the eight keys and the expected results. CCTV says to ignore a file with any other key; the test fails on one instead, so a re-vendored set cannot drop vectors quietly.
+- **Not secrets.** The `identity:` lines hold `AGE-SECRET-KEY-1…` and `AGE-SECRET-KEY-PQ-1…` strings. They are CCTV's published test keys and protect nothing, but a secret scanner (gitleaks, GitHub push protection) may still flag them. These files are the one place the repository commits an age secret key: Sweepky's own source and tests generate their keys at run time ([P1b](../docs/plan/phases/P1b-core-crypto.md#notes)).
+- **Byte for byte.** The repository's [`.gitattributes`](../.gitattributes) marks everything under `cctv-age/` as `binary`. Some vectors (`header_crlf`, `armor_crlf`) hold CRLF line endings on purpose and every age file is binary, so git must never convert their line endings.
+
+### What the test does with them
+
+Every vector lands in exactly one group, and the test asserts each group's exact size, so no vector is skipped without the test failing:
+
+| Group | How many | Which | What the test checks |
+|---|---|---|---|
+| Hybrid | 19 | an `AGE-SECRET-KEY-PQ-` identity: the 18 `hybrid*` files and `armor_hybrid` | Skipped: age 0.12.1 has no hybrid post-quantum identity |
+| Armored | 36 | `armored: yes`, not hybrid | `decrypt` refuses each at the header, with the vector's X25519 identity or, for `armor_empty` and `armor_scrypt`, a generated one: `InvalidHeader`, or `HeaderTooLarge` for `armor_garbage_encoded`, which inflates past the 8 KiB header cap. Sweep packages are binary and age's `armor` feature is not compiled in. CCTV allows ignoring these; checking the refusal is stricter |
+| Scrypt | 24 | a passphrase and no identity | age's own `age::scrypt::Identity` with a maximum work factor of 16, so `scrypt_work_factor_23` is a header failure |
+| X25519 | 68 | the rest | `decrypt`, with the identity read by `DeviceIdentity::from_secret` (a generated one for `empty`, which has none) |
+
+In the scrypt and X25519 groups each `expect` value allows exactly one result: `success` is `Ok` with the plaintext's SHA-256 equal to `payload`; `no match`, `header failure`, `HMAC failure` and `payload failure` are `NoMatchingKey`, `InvalidHeader`, `InvalidMac` and `InvalidPayload`. `HeaderTooLarge` fails the test, since no header-failure vector is longer than 1,674 bytes. Compressed vectors are inflated with a 32 MiB limit; the largest inflates to 16,847,065 bytes.
+
+Two vectors are lenient. `stanza_missing_body` and `stanza_missing_final_line` expect a header failure, but age 0.12.1 still accepts stanzas in that older form and decrypts them, the same exception age's own CCTV test makes. The test allowlists exactly those two and asserts that they still decrypt, so it fails if a later age starts refusing them.
+
+Last, every vector, hybrid ones included, goes through `decrypt` once more with a key it was not written to. Each must be refused at the header, and none may panic.
+
+### Re-vendoring
+
+Run `fixtures/fetch-cctv-age.sh` from any directory, with `curl` and `tar`. It downloads `https://codeload.github.com/C2SP/CCTV/tar.gz/<commit>` into a new temporary directory, extracts only `age/testdata`, checks that it holds exactly 147 plain files with plain names, and only then replaces `cctv-age/`. It runs nothing from the download, and no test runs it, so the tests stay offline. Run again at the same commit, it leaves `git status` clean.
+
+To move the pin, change `commit` and `expected_files` in the script and run it, then review `git status fixtures/cctv-age`. Update the commit here and in the test's module docs, and the group counts and the lenient-vector list in the test, until `cargo nextest run -p sweepky-core` passes.

@@ -90,6 +90,8 @@ Exact pins, re-checked against crates.io and npm for P0 on 2026-10-15; each is t
 | `age` | =0.12.1 | default features only; never `plugin`, never `ssh` |
 | `secrecy` | =0.10.3 | use the `age::secrecy` re-export so the two agree |
 | `zeroize` | =1.9.1 | |
+| `sha2` | =0.10.9 | dev-dependency of `sweepky-core` (P1b), hashing the C2SP CCTV vectors' plaintexts; the release `age` itself uses at run time, so it adds no code. Not the newest: 0.11.1 is, and is in the graph too, through `rust-embed-utils` |
+| `miniz_oxide` | =0.9.1 | dev-dependency of `sweepky-core` (P1b), inflating the CCTV vectors stored with zlib; brings in only `adler2` |
 | `qrcode` | =0.14.1 | `default-features = false, features = ["svg"]`, so the image stack stays out |
 | `fd-lock` | =4.0.4 | the writers' lock file |
 | `clap` | =4.6.7 | |

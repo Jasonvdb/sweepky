@@ -3,3 +3,7 @@
 # are text files, but git reads them exactly as written. `binary` is short for
 # `-diff -merge -text`.
 fixtures/target-repo.git/** binary
+# The C2SP CCTV age vectors are vendored byte for byte too. Some hold CRLF line
+# endings on purpose (`header_crlf`, `armor_crlf`) and the age file after each
+# vector's header is binary, so git must never convert their line endings.
+fixtures/cctv-age/** binary

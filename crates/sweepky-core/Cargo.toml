@@ -37,3 +37,14 @@ age = { workspace = true }
 # `Zeroizing<T>`, a wrapper that overwrites its value with zeros when it is
 # dropped, for buffers that held plaintext or key material.
 zeroize = { workspace = true }
+
+# Crates for this crate's own tests only. Cargo builds `[dev-dependencies]` for
+# `cargo test`, never for a crate that depends on this one, so none of them
+# reaches the CLI binary.
+[dev-dependencies]
+# SHA-256 of the C2SP CCTV vectors' plaintexts, checked against their
+# `payload` lines (tests/cctv_age.rs).
+sha2 = { workspace = true }
+# zlib inflate for the CCTV vectors stored compressed. The test calls its
+# `_with_limit` function, which stops at a size cap.
+miniz_oxide = { workspace = true }
