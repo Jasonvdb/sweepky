@@ -29,6 +29,9 @@
 //!   goes through: directories 0700 and files 0600, each mode set when it is
 //!   created, files written to a temp file then renamed, no links followed,
 //!   and loose or oversized files refused on read.
+//! - `lock`, the writers' lock: an exclusive `flock` on `credential.lock`,
+//!   waited for without blocking the async runtime, which every command that
+//!   opens a session holds around the session restore and its writes.
 //!
 //! The rules that hold for everything here (see "Rust conventions" in
 //! `docs/plan/03-cli-and-skill.md`):
@@ -76,6 +79,17 @@ mod cli;
 mod clock;
 mod dirs;
 mod init;
+// The writers' lock. Like `private_fs` below, nothing outside its tests calls
+// it yet, so the same `expect(dead_code)` applies until the first writing
+// command lands.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "keys, circle and logout, the next P2a steps, are the first callers"
+    )
+)]
+mod lock;
 mod network;
 // Nothing outside its tests calls it yet, so a build without tests would warn
 // that it is unused, which CI's `-D warnings` turns into an error. `expect`
@@ -90,6 +104,10 @@ mod network;
     )
 )]
 mod private_fs;
+// Fixtures the unit tests of several modules share. `cfg(test)` compiles it
+// only for `cargo test`, so it never reaches the binary.
+#[cfg(test)]
+mod test_support;
 
 pub use cli::{Cli, Command};
 pub use dirs::{Dirs, IdentityName};

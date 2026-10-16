@@ -9,6 +9,8 @@
 //!   could read, anything over a size cap, and links, into a buffer that
 //!   zeroes itself.
 //! - [`remove_private_file`] deletes one, a missing file counting as success.
+//! - [`open_private_lock_file`] opens the writers' lock file, creating it
+//!   empty and 0600, and never replaces or truncates it.
 //!
 //! The rules, and why:
 //!
@@ -227,7 +229,7 @@ pub(crate) fn read_private_file(
         return Ok(None);
     };
     check_private_file(path, &seen, cap)?;
-    let (mut file, opened) = open_seen_file(path, &seen)?;
+    let (mut file, opened) = open_seen_file(path, &seen, OpenOptions::new().read(true))?;
     // The checks again, on the open file: its mode or size may have changed
     // between the `lstat` and the open.
     let len = check_private_file(path, &opened, cap)?;
@@ -237,16 +239,7 @@ pub(crate) fn read_private_file(
 /// Refuses `path` unless `meta` is a regular file with no group or other
 /// permission bit and at most `cap` bytes. Returns its length.
 fn check_private_file(path: &Path, meta: &Metadata, cap: usize) -> anyhow::Result<usize> {
-    refuse_unless_regular(path, meta)?;
-    if let Some(mode) = loose_permissions(meta) {
-        bail!(
-            "{} is open to other users (mode {mode:03o}); Sweepky refuses it, as ssh refuses a \
-             loose key file. If the file is yours and nobody else has read it, run \
-             `chmod 600 {}` and try again",
-            path.display(),
-            path.display()
-        );
-    }
+    refuse_unless_private(path, meta)?;
     // `try_from` fails only for a length that does not fit in `usize`, which
     // is over any cap anyway, so it falls into the same refusal. `if len <=
     // cap` is a match guard: the arm matches only when it holds.
@@ -258,6 +251,22 @@ fn check_private_file(path: &Path, meta: &Metadata, cap: usize) -> anyhow::Resul
             meta.len()
         ),
     }
+}
+
+/// Refuses `path` unless `meta` is a regular file with no group or other
+/// permission bit, saying which `chmod` fixes a loose one.
+fn refuse_unless_private(path: &Path, meta: &Metadata) -> anyhow::Result<()> {
+    refuse_unless_regular(path, meta)?;
+    if let Some(mode) = loose_permissions(meta) {
+        bail!(
+            "{} is open to other users (mode {mode:03o}); Sweepky refuses it, as ssh refuses a \
+             loose key file. If the file is yours and nobody else has read it, run \
+             `chmod 600 {}` and try again",
+            path.display(),
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 /// Refuses `path` unless `meta`, its `lstat`, is a regular file.
@@ -279,14 +288,20 @@ fn refuse_unless_regular(path: &Path, meta: &Metadata) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Opens `path` to read and checks it is the very file `seen`, its `lstat`,
-/// describes. Returns the open file and its own metadata.
+/// Opens `path` with `options` and checks it is the very file `seen`, its
+/// `lstat`, describes. Returns the open file and its own metadata.
 ///
 /// `open` follows symlinks, and std has no portable "do not follow" flag, so
 /// the check is by device and inode: if the path was swapped for a link in
-/// between, the numbers differ and nothing is read.
-fn open_seen_file(path: &Path, seen: &Metadata) -> anyhow::Result<(File, Metadata)> {
-    let file = File::open(path).with_context(|| format!("could not open {}", path.display()))?;
+/// between, the numbers differ and the file is refused before it is used.
+fn open_seen_file(
+    path: &Path,
+    seen: &Metadata,
+    options: &OpenOptions,
+) -> anyhow::Result<(File, Metadata)> {
+    let file = options
+        .open(path)
+        .with_context(|| format!("could not open {}", path.display()))?;
     let opened = file
         .metadata()
         .with_context(|| format!("could not inspect {}", path.display()))?;
@@ -351,6 +366,71 @@ pub(crate) fn remove_private_file(path: &Path) -> anyhow::Result<()> {
     }
 }
 
+/// Opens the lock file at `path` to read and write, creating it empty and
+/// 0600 when nothing is there. For the writers' lock (`crate::lock`).
+///
+/// Unlike [`write_private_file`], this never replaces the file, and unlike a
+/// plain create it never truncates it. A `flock` belongs to the file itself
+/// (its inode), so two commands only exclude each other while both have the
+/// very same file open; a lock file swapped for a new one would let a second
+/// writer in.
+///
+/// The file rules are the others': a symlink, dangling or not, anything but a
+/// regular file, and a file with any group or other permission bit are
+/// refused, and an existing file is checked on its `lstat` before the open
+/// and again on the opened file, which must be the one inspected (same device
+/// and inode). The directory must already exist; make it with
+/// [`ensure_private_dir`].
+pub(crate) fn open_private_lock_file(path: &Path) -> anyhow::Result<File> {
+    if let Some(seen) = lstat(path)? {
+        return open_existing_lock_file(path, &seen);
+    }
+    // `create_new` (`O_CREAT | O_EXCL`) creates the file 0600 in the same
+    // call, and fails on anything already at the path, a symlink included,
+    // so it never follows one.
+    match lock_file_options()
+        .create_new(true)
+        .mode(FILE_MODE)
+        .open(path)
+    {
+        Ok(file) => Ok(file),
+        // Another command created it between the `lstat` above and this
+        // call: open the one it made, with the same checks.
+        Err(err) if err.kind() == ErrorKind::AlreadyExists => match lstat(path)? {
+            Some(seen) => open_existing_lock_file(path, &seen),
+            None => bail!(
+                "{} kept changing while Sweepky was opening it; try again",
+                path.display()
+            ),
+        },
+        Err(err) => Err(err).with_context(|| format!("could not create {}", path.display())),
+    }
+}
+
+/// Opens the existing lock file at `path`, whose `lstat` is `seen`, as it
+/// is: no create, no truncate.
+fn open_existing_lock_file(path: &Path, seen: &Metadata) -> anyhow::Result<File> {
+    refuse_unless_private(path, seen)?;
+    let (file, opened) = open_seen_file(path, seen, &lock_file_options())?;
+    // The checks again, on the open file: its mode may have changed between
+    // the `lstat` and the open.
+    refuse_unless_private(path, &opened)?;
+    Ok(file)
+}
+
+/// How the lock file is opened: read and write. `flock` itself needs
+/// neither, but `fcntl` locks, which some systems use in its place, need
+/// write access for an exclusive lock.
+///
+/// `OpenOptions` is a builder: each call sets one flag on it and returns it
+/// again (`&mut Self`), so `let mut` plus two calls, then the value, is how a
+/// function hands one back for the caller to add to.
+fn lock_file_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    options
+}
+
 /// What is at `path` itself, or `None` when nothing is.
 ///
 /// `symlink_metadata` is `lstat`: for a link it describes the link itself.
@@ -374,28 +454,19 @@ fn loose_permissions(meta: &Metadata) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::{self, File, Permissions};
+    use std::fs::{self, File};
     use std::io::Read;
-    use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+    use std::os::unix::fs::{MetadataExt, symlink};
     use std::os::unix::net::UnixListener;
     use std::path::Path;
 
     use sweepky_core::Zeroizing;
-    use tempfile::TempDir;
 
     use super::{
-        PERMISSION_BITS, create_private_temp, ensure_private_dir, read_private_file,
-        remove_private_file, replace_with, write_private_file,
+        create_private_temp, ensure_private_dir, read_private_file, remove_private_file,
+        replace_with, write_private_file,
     };
-
-    /// The permission bits of whatever is at `path`, not following a link.
-    fn mode(path: &Path) -> u32 {
-        fs::symlink_metadata(path).expect("exists").mode() & PERMISSION_BITS
-    }
-
-    fn chmod(path: &Path, mode: u32) {
-        fs::set_permissions(path, Permissions::from_mode(mode)).expect("chmod");
-    }
+    use crate::test_support::{chmod, mode, private_temp};
 
     /// The names directly inside `dir`, sorted.
     fn entries(dir: &Path) -> Vec<String> {
@@ -411,18 +482,6 @@ mod tests {
             .collect();
         names.sort();
         names
-    }
-
-    /// A fresh private directory to work in, created 0700 (`tempfile` passes
-    /// `permissions` to the `mkdir` itself; its default would follow the
-    /// umask, usually 0755).
-    fn private_temp() -> TempDir {
-        let temp = tempfile::Builder::new()
-            .permissions(Permissions::from_mode(0o700))
-            .tempdir()
-            .expect("temp dir");
-        assert_eq!(mode(temp.path()), 0o700);
-        temp
     }
 
     #[test]

@@ -38,6 +38,9 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 anyhow = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+# The writers' lock: an exclusive `flock` on `credential.lock`, made through
+# rustix, so this crate needs no `unsafe` and no `libc` of its own for it.
+fd-lock = { workspace = true }
 
 # Crates for this crate's own tests only; none of them reaches the binary.
 [dev-dependencies]
@@ -45,8 +48,9 @@ serde_json = { workspace = true }
 # end-to-end test. Its homeserver needs Postgres through
 # TEST_PUBKY_CONNECTION_STRING.
 pubky-testnet = { workspace = true }
-# `#[tokio::test]` needs these two, named here so the tests keep them even if
-# the library's own list changes.
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# `#[tokio::test]` needs `macros` and `rt-multi-thread`, named here so the
+# tests keep them even if the library's own list changes. `sync` adds the
+# oneshot channel and the barrier the writers' lock tests coordinate with.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
 # Temporary directories that delete themselves when the test ends.
 tempfile = { workspace = true }
