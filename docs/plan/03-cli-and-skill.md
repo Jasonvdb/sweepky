@@ -92,6 +92,7 @@ Exact pins, re-checked against crates.io and npm for P0 on 2026-10-15; each is t
 | `zeroize` | =1.9.1 | |
 | `sha2` | =0.10.9 | dev-dependency of `sweepky-core` (P1b), hashing the C2SP CCTV vectors' plaintexts; the release `age` itself uses at run time, so it adds no code. Not the newest: 0.11.1 is, and is in the graph too, through `rust-embed-utils` |
 | `miniz_oxide` | =0.9.1 | dev-dependency of `sweepky-core` (P1b), inflating the CCTV vectors stored with zlib; brings in only `adler2` |
+| `tempfile` | =3.27.0 | dev-dependency of `sweepky-cli` (P2a), temporary directories for its tests; the release `pubky-testnet` already brings into the graph, so it adds no code |
 | `qrcode` | =0.14.1 | `default-features = false, features = ["svg"]`, so the image stack stays out |
 | `fd-lock` | =4.0.4 | the writers' lock file |
 | `clap` | =4.6.7 | |
@@ -106,7 +107,7 @@ No `paykit` or `locks` crates in v1: they pin `pubky` 0.15 and 0.11 (a git rev) 
 ## Rust conventions (teaching notes, keep in code comments)
 
 - `sweepky-core` does no network or file I/O, so it is unit-testable and could compile to WASM later. The package envelope is built from an in-memory list of files; the directory walk and its safety rules live in the CLI.
-- Typed errors with `thiserror` in the library; `anyhow` only in the binary, which only needs a good message.
+- Typed errors with `thiserror` in `sweepky-core`; `anyhow` only in `sweepky-cli`, library and binary alike, which only needs a good message.
 - Secrets: `age::x25519::Identity` wipes itself on drop and has no `Debug`, so hold it directly; it does not implement `Zeroize`, so wrapping it in `SecretBox` would not compile. `SecretString` for the bech32 identity string, passphrases and the grant token (which the SDK hands back as a plain `String`, so move it in at once); `Zeroizing<Vec<u8>>` for file buffers.
 - Open enums (`kind`, `status`, `alg`) are newtype `String`s with `as_known() -> Option<Known>` helpers, never closed serde enums, so unknown values from newer clients are skipped rather than failing the whole feed.
 - Sealed content (findings, attachments, the unknown fields of a package or its manifest) never derives `Debug`. Its hand-written `Debug` prints structure and counts only, and destructures the value naming every field, with no `..` in the pattern, so a field added later does not compile until someone decides whether it may print. Types built from it, such as the finding groups and the merged report, print it through that `Debug`.

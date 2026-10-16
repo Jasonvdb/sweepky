@@ -1,0 +1,49 @@
+# Clippy settings for sweepky-cli only.
+#
+# Clippy looks for this file in the crate's own directory first, then in each
+# parent. It lives here rather than at the workspace root so that sweepky-core,
+# which has no `pubky` dependency, never sees paths it cannot resolve.
+#
+# `disallowed-methods` makes every call to a listed function or method a
+# clippy warning, which CI's `-D warnings` turns into an error. An `#[allow]`
+# can silence one call, so a reviewer should treat any
+# `#[allow(clippy::disallowed_methods)]` as a red flag.
+disallowed-methods = [
+    # The deprecated cookie sign-in. Sweepky signs in with grants only: a grant
+    # is scoped and revocable, while a cookie session is neither, and the
+    # deployed homeserver rate-limits the cookie endpoint (20 a minute).
+    { path = "pubky::PubkySigner::signin_cookie", reason = "deprecated cookie sign-in; use PubkySigner::signin" },
+    { path = "pubky::PubkySigner::signin_cookie_blocking", reason = "deprecated cookie sign-in; use PubkySigner::signin_blocking" },
+    { path = "pubky::PubkySigner::signup_cookie", reason = "deprecated cookie sign-up; use PubkySigner::signup, then signin" },
+    { path = "pubky::Pubky::start_cookie_auth_flow", reason = "deprecated cookie auth flow; use the grant flow (PubkyGrantAuthFlow::builder with the network's relay)" },
+    { path = "pubky::Pubky::resume_cookie_auth_flow", reason = "deprecated cookie auth flow; use the grant flow" },
+
+    # The other deprecated cookie-session paths, belt and braces: deprecation
+    # already fails the build under -D warnings, but an #[allow(deprecated)]
+    # would silence that and not this.
+    { path = "pubky::Pubky::session_from_file", reason = "cookie session file; Sweepky stores the grant secret itself and restores it with Pubky::restore_session" },
+    { path = "pubky::PubkySession::import", reason = "cookie session import; restore a grant secret with Pubky::restore_session" },
+    { path = "pubky::PubkySession::import_secret", reason = "cookie session import; restore a grant secret with Pubky::restore_session" },
+    { path = "pubky::PubkySession::from_secret_file", reason = "cookie session file; restore a grant secret with Pubky::restore_session" },
+    { path = "pubky::PubkySession::write_secret_file", reason = "cookie session file; Sweepky writes its own 0600 secret files" },
+
+    # The SDK's own secret-key file helpers. They bypass Sweepky's private file
+    # writer (mode 0600, temp file then rename) and its secret-material checks,
+    # so an identity's secret only ever goes through Sweepky's code.
+    { path = "pubky::Keypair::write_secret_key_file", reason = "bypasses Sweepky's 0600 temp-file-then-rename writer for secrets" },
+    { path = "pubky::Keypair::from_secret_key_file", reason = "bypasses Sweepky's checked reader for secret files" },
+    # The same two helpers on pkarr's own `Keypair`, which `pubky::Keypair`
+    # derefs to: `(*keypair).write_secret_key_file(..)` or
+    # `keypair.as_inner().write_secret_key_file(..)` would reach them without
+    # naming `pubky::Keypair`.
+    { path = "pubky::pkarr::Keypair::write_secret_key_file", reason = "bypasses Sweepky's 0600 temp-file-then-rename writer for secrets" },
+    { path = "pubky::pkarr::Keypair::from_secret_key_file", reason = "bypasses Sweepky's checked reader for secret files" },
+
+    # Pubky recovery files. 03 refuses importing an existing identity's secret
+    # or recovery file, and 02 keeps a dedicated identity's secret in a Sweepky
+    # file, never in the recovery-file format, so `login` can refuse every
+    # recovery file without ambiguity.
+    { path = "pubky::Pubky::signer_from_recovery_file", reason = "importing an identity's recovery file is refused (03, Two ways to log in)" },
+    { path = "pubky::recovery_file::decrypt_recovery_file", reason = "importing an identity's recovery file is refused (03, Two ways to log in)" },
+    { path = "pubky::recovery_file::create_recovery_file", reason = "a dedicated identity's secret lives in a Sweepky file, never a recovery file (02, Device keys)" },
+]
