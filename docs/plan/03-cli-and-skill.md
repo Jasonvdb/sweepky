@@ -107,6 +107,6 @@ No `paykit` or `locks` crates in v1: they pin `pubky` 0.15 and 0.11 (a git rev) 
 - Typed errors with `thiserror` in the library; `anyhow` only in the binary, which only needs a good message.
 - Secrets: `age::x25519::Identity` wipes itself on drop and has no `Debug`, so hold it directly; it does not implement `Zeroize`, so wrapping it in `SecretBox` would not compile. `SecretString` for the bech32 identity string, passphrases and the grant token (which the SDK hands back as a plain `String`, so move it in at once); `Zeroizing<Vec<u8>>` for file buffers.
 - Open enums (`kind`, `status`, `alg`) are newtype `String`s with `as_known() -> Option<Known>` helpers, never closed serde enums, so unknown values from newer clients are skipped rather than failing the whole feed.
-- Unknown top-level fields are preserved with `#[serde(flatten)] extra: Map` so rewrites do not drop them. `done` is a rewrite, so this is tested from the start.
+- Unknown top-level fields are preserved with `#[serde(flatten)] extra: Map` so rewrites do not drop them. The findings types name that map `unknown`, because a finding has a real `extra` field. `done` is a rewrite, so this is tested from the start.
 - Pin `age` exactly: it is pre-1.0 and its docs call releases "beta". Leaving out `plugin` removes the code path behind its one security advisory (already patched in 0.12.1, so this is defence in depth).
 - Pubkys are a newtype that parses both `pubky<z32>` and raw z32 and compares by bytes ([01](01-records-and-discovery.md#compatibility-rules-every-client-follows)).

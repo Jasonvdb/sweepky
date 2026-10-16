@@ -51,6 +51,14 @@
 //!   [`RepoTarget`]; and [`TargetScope`], what a sweep of each covers, as
 //!   `scope.json` hands it to the skill, built from those checked values
 //!   alone.
+//! - The common findings format every playbook's output ends up in:
+//!   [`Findings`], its [`Finding`]s and their [`Location`]s, with the
+//!   open-string [`FindingStatus`], [`Severity`], [`Confidence`] and
+//!   [`LocationKind`]. `severity` and `confidence` are `null` unless the
+//!   playbook established them. Findings are sealed content: they exist only
+//!   inside the encrypted package and the owner's decrypted copies, never in
+//!   a public record, and [`Findings::from_json`] reads them with the larger
+//!   [`MAX_FINDINGS_BYTES`] cap.
 //!
 //! The rules that hold for everything here (see "Rust conventions" in
 //! `docs/plan/03-cli-and-skill.md`):
@@ -105,6 +113,7 @@
 )]
 
 mod error;
+mod findings;
 mod ids;
 mod names;
 mod open_enum;
@@ -122,6 +131,10 @@ mod url;
 mod validated_string;
 
 pub use error::{JsonCategory, RecordError};
+pub use findings::{
+    Confidence, Finding, FindingStatus, Findings, KnownConfidence, KnownFindingStatus,
+    KnownLocationKind, KnownSeverity, Location, LocationKind, Severity,
+};
 pub use ids::{EventCursor, RecordId};
 pub use names::{DeviceId, GitSha, Playbook, RepoName, RepoPath, Sha256Hex, TargetId};
 pub use pubky::Pubky;
