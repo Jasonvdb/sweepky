@@ -1,9 +1,10 @@
 //! Helpers that the unit tests of several modules share: a private temp
 //! directory, the [`Dirs`] under it and the file-mode checks around it, a
 //! [`FileSnapshot`] that tells whether a file was written at all, a random
-//! public key, a [`FakeKeyStore`] in place of a homeserver's `keys/`, and a
-//! compile-time check that a secret type implements none of the traits that
-//! would print or copy it.
+//! public key, a [`FakeKeyStore`] in place of a homeserver's `keys/`, the
+//! passphrase the tests wrap secret files with and a byte search to check a
+//! wrapped file shows none of its secret, and a compile-time check that a
+//! secret type implements none of the traits that would print or copy it.
 //!
 //! Compiled only for `cargo test` (`#[cfg(test)]` on its `mod` line in
 //! `lib.rs`), so nothing here reaches the binary, and like any test code it
@@ -47,6 +48,20 @@ pub(crate) fn dirs_in(home: &TempDir) -> Dirs {
 /// `Pubky` (the same 32 bytes).
 pub(crate) fn random_pubky() -> Pubky {
     Pubky::from_bytes(Keypair::random().public_key().to_bytes())
+}
+
+/// The passphrase the tests wrap secret files with, through
+/// `Passphrase::for_tests`. Synthetic, like every secret in this crate's
+/// tests.
+pub(crate) const TEST_PASSPHRASE: &str = "synthetic correct horse battery";
+
+/// Whether `needle` appears anywhere in `haystack`: how a test checks that a
+/// wrapped file holds none of its secret in the clear. `windows` takes the
+/// window length from `needle`, so no length is counted by hand.
+pub(crate) fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 /// What the [`FakeKeyStore`] answers a write it refuses with: the server's

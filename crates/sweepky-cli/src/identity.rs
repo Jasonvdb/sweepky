@@ -12,7 +12,10 @@
 //!   <64 lower-case hex digits>
 //!   ```
 //!
-//!   each line ending in `\n`, and nothing before, between or after.
+//!   each line ending in `\n`, and nothing before, between or after. With
+//!   `login --passphrase-file`, the file holds those bytes wrapped with the
+//!   passphrase instead (binary age, one scrypt stanza), and
+//!   [`IdentitySecret::from_stored`] unwraps it before reading.
 //! - [`IdentityMeta`], the identity's public details in
 //!   `identities/<name>.json`: its name, pubky, homeserver and whether it
 //!   has signed up. It is a cache `login` can rebuild; `<name>.key` alone is
@@ -32,7 +35,7 @@
 
 use std::fmt;
 use std::fs::{self, File};
-use std::io::{self, ErrorKind, Read};
+use std::io::{self, ErrorKind};
 // `MetadataExt` adds `.dev()` and `.ino()`, the device and inode numbers, to
 // `Metadata`. A trait's methods can only be called while it is in scope.
 use std::os::unix::fs::MetadataExt;
@@ -43,6 +46,9 @@ use anyhow::{Context as _, anyhow, bail};
 use pubky::Keypair;
 use serde::{Deserialize, Serialize};
 use sweepky_core::{Pubky, RecordError, SchemaVersion, UnknownFields, Zeroizing};
+
+use crate::passphrase::{Passphrase, open_secret_file};
+use crate::private_fs::read_up_to_cap;
 
 /// The most Sweepky reads of a file that should hold an identity: the file
 /// an `--identity` argument names, and (for `login`) an identity file read
@@ -241,7 +247,7 @@ pub(crate) fn read_argument_file(path: &Path) -> io::Result<Option<Zeroizing<Vec
             "the file changed while Sweepky was opening it; try again",
         ));
     }
-    read_up_to_cap(&mut file).map(Some)
+    read_up_to_cap(&mut file, MAX_IDENTITY_FILE_BYTES).map(Some)
 }
 
 /// Whether `err`, from a `stat`, means no file can be at that path.
@@ -253,33 +259,6 @@ fn names_no_file(err: &io::Error) -> bool {
             | ErrorKind::InvalidFilename
             | ErrorKind::InvalidInput
     )
-}
-
-/// Reads `file` up to [`MAX_IDENTITY_FILE_BYTES`] or its end, whichever
-/// comes first.
-fn read_up_to_cap(file: &mut File) -> io::Result<Zeroizing<Vec<u8>>> {
-    // A zeroed buffer of exactly the cap, filled in place and never grown,
-    // so the bytes are never copied into a bigger allocation and left
-    // behind, unwiped, in the old one. `Zeroizing` wipes all of it, spare
-    // capacity included, when the caller drops it.
-    let mut bytes = Zeroizing::new(vec![0_u8; MAX_IDENTITY_FILE_BYTES]);
-    let mut filled = 0;
-    // `get_mut(filled..)` is the unfilled rest, or `None` past the end, so
-    // this cannot index out of bounds; the loop ends at the cap or at the
-    // end of the file. `rest` borrows `bytes` only inside each pass.
-    while let Some(rest) = bytes.get_mut(filled..).filter(|rest| !rest.is_empty()) {
-        match file.read(rest) {
-            Ok(0) => break,
-            // `read` fills at most `rest.len()` bytes, so `filled` never
-            // passes the cap.
-            Ok(count) => filled += count,
-            // A signal arrived before any byte did: try again.
-            Err(err) if err.kind() == ErrorKind::Interrupted => {}
-            Err(err) => return Err(err),
-        }
-    }
-    bytes.truncate(filled);
-    Ok(bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -606,6 +585,24 @@ impl IdentitySecret {
         }
         Ok(Self { secret })
     }
+
+    /// Reads an identity file as it is stored at `path`, from `stored`, the
+    /// bytes read from it: unwrapped first with `passphrase` when it is
+    /// wrapped ([`open_secret_file`], the path every secret file is read
+    /// through), then read with [`IdentitySecret::from_file_bytes`].
+    ///
+    /// So the format checks and the classifier run on what the wrap holds:
+    /// a recovery file or raw key someone wrapped is refused by name all the
+    /// same. A wrapped file without a passphrase is a `NeedsPassphrase`
+    /// error that says how to give one.
+    pub(crate) fn from_stored(
+        path: &Path,
+        stored: Zeroizing<Vec<u8>>,
+        passphrase: Option<&Passphrase>,
+    ) -> anyhow::Result<Self> {
+        let plain = open_secret_file(path, stored, passphrase)?;
+        Self::from_file_bytes(&plain)
+    }
 }
 
 /// The first line of `bytes`, without its `\n` or a `\r` before that.
@@ -802,7 +799,11 @@ mod tests {
         refuse_secret_material,
     };
     use crate::network::TESTNET_HOMESERVER;
-    use crate::test_support::private_temp;
+    use crate::passphrase::{NeedsPassphrase, Passphrase};
+    use crate::state::{StoredIdentity, create_identity, read_identity};
+    use crate::test_support::{
+        TEST_PASSPHRASE, contains_bytes, dirs_in, mode, private_temp, random_pubky,
+    };
 
     /// A recovery file for a fresh random keypair, made by the SDK at run
     /// time, so no recovery file or secret is ever committed.
@@ -1305,6 +1306,98 @@ mod tests {
         // A wrong marker before a key is refused as the raw key it holds.
         let err = file_error(format!("Sweepky-Identity/v1\n{digits}\n").as_bytes());
         assert_eq!(refusal_of(&err), Some(Refusal::RawKey));
+    }
+
+    #[test]
+    fn wrapped_identity_file_round_trips_with_the_passphrase() {
+        let temp = private_temp();
+        let dirs = dirs_in(&temp);
+        let name: IdentityName = "throwaway".parse().expect("valid");
+        let secret = IdentitySecret::generate();
+        let meta = IdentityMeta::new(name.clone(), secret.pubky(), random_pubky(), true);
+        let passphrase = Passphrase::for_tests(TEST_PASSPHRASE);
+        create_identity(&dirs, &secret, &meta, Some(&passphrase)).expect("creates");
+
+        // On disk: a 0600 binary age file wrapped with the passphrase, with
+        // neither the format's marker nor the secret's hex in the clear.
+        let path = dirs.identity_key_file(&name);
+        assert_eq!(mode(&path), 0o600);
+        let raw = fs::read(&path).expect("read");
+        assert!(raw.starts_with(b"age-encryption.org/v1\n-> scrypt "));
+        let plain = secret.to_file_bytes();
+        let hex_line = &plain[b"sweepky-identity/v1\n".len()..plain.len() - 1];
+        for inner in [&b"sweepky-identity"[..], hex_line] {
+            assert!(!contains_bytes(&raw, inner));
+        }
+
+        // Read back with the passphrase: the same identity, its details
+        // still matching.
+        match read_identity(&dirs, &name, Some(&passphrase)).expect("reads") {
+            StoredIdentity::Complete {
+                secret: read,
+                meta: read_meta,
+            } => {
+                assert_eq!(read.pubky(), secret.pubky());
+                assert_eq!(read_meta, meta);
+            }
+            _ => panic!("expected both files"),
+        }
+        // `from_stored`, which `read_identity` calls, on the bytes alone.
+        let read =
+            IdentitySecret::from_stored(&path, Zeroizing::new(raw.clone()), Some(&passphrase))
+                .expect("unwraps");
+        assert_eq!(read.pubky(), secret.pubky());
+
+        // The wrong passphrase is refused, quoting neither.
+        let wrong = Passphrase::for_tests("synthetic wrong guess");
+        let err = IdentitySecret::from_stored(&path, Zeroizing::new(raw), Some(&wrong))
+            .err()
+            .expect("refused");
+        let shown = format!("{err:#}");
+        assert!(shown.contains("does not open"), "{shown}");
+        assert!(!shown.contains("synthetic"), "{shown}");
+
+        // The classifier still runs on what the wrap holds: a recovery file
+        // someone wrapped is refused by name, never imported.
+        let wrapped_recovery = passphrase.wrap(&synthetic_recovery_file()).expect("wraps");
+        let err =
+            IdentitySecret::from_stored(&path, Zeroizing::new(wrapped_recovery), Some(&passphrase))
+                .err()
+                .expect("refused");
+        assert_eq!(refusal_of(&err), Some(Refusal::RecoveryFile), "{err:#}");
+
+        // A plain file still reads with a passphrase given: each file says
+        // by its first bytes whether it is wrapped.
+        let plain = IdentitySecret::from_stored(&path, secret.to_file_bytes(), Some(&passphrase))
+            .expect("plain");
+        assert_eq!(plain.pubky(), secret.pubky());
+    }
+
+    #[test]
+    fn wrapped_file_without_a_passphrase_says_how_to_supply_one() {
+        let temp = private_temp();
+        let dirs = dirs_in(&temp);
+        let name: IdentityName = "throwaway".parse().expect("valid");
+        let secret = IdentitySecret::generate();
+        let meta = IdentityMeta::new(name.clone(), secret.pubky(), random_pubky(), true);
+        let passphrase = Passphrase::for_tests(TEST_PASSPHRASE);
+        create_identity(&dirs, &secret, &meta, Some(&passphrase)).expect("creates");
+
+        let err = read_identity(&dirs, &name, None)
+            .err()
+            .expect("needs the passphrase");
+        assert!(err.is::<NeedsPassphrase>(), "{err:#}");
+        // Not a refusal of someone else's secret: the file is ours.
+        assert_eq!(refusal_of(&err), None);
+        let shown = format!("{err:#}");
+        for part in [
+            dirs.identity_key_file(&name).display().to_string(),
+            "wrapped with a passphrase".to_owned(),
+            "--passphrase-file <file>".to_owned(),
+            "<(pass show sweepky)".to_owned(),
+        ] {
+            assert!(shown.contains(&part), "{part:?} missing from: {shown}");
+        }
     }
 
     #[test]

@@ -25,33 +25,38 @@
 //!
 //! **The key file holds the secret and nothing else**: age's 74-byte
 //! `AGE-SECRET-KEY-1…` string, no newline, 0600, written to a temp file and
-//! renamed into place ([`crate::private_fs`]). [`DeviceIdentity`] has no
+//! renamed into place ([`crate::private_fs`]). With `login
+//! --passphrase-file` it holds that string wrapped with the passphrase
+//! instead (binary age, one scrypt stanza), and is unwrapped on read
+//! ([`crate::passphrase::open_secret_file`]). [`DeviceIdentity`] has no
 //! `Debug`, `Display` or `Serialize`, so it cannot be printed or logged; its
-//! text exists only inside a [`SecretString`], which wipes itself, on its way
-//! to and from that file.
+//! text exists only inside a [`SecretString`], which wipes itself, and the
+//! file's buffers, which wipe themselves, on its way to and from that file.
 
 use anyhow::{Context as _, bail};
 use pubky::{PubkySession, PublicKey};
 use sweepky_core::paths::{self, SweepkyPath};
 use sweepky_core::{
     AgeRecipient, DeviceId, DeviceIdentity, DeviceKey, ExposeSecret, KnownKeyAlg, MAX_RECORD_BYTES,
-    RecordId, RecordTime, SchemaVersion, SecretString, Timestamp, UnknownFields, Zeroizing,
+    MAX_WRAPPED_BYTES, RecordId, RecordTime, SchemaVersion, SecretString, Timestamp, UnknownFields,
+    Zeroizing,
 };
 
 use crate::Dirs;
 use crate::clock;
-use crate::private_fs::{
-    ensure_private_dir, lstat, read_private_file, remove_private_file, write_private_file,
-};
+use crate::passphrase::{Passphrase, open_secret_file, write_secret_file};
+use crate::private_fs::{ensure_private_dir, lstat, read_private_file, remove_private_file};
 use crate::remote::{ListLimits, Listing, get_own, get_public, list_dir};
 
 /// The `label` of every key this CLI publishes. Fixed, because `keys/` is
 /// public and a host name there would leak (see the module docs).
 const DEVICE_KEY_LABEL: &str = "sweepky-cli";
 
-/// The most Sweepky reads of `device.key`: 4 KiB. The plain key is 74 bytes;
-/// the rest is room for the passphrase-wrapped form a later step adds.
-const MAX_DEVICE_KEY_FILE_BYTES: usize = 4096;
+/// The most Sweepky reads of `device.key`: 4 KiB, sweepky-core's
+/// `MAX_WRAPPED_BYTES`, the most it unwraps, so the two caps cannot drift
+/// apart. The plain key is 74 bytes and its passphrase-wrapped form 256; the
+/// rest is room.
+const MAX_DEVICE_KEY_FILE_BYTES: usize = MAX_WRAPPED_BYTES;
 
 /// What `device.key` holds when it is not an age identity. Fixed text: the
 /// file is a secret, so no message quotes any of it.
@@ -106,14 +111,19 @@ pub(crate) fn device_key_bytes(record: &DeviceKey) -> anyhow::Result<Vec<u8>> {
 }
 
 /// Writes `identity` to `device.key` (0600, in the 0700 config directory),
-/// unless something is already there.
+/// unless something is already there; wrapped with `passphrase` when there
+/// is one.
 ///
 /// It never replaces a key: an existing `device.key` may be the only key
 /// that opens the sweeps encrypted to it, so it is refused and left alone.
 /// The check and the write are two steps, which is safe because every
 /// caller holds the writers' lock, so no other `sweepky` command writes the
 /// config directory meanwhile.
-pub(crate) fn create_device_key(dirs: &Dirs, identity: &DeviceIdentity) -> anyhow::Result<()> {
+pub(crate) fn create_device_key(
+    dirs: &Dirs,
+    identity: &DeviceIdentity,
+    passphrase: Option<&Passphrase>,
+) -> anyhow::Result<()> {
     let path = dirs.device_key_file();
     // `lstat` does not follow a link, so a link at the path, even one
     // pointing nowhere, counts as something there.
@@ -128,19 +138,27 @@ pub(crate) fn create_device_key(dirs: &Dirs, identity: &DeviceIdentity) -> anyho
     ensure_private_dir(dirs.config())?;
     // `to_secret_string` hands out the identity's text in a `SecretString`,
     // which is wiped when it is dropped at the end of this function;
-    // `expose_secret` lends it out for the one write, without a copy.
+    // `expose_secret` lends it out for the one write (or the wrap), without
+    // a copy.
     let secret = identity.to_secret_string();
-    write_private_file(&path, secret.expose_secret().as_bytes())
+    write_secret_file(&path, secret.expose_secret().as_bytes(), passphrase)
 }
 
 /// Reads this install's identity back from `device.key`, or `None` when
 /// there is no such file. `login` reads it when it reuses this install's
-/// key; `pull` will, to open sweeps.
-pub(crate) fn read_device_key(dirs: &Dirs) -> anyhow::Result<Option<DeviceIdentity>> {
+/// key; `pull` will, to open sweeps. A wrapped file is unwrapped with
+/// `passphrase`, and without one is an error that says how to give it.
+pub(crate) fn read_device_key(
+    dirs: &Dirs,
+    passphrase: Option<&Passphrase>,
+) -> anyhow::Result<Option<DeviceIdentity>> {
     let path = dirs.device_key_file();
-    let Some(bytes) = read_private_file(&path, MAX_DEVICE_KEY_FILE_BYTES)? else {
+    let Some(stored) = read_private_file(&path, MAX_DEVICE_KEY_FILE_BYTES)? else {
         return Ok(None);
     };
+    // The one unwrap path every secret file goes through. Its own errors
+    // name the file.
+    let bytes = open_secret_file(&path, stored, passphrase)?;
     // `from_utf8` borrows the bytes as a `&str`, copying nothing. Its error
     // is dropped for fixed text.
     let Ok(text) = std::str::from_utf8(&bytes) else {
@@ -332,13 +350,17 @@ mod tests {
     use std::fs;
 
     use serde_json::{Value, json};
-    use sweepky_core::{DeviceId, DeviceIdentity, DeviceKey, RecordId, SecretString, Timestamp};
+    use sweepky_core::{
+        DeviceId, DeviceIdentity, DeviceKey, RecordId, SecretString, Timestamp,
+        unwrap_with_passphrase,
+    };
 
     use super::{
         create_device_key, device_key_bytes, device_key_record, new_device_id, read_device_key,
     };
     use crate::clock;
-    use crate::test_support::{dirs_in, mode, private_temp};
+    use crate::passphrase::{NeedsPassphrase, Passphrase};
+    use crate::test_support::{TEST_PASSPHRASE, contains_bytes, dirs_in, mode, private_temp};
 
     #[test]
     fn device_id_is_a_valid_device_id() {
@@ -400,7 +422,7 @@ mod tests {
         let temp = private_temp();
         let dirs = dirs_in(&temp);
         let identity = DeviceIdentity::generate();
-        create_device_key(&dirs, &identity).expect("written");
+        create_device_key(&dirs, &identity, None).expect("written");
 
         let path = dirs.device_key_file();
         assert_eq!(mode(&path), 0o600);
@@ -413,15 +435,54 @@ mod tests {
         let read = DeviceIdentity::from_secret(&secret).expect("an identity");
         assert_eq!(read.recipient(), identity.recipient());
         // `read_device_key` reads it back the same way.
-        let read = read_device_key(&dirs).expect("reads").expect("present");
+        let read = read_device_key(&dirs, None)
+            .expect("reads")
+            .expect("present");
         assert_eq!(read.recipient(), identity.recipient());
 
         // A second key is never written over the first, which may be the
         // only key that opens the sweeps encrypted to it.
         let other = DeviceIdentity::generate();
-        let err = create_device_key(&dirs, &other).expect_err("refused");
+        let err = create_device_key(&dirs, &other, None).expect_err("refused");
         assert!(format!("{err:#}").contains("never replaces"), "{err:#}");
-        let kept = read_device_key(&dirs).expect("reads").expect("present");
+        let kept = read_device_key(&dirs, None)
+            .expect("reads")
+            .expect("present");
         assert_eq!(kept.recipient(), identity.recipient());
+    }
+
+    #[test]
+    fn wrapped_device_key_reads_back_through_from_secret() {
+        let temp = private_temp();
+        let dirs = dirs_in(&temp);
+        let identity = DeviceIdentity::generate();
+        // `for_tests` wraps at work factor 10, so the test stays fast;
+        // `--passphrase-file` always writes at 18.
+        let passphrase = Passphrase::for_tests(TEST_PASSPHRASE);
+        create_device_key(&dirs, &identity, Some(&passphrase)).expect("written");
+
+        // On disk: 0600, binary age wrapped with the passphrase, with no
+        // `AGE-SECRET-KEY-` string in the clear.
+        let path = dirs.device_key_file();
+        assert_eq!(mode(&path), 0o600);
+        let raw = fs::read(&path).expect("readable");
+        assert!(raw.starts_with(b"age-encryption.org/v1\n-> scrypt "));
+        assert!(!contains_bytes(&raw, b"AGE-SECRET-KEY-"));
+        // Unwrapped, it is exactly the 74-byte identity string, which
+        // `DeviceIdentity::from_secret` reads as this identity.
+        let plain = unwrap_with_passphrase(&raw, passphrase.secret()).expect("unwraps");
+        assert_eq!(plain.len(), 74);
+        let text = std::str::from_utf8(&plain).expect("UTF-8");
+        let read = DeviceIdentity::from_secret(&SecretString::from(text)).expect("an identity");
+        assert_eq!(read.recipient(), identity.recipient());
+        // `read_device_key` does the same with the passphrase...
+        let read = read_device_key(&dirs, Some(&passphrase))
+            .expect("reads")
+            .expect("present");
+        assert_eq!(read.recipient(), identity.recipient());
+        // ...and says how to give it without.
+        let err = read_device_key(&dirs, None).err().expect("refused");
+        assert!(err.is::<NeedsPassphrase>(), "{err:#}");
+        assert!(format!("{err:#}").contains("--passphrase-file"), "{err:#}");
     }
 }

@@ -45,12 +45,21 @@
 //!    check `keys list` makes (`keys::unknown_key_alarms`). A listing that
 //!    fails is a warning in the report; login has done its work by then.
 //!
+//! **The passphrase.** With `--passphrase-file`, the two secret files login
+//! creates, the identity's key file (step 3) and `device.key` (step 6), are
+//! written wrapped with that passphrase, and every secret file it reads is
+//! unwrapped with it ([`crate::passphrase::open_secret_file`]). A wrapped file
+//! read without the flag stops login before anything is written, with how
+//! to give it. Files that already exist are never rewritten, so the flag
+//! never wraps or unwraps a file that is there.
+//!
 //! **The signup token is never printed.** The SDK puts it in the signup
 //! request's URL (`?signup_token=…`), and a transport error's `Display`
 //! includes that URL, so a failed signup is reported as fixed text and the
 //! HTTP status only ([`signup_error`]), never through the SDK's own message.
 
 use std::fmt;
+use std::path::PathBuf;
 
 use anyhow::{Context as _, anyhow, bail};
 use pubky::{PubkySigner, PublicKey, StatusCode};
@@ -67,6 +76,7 @@ use crate::identity::{IdentityMeta, IdentityName, IdentitySecret, read_argument_
 use crate::installs::{forget_install, read_installs, record_install, unknown_key_alarm};
 use crate::keys::unknown_key_alarms;
 use crate::network::{NetworkKind, client_id};
+use crate::passphrase::{NeedsPassphrase, Passphrase};
 use crate::remote::{pubky_of, public_key_of, request_error, status_of, write_error};
 use crate::session::{sign_out, with_writers_lock};
 use crate::state::{
@@ -400,13 +410,14 @@ struct TailOutcome {
 /// reads as unknown.
 async fn record_login_and_check_keys(
     dirs: &Dirs,
+    passphrase: Option<&Passphrase>,
     keys: &impl KeyStore,
     state: LoginState,
 ) -> anyhow::Result<TailOutcome> {
     // `Pubky` is `Copy` (32 bytes), so this keeps a copy while `state`
     // moves into `record_login`.
     let owner = state.pubky;
-    let device = record_login(dirs, keys, state).await?;
+    let device = record_login(dirs, passphrase, keys, state).await?;
     let key_check = check_key_ids(dirs, keys, owner).await;
     Ok(TailOutcome { device, key_check })
 }
@@ -450,11 +461,13 @@ async fn check_key_ids(dirs: &Dirs, keys: &impl PublicKeys, owner: Pubky) -> Str
 ///   age key per install (00), so a second login never makes another.
 ///
 /// `keys` is where `keys/<deviceId>.json` is read and written: the
-/// signed-in session in `login`, a fake in the tests. On any failure of the
-/// tail `login.json` is left as it was, so it never names a device key that
-/// is not published.
+/// signed-in session in `login`, a fake in the tests. `passphrase`, from
+/// `--passphrase-file`, wraps a new `device.key` and unwraps an existing
+/// one. On any failure of the tail `login.json` is left as it was, so it
+/// never names a device key that is not published.
 async fn record_login(
     dirs: &Dirs,
+    passphrase: Option<&Passphrase>,
     keys: &impl KeyStore,
     mut state: LoginState,
 ) -> anyhow::Result<DeviceKeyOutcome> {
@@ -462,11 +475,11 @@ async fn record_login(
     // rather than moving it out, so `state` is still whole for the write
     // below; both borrows are shared, which Rust allows at once.
     if let Some(id) = &state.device_id {
-        let outcome = reuse_device_key(dirs, keys, state.pubky, id).await?;
+        let outcome = reuse_device_key(dirs, passphrase, keys, state.pubky, id).await?;
         write_login_state(dirs, &state)?;
         return Ok(outcome);
     }
-    let id = publish_device_key(dirs, keys, state.pubky).await?;
+    let id = publish_device_key(dirs, passphrase, keys, state.pubky).await?;
     state.device_id = Some(id.clone());
     // The key is published by now and its secret is on disk, so a failure
     // here undoes nothing: removing the secret of a published key would make
@@ -486,8 +499,8 @@ async fn record_login(
 /// is not saved, and never leaves the key unknown to this owner's list.
 ///
 /// 1. a new age identity, from the operating system's random numbers;
-/// 2. its secret in `device.key`, refused (with nothing changed) when a key
-///    file is there already;
+/// 2. its secret in `device.key`, wrapped with `passphrase` when there is
+///    one, refused (with nothing changed) when a key file is there already;
 /// 3. its id in `installs.json` under `owner`;
 /// 4. the record, `keys/<id>.json`, written through `keys`: the capability
 ///    probe. A 403 or a 507 becomes its own message, never the server's.
@@ -497,6 +510,7 @@ async fn record_login(
 /// refused in step 2, before there is anything to undo.
 async fn publish_device_key(
     dirs: &Dirs,
+    passphrase: Option<&Passphrase>,
     keys: &impl KeyStore,
     owner: Pubky,
 ) -> anyhow::Result<DeviceId> {
@@ -506,7 +520,7 @@ async fn publish_device_key(
     let record = device_key_bytes(&device_key_record(&identity.recipient(), created_at))?;
     // The secret is saved before anything is published, so a crash can
     // never leave a published key that nothing on this machine can open.
-    create_device_key(dirs, &identity)?;
+    create_device_key(dirs, &identity, passphrase)?;
     // The id is recorded before the write too, so this owner's own key never
     // shows up as unknown under `keys/`.
     if let Err(error) = record_install(dirs, owner, &id) {
@@ -560,8 +574,9 @@ fn rolled_back(
 /// writes over or deletes `device.key`, which may be the only key that opens
 /// the sweeps encrypted to it:
 ///
-/// 1. `device.key` must be there and hold an age identity, or login refuses
-///    before anything goes out ([`read_recorded_device_key`]).
+/// 1. `device.key` must be there and hold an age identity, unwrapped with
+///    `passphrase` when it is wrapped, or login refuses before anything goes
+///    out ([`read_recorded_device_key`]).
 /// 2. `keys/<id>.json` is read back (the key store caps it at
 ///    `MAX_RECORD_BYTES`):
 ///    - gone: it is published again with this install's key
@@ -572,10 +587,9 @@ fn rolled_back(
 /// 3. The id goes back into `installs.json` if it went missing there. That
 ///    comes last, so a refusal leaves the file as it was, and when the id is
 ///    there the file is not written.
-///
-/// A later step reads a passphrase-wrapped `device.key` here.
 async fn reuse_device_key(
     dirs: &Dirs,
+    passphrase: Option<&Passphrase>,
     keys: &impl KeyStore,
     owner: Pubky,
     id: &DeviceId,
@@ -584,7 +598,7 @@ async fn reuse_device_key(
     // on the temporary identity, which is dropped (and wiped, by age) at the
     // end of this statement, so the secret is not held while the requests
     // below wait on the network.
-    let local = read_recorded_device_key(dirs, id)?.recipient();
+    let local = read_recorded_device_key(dirs, passphrase, id)?.recipient();
     let published = keys.get_own_key(id).await.with_context(|| {
         format!("could not read back keys/{id}.json, this install's device key record")
     })?;
@@ -610,19 +624,29 @@ async fn reuse_device_key(
 /// it or retiring the key, and nothing is written: the file may only be
 /// misplaced, and making a new key in its place would give this install a
 /// second published key while the sweeps encrypted to the first stay
-/// unopened.
-fn read_recorded_device_key(dirs: &Dirs, id: &DeviceId) -> anyhow::Result<DeviceIdentity> {
+/// unopened. A wrapped file read without `passphrase` is refused with how to
+/// give it, and nothing else: the file is fine.
+fn read_recorded_device_key(
+    dirs: &Dirs,
+    passphrase: Option<&Passphrase>,
+    id: &DeviceId,
+) -> anyhow::Result<DeviceIdentity> {
     let path = dirs.device_key_file();
     // `display()` borrows `path` as something `{}` can print; a path is not
     // always UTF-8, so it has no `Display` of its own.
     let shown = path.display();
-    match read_device_key(dirs) {
+    match read_device_key(dirs, passphrase) {
         Ok(Some(identity)) => Ok(identity),
         Ok(None) => bail!(
             "{shown} is missing, but login.json records it as the secret of this install's device \
              key keys/{id}.json, so login changed nothing: restore {shown} from your backup, or \
              run `sweepky logout` to retire keys/{id}.json"
         ),
+        // A match guard: this arm is taken only for the error that says the
+        // passphrase is missing, which `is` finds through any context. The
+        // file is fine, so the advice below about a backup would mislead;
+        // the error's own message names the file and the flag.
+        Err(error) if error.is::<NeedsPassphrase>() => Err(error.context("login changed nothing")),
         // `read_device_key`'s own error says what is wrong with the file, in
         // fixed words, and comes after this context in the printed chain.
         Err(error) => Err(error.context(format!(
@@ -779,7 +803,9 @@ async fn login_locked(
     signup_token: Option<&SecretString>,
 ) -> anyhow::Result<Report> {
     let current = read_login_state(&ctx.dirs)?;
-    let stored = read_identity(&ctx.dirs, name)?;
+    // A wrapped key file read without --passphrase-file stops login here,
+    // before anything is written.
+    let stored = read_identity(&ctx.dirs, name, ctx.passphrase.as_ref())?;
     let settings = ctx.network.settings();
     let plan = plan_login(&PlanInput {
         name,
@@ -803,6 +829,9 @@ async fn login_locked(
     let homeserver = public_key_of(&plan.homeserver)?;
 
     let mut report = String::new();
+    // The secret files this run creates wrapped with the passphrase, for the
+    // report.
+    let mut wrapped_files = Vec::new();
     // 3. Create or reuse. `stored` is moved apart here: each arm takes the
     // secret out of it by value.
     let (secret, mut meta) = match stored {
@@ -810,7 +839,10 @@ async fn login_locked(
         StoredIdentity::Missing => {
             let secret = IdentitySecret::generate();
             let meta = IdentityMeta::new(name.clone(), secret.pubky(), plan.homeserver, false);
-            create_identity(&ctx.dirs, &secret, &meta)?;
+            create_identity(&ctx.dirs, &secret, &meta, ctx.passphrase.as_ref())?;
+            if ctx.passphrase.is_some() {
+                wrapped_files.push(ctx.dirs.identity_key_file(name));
+            }
             report.push_str(&format!(
                 "Created the dedicated identity {name}, pubky {}.\n",
                 meta.pubky
@@ -855,8 +887,33 @@ async fn login_locked(
         meta.pubky, meta.homeserver
     ));
     report.push_str(&device_key_report(&ctx.dirs, &tail.device));
+    if ctx.passphrase.is_some() && matches!(tail.device, DeviceKeyOutcome::Published(_)) {
+        wrapped_files.push(ctx.dirs.device_key_file());
+    }
+    report.push_str(&wrapped_report(&wrapped_files));
     report.push_str(&tail.key_check);
     Ok(Report::new(report))
+}
+
+/// What the report says about the secret files this run wrapped with the
+/// passphrase, `paths`: nothing when it wrapped none.
+///
+/// `&[PathBuf]` is a borrowed slice, so the caller keeps its `Vec`.
+fn wrapped_report(paths: &[PathBuf]) -> String {
+    if paths.is_empty() {
+        return String::new();
+    }
+    let shown: Vec<String> = paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect();
+    format!(
+        "Wrapped {} with the passphrase from --passphrase-file. Give --passphrase-file again to \
+         every command that signs in or reads this install's key (login, logout, keys revoke, \
+         circle create, add and remove), and keep the passphrase as safe as the files: without \
+         it they cannot be opened.\n",
+        shown.join(" and ")
+    )
 }
 
 /// What the plan needs to know of `stored`. For a key without its details,
@@ -922,7 +979,8 @@ async fn sign_in_and_record(
     // future is done, so the session can then be moved into `sign_out`,
     // which consumes it.
     let keys = SessionKeyStore::new(&session, ctx.network.pubky());
-    let recorded = record_login_and_check_keys(&ctx.dirs, &keys, state).await;
+    let recorded =
+        record_login_and_check_keys(&ctx.dirs, ctx.passphrase.as_ref(), &keys, state).await;
     sign_out(ctx, session).await;
     recorded
 }
@@ -971,14 +1029,15 @@ mod tests {
     use crate::identity::{IdentityMeta, IdentityName, IdentitySecret};
     use crate::installs::{read_installs, record_install};
     use crate::network::{NetworkKind, PRODUCTION_HOMESERVER, TESTNET_HOMESERVER};
+    use crate::passphrase::{NeedsPassphrase, Passphrase};
     use crate::remote::{QUOTA_FULL, WRITE_FORBIDDEN, public_key_of};
     use crate::state::{
         LoginState, StoredIdentity, create_identity, read_identity, read_login_state,
         write_login_state,
     };
     use crate::test_support::{
-        FAKE_SERVER_TEXT, FakeKeyStore, FileSnapshot, KeyStoreCall, dirs_in, private_temp,
-        random_pubky,
+        FAKE_SERVER_TEXT, FakeKeyStore, FileSnapshot, KeyStoreCall, TEST_PASSPHRASE, dirs_in,
+        private_temp, random_pubky,
     };
     use crate::{Dirs, clock};
 
@@ -1298,7 +1357,7 @@ mod tests {
         let name = throwaway();
         let secret = IdentitySecret::generate();
         let meta = IdentityMeta::new(name.clone(), secret.pubky(), random_pubky(), true);
-        create_identity(&dirs, &secret, &meta).expect("creates");
+        create_identity(&dirs, &secret, &meta, None).expect("creates");
         let state = LoginState::identity(name, meta.pubky, meta.homeserver);
         write_login_state(&dirs, &state).expect("writes");
         let earlier: DeviceId = "earlier-install".parse().expect("valid");
@@ -1327,7 +1386,7 @@ mod tests {
             let installs_before = fs::read(dirs.installs_file()).expect("readable");
             let keys = FakeKeyStore::refusing_puts(status);
 
-            let err = record_login(&dirs, &keys, state.clone())
+            let err = record_login(&dirs, None, &keys, state.clone())
                 .await
                 .expect_err("login aborts");
             // Our message, never the server's own text.
@@ -1364,7 +1423,7 @@ mod tests {
             // token.
             let name = state.name.as_ref().expect("a name");
             assert!(matches!(
-                read_identity(&dirs, name).expect("reads"),
+                read_identity(&dirs, name, None).expect("reads"),
                 StoredIdentity::Complete { .. }
             ));
         }
@@ -1377,15 +1436,15 @@ mod tests {
         // anything, and the key it did not make is never deleted.
         let (_temp, dirs, state, earlier) = before_the_tail();
         let existing = DeviceIdentity::generate();
-        create_device_key(&dirs, &existing).expect("written");
+        create_device_key(&dirs, &existing, None).expect("written");
         let keys = FakeKeyStore::default();
 
-        let err = record_login(&dirs, &keys, state.clone())
+        let err = record_login(&dirs, None, &keys, state.clone())
             .await
             .expect_err("refused");
         assert!(format!("{err:#}").contains("never replaces"), "{err:#}");
         assert_eq!(keys.calls(), []);
-        let kept = read_device_key(&dirs).expect("reads").expect("kept");
+        let kept = read_device_key(&dirs, None).expect("reads").expect("kept");
         assert_eq!(kept.recipient(), existing.recipient());
         assert_eq!(
             read_installs(&dirs).expect("reads").ids_of(&state.pubky),
@@ -1400,13 +1459,23 @@ mod tests {
     /// `keys` now holds. Returns the directory, its `Dirs`, the `login.json`
     /// the next login starts from, and the device id.
     async fn after_a_first_login(keys: &FakeKeyStore) -> (TempDir, Dirs, LoginState, DeviceId) {
+        after_a_first_login_with(keys, None).await
+    }
+
+    /// [`after_a_first_login`], with the identity and `device.key` wrapped
+    /// with `passphrase` when there is one, as `login --passphrase-file`
+    /// leaves them.
+    async fn after_a_first_login_with(
+        keys: &FakeKeyStore,
+        passphrase: Option<&Passphrase>,
+    ) -> (TempDir, Dirs, LoginState, DeviceId) {
         let temp = private_temp();
         let dirs = dirs_in(&temp);
         let secret = IdentitySecret::generate();
         let meta = IdentityMeta::new(throwaway(), secret.pubky(), random_pubky(), true);
-        create_identity(&dirs, &secret, &meta).expect("creates");
+        create_identity(&dirs, &secret, &meta, passphrase).expect("creates");
         let state = LoginState::identity(meta.name.clone(), meta.pubky, meta.homeserver);
-        let outcome = record_login(&dirs, keys, state)
+        let outcome = record_login(&dirs, passphrase, keys, state)
             .await
             .expect("the first login");
         let DeviceKeyOutcome::Published(id) = outcome else {
@@ -1437,7 +1506,7 @@ mod tests {
         let [device_key, installs, _] = device_state(&dirs);
         let calls_before = keys.calls().len();
 
-        let outcome = record_login(&dirs, &keys, state.clone())
+        let outcome = record_login(&dirs, None, &keys, state.clone())
             .await
             .expect("the second login");
         assert!(
@@ -1463,14 +1532,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn second_login_reuses_a_wrapped_device_key() {
+        // `for_tests` wraps at work factor 10, so the test stays fast;
+        // `--passphrase-file` always writes at 18.
+        let passphrase = Passphrase::for_tests(TEST_PASSPHRASE);
+        let keys = FakeKeyStore::default();
+        let (_temp, dirs, state, id) = after_a_first_login_with(&keys, Some(&passphrase)).await;
+        // The first login wrote the new device.key wrapped, and published
+        // the key inside it.
+        let raw = fs::read(dirs.device_key_file()).expect("readable");
+        assert!(raw.starts_with(b"age-encryption.org/v1\n-> scrypt "));
+        let local = read_device_key(&dirs, Some(&passphrase))
+            .expect("reads")
+            .expect("present");
+        let published = keys.record(&id).expect("published");
+        let record = DeviceKey::from_json(&published).expect("parses");
+        assert_eq!(
+            record.encryption_recipient().expect("usable"),
+            local.recipient()
+        );
+        let [device_key, installs, login_file] = device_state(&dirs);
+        let calls_before = keys.calls().len();
+
+        // Without the passphrase: the how-to-supply error, before anything
+        // goes out, and nothing written here or there.
+        let err = record_login(&dirs, None, &keys, state.clone())
+            .await
+            .expect_err("needs the passphrase");
+        assert!(err.is::<NeedsPassphrase>(), "{err:#}");
+        let shown = format!("{err:#}");
+        for part in [
+            "login changed nothing",
+            "wrapped with a passphrase",
+            "--passphrase-file <file>",
+        ] {
+            assert!(shown.contains(part), "{part:?} missing from: {shown}");
+        }
+        assert!(!shown.contains("synthetic"), "{shown}");
+        assert_eq!(keys.calls().len(), calls_before);
+        assert_eq!(keys.record(&id).as_ref(), Some(&published));
+        assert_eq!(device_state(&dirs), [device_key, installs, login_file]);
+
+        // With it: the reuse branch reads the wrapped key, finds its record
+        // in order, and writes neither device.key nor the record.
+        let [device_key, installs, _] = device_state(&dirs);
+        let outcome = record_login(&dirs, Some(&passphrase), &keys, state.clone())
+            .await
+            .expect("the second login");
+        assert!(
+            matches!(&outcome, DeviceKeyOutcome::Reused(reused) if reused == &id),
+            "{outcome:?}"
+        );
+        let calls = keys.calls();
+        assert_eq!(calls[calls_before..], [KeyStoreCall::GetOwnKey(id.clone())]);
+        assert_eq!(keys.record(&id), Some(published));
+        let [device_key_after, installs_after, _] = device_state(&dirs);
+        assert_eq!(device_key_after, device_key);
+        assert_eq!(installs_after, installs);
+        assert_eq!(read_login_state(&dirs).expect("reads"), Some(state));
+    }
+
+    #[tokio::test]
     async fn second_login_republishes_a_missing_key_record() {
         let (_temp, dirs, state, id) = after_a_first_login(&FakeKeyStore::default()).await;
-        let local = read_device_key(&dirs).expect("reads").expect("present");
+        let local = read_device_key(&dirs, None)
+            .expect("reads")
+            .expect("present");
         let [device_key, installs, _] = device_state(&dirs);
         // A homeserver that has lost the record: this store holds none.
         let keys = FakeKeyStore::default();
 
-        let outcome = record_login(&dirs, &keys, state.clone())
+        let outcome = record_login(&dirs, None, &keys, state.clone())
             .await
             .expect("republished");
         assert!(
@@ -1509,7 +1641,7 @@ mod tests {
             // The record is gone and the homeserver refuses to take it back.
             let keys = FakeKeyStore::refusing_puts(status);
 
-            let err = record_login(&dirs, &keys, state)
+            let err = record_login(&dirs, None, &keys, state)
                 .await
                 .expect_err("login aborts");
             assert_eq!(err.root_cause().to_string(), message, "{status}");
@@ -1541,7 +1673,9 @@ mod tests {
         ] {
             let keys = FakeKeyStore::default();
             let (_temp, dirs, state, id) = after_a_first_login(&keys).await;
-            let local = read_device_key(&dirs).expect("reads").expect("present");
+            let local = read_device_key(&dirs, None)
+                .expect("reads")
+                .expect("present");
             let other = DeviceIdentity::generate();
             let created_at = clock::now().expect("a time");
             let ours = device_key_record(&local.recipient(), created_at.clone());
@@ -1570,7 +1704,9 @@ mod tests {
             let before = device_state(&dirs);
             let calls_before = keys.calls().len();
 
-            let err = record_login(&dirs, &keys, state).await.expect_err(case);
+            let err = record_login(&dirs, None, &keys, state)
+                .await
+                .expect_err(case);
             let shown = format!("{err:#}");
             // The device id, and never a recipient's text: neither this
             // install's, nor the one in the record, in either case. (Core's
@@ -1617,7 +1753,9 @@ mod tests {
             let before = device_state(&dirs);
             let calls_before = keys.calls().len();
 
-            let err = record_login(&dirs, &keys, state).await.expect_err(case);
+            let err = record_login(&dirs, None, &keys, state)
+                .await
+                .expect_err(case);
             let shown = format!("{err:#}");
             for part in [
                 path.display().to_string(),
@@ -1675,7 +1813,7 @@ mod tests {
         let (_temp, dirs, state, _earlier) = before_the_tail();
         let keys = FakeKeyStore::default();
         keys.set_record(&injected_id(), injected_record(false));
-        let tail = record_login_and_check_keys(&dirs, &keys, state.clone())
+        let tail = record_login_and_check_keys(&dirs, None, &keys, state.clone())
             .await
             .expect("the first login");
         let DeviceKeyOutcome::Published(own) = &tail.device else {
@@ -1701,7 +1839,7 @@ mod tests {
         let keys = FakeKeyStore::default();
         let (_temp, dirs, state, own) = after_a_first_login(&keys).await;
         keys.set_record(&injected_id(), injected_record(false));
-        let tail = record_login_and_check_keys(&dirs, &keys, state.clone())
+        let tail = record_login_and_check_keys(&dirs, None, &keys, state.clone())
             .await
             .expect("the second login");
         assert!(
@@ -1714,7 +1852,7 @@ mod tests {
         // Once the injected key is revoked, the fix is in, and login says
         // nothing more about it.
         keys.set_record(&injected_id(), injected_record(true));
-        let tail = record_login_and_check_keys(&dirs, &keys, state)
+        let tail = record_login_and_check_keys(&dirs, None, &keys, state)
             .await
             .expect("a third login");
         assert_eq!(tail.key_check, "");
@@ -1724,7 +1862,7 @@ mod tests {
     async fn login_with_only_its_own_key_raises_no_alarm() {
         let keys = FakeKeyStore::default();
         let (_temp, dirs, state, _own) = after_a_first_login(&keys).await;
-        let tail = record_login_and_check_keys(&dirs, &keys, state)
+        let tail = record_login_and_check_keys(&dirs, None, &keys, state)
             .await
             .expect("the second login");
         assert_eq!(tail.key_check, "");
@@ -1739,7 +1877,7 @@ mod tests {
         let (_temp, dirs, state, id) = after_a_first_login(&keys).await;
         fs::remove_file(dirs.installs_file()).expect("remove");
 
-        record_login(&dirs, &keys, state.clone())
+        record_login(&dirs, None, &keys, state.clone())
             .await
             .expect("the second login");
         assert_eq!(

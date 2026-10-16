@@ -26,6 +26,24 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub testnet: bool,
 
+    /// Read the passphrase that wraps this install's secret files from
+    /// FILE: its one line, without the line ending. With it, `login` writes
+    /// the identity file and device key it creates wrapped with the
+    /// passphrase (age's scrypt), and every command that reads a wrapped
+    /// file needs it again. Meant for process substitution, as in
+    /// --passphrase-file <(pass show sweepky), which keeps the passphrase out
+    /// of the argument list, the shell history and the disk.
+    //
+    // A path, not the passphrase: a value on the command line would sit in
+    // the process list and the shell history. `main.rs` reads the file into
+    // `Context::passphrase` before the command runs; nothing in clap reads
+    // it. Global, like `--testnet`, because every command that signs in
+    // needs it when the files are wrapped. An interactive prompt that does
+    // not echo would need a new crate or `unsafe` terminal calls, so it is
+    // left for later; this also keeps standard input free for P2b.
+    #[arg(long, global = true, value_name = "FILE")]
+    pub passphrase_file: Option<PathBuf>,
+
     /// The command to run.
     #[command(subcommand)]
     pub command: Command,
@@ -54,8 +72,9 @@ pub enum Command {
 
     /// Log in. With --identity NAME: create a dedicated identity under that
     /// name, or reuse the one created earlier, sign it up on its homeserver
-    /// the first time, and sign in. (The Pubky Ring sign-in comes in a later
-    /// build.)
+    /// the first time, and sign in. With --passphrase-file, the identity
+    /// file and device key it creates are wrapped with that passphrase.
+    /// (The Pubky Ring sign-in comes in a later build.)
     Login {
         /// The name of a dedicated Sweepky identity: 1 to 32 characters of
         /// a-z, 0-9, - and _, starting with a letter. Never a key, a recovery
@@ -220,6 +239,48 @@ mod tests {
 
         let cli = Cli::try_parse_from(["sweepky", "init", "d"]).expect("parses");
         assert!(!cli.testnet);
+    }
+
+    #[test]
+    fn passphrase_file_is_a_global_flag() {
+        // Before or after the command, and with any command, as for
+        // --testnet: the shell's process substitution hands over a path such
+        // as /dev/fd/63.
+        for args in [
+            vec![
+                "sweepky",
+                "--passphrase-file",
+                "/dev/fd/63",
+                "login",
+                "--identity",
+                "x",
+            ],
+            vec![
+                "sweepky",
+                "login",
+                "--identity",
+                "x",
+                "--passphrase-file",
+                "/dev/fd/63",
+            ],
+            vec![
+                "sweepky",
+                "keys",
+                "revoke",
+                "id",
+                "--passphrase-file",
+                "/dev/fd/63",
+            ],
+        ] {
+            let cli = Cli::try_parse_from(&args).expect("parses");
+            assert_eq!(
+                cli.passphrase_file.as_deref(),
+                Some(Path::new("/dev/fd/63")),
+                "{args:?}"
+            );
+        }
+        let cli = Cli::try_parse_from(["sweepky", "logout"]).expect("parses");
+        assert_eq!(cli.passphrase_file, None);
     }
 
     #[test]

@@ -7,7 +7,8 @@
 //!   fields a newer Sweepky added; `deviceId` appears once this install's
 //!   device key is published. It holds no secret, and no secret may ever be
 //!   added to it: the secret lives in its own file.
-//! - A dedicated identity's two files, `identities/<name>.key` (the secret)
+//! - A dedicated identity's two files, `identities/<name>.key` (the secret,
+//!   wrapped with a passphrase when `login` was given `--passphrase-file`)
 //!   and `identities/<name>.json` (its public details), read together by
 //!   [`read_identity`] into a [`StoredIdentity`].
 //!
@@ -26,6 +27,7 @@ use crate::Dirs;
 use crate::identity::{
     IdentityMeta, IdentityName, IdentitySecret, MAX_IDENTITY_FILE_BYTES, MAX_IDENTITY_META_BYTES,
 };
+use crate::passphrase::{Passphrase, write_secret_file};
 use crate::private_fs::{ensure_private_dir, read_private_file, write_private_file};
 
 /// The most Sweepky reads of `login.json`: 64 KiB. The file is a few hundred
@@ -194,10 +196,17 @@ pub(crate) enum StoredIdentity {
 /// The key file is read only in Sweepky's own format
 /// ([`IdentitySecret::from_file_bytes`]), so a Pubky recovery file, a raw
 /// key or a recovery phrase someone dropped in as `<name>.key` is refused
-/// with its one-line reason, never imported. Refused too: details without
-/// a key (the secret is gone, and a new key would be a different pubky),
-/// and details that name another identity or another pubky than the key's.
-pub(crate) fn read_identity(dirs: &Dirs, name: &IdentityName) -> anyhow::Result<StoredIdentity> {
+/// with its one-line reason, never imported. A key file wrapped with a
+/// passphrase is unwrapped with `passphrase` first
+/// ([`IdentitySecret::from_stored`]), and without one is an error that says
+/// how to give it. Refused too: details without a key (the secret is gone,
+/// and a new key would be a different pubky), and details that name another
+/// identity or another pubky than the key's.
+pub(crate) fn read_identity(
+    dirs: &Dirs,
+    name: &IdentityName,
+    passphrase: Option<&Passphrase>,
+) -> anyhow::Result<StoredIdentity> {
     let key_path = dirs.identity_key_file(name);
     let meta_path = dirs.identity_file(name);
     let key_bytes = read_private_file(&key_path, MAX_IDENTITY_FILE_BYTES)?;
@@ -215,7 +224,9 @@ pub(crate) fn read_identity(dirs: &Dirs, name: &IdentityName) -> anyhow::Result<
         }
         return Ok(StoredIdentity::Missing);
     };
-    let secret = IdentitySecret::from_file_bytes(&key_bytes)
+    // `key_bytes` moves into `from_stored`, which unwraps it if it is
+    // wrapped and wipes it when done either way.
+    let secret = IdentitySecret::from_stored(&key_path, key_bytes, passphrase)
         .with_context(|| format!("could not read {}", key_path.display()))?;
     let Some(meta_bytes) = meta_bytes else {
         return Ok(StoredIdentity::KeyOnly(secret));
@@ -247,6 +258,8 @@ fn check_details_match(
 }
 
 /// Writes a new identity's two files: the secret first, then the details.
+/// The secret's file is wrapped with `passphrase` when there is one; the
+/// details are public and never wrapped.
 ///
 /// In that order so a crash in between leaves a key without details, which
 /// `login` picks up again ([`StoredIdentity::KeyOnly`]), and never details
@@ -255,11 +268,16 @@ pub(crate) fn create_identity(
     dirs: &Dirs,
     secret: &IdentitySecret,
     meta: &IdentityMeta,
+    passphrase: Option<&Passphrase>,
 ) -> anyhow::Result<()> {
     ensure_private_dir(&dirs.identities_dir())?;
     // `to_file_bytes` returns a `Zeroizing` buffer that wipes the secret's
     // hex when this statement ends and the temporary is dropped.
-    write_private_file(&dirs.identity_key_file(&meta.name), &secret.to_file_bytes())?;
+    write_secret_file(
+        &dirs.identity_key_file(&meta.name),
+        &secret.to_file_bytes(),
+        passphrase,
+    )?;
     write_identity_meta(dirs, meta)
 }
 
@@ -317,7 +335,7 @@ mod tests {
         let dirs = dirs_in(&temp);
         let name: IdentityName = "throwaway".parse().expect("valid");
         assert!(matches!(
-            read_identity(&dirs, &name).expect("reads"),
+            read_identity(&dirs, &name, None).expect("reads"),
             StoredIdentity::Missing
         ));
 
@@ -326,11 +344,11 @@ mod tests {
         let secret = IdentitySecret::generate();
         let pubky = secret.pubky();
         let meta = IdentityMeta::new(name.clone(), pubky, random_pubky(), false);
-        create_identity(&dirs, &secret, &meta).expect("creates");
+        create_identity(&dirs, &secret, &meta, None).expect("creates");
         assert_eq!(mode(&dirs.identity_key_file(&name)), 0o600);
         assert_eq!(mode(&dirs.identity_file(&name)), 0o600);
         assert_eq!(mode(&dirs.identities_dir()), 0o700);
-        match read_identity(&dirs, &name).expect("reads") {
+        match read_identity(&dirs, &name, None).expect("reads") {
             StoredIdentity::Complete {
                 secret: read,
                 meta: read_meta,
@@ -344,7 +362,7 @@ mod tests {
         // The key alone, as P2c copies it, is an identity whose details
         // `login` rebuilds.
         fs::remove_file(dirs.identity_file(&name)).expect("remove");
-        match read_identity(&dirs, &name).expect("reads") {
+        match read_identity(&dirs, &name, None).expect("reads") {
             StoredIdentity::KeyOnly(read) => assert_eq!(read.pubky(), pubky),
             _ => panic!("expected the key alone"),
         }
@@ -352,11 +370,11 @@ mod tests {
         // Details for another pubky than the key's are refused.
         let other = IdentityMeta::new(name.clone(), random_pubky(), random_pubky(), true);
         write_identity_meta(&dirs, &other).expect("writes");
-        assert!(read_identity(&dirs, &name).is_err());
+        assert!(read_identity(&dirs, &name, None).is_err());
 
         // Details without their key: the secret is gone, refused.
         fs::remove_file(dirs.identity_key_file(&name)).expect("remove");
-        assert!(read_identity(&dirs, &name).is_err());
+        assert!(read_identity(&dirs, &name, None).is_err());
     }
 
     #[test]
@@ -366,7 +384,7 @@ mod tests {
         let name: IdentityName = "throwaway".parse().expect("valid");
         let secret = IdentitySecret::generate();
         let meta = IdentityMeta::new(name.clone(), secret.pubky(), random_pubky(), true);
-        create_identity(&dirs, &secret, &meta).expect("creates");
+        create_identity(&dirs, &secret, &meta, None).expect("creates");
 
         // Someone drops a recovery file in place of the key file. Built here
         // from its fixed first line and some bytes; the classifier looks at
@@ -376,7 +394,7 @@ mod tests {
             b"pubky.org/recovery\nsynthetic encrypted bytes",
         )
         .expect("write");
-        let err = read_identity(&dirs, &name)
+        let err = read_identity(&dirs, &name, None)
             .err()
             .expect("a recovery file is refused");
         assert_eq!(

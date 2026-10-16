@@ -8,6 +8,10 @@
 //! - [`read_private_file`] reads one back, refusing anything another user
 //!   could read, anything over a size cap, and links, into a buffer that
 //!   zeroes itself.
+//! - [`read_up_to_cap`] reads an already open file up to a cap, into the
+//!   same kind of buffer. It is for the files a user's argument names
+//!   (`--identity`, `--passphrase-file`), which are not Sweepky's own, so
+//!   each caller makes its own checks before it reads.
 //! - [`remove_private_file`] deletes one, a missing file counting as success.
 //! - [`lstat`] says what is at a path, a link itself rather than what it
 //!   points at, or `None` when nothing is.
@@ -44,7 +48,7 @@
 
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder, File, Metadata, OpenOptions};
-use std::io::{ErrorKind, Read, Write};
+use std::io::{self, ErrorKind, Read, Write};
 // Extension traits: Unix-only methods added to std's types. `DirBuilderExt`
 // and `OpenOptionsExt` add `.mode(...)`, the mode a new directory or file is
 // created with; `MetadataExt` adds `.mode()`, `.dev()` and `.ino()`. A
@@ -353,6 +357,35 @@ fn ensure_at_end(path: &Path, file: &mut File) -> anyhow::Result<()> {
     }
 }
 
+/// Reads `file` up to `cap` bytes or its end, whichever comes first.
+///
+/// For a file whose size is not known before reading, such as a pipe: a
+/// zeroed buffer of exactly `cap` bytes, filled in place and never grown,
+/// so the bytes are never copied into a bigger allocation and left behind,
+/// unwiped, in the old one. `Zeroizing` wipes all of it, spare capacity
+/// included, when the caller drops it. Its error is the system's, which
+/// never names the file.
+pub(crate) fn read_up_to_cap(file: &mut File, cap: usize) -> io::Result<Zeroizing<Vec<u8>>> {
+    let mut bytes = Zeroizing::new(vec![0_u8; cap]);
+    let mut filled = 0;
+    // `get_mut(filled..)` is the unfilled rest, or `None` past the end, so
+    // this cannot index out of bounds; the loop ends at the cap or at the
+    // end of the file. `rest` borrows `bytes` only inside each pass.
+    while let Some(rest) = bytes.get_mut(filled..).filter(|rest| !rest.is_empty()) {
+        match file.read(rest) {
+            Ok(0) => break,
+            // `read` fills at most `rest.len()` bytes, so `filled` never
+            // passes the cap.
+            Ok(count) => filled += count,
+            // A signal arrived before any byte did: try again.
+            Err(err) if err.kind() == ErrorKind::Interrupted => {}
+            Err(err) => return Err(err),
+        }
+    }
+    bytes.truncate(filled);
+    Ok(bytes)
+}
+
 /// Deletes the file at `path`. Nothing there counts as success, so `logout`
 /// can tidy up after a login that left only some of its files.
 ///
@@ -448,7 +481,7 @@ pub(crate) fn lstat(path: &Path) -> anyhow::Result<Option<Metadata>> {
 
 /// The permission bits of `meta` when any group or other bit is among them;
 /// `None` when the mode is private.
-fn loose_permissions(meta: &Metadata) -> Option<u32> {
+pub(crate) fn loose_permissions(meta: &Metadata) -> Option<u32> {
     let mode = meta.mode() & PERMISSION_BITS;
     // `then_some` turns `true` into `Some(mode)` and `false` into `None`.
     (mode & GROUP_OR_OTHER != 0).then_some(mode)

@@ -28,6 +28,11 @@
 //! **Never `{:?}` a session or a signer.** `PubkySession`'s `Debug` prints
 //! its credential's, and a signer holds the identity's keypair. Nothing here
 //! derives or calls `Debug` on either, and [`WriterSession`] has no `Debug`.
+//!
+//! **The passphrase.** The identity's key file that step 2 signs in with may
+//! be wrapped with a passphrase (`login --passphrase-file`). Step 2 reads it
+//! through [`crate::passphrase`], which unwraps it with the context's
+//! passphrase, or says how to give one when there is none.
 
 use anyhow::{Context as _, bail};
 use pubky::PubkySession;
@@ -35,6 +40,7 @@ use pubky::PubkySession;
 use crate::identity::IdentitySecret;
 use crate::lock::WritersLock;
 use crate::network::client_id;
+use crate::passphrase::Passphrase;
 use crate::remote::request_error;
 use crate::state::{KnownLoginKind, LoginState, StoredIdentity, read_identity, read_login_state};
 use crate::{Context, Dirs};
@@ -154,7 +160,7 @@ pub(crate) async fn with_writer_session<T>(
 /// ([`WriterSession::sign_out`]) whatever happens next; prefer
 /// [`with_writer_session`], which does both.
 pub(crate) async fn sign_in(ctx: &Context) -> anyhow::Result<WriterSession> {
-    let (login, secret) = read_logged_in_identity(&ctx.dirs)?;
+    let (login, secret) = read_logged_in_identity(&ctx.dirs, ctx.passphrase.as_ref())?;
     // `keypair()` makes a keypair from the secret for the signer, which owns
     // it and wipes it when the signer is dropped at the end of this function.
     // `signin` (unlike `signin_blocking`) also hands a clone of the signer to
@@ -171,7 +177,12 @@ pub(crate) async fn sign_in(ctx: &Context) -> anyhow::Result<WriterSession> {
 
 /// `login.json` and the secret of the identity it names, checked to be the
 /// key of the pubky logged in. Files only: nothing here touches the network.
-fn read_logged_in_identity(dirs: &Dirs) -> anyhow::Result<(LoginState, IdentitySecret)> {
+/// A wrapped key file is unwrapped with `passphrase`, and without one is a
+/// [`NeedsPassphrase`](crate::passphrase::NeedsPassphrase) error.
+fn read_logged_in_identity(
+    dirs: &Dirs,
+    passphrase: Option<&Passphrase>,
+) -> anyhow::Result<(LoginState, IdentitySecret)> {
     let Some(login) = read_login_state(dirs)? else {
         bail!(NOT_LOGGED_IN);
     };
@@ -193,7 +204,7 @@ fn read_logged_in_identity(dirs: &Dirs) -> anyhow::Result<(LoginState, IdentityS
     };
     // The key file is what signs; the details file is only a cache, so a
     // key without its details still signs in.
-    let secret = match read_identity(dirs, name)? {
+    let secret = match read_identity(dirs, name, passphrase)? {
         StoredIdentity::KeyOnly(secret) | StoredIdentity::Complete { secret, .. } => secret,
         StoredIdentity::Missing => bail!(
             "this install is logged in as the identity {name}, but {} is missing, so it cannot \
@@ -219,9 +230,44 @@ mod tests {
     use anyhow::bail;
     use pubky_testnet::EphemeralTestnet;
 
-    use super::with_writer_session;
-    use crate::test_support::{dirs_in, private_temp};
+    use super::{read_logged_in_identity, with_writer_session};
+    use crate::identity::{IdentityMeta, IdentityName, IdentitySecret};
+    use crate::passphrase::{NeedsPassphrase, Passphrase};
+    use crate::state::{LoginState, create_identity, write_login_state};
+    use crate::test_support::{TEST_PASSPHRASE, dirs_in, private_temp, random_pubky};
     use crate::{Context, Network, StderrWriter};
+
+    #[test]
+    fn wrapped_identity_signs_in_only_with_its_passphrase() {
+        // What `sign_in` reads before it signs in: login.json and the key of
+        // the identity it names, here wrapped.
+        let temp = private_temp();
+        let dirs = dirs_in(&temp);
+        let name: IdentityName = "throwaway".parse().expect("valid");
+        let secret = IdentitySecret::generate();
+        let meta = IdentityMeta::new(name.clone(), secret.pubky(), random_pubky(), true);
+        let passphrase = Passphrase::for_tests(TEST_PASSPHRASE);
+        create_identity(&dirs, &secret, &meta, Some(&passphrase)).expect("creates");
+        write_login_state(
+            &dirs,
+            &LoginState::identity(name.clone(), meta.pubky, meta.homeserver),
+        )
+        .expect("writes");
+
+        let (login, read) =
+            read_logged_in_identity(&dirs, Some(&passphrase)).expect("unwraps and reads");
+        assert_eq!(read.pubky(), meta.pubky);
+        assert_eq!(login.pubky, meta.pubky);
+
+        // Without the passphrase there is nothing to sign in with, and the
+        // error says how to give it.
+        let error = read_logged_in_identity(&dirs, None).err().expect("refused");
+        assert!(error.is::<NeedsPassphrase>(), "{error:#}");
+        assert!(
+            format!("{error:#}").contains(&dirs.identity_key_file(&name).display().to_string()),
+            "{error:#}"
+        );
+    }
 
     /// A writer the test keeps a handle on: the context writes into it, the
     /// test reads what was written. `Arc<Mutex<…>>` is shared ownership of
@@ -266,6 +312,7 @@ mod tests {
             ),
             dirs: dirs_in(&temp),
             stderr: StderrWriter::new(stderr.clone()),
+            passphrase: None,
         };
 
         // Without a login there is no session to open, and the body never

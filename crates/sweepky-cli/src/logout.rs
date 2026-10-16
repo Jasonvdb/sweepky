@@ -348,9 +348,9 @@ mod tests {
         let dirs = dirs_in(&temp);
         let secret = IdentitySecret::generate();
         let meta = IdentityMeta::new(name("throwaway"), secret.pubky(), random_pubky(), true);
-        create_identity(&dirs, &secret, &meta).expect("creates");
+        create_identity(&dirs, &secret, &meta, None).expect("creates");
         let device = DeviceIdentity::generate();
-        create_device_key(&dirs, &device).expect("writes device.key");
+        create_device_key(&dirs, &device, None).expect("writes device.key");
         let id: DeviceId = "0035G87EK4XFE".parse().expect("a valid id");
         record_install(&dirs, meta.pubky, &id).expect("records");
         let record = device_key_record(&device.recipient(), time("2026-10-16T09:41:07Z"));
@@ -474,7 +474,7 @@ mod tests {
         WritersLock::open(&dirs).expect("creates credential.lock");
         let other = IdentitySecret::generate();
         let other_meta = IdentityMeta::new(name("other"), other.pubky(), random_pubky(), true);
-        create_identity(&dirs, &other, &other_meta).expect("creates");
+        create_identity(&dirs, &other, &other_meta, None).expect("creates");
         let other_owner = random_pubky();
         let other_install: DeviceId = "other-install".parse().expect("a valid id");
         record_install(&dirs, other_owner, &other_install).expect("records");
@@ -500,7 +500,7 @@ mod tests {
         // the other owner's install and the user's file.
         assert_eq!(mode(&dirs.credential_lock_file()), 0o600);
         assert!(matches!(
-            read_identity(&dirs, &other_meta.name).expect("reads"),
+            read_identity(&dirs, &other_meta.name, None).expect("reads"),
             StoredIdentity::Complete { .. }
         ));
         let installs = read_installs(&dirs).expect("reads");

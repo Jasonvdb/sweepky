@@ -7,9 +7,10 @@
 //!    `std::env::var_os`, and it passes each value in, so the library and
 //!    its tests never depend on the process environment;
 //! 3. resolves the config and data directories ([`Dirs`], from `HOME` or
-//!    `SWEEPKY_HOME`), builds the [`Network`] (production, or the local
-//!    testnet under `--testnet` / `SWEEPKY_TESTNET`) and the [`Context`]
-//!    around both and standard error;
+//!    `SWEEPKY_HOME`), reads the passphrase when `--passphrase-file` names
+//!    one ([`Passphrase::from_file`]), builds the [`Network`] (production, or
+//!    the local testnet under `--testnet` / `SWEEPKY_TESTNET`) and the
+//!    [`Context`] around them and standard error;
 //! 4. runs the command and prints its report, or `error: ...` and exits with
 //!    status 1.
 //!
@@ -36,7 +37,9 @@ use std::io::Write;
 use std::process::ExitCode;
 
 use clap::Parser;
-use sweepky_cli::{Cli, Context, Dirs, Network, Report, StderrWriter, run, select_kind};
+use sweepky_cli::{
+    Cli, Context, Dirs, Network, Passphrase, Report, StderrWriter, run, select_kind,
+};
 
 /// `#[tokio::main]` turns this `async fn main` into an ordinary `fn main`
 /// that starts tokio's multi-threaded runtime and blocks on the body. Returning
@@ -72,12 +75,22 @@ async fn execute(cli: Cli) -> anyhow::Result<Report> {
     let home = std::env::var_os("HOME");
     let sweepky_home = std::env::var_os("SWEEPKY_HOME");
     let dirs = Dirs::resolve(home.as_deref(), sweepky_home.as_deref())?;
+    // The passphrase, when --passphrase-file names one, also before the
+    // network: a missing or unreadable file fails with nothing done. `map`
+    // reads it only when the flag is there, and `transpose` turns the
+    // `Option<Result<…>>` into a `Result<Option<…>>` for `?`.
+    let passphrase = cli
+        .passphrase_file
+        .as_deref()
+        .map(Passphrase::from_file)
+        .transpose()?;
     let ctx = Context {
         network: Network::for_kind(kind)?,
         dirs,
         // A command's warnings go straight to standard error, so they appear
         // before it acts; its report goes to standard output at the end.
         stderr: StderrWriter::new(std::io::stderr()),
+        passphrase,
     };
     run(cli, &ctx).await
 }

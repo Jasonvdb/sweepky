@@ -203,6 +203,9 @@ async fn end_to_end() {
         network: Network::injected(testnet.sdk().expect("client"), relay, homeserver.clone()),
         dirs: Dirs::resolve(None, Some(home.path().as_os_str())).expect("absolute"),
         stderr: StderrWriter::new(stderr.clone()),
+        // No --passphrase-file: the secret files are written plain, as the
+        // test reads them.
+        passphrase: None,
     };
     // The test looks at the files through the context's own `Dirs`.
     let dirs = &ctx.dirs;

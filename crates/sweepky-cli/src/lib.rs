@@ -87,6 +87,13 @@
 //! - `session`, the per-command session every writing command runs in: the
 //!   writers' lock, a fresh sign-in, the command's work, and a sign-out that
 //!   is always attempted.
+//! - `passphrase`, [`Passphrase`], read from the global `--passphrase-file`,
+//!   and the one way every secret file is written and read: wrapped with
+//!   that passphrase through age's scrypt recipient when one is given
+//!   (`login` wraps the identity file and `device.key` it creates), and
+//!   unwrapped on read whenever a file starts with an age header, a wrapped
+//!   file read without the passphrase being an error that says how to give
+//!   it.
 //!
 //! The rules that hold for everything here (see "Rust conventions" in
 //! `docs/plan/03-cli-and-skill.md`):
@@ -155,6 +162,9 @@ mod login;
 // delete this install's files, in that order.
 mod logout;
 mod network;
+// `--passphrase-file` and the one way every secret file is written and read,
+// wrapped with that passphrase or plain.
+mod passphrase;
 // Owner-only files and directories, which every secret and state file goes
 // through.
 mod private_fs;
@@ -177,6 +187,8 @@ mod test_support;
 use std::io::Write;
 use std::sync::{Mutex, PoisonError};
 
+use anyhow::bail;
+
 pub use cli::{CircleCommand, Cli, Command, KeysCommand};
 pub use dirs::Dirs;
 pub use identity::IdentityName;
@@ -184,6 +196,7 @@ pub use network::{
     CLIENT_ID, Network, NetworkKind, NetworkSettings, PRODUCTION_HOMESERVER, SWEEPKY_CAPABILITY,
     TESTNET_HOMESERVER, TESTNET_RELAY_URL, select_kind,
 };
+pub use passphrase::Passphrase;
 
 /// This crate's version, `version` from Cargo.toml, which `sweepky --version`
 /// prints.
@@ -196,8 +209,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 ///
 /// The binary builds one from the arguments and the environment; a test builds
 /// one around a local testnet, a temporary `SWEEPKY_HOME` and a buffer for
-/// what would go to standard error. Later commands add the standard input and
-/// the passphrase source here, so that no command reaches for a global.
+/// what would go to standard error. Later commands add the standard input
+/// here, so that no command reaches for a global.
 pub struct Context {
     /// The network every command talks to.
     pub network: Network,
@@ -206,6 +219,13 @@ pub struct Context {
     /// Where a command writes what it has to say before it is done: a
     /// warning before it acts, or that it is waiting for another command.
     pub stderr: StderrWriter,
+    /// The passphrase from `--passphrase-file`, which the caller reads with
+    /// [`Passphrase::from_file`] before [`run`]: `login` wraps the secret
+    /// files it creates with it, and every command that reads a wrapped one
+    /// unwraps it with it. `None` without the flag; [`run`] refuses a
+    /// command line that has the flag when this is `None`, so the flag can
+    /// never be dropped on the way and leave files written unwrapped.
+    pub passphrase: Option<Passphrase>,
 }
 
 /// Where a command writes the lines it says along the way, rather than in
@@ -278,6 +298,16 @@ impl Report {
 /// injecting one. `async` because most commands wait on the network; `init`
 /// does only a few small file operations, which are fine to do directly here.
 pub async fn run(cli: Cli, ctx: &Context) -> anyhow::Result<Report> {
+    // The flag is read by the caller into `ctx.passphrase` (see `Context`).
+    // A caller that forgot would have `login` write the user's secrets
+    // unwrapped while they believe them wrapped, so that is refused here,
+    // before any command runs.
+    if cli.passphrase_file.is_some() && ctx.passphrase.is_none() {
+        bail!(
+            "--passphrase-file was given, but the passphrase was not read before the command \
+             ran; this is a bug in the caller of sweepky_cli::run"
+        );
+    }
     match cli.command {
         Command::Init { dir } => init::init(&dir),
         Command::Login {
