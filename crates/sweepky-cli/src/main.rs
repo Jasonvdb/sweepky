@@ -6,8 +6,10 @@
 //! 2. reads the environment. This file is the only place that does, with
 //!    `std::env::var_os`, and it passes each value in, so the library and
 //!    its tests never depend on the process environment;
-//! 3. builds the [`Network`] (production, or the local testnet under
-//!    `--testnet` / `SWEEPKY_TESTNET`) and the [`Context`] around it;
+//! 3. resolves the config and data directories ([`Dirs`], from `HOME` or
+//!    `SWEEPKY_HOME`), builds the [`Network`] (production, or the local
+//!    testnet under `--testnet` / `SWEEPKY_TESTNET`) and the [`Context`]
+//!    around both;
 //! 4. runs the command and prints its report, or `error: ...` and exits with
 //!    status 1.
 //!
@@ -34,7 +36,7 @@ use std::io::Write;
 use std::process::ExitCode;
 
 use clap::Parser;
-use sweepky_cli::{Cli, Context, Network, Report, run, select_kind};
+use sweepky_cli::{Cli, Context, Dirs, Network, Report, run, select_kind};
 
 /// `#[tokio::main]` turns this `async fn main` into an ordinary `fn main`
 /// that starts tokio's multi-threaded runtime and blocks on the body. Returning
@@ -65,8 +67,14 @@ async fn execute(cli: Cli) -> anyhow::Result<Report> {
     // `as_deref` turns `Option<OsString>` (owned) into `Option<&OsStr>`
     // (borrowed), which is what `select_kind` takes.
     let kind = select_kind(cli.testnet, testnet_env.as_deref())?;
+    // The directories first: resolving them touches nothing, so a bad HOME or
+    // SWEEPKY_HOME fails before a network client is built.
+    let home = std::env::var_os("HOME");
+    let sweepky_home = std::env::var_os("SWEEPKY_HOME");
+    let dirs = Dirs::resolve(home.as_deref(), sweepky_home.as_deref())?;
     let ctx = Context {
         network: Network::for_kind(kind)?,
+        dirs,
     };
     run(cli, &ctx).await
 }

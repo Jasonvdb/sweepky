@@ -21,6 +21,14 @@
 //!   marker and a `.gitignore` with `sweeps/`.
 //! - `clock::now()`, the current time for a record's time fields
 //!   (`createdAt`, `revokedAt`, ...), as RFC 3339 in UTC to the second.
+//! - [`Dirs`], the config and data directories (`~/.config/sweepky/` and
+//!   `~/.local/share/sweepky/`, or both under `SWEEPKY_HOME`) and the paths
+//!   of the files in them, with [`IdentityName`], the checked name of a
+//!   dedicated identity.
+//! - `private_fs`, the owner-only file primitives every secret or state file
+//!   goes through: directories 0700 and files 0600, each mode set when it is
+//!   created, files written to a temp file then renamed, no links followed,
+//!   and loose or oversized files refused on read.
 //!
 //! The rules that hold for everything here (see "Rust conventions" in
 //! `docs/plan/03-cli-and-skill.md`):
@@ -66,10 +74,25 @@
 
 mod cli;
 mod clock;
+mod dirs;
 mod init;
 mod network;
+// Nothing outside its tests calls it yet, so a build without tests would warn
+// that it is unused, which CI's `-D warnings` turns into an error. `expect`
+// (rather than `allow`) says those warnings are wanted for now and warns in
+// turn once every item has a caller, so whoever adds the last one has to
+// delete this line. On a `mod`, the attribute covers everything inside it.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "login, keys and logout, the next P2a steps, are the first callers"
+    )
+)]
+mod private_fs;
 
 pub use cli::{Cli, Command};
+pub use dirs::{Dirs, IdentityName};
 pub use network::{
     CLIENT_ID, Network, NetworkKind, NetworkSettings, PRODUCTION_HOMESERVER, SWEEPKY_CAPABILITY,
     TESTNET_HOMESERVER, TESTNET_RELAY_URL, select_kind,
@@ -85,12 +108,14 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Everything a command needs from outside itself, handed in by the caller.
 ///
 /// The binary builds one from the arguments and the environment; a test builds
-/// one around a local testnet. Later commands add the config and state
-/// directories, the standard input and error writers, and the passphrase
-/// source here, so that no command reaches for a global.
+/// one around a local testnet and a temporary `SWEEPKY_HOME`. Later commands
+/// add the standard input and error writers and the passphrase source here,
+/// so that no command reaches for a global.
 pub struct Context {
     /// The network every command talks to.
     pub network: Network,
+    /// Where this install keeps its secrets and state.
+    pub dirs: Dirs,
 }
 
 /// What a command has to tell the user when it succeeds.
