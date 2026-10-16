@@ -3,7 +3,10 @@
 //!
 //! No archive format and no compression (01). Sealing goes
 //! [`SweepPackage::to_padded`], then [`encrypt`](crate::encrypt); opening
-//! goes [`decrypt`](crate::decrypt), then [`SweepPackage::from_json`].
+//! goes [`decrypt`](crate::decrypt), then [`SweepPackage::from_json`], then
+//! [`Manifest::check_binding`](crate::Manifest::check_binding). The `seal`
+//! module's [`seal_package`] and [`open_package`] do each direction in one
+//! call, and the CLI uses those, so it cannot leave a step out.
 //!
 //! The `build` module turns a sweep directory's files into a package
 //! ([`SweepPackage::build`]) and a package back into files
@@ -24,8 +27,10 @@ use crate::records::Manifest;
 use crate::schema::{MAX_PACKAGE_BYTES, SchemaVersion, UnknownFields, parse_record};
 
 mod build;
+mod seal;
 
 pub use build::{BuiltPackage, PackageFiles, SkipReason, SkippedFile, SweepFile};
+pub use seal::{OpenError, SealError, open_package, seal_package};
 
 /// `findings.json`: the file a sweep's findings are read from and written
 /// back to, and so the one name a package's [`Attachments`] refuse as a key.
@@ -124,7 +129,8 @@ pub struct SweepPackage {
     /// findings carry theirs.
     pub schema_version: SchemaVersion,
     /// What the sweep covers: sweeper, bounty, targets and their commits.
-    /// The owner's CLI checks it against the sweep record and its path.
+    /// [`open_package`] checks it against the sweep record and its path
+    /// ([`Manifest::check_binding`]).
     pub manifest: Manifest,
     /// The findings, in the common format.
     pub findings: Findings,
@@ -397,10 +403,10 @@ mod test_support {
     use crate::names::AttachmentPath;
 
     /// Sweeper S1 and owner A from `fixtures/trust-labels.json`.
-    const SWEEPER: &str = "a8fyof86uespzzjc3hiryromqy6hgw1gem5htj76jn6sto4jokhy";
+    pub(super) const SWEEPER: &str = "a8fyof86uespzzjc3hiryromqy6hgw1gem5htj76jn6sto4jokhy";
     pub(super) const OWNER: &str = "ybymzxgk1zd3a7dm3i15gcuq7ewqkbimft6r1n8oc9o6uay8mqfo";
     /// One of A's bounty ids.
-    const BOUNTY_ID: &str = "0035G87EK4XFE";
+    pub(super) const BOUNTY_ID: &str = "0035G87EK4XFE";
     pub(super) const REV: &str = "4444444444444444444444444444444444444444";
     /// Text no output may contain: errors and `Debug` never quote content.
     pub(super) const MARKER: &str = "MARKER-7f3a";
@@ -410,13 +416,18 @@ mod test_support {
     pub(super) fn manifest_json() -> Value {
         json!({
             "sweeper": SWEEPER,
-            "bounty": format!("pubky://{OWNER}/pub/sweepky/bounties/{BOUNTY_ID}.json"),
+            "bounty": bounty_url(OWNER, BOUNTY_ID),
             "targets": ["t1"],
             "targetShas": { "t1": REV },
             "playbook": "cloudflare/security-audit@c1c8a8c",
             "startedAt": "2026-10-16T08:00:00Z",
             "finishedAt": "2026-10-16T09:10:00Z",
         })
+    }
+
+    /// The URL of bounty record `id` under `owner`.
+    pub(super) fn bounty_url(owner: &str, id: &str) -> String {
+        format!("pubky://{owner}/pub/sweepky/bounties/{id}.json")
     }
 
     pub(super) fn path(value: &str) -> AttachmentPath {

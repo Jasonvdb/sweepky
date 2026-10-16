@@ -53,5 +53,5 @@ pub use bounty::{
 pub use circle::{Circle, CircleMember};
 pub use device_key::{DeviceKey, KeyAlg, KnownKeyAlg};
 pub use discovered::Discovered;
-pub use manifest::Manifest;
+pub use manifest::{BindingError, Manifest};
 pub use sweep::{KnownSweepStatus, Sweep, SweepStatus};

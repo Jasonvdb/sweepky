@@ -45,7 +45,12 @@
 //!   [`Sweep`], a sweep record with its open-string [`SweepStatus`]; and
 //!   [`Manifest`], the part of a sweep package that names the sweeper, the
 //!   bounty and the targets' commits, whose `Debug` prints how many unknown
-//!   fields it has but not what they hold.
+//!   fields it has but not what they hold. [`Manifest::check_binding`]
+//!   (P1b) ties a decrypted manifest to the [`Sweep`] record and the
+//!   [`SweepRef`] path it was fetched with: the path's owner must be the
+//!   sweeper named inside, the bounty the record's, and the targets the
+//!   record's and the `targetShas` keys, as one set. Its [`BindingError`]
+//!   holds no data.
 //! - A bounty's targets: [`Target`], which keeps its open-string
 //!   [`TargetKind`] and its other fields as written, so a kind this build
 //!   does not know round-trips and is skipped; [`Target::known`], which
@@ -123,6 +128,12 @@
 //!   [`SkipReason`] in a [`BuiltPackage`], for the CLI to warn about.
 //!   [`SweepPackage::into_files`] splits one back into [`PackageFiles`], one
 //!   wiped buffer per path, `findings.json` exactly once.
+//! - Sealing and opening a package in one call each (P1b), so the CLI cannot
+//!   leave a step out: [`seal_package`] checks the manifest's targets, pads
+//!   and encrypts; [`open_package`] decrypts, parses with the package cap and
+//!   checks the manifest binding, and returns the package only when all
+//!   three pass. Their errors, [`SealError`] and [`OpenError`], say which
+//!   step failed and hold no data.
 //! - The secret-holding types, re-exported so the CLI uses the same ones
 //!   without depending on `age` for them: [`SecretString`] and
 //!   [`ExposeSecret`] (age's re-export of `secrecy`) and [`Zeroizing`].
@@ -231,14 +242,14 @@ pub use names::{
     AttachmentPath, DeviceId, GitSha, Playbook, RepoName, RepoPath, Sha256Hex, TargetId,
 };
 pub use package::{
-    Attachments, BuiltPackage, FINDINGS_FILE, PackageError, PackageFiles, SkipReason, SkippedFile,
-    SweepFile, SweepPackage,
+    Attachments, BuiltPackage, FINDINGS_FILE, OpenError, PackageError, PackageFiles, SealError,
+    SkipReason, SkippedFile, SweepFile, SweepPackage, open_package, seal_package,
 };
 pub use pubky::Pubky;
 pub use records::{
-    Bounty, BountyPlaybook, BountyStatus, Circle, CircleMember, DeviceKey, Discovered, Focus,
-    KeyAlg, KnownBountyStatus, KnownFocus, KnownKeyAlg, KnownSweepStatus, Manifest, MarkDoneError,
-    Sweep, SweepStatus,
+    BindingError, Bounty, BountyPlaybook, BountyStatus, Circle, CircleMember, DeviceKey,
+    Discovered, Focus, KeyAlg, KnownBountyStatus, KnownFocus, KnownKeyAlg, KnownSweepStatus,
+    Manifest, MarkDoneError, Sweep, SweepStatus,
 };
 pub use schema::{
     MAX_FINDINGS_BYTES, MAX_PACKAGE_BYTES, MAX_RECORD_BYTES, SchemaVersion, UnknownFields,
