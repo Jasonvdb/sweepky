@@ -1,0 +1,5 @@
+# The bare fixture repository is committed byte for byte: git never converts
+# its line endings and never diffs or merges it as text. Its refs and config
+# are text files, but git reads them exactly as written. `binary` is short for
+# `-diff -merge -text`.
+fixtures/target-repo.git/** binary

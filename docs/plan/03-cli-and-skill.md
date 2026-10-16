@@ -85,7 +85,8 @@ Exact pins, re-checked against crates.io and npm for P0 on 2026-10-15; each is t
 |---|---|---|
 | `pubky` | =0.16.2 | features `json`; production's homeserver runs 0.16.1, and 0.16.2 changed only the homeserver (the SDK diff is doc comments) |
 | `pubky-testnet` | =0.16.2 | dev-dependency; same version as `pubky` |
-| `pubky-timestamp` | =0.4.1 | ids in `sweepky-core`, which must not depend on `pubky` |
+| `pubky-timestamp` | =0.4.1 | ids in `sweepky-core`, which must not depend on `pubky`; feature `base32` (never `serde`, which writes a timestamp as 8 raw bytes) |
+| `base32` | =0.5.1 | z-base32 for the `Pubky` type in `sweepky-core` (added in P1a); the exact release `pubky-timestamp`'s `base32` feature already pulls in, so it adds no new code. The newest stable release; 1.0.0-rc.1 is a pre-release |
 | `age` | =0.12.1 | default features only; never `plugin`, never `ssh` |
 | `secrecy` | =0.10.3 | use the `age::secrecy` re-export so the two agree |
 | `zeroize` | =1.9.1 | |
@@ -106,6 +107,6 @@ No `paykit` or `locks` crates in v1: they pin `pubky` 0.15 and 0.11 (a git rev) 
 - Typed errors with `thiserror` in the library; `anyhow` only in the binary, which only needs a good message.
 - Secrets: `age::x25519::Identity` wipes itself on drop and has no `Debug`, so hold it directly; it does not implement `Zeroize`, so wrapping it in `SecretBox` would not compile. `SecretString` for the bech32 identity string, passphrases and the grant token (which the SDK hands back as a plain `String`, so move it in at once); `Zeroizing<Vec<u8>>` for file buffers.
 - Open enums (`kind`, `status`, `alg`) are newtype `String`s with `as_known() -> Option<Known>` helpers, never closed serde enums, so unknown values from newer clients are skipped rather than failing the whole feed.
-- Unknown top-level fields are preserved with `#[serde(flatten)] extra: Map` so rewrites do not drop them. `done` is a rewrite, so this is tested from the start.
+- Unknown top-level fields are preserved with `#[serde(flatten)] extra: Map` so rewrites do not drop them. The findings types name that map `unknown`, because a finding has a real `extra` field. `done` is a rewrite, so this is tested from the start.
 - Pin `age` exactly: it is pre-1.0 and its docs call releases "beta". Leaving out `plugin` removes the code path behind its one security advisory (already patched in 0.12.1, so this is defence in depth).
 - Pubkys are a newtype that parses both `pubky<z32>` and raw z32 and compares by bytes ([01](01-records-and-discovery.md#compatibility-rules-every-client-follows)).
