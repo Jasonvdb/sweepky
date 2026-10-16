@@ -1,6 +1,6 @@
 # Fixtures
 
-Synthetic test data for the Rust tests in `crates/` and the TypeScript tests in `web/`. So far it holds `trust-labels.json` and `discovered.json`. The rest of [P1a](../docs/plan/phases/P1a-core-records.md) adds the Cloudflare-shaped `findings.json` and the small bare git repository the CLI's target tests fetch from, and [P1b](../docs/plan/phases/P1b-core-crypto.md) adds the synthetic run directories.
+Synthetic test data for the Rust tests in `crates/` and the TypeScript tests in `web/`. So far it holds `trust-labels.json`, `discovered.json` and the Cloudflare-shaped `cloudflare/findings.json`. The rest of [P1a](../docs/plan/phases/P1a-core-records.md) adds the small bare git repository the CLI's target tests fetch from, and [P1b](../docs/plan/phases/P1b-core-crypto.md) adds the synthetic run directories.
 
 Nothing real lands here. Every pubky, id and finding is made up for the test that uses it. The local demo's audit report is read from a path in an environment variable and is never committed ([P5](../docs/plan/phases/P5-local-demo.md#inputs-environment-never-committed)).
 
@@ -8,6 +8,7 @@ Nothing real lands here. Every pubky, id and finding is made up for the test tha
 |---|---|---|
 | [`trust-labels.json`](trust-labels.json) | A roster, bounties with credits, and the trust label and credit tally every pubky in it should get | P1a's trust-label test (Rust), P4's trust-badge test (TypeScript) |
 | [`discovered.json`](discovered.json) | An open bounty's discovered-sweeps file: two strangers' sweeps and the feed cursors of two homeservers | P1a's `Discovered` round-trip test (Rust) |
+| [`cloudflare/findings.json`](cloudflare/findings.json) | A `findings.json` in the shape Cloudflare's `security-audit` skill writes: a `confirmed`, a `needs_validation` and a `rejected` record, sorted by fingerprint | P1a's Cloudflare converter tests (Rust) |
 
 ## `trust-labels.json`
 
@@ -75,3 +76,12 @@ The file is in the form `sweepky-core` writes: keys in raw z-base32 in the sweep
 
 - The two sweepers are S1 (`a8fyof86`) and S3 (`qwujy4ep`) from `trust-labels.json`: sweepers outside the roster, the only kind discovery adds. The sweep ids are synthetic `pubky-timestamp` values from October 2026.
 - The two homeserver keys (`1nepshaq` and `iod35orp`) are random Ed25519 public keys generated for this file with the private keys discarded. Neither is a real homeserver or the testnet homeserver's key. The event ids are made up.
+
+## `cloudflare/findings.json`
+
+A `findings.json` in the shape that Cloudflare's `security-audit` skill writes at the pinned commit `c1c8a8c1471069fb0e188eeaff69b8e8db6564a8`: a top-level array of records, each `confirmed`, `needs_validation` or `rejected`, sorted by `fingerprint`. It keeps the file name Cloudflare's skill uses, so a Cloudflare-shaped run directory can reuse it as it is.
+
+- Every record is made up. The code paths, line numbers, scopes and text describe an imagined auth module, not any real audit. The locations point at `src/auth/session.rs` and `src/auth/handler.rs`, the files of the auth module in the bare fixture repository that P1a adds; no test reads those files at these lines.
+- The `confirmed` record has `overall_severity` `informational`, which converts to `info`. The `needs_validation` and `rejected` records carry no severity or confidence, as Cloudflare's schema requires, so they convert with both `null`.
+- The converter test turns the file into common findings, writes them to bytes, reads them back and rebuilds the array from each finding's `extra.cloudflare`; the result must equal this file's JSON value exactly. `fix` comes from `remediation.strategy` alone, so the record's `code_changes` survive only in `extra.cloudflare`.
+- The file is valid against Cloudflare's own schema. After changing it, check it again: fetch `report-schema.json` and `validate-findings.cjs` from `skills/security-audit/` at the pinned commit into a scratch directory outside the repository (never commit them), then run `node <scratch>/validate-findings.cjs fixtures/cloudflare/findings.json` from the repository root. It prints `PASS: 3 findings valid`.

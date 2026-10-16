@@ -1,0 +1,154 @@
+[
+  {
+    "verdict": "confirmed",
+    "fingerprint": "auth-expiry-inclusive",
+    "title": "Session expiry check accepts a token during its expiry second",
+    "description": "`Session::is_expired` treats the second a token expires in as still valid, so `validate` accepts the token for up to one second past its `expires_at`.",
+    "root_cause": "`is_expired` compares with `now > self.expires_at` where `now >= self.expires_at` is meant.",
+    "intended_behavior": "A token is refused from its `expires_at` second on.",
+    "trace": [
+      {
+        "kind": "entrypoint",
+        "file": "src/auth/handler.rs",
+        "line": 18,
+        "scope": "fn handle_request",
+        "description": "The handler reads the session token from the `Authorization` header and calls `Session::validate`."
+      },
+      {
+        "kind": "sink",
+        "file": "src/auth/session.rs",
+        "line": 88,
+        "scope": "fn is_expired",
+        "description": "The expiry comparison lets `now == expires_at` through."
+      }
+    ],
+    "evidence": [
+      {
+        "file": "src/auth/session.rs",
+        "line": 88,
+        "description": "The only expiry check is `now > self.expires_at`."
+      }
+    ],
+    "conditions": [
+      {
+        "kind": "timing_dependency",
+        "description": "The request has to arrive within the token's last second."
+      }
+    ],
+    "execution": {
+      "attacker_perspective": "A client whose session token is about to expire.",
+      "payloads": [
+        "a session token whose expires_at equals the test clock"
+      ],
+      "instructions": [
+        "Set the test clock to the token's expires_at.",
+        "Call Session::validate with that token."
+      ],
+      "observed_result": "In a local test run, validate returned Ok for the token at its expires_at second."
+    },
+    "remediation": {
+      "strategy": "Compare with `>=`, so a token is refused from its `expires_at` second on.",
+      "code_changes": [
+        {
+          "file_name": "src/auth/session.rs",
+          "fixed_code": "fn is_expired(&self, now: u64) -> bool {\n    now >= self.expires_at\n}\n"
+        }
+      ]
+    },
+    "severity": {
+      "likelihood": {
+        "score": "low",
+        "reason": "The window is one second long."
+      },
+      "impact": {
+        "score": "informational",
+        "reason": "The token was valid a second earlier, so no new access is gained."
+      },
+      "overall_severity": "informational"
+    },
+    "confidence": {
+      "score": "high",
+      "reason": "Reproduced in a local test run."
+    }
+  },
+  {
+    "verdict": "needs_validation",
+    "fingerprint": "auth-token-compare-timing",
+    "title": "Session token compared with `==`",
+    "description": "`Session::validate` compares the presented token with the stored one using `==` on byte slices, which can return at the first byte that differs.",
+    "claimed_root_cause": "A secret is compared with a short-circuiting comparison instead of a constant-time one.",
+    "trace": [
+      {
+        "kind": "entrypoint",
+        "file": "src/auth/handler.rs",
+        "line": 18,
+        "scope": "fn handle_request",
+        "description": "The handler passes the `Authorization` header to `Session::from_header`."
+      },
+      {
+        "kind": "propagation",
+        "file": "src/auth/session.rs",
+        "line": 64,
+        "scope": "fn from_header",
+        "description": "The token is decoded and handed to `validate` unchanged."
+      },
+      {
+        "kind": "sink",
+        "file": "src/auth/session.rs",
+        "line": 120,
+        "scope": "fn validate",
+        "description": "The decoded token is compared with the stored token using `==`."
+      }
+    ],
+    "evidence": [
+      {
+        "file": "src/auth/session.rs",
+        "line": 120,
+        "description": "`if presented == self.token` decides whether the session is valid."
+      },
+      {
+        "file": "src/auth/session.rs",
+        "line": 12,
+        "description": "`token` is a plain `Vec<u8>` field, with no constant-time comparison type around it."
+      }
+    ],
+    "blockers": [
+      "Whether the timing difference can be measured over the network needs the deployed service."
+    ],
+    "validation_plan": {
+      "local": "Time `validate` over many tokens that share a prefix of growing length with the stored token, and look for a trend.",
+      "deployment": "Repeat the measurement against a test deployment from a host on the same network."
+    }
+  },
+  {
+    "verdict": "rejected",
+    "fingerprint": "auth-unchecked-redirect",
+    "title": "Login redirect target taken from the query string",
+    "description": "`handle_login` reads the `next` query parameter and redirects to it after a successful login.",
+    "claimed_root_cause": "An unchecked redirect target could send a user to another site after login.",
+    "trace": [
+      {
+        "kind": "entrypoint",
+        "file": "src/auth/handler.rs",
+        "line": 31,
+        "scope": "fn handle_login",
+        "description": "The handler reads the `next` query parameter."
+      },
+      {
+        "kind": "sink",
+        "file": "src/auth/handler.rs",
+        "line": 47,
+        "scope": "fn redirect_after_login",
+        "description": "The redirect response is built from the checked target."
+      }
+    ],
+    "evidence": [
+      {
+        "file": "src/auth/handler.rs",
+        "line": 42,
+        "description": "`safe_redirect` keeps only relative paths that start with a single `/` and falls back to `/` otherwise."
+      }
+    ],
+    "reason": "`safe_redirect` runs before the redirect is built and refuses any absolute or scheme-relative target, so the redirect cannot leave the site."
+  }
+]

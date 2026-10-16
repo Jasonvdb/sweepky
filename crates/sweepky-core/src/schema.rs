@@ -79,6 +79,19 @@ impl TryFrom<u64> for SchemaVersion {
 /// are kept only if that field's own type has an `extra` map too.
 pub type UnknownFields = serde_json::Map<String, serde_json::Value>;
 
+/// Refuses `input` longer than `limit` with [`RecordError::TooLarge`], without
+/// looking at a single byte of it. Every from-bytes parse calls this first,
+/// so a stranger's oversized document is never parsed at all.
+pub(crate) fn check_size(input: &[u8], limit: usize) -> Result<(), RecordError> {
+    if input.len() > limit {
+        return Err(RecordError::TooLarge {
+            limit,
+            len: input.len(),
+        });
+    }
+    Ok(())
+}
+
 /// The first pass of [`parse_record`]: only `schemaVersion`. serde skips every
 /// other key, whatever its shape.
 ///
@@ -113,12 +126,7 @@ pub(crate) fn parse_record<T: DeserializeOwned>(
     input: &[u8],
     limit: usize,
 ) -> Result<T, RecordError> {
-    if input.len() > limit {
-        return Err(RecordError::TooLarge {
-            limit,
-            len: input.len(),
-        });
-    }
+    check_size(input, limit)?;
     // `?` turns a serde_json error into a `RecordError` through the `From` impl
     // in error.rs, which keeps only the error's category and position.
     let probe: VersionProbe = serde_json::from_slice(input)?;

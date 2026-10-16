@@ -2,13 +2,24 @@
 //! [`Location`]s a finding points at (01, "The sweep package"). The rules
 //! that hold for all three are on [`Findings`], because this module is
 //! private and only the re-exported types appear in the crate's docs.
+//!
+//! [`parse_audit_findings`] reads the findings a sweeper's agent left in
+//! either format, the common one or Cloudflare's, which the `cloudflare`
+//! module converts.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::error::RecordError;
+use crate::names::Playbook;
 use crate::open_enum::open_enum;
-use crate::schema::{MAX_FINDINGS_BYTES, SchemaVersion, UnknownFields, parse_record};
+use crate::schema::{MAX_FINDINGS_BYTES, SchemaVersion, UnknownFields, check_size, parse_record};
+
+mod cloudflare;
+
+pub use cloudflare::{
+    CloudflareField, ConvertError, from_cloudflare, is_cloudflare_shape, to_cloudflare,
+};
 
 open_enum! {
     /// A finding's `status`: what the playbook concluded about it.
@@ -83,8 +94,9 @@ open_enum! {
 ///
 /// Every playbook's output ends up in this one small shape, so the owner's
 /// tooling can group findings from any sweep. A sweeper's agent writes it as
-/// `findings.json`, or leaves Cloudflare's output for the CLI to convert; the
-/// sweep package carries it as `findings`.
+/// `findings.json`, or leaves Cloudflare's output for the CLI to convert
+/// ([`parse_audit_findings`] reads either); the sweep package carries it as
+/// `findings`.
 ///
 /// **Sealed content.** This type, [`Finding`] and [`Location`] exist only
 /// inside the encrypted sweep package and in the owner's decrypted copies.
@@ -172,8 +184,8 @@ pub struct Finding {
     pub fix: Option<String>,
     /// The JSON field `extra`: whatever the playbook keeps with a finding
     /// that the common fields have no place for. The Cloudflare converter
-    /// keeps the original record here, under `cloudflare`, so it can be
-    /// rebuilt exactly.
+    /// ([`from_cloudflare`]) keeps the original record here, under
+    /// `cloudflare`, so [`to_cloudflare`] can rebuild it exactly.
     ///
     /// Not the unknown-field map, which is [`unknown`](Self::unknown).
     // `Option` around the map, so that a missing `extra` and an empty one
@@ -243,11 +255,77 @@ impl Findings {
     }
 }
 
+/// Which format [`parse_audit_findings`] found an audit's findings in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FindingsSource {
+    /// Sweepky's common format, a JSON object, read as it is.
+    Common,
+    /// Cloudflare's `findings.json`, a JSON array, converted with
+    /// [`from_cloudflare`].
+    Cloudflare,
+}
+
+/// Reads the findings a sweeper's agent left, in the common format or in
+/// Cloudflare's, as the common [`Findings`], and says which it was.
+///
+/// This is what `submit` calls on the `findings.json` in a sweep directory.
+/// The format is detected by shape, after the bytes parse as JSON:
+///
+/// - **An object** is the common format, read with [`Findings::from_json`]
+///   and its `schemaVersion` check. `playbook` is not used: the document
+///   names its own, and the checked name is the manifest's.
+/// - **An array** is Cloudflare's, converted with [`from_cloudflare`] and
+///   `playbook` as the document's playbook. The common format is never an
+///   array, so an array whose items do not all carry `verdict` and
+///   `fingerprint` (01's rule, [`is_cloudflare_shape`]) is not some third
+///   format but a broken Cloudflare file: the error names the first item that
+///   is not a record, by index. An empty array converts to no findings.
+/// - **Anything else** is a [`ConvertError::UnknownShape`].
+///
+/// The input is agent-written and untrusted. Input over
+/// [`MAX_FINDINGS_BYTES`] is refused before parsing, with
+/// [`RecordError::TooLarge`] inside [`ConvertError::Record`]; serde_json's
+/// recursion limit stays on; malformed input is an error, never a panic; and
+/// no error quotes the input.
+pub fn parse_audit_findings(
+    input: &[u8],
+    playbook: &Playbook,
+) -> Result<(Findings, FindingsSource), ConvertError> {
+    // `?` turns the `RecordError` into a `ConvertError` through the `#[from]`
+    // on `ConvertError::Record`.
+    check_size(input, MAX_FINDINGS_BYTES)?;
+    // `?` applies one `From` conversion, and there are two steps here
+    // (serde_json's error to `RecordError`, then to `ConvertError`), so
+    // `map_err` takes the first, keeping only the category and position.
+    let document: Value = serde_json::from_slice(input).map_err(RecordError::from)?;
+    match document {
+        // `records` takes the array's `Vec` out of `document` without a copy,
+        // and `from_cloudflare` moves each record on into its finding.
+        Value::Array(records) => Ok((
+            from_cloudflare(records, playbook)?,
+            FindingsSource::Cloudflare,
+        )),
+        Value::Object(_) => {
+            // The `Value` was only for telling the formats apart. Drop it
+            // before parsing the bytes again into the typed `Findings`, so
+            // the two never sit in memory together.
+            drop(document);
+            Ok((Findings::from_json(input)?, FindingsSource::Common))
+        }
+        _ => Err(ConvertError::UnknownShape),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::{Map, Value, json};
 
-    use super::{Findings, KnownConfidence, KnownFindingStatus, KnownLocationKind, KnownSeverity};
+    use super::cloudflare::test_support::{FIXTURE, fixture, playbook};
+    use super::{
+        CloudflareField, ConvertError, Findings, FindingsSource, KnownConfidence,
+        KnownFindingStatus, KnownLocationKind, KnownSeverity, is_cloudflare_shape,
+        parse_audit_findings,
+    };
     use crate::error::{JsonCategory, RecordError};
     use crate::schema::{MAX_FINDINGS_BYTES, MAX_RECORD_BYTES};
 
@@ -316,6 +394,113 @@ mod tests {
         let findings = parse(input).unwrap();
         assert_eq!(serde_json::to_value(&findings).unwrap(), *input);
         findings
+    }
+
+    fn audit(input: &[u8]) -> Result<(Findings, FindingsSource), ConvertError> {
+        parse_audit_findings(input, &playbook())
+    }
+
+    #[test]
+    fn a_cloudflare_array_is_converted_with_the_callers_playbook() {
+        // A top-level array whose items carry `verdict` and `fingerprint`.
+        // Cloudflare's file names no playbook, so the caller's is used.
+        assert!(is_cloudflare_shape(&Value::Array(fixture())));
+        let (findings, source) = audit(FIXTURE.as_bytes()).unwrap();
+        assert_eq!(source, FindingsSource::Cloudflare);
+        assert_eq!(findings.findings.len(), 3);
+        assert_eq!(findings.playbook, playbook().as_str());
+    }
+
+    #[test]
+    fn an_empty_array_is_a_cloudflare_run_that_found_nothing() {
+        assert!(is_cloudflare_shape(&json!([])));
+        let (findings, source) = audit(b" [ ] ").unwrap();
+        assert_eq!(source, FindingsSource::Cloudflare);
+        assert!(findings.findings.is_empty());
+    }
+
+    #[test]
+    fn an_object_is_read_as_the_common_format_with_its_own_playbook() {
+        // `bare()` names a playbook other than the caller's, so reading it as
+        // it is shows the caller's playbook is not used.
+        let common = bare();
+        assert_ne!(common["playbook"], playbook().as_str());
+        assert!(!is_cloudflare_shape(&common));
+        let (findings, source) = audit(common.to_string().as_bytes()).unwrap();
+        assert_eq!(source, FindingsSource::Common);
+        assert_eq!(serde_json::to_value(&findings).unwrap(), common);
+    }
+
+    #[test]
+    fn a_json_scalar_is_an_unknown_shape() {
+        for scalar in ["null", "true", "7", r#""findings""#] {
+            assert!(!is_cloudflare_shape(&serde_json::from_str(scalar).unwrap()));
+            assert_eq!(
+                audit(scalar.as_bytes()).unwrap_err(),
+                ConvertError::UnknownShape
+            );
+        }
+    }
+
+    #[test]
+    fn an_array_item_that_is_not_a_cloudflare_record_is_named_by_index() {
+        // The common format is never an array, so an array that mixes
+        // Cloudflare records with anything else is a broken Cloudflare file;
+        // the error names the first item that is not a record.
+        let mut items = fixture();
+        items.insert(1, json!({ "title": "no verdict or fingerprint" }));
+        let mixed = Value::Array(items.clone());
+        assert!(!is_cloudflare_shape(&mixed));
+        assert_eq!(
+            audit(mixed.to_string().as_bytes()).unwrap_err(),
+            ConvertError::Missing {
+                index: 1,
+                field: CloudflareField::Key("fingerprint")
+            }
+        );
+        items[1] = json!(1);
+        let mixed = Value::Array(items);
+        assert!(!is_cloudflare_shape(&mixed));
+        assert_eq!(
+            audit(mixed.to_string().as_bytes()).unwrap_err(),
+            ConvertError::NotAnObject { index: 1 }
+        );
+    }
+
+    #[test]
+    fn audit_findings_over_the_cap_are_refused_before_parsing() {
+        // At the findings cap an empty array padded with JSON whitespace
+        // converts; one byte more is refused before any parsing, so input
+        // that is not JSON at all gets the same answer.
+        let mut input = b"[]".to_vec();
+        input.resize(MAX_FINDINGS_BYTES, b' ');
+        assert!(audit(&input).is_ok());
+        let too_large = ConvertError::Record(RecordError::TooLarge {
+            limit: MAX_FINDINGS_BYTES,
+            len: MAX_FINDINGS_BYTES + 1,
+        });
+        input.push(b' ');
+        assert_eq!(audit(&input).unwrap_err(), too_large);
+        assert_eq!(
+            audit(&vec![b'['; MAX_FINDINGS_BYTES + 1]).unwrap_err(),
+            too_large
+        );
+    }
+
+    #[test]
+    fn malformed_audit_findings_are_an_error_that_never_quotes_them() {
+        // Malformed JSON, and nesting past serde_json's recursion limit, are
+        // errors that never quote the input, not a panic or a stack overflow.
+        const MARKER: &str = "MARKER-7f3a";
+        let deep = format!("{}{}", "[".repeat(10_000), "]".repeat(10_000));
+        for input in [format!(r#"[{{"fingerprint":"{MARKER}",}}]"#), deep] {
+            let err = audit(input.as_bytes()).unwrap_err();
+            assert!(
+                matches!(err, ConvertError::Record(RecordError::Json { .. })),
+                "{err:?}"
+            );
+            assert!(!err.to_string().contains(MARKER), "{err}");
+        }
     }
 
     #[test]

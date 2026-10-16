@@ -59,6 +59,14 @@
 //!   inside the encrypted package and the owner's decrypted copies, never in
 //!   a public record, and [`Findings::from_json`] reads them with the larger
 //!   [`MAX_FINDINGS_BYTES`] cap.
+//! - Reading what a sweeper's agent left: [`parse_audit_findings`] takes the
+//!   bytes of a `findings.json` in the common format or in Cloudflare's,
+//!   detected by shape, and says which with [`FindingsSource`].
+//!   [`from_cloudflare`] converts Cloudflare's array, filling `severity` and
+//!   `confidence` from `confirmed` records only and keeping each whole record
+//!   in `extra.cloudflare`, and [`to_cloudflare`] rebuilds the array from
+//!   there. Its errors are [`ConvertError`]s, which name a record by index
+//!   and a field by its [`CloudflareField`] path, never the content.
 //!
 //! The rules that hold for everything here (see "Rust conventions" in
 //! `docs/plan/03-cli-and-skill.md`):
@@ -132,8 +140,9 @@ mod validated_string;
 
 pub use error::{JsonCategory, RecordError};
 pub use findings::{
-    Confidence, Finding, FindingStatus, Findings, KnownConfidence, KnownFindingStatus,
-    KnownLocationKind, KnownSeverity, Location, LocationKind, Severity,
+    CloudflareField, Confidence, ConvertError, Finding, FindingStatus, Findings, FindingsSource,
+    KnownConfidence, KnownFindingStatus, KnownLocationKind, KnownSeverity, Location, LocationKind,
+    Severity, from_cloudflare, is_cloudflare_shape, parse_audit_findings, to_cloudflare,
 };
 pub use ids::{EventCursor, RecordId};
 pub use names::{DeviceId, GitSha, Playbook, RepoName, RepoPath, Sha256Hex, TargetId};
