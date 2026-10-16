@@ -23,7 +23,9 @@ use pubky::{ClientId, Keypair, PublicKey};
 use pubky_testnet::EphemeralTestnet;
 use serde_json::{Value, json};
 use sweepky_cli::{CLIENT_ID, Cli, Context, Dirs, Network, Report, StderrWriter, run};
-use sweepky_core::{DeviceIdentity, DeviceKey, MAX_RECORD_BYTES, SecretString, Zeroizing};
+use sweepky_core::{
+    Circle, DeviceIdentity, DeviceKey, MAX_RECORD_BYTES, Pubky, SecretString, Zeroizing,
+};
 
 /// What the context writes to standard error, kept where the test can read
 /// it. `Arc<Mutex<…>>` is one buffer with two owners, the context and the
@@ -457,5 +459,94 @@ async fn end_to_end() {
         "{text}"
     );
     assert!(!text.contains("alarm"), "{text}");
+    assert_eq!(stderr.text(), "", "nothing on standard error");
+
+    // `circle create` makes the throwaway's circle, with the throwaway as
+    // its admin and its first member.
+    let report = sweepky(&ctx, &["circle", "create", "Throwaway circle"])
+        .await
+        .expect("circle create");
+    assert!(
+        report
+            .text()
+            .contains("Created the circle Throwaway circle"),
+        "{}",
+        report.text()
+    );
+
+    // `circle add` of a synthetic member, a key made for this run and used
+    // nowhere else, given in the SDK's `pubky<z32>` spelling.
+    let member = Keypair::random().public_key();
+    let member_z32 = member.z32();
+    let report = sweepky(
+        &ctx,
+        &[
+            "circle",
+            "add",
+            &member.to_string(),
+            "--label",
+            "synthetic member",
+        ],
+    )
+    .await
+    .expect("circle add");
+    assert!(
+        report.text().contains(&format!("Added {member_z32}")),
+        "{}",
+        report.text()
+    );
+
+    // Anyone can read the roster, and it lists the admin in `members` as
+    // well as in `admin`, then the member with its label.
+    let roster = get_capped(
+        &testnet,
+        &user,
+        "/pub/sweepky/circle.json",
+        MAX_RECORD_BYTES,
+    )
+    .await;
+    let circle = Circle::from_json(&roster).expect("a circle record");
+    let admin: Pubky = pubky.parse().expect("a pubky");
+    let added: Pubky = member_z32.parse().expect("a pubky");
+    assert_eq!(circle.name, "Throwaway circle");
+    assert_eq!(circle.admin, admin);
+    let listed: Vec<(Pubky, Option<&str>)> = circle
+        .members
+        .iter()
+        .map(|entry| (entry.pubky, entry.label.as_deref()))
+        .collect();
+    assert_eq!(listed, [(admin, None), (added, Some("synthetic member"))]);
+
+    // `circle show`, with no argument, shows this identity's circle: the
+    // admin and the member.
+    let report = sweepky(&ctx, &["circle", "show"])
+        .await
+        .expect("circle show");
+    let text = report.text();
+    assert!(text.contains(&format!("Admin: {pubky}\n")), "{text}");
+    assert!(text.contains(&format!("  {pubky} (admin)\n")), "{text}");
+    assert!(
+        text.contains(&format!("  {member_z32}, label synthetic member\n")),
+        "{text}"
+    );
+
+    // `circle remove`, given the raw z-base32 spelling this time: the key is
+    // the same member, compared by its bytes. `circle show <admin>` then
+    // lists the admin only.
+    let report = sweepky(&ctx, &["circle", "remove", &member_z32])
+        .await
+        .expect("circle remove");
+    assert!(
+        report.text().contains(&format!("Removed {member_z32}")),
+        "{}",
+        report.text()
+    );
+    let report = sweepky(&ctx, &["circle", "show", &pubky])
+        .await
+        .expect("circle show of the admin");
+    let text = report.text();
+    assert!(text.contains("Members (1):\n"), "{text}");
+    assert!(text.contains(&format!("  {pubky} (admin)\n")), "{text}");
+    assert!(!text.contains(&member_z32), "{text}");
     assert_eq!(stderr.text(), "", "nothing on standard error");
 }

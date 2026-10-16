@@ -99,6 +99,63 @@ pub enum Command {
         #[command(subcommand)]
         command: KeysCommand,
     },
+
+    /// The circle: the roster this identity keeps as its admin, at
+    /// /pub/sweepky/circle.json. Create it, add or remove a member, or show
+    /// a circle.
+    Circle {
+        /// What to do with it.
+        #[command(subcommand)]
+        command: CircleCommand,
+    },
+}
+
+/// The `circle` commands.
+///
+/// Every pubky and label is read as plain text and checked by the command,
+/// not by clap, whose parse error would quote the value back.
+#[derive(Debug, Subcommand)]
+pub enum CircleCommand {
+    /// Create this identity's circle, named NAME, with this identity as its
+    /// admin and its first member. Refused when the circle exists already.
+    Create {
+        /// The circle's name: 1 to 64 characters, with no control,
+        /// formatting or invisible characters and no backslash. Public.
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
+
+    /// Add PUBKY to this identity's circle, or set its label when it is a
+    /// member already.
+    Add {
+        /// The member's public key: 52 characters of z-base32, with or
+        /// without the `pubky` prefix the Pubky SDK prints.
+        #[arg(value_name = "PUBKY")]
+        pubky: String,
+
+        /// A short name for the member, shown beside the key: 1 to 64
+        /// characters, with no control, formatting or invisible characters
+        /// and no backslash. Public.
+        #[arg(long, value_name = "LABEL")]
+        label: Option<String>,
+    },
+
+    /// Remove PUBKY from this identity's circle. The admin cannot be
+    /// removed.
+    Remove {
+        /// The member's public key, in either form.
+        #[arg(value_name = "PUBKY")]
+        pubky: String,
+    },
+
+    /// Show a circle: the one ADMIN keeps, or this identity's own. Reads
+    /// public data only.
+    Show {
+        /// The admin whose circle to show, in either form; this identity
+        /// when left out.
+        #[arg(value_name = "ADMIN")]
+        admin: Option<String>,
+    },
 }
 
 /// The `keys` commands.

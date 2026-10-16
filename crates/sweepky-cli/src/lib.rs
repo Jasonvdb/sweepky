@@ -69,6 +69,14 @@
 //!   its device id, and every string from a record sanitised; and the
 //!   revoke, which sets `revokedAt` under the writers' lock and keeps every
 //!   other field. `login` runs the same unknown-id check after its tail.
+//! - `circle create|add|remove|show` (`circle`): the roster this identity
+//!   keeps as its admin, `/pub/sweepky/circle.json`. The three writes read
+//!   the record back under the writers' lock with a session of their own,
+//!   change it with a pure function that keeps every field this build does
+//!   not know, and write it again; every pubky is checked by the SDK and
+//!   compared by its bytes, and every name and label is checked before it
+//!   is written. `show` reads anyone's circle from public storage with no
+//!   session, and sanitises the name and the labels it prints.
 //! - `state`, this install's own state files: `login.json` and a dedicated
 //!   identity's key and details files, read and written together.
 //! - `session`, the per-command session every writing command runs in: the
@@ -117,6 +125,8 @@
     )
 )]
 
+// `circle create|add|remove|show`: the roster in `circle.json`.
+mod circle;
 mod cli;
 mod clock;
 // This install's device key: its secret in `device.key`, its public record
@@ -158,7 +168,7 @@ mod test_support;
 use std::io::Write;
 use std::sync::{Mutex, PoisonError};
 
-pub use cli::{Cli, Command, KeysCommand};
+pub use cli::{CircleCommand, Cli, Command, KeysCommand};
 pub use dirs::Dirs;
 pub use identity::IdentityName;
 pub use network::{
@@ -280,6 +290,12 @@ pub async fn run(cli: Cli, ctx: &Context) -> anyhow::Result<Report> {
         Command::Keys { command } => match command {
             KeysCommand::List => keys::list(ctx).await,
             KeysCommand::Revoke { device_id } => keys::revoke(ctx, &device_id).await,
+        },
+        Command::Circle { command } => match command {
+            CircleCommand::Create { name } => circle::create(ctx, &name).await,
+            CircleCommand::Add { pubky, label } => circle::add(ctx, &pubky, label.as_deref()).await,
+            CircleCommand::Remove { pubky } => circle::remove(ctx, &pubky).await,
+            CircleCommand::Show { admin } => circle::show(ctx, admin.as_deref()).await,
         },
     }
 }
