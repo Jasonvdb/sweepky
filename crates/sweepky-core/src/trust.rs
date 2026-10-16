@@ -1,5 +1,5 @@
 //! Trust labels: how far a reader trusts a pubky, computed from a roster and
-//! the credits on the bounties its members marked done.
+//! the credits on the bounties its admin and members marked done.
 //!
 //! The rule is on [`trust_labels`], because this module is private and only
 //! the re-exported items appear in the crate's docs. It has two
@@ -26,12 +26,12 @@ use crate::records::{Bounty, BountyStatus, Circle, KnownBountyStatus};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum TrustLabel {
-    /// Listed in the roster's `members`, whatever its tally.
+    /// In the roster (the admin, or listed in `members`), whatever its tally.
     Circle,
-    /// Not a member, but credited on at least one counted bounty. The
+    /// Not in the roster, but credited on at least one counted bounty. The
     /// [`CreditTally`] says on how many, and from how many owners.
     Known,
-    /// Neither a member nor credited on any counted bounty.
+    /// Neither in the roster nor credited on any counted bounty.
     Unknown,
 }
 
@@ -114,13 +114,13 @@ impl CreditedBounty {
         }
     }
 
-    /// Whether this bounty's credits count: it is done and its owner is a
-    /// roster member.
+    /// Whether this bounty's credits count: it is done and its owner is in
+    /// the roster.
     fn is_counted(&self, circle: &Circle) -> bool {
         // `as_known` matches the status string exactly, so `Done`, `closed`
         // or a status a newer client adds is not `done`: when in doubt, a
         // bounty counts for nothing.
-        self.status.as_known() == Some(KnownBountyStatus::Done) && circle.is_member(self.owner)
+        self.status.as_known() == Some(KnownBountyStatus::Done) && circle.is_in_roster(self.owner)
     }
 
     /// The sweepers this bounty credits, each once and without its owner.
@@ -180,15 +180,16 @@ impl TrustTable {
 /// trust model adds to `known`. For each pubky:
 ///
 /// - A credit counts only on a bounty whose `status` is `done` and whose owner
-///   is trusted: in v1, a roster member ([`Circle::is_member`], the `members`
-///   list only, so an admin missing from it is not trusted).
+///   is trusted: in v1, anyone in the roster ([`Circle::is_in_roster`], the
+///   admin and every entry in `members`, so an admin missing from `members`
+///   is still trusted).
 /// - A credit naming the bounty's own owner counts for nothing. The CLI never
 ///   writes one, but anyone can hand-write their own records, so the read
 ///   side is where the rule holds.
 /// - `bounties` is the number of counted bounties crediting the pubky, each
 ///   once however many times it names the pubky, and `owners` the number of
 ///   distinct owners among them.
-/// - The label is `circle` for a roster member, whatever its tally; else
+/// - The label is `circle` for anyone in the roster, whatever its tally; else
 ///   `known` if `bounties` > 0; else `unknown`.
 ///
 /// Pass the whole list of bounties you have: open ones, ones from owners
@@ -244,7 +245,7 @@ fn seen_pubkys(circle: &Circle, bounties: &[CreditedBounty]) -> BTreeSet<Pubky> 
 
 /// The label for `pubky`, given its tally.
 fn label_for(circle: &Circle, pubky: Pubky, tally: CreditTally) -> TrustLabel {
-    if circle.is_member(pubky) {
+    if circle.is_in_roster(pubky) {
         TrustLabel::Circle
     } else if tally.bounties > 0 {
         TrustLabel::Known
@@ -344,6 +345,17 @@ mod tests {
 
         fn roster(&self) -> Circle {
             Circle::from_json(self.roster.to_string().as_bytes()).unwrap()
+        }
+
+        /// The roster with its admin, A, taken out of `members`, so A is in
+        /// it as the admin alone.
+        fn roster_without_admin_in_members(&self) -> Circle {
+            let mut roster = self.roster();
+            // `Pubky` is `Copy`, so this copies the admin's key out, and
+            // `retain` keeps only the members the closure returns `true` for.
+            let admin = roster.admin;
+            roster.members.retain(|member| member.pubky != admin);
+            roster
         }
 
         /// Every bounty in the file, open ones and the outsider's included.
@@ -514,31 +526,36 @@ mod tests {
     }
 
     #[test]
-    fn an_admin_not_listed_in_members_is_not_circle_or_trusted() {
-        // fixtures/README.md: membership is the `members` list. A is the admin
-        // here but not listed, so A is not `circle`, and A's done bounties
-        // (0035G87EK4XFE and 0035M2DX3Q44W) are an untrusted owner's.
-        let roster = json!({
-            "schemaVersion": 1,
-            "name": "Admin not listed",
-            "admin": A,
-            "members": [{ "pubky": B, "label": "B" }, { "pubky": D, "label": "D" }],
-        });
-        let roster = Circle::from_json(roster.to_string().as_bytes()).unwrap();
+    fn an_admin_left_out_of_members_is_a_trusted_owner() {
+        // As in 06's end-to-end test, A is the admin and the bounty's owner;
+        // here `members` leaves A out. A's done bounty credits B, a member,
+        // and S3, a stranger.
+        let roster = Fixture::load().roster_without_admin_in_members();
+        let table = trust_labels(&roster, &[done(A, &[B, S3])]);
+
+        assert_eq!(table.get(pubky(A)), trust(TrustLabel::Circle, 0, 0));
+        assert_eq!(table.get(pubky(B)), trust(TrustLabel::Circle, 1, 1));
+        // S3 would be `unknown` if A's bounty were an untrusted owner's.
+        assert_eq!(table.get(pubky(S3)), trust(TrustLabel::Known, 1, 1));
+    }
+
+    #[test]
+    fn leaving_the_admin_out_of_members_changes_no_label_or_tally() {
+        // fixtures/README.md: the roster is the admin and every entry in
+        // `members`. The fixture lists its admin, A, in `members` as well;
+        // this roster leaves A out.
         let fixture = Fixture::load();
         let mut bounties = fixture.bounties();
-        // B, a member, credits the admin: A reads as `known`, never `circle`.
+        // B, a member, credits the admin: A stays `circle`, and the credit
+        // still shows in A's tally.
         bounties.push(done(B, &[A]));
-        let table = trust_labels(&roster, &bounties);
+        let table = trust_labels(&fixture.roster_without_admin_in_members(), &bounties);
 
-        assert_eq!(table.get(pubky(A)), trust(TrustLabel::Known, 1, 1));
-        // S4's credits all came from A.
-        assert_eq!(table.get(pubky(S4)), trust(TrustLabel::Unknown, 0, 0));
-        // S1 keeps B's credit and loses A's; S2 keeps D's and loses A's.
-        assert_eq!(table.get(pubky(S1)), trust(TrustLabel::Known, 1, 1));
-        assert_eq!(table.get(pubky(S2)), trust(TrustLabel::Known, 1, 1));
-        // B's credit from A no longer counts; D's from B still does.
-        assert_eq!(table.get(pubky(B)), trust(TrustLabel::Circle, 0, 0));
-        assert_eq!(table.get(pubky(D)), trust(TrustLabel::Circle, 1, 1));
+        // Every label and tally is the one the fixture's own roster gives.
+        assert_eq!(table, trust_labels(&fixture.roster(), &bounties));
+        assert_eq!(table.get(pubky(A)), trust(TrustLabel::Circle, 1, 1));
+        // A's done bounties (0035G87EK4XFE and 0035M2DX3Q44W) are a trusted
+        // owner's: S4's credits all came from A.
+        assert_eq!(table.get(pubky(S4)), trust(TrustLabel::Known, 2, 1));
     }
 }

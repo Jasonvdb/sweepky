@@ -14,8 +14,8 @@ use crate::schema::{MAX_RECORD_BYTES, SchemaVersion, UnknownFields, parse_record
 /// spelling, and a member whose `pubky` is not a valid key makes the whole
 /// record an error.
 ///
-/// Who counts as a member is [`is_member`](Self::is_member)'s rule: the
-/// `members` list, and only that list.
+/// Who is in the roster is [`is_in_roster`](Self::is_in_roster)'s rule: the
+/// `admin` and every entry in `members`.
 // `PartialEq` lets a test compare whole records. `Eq` marks that equality as
 // total, which every field's is: `UnknownFields` is a `serde_json::Map`, and
 // a serde_json number is never NaN, so it is `Eq` too.
@@ -27,7 +27,7 @@ pub struct Circle {
     /// The circle's name, as the admin wrote it. Untrusted text.
     pub name: String,
     /// The admin, whose homeserver holds this file and who alone can rewrite
-    /// it. Being the admin does not make a pubky a member.
+    /// it. The admin is in the roster whether or not `members` lists them.
     pub admin: Pubky,
     /// The members, in the order the admin listed them.
     pub members: Vec<CircleMember>,
@@ -66,24 +66,26 @@ impl Circle {
         parse_record(input, MAX_RECORD_BYTES)
     }
 
-    /// Whether `pubky` is listed in `members`.
+    /// Whether `pubky` is in the roster: the `admin`, or an entry in
+    /// `members`.
     ///
-    /// Membership is the `members` list only. The `admin` is a member only if
-    /// listed there too: an admin missing from `members` is not labelled
-    /// `circle`, and their done bounties do not count as a trusted owner's.
-    /// `fixtures/README.md` states the same rule for the board's TypeScript
-    /// trust badge, so the CLI and the board agree.
+    /// 01 calls the whole `circle.json` record the roster, so the admin is in
+    /// it whether or not `members` lists them too: an admin missing from
+    /// `members` is still labelled `circle`, and their done bounties count as
+    /// a trusted owner's. `fixtures/README.md` states the same rule for the
+    /// board's TypeScript trust badge, so the CLI and the board agree.
     ///
-    /// Compares key bytes, so the spelling a member was written in does not
+    /// Compares key bytes, so the spelling a key was written in does not
     /// matter. The comparison is not constant-time and need not be: these are
     /// public keys from a public file.
     // `Pubky` is `Copy` (32 bytes), so it is taken by value, as the rest of
     // this crate does: the caller keeps theirs, and there is no reference to
     // manage.
-    pub fn is_member(&self, pubky: Pubky) -> bool {
-        // `iter().any(..)` stops at the first match. A linear scan is right
-        // for a roster of a few dozen members.
-        self.members.iter().any(|member| member.pubky == pubky)
+    pub fn is_in_roster(&self, pubky: Pubky) -> bool {
+        // `||` stops at the first `true`, so the admin's own key skips the
+        // scan of `members`. `iter().any(..)` also stops at the first match;
+        // a linear scan is right for a roster of a few dozen members.
+        self.admin == pubky || self.members.iter().any(|member| member.pubky == pubky)
     }
 }
 
@@ -99,7 +101,7 @@ mod tests {
     /// The trust-label fixture. Its `roster` is a full `circle.json` record.
     const TRUST_LABELS: &str = include_str!("../../../../fixtures/trust-labels.json");
 
-    /// Members A and B, and X, an owner outside the roster, from
+    /// Members A and B, and X, an owner outside the fixture's roster, from
     /// trust-labels.json.
     const A: &str = "ybymzxgk1zd3a7dm3i15gcuq7ewqkbimft6r1n8oc9o6uay8mqfo";
     const B: &str = "btyoe954e99wb6sp7csdipt9ki8ca3iyus1tfi3171zqdixb5csy";
@@ -134,22 +136,26 @@ mod tests {
     }
 
     #[test]
-    fn membership_is_the_members_list_compared_by_key_bytes() {
+    fn the_roster_is_the_admin_and_the_members_compared_by_key_bytes() {
+        // X is the admin and is not listed in `members`.
         let input = json!({
             "schemaVersion": 1,
             "name": "Admin not listed",
-            "admin": X,
+            "admin": format!("pubky{X}"),
             "members": [{ "pubky": format!("pubky{A}") }, { "pubky": B, "label": "B" }],
         });
         let circle = parse(&input).unwrap();
         // Written as pubky<z32>, compared as key bytes.
-        assert!(circle.is_member(pubky(A)));
-        assert!(circle.is_member(pubky(B)));
-        // Being the admin does not make X a member.
+        assert!(circle.is_in_roster(pubky(A)));
+        assert!(circle.is_in_roster(pubky(B)));
+        // The admin is in the roster without a `members` entry.
         assert_eq!(circle.admin, pubky(X));
-        assert!(!circle.is_member(pubky(X)));
-        // And the member is written back in the raw form.
+        assert!(circle.is_in_roster(pubky(X)));
+        // A key that is neither the admin nor listed is not.
+        assert!(!circle.is_in_roster(Pubky::from_bytes([7; 32])));
+        // And the keys are written back in the raw form.
         let output = serde_json::to_value(&circle).unwrap();
+        assert_eq!(output["admin"], X);
         assert_eq!(output["members"][0]["pubky"], A);
     }
 

@@ -26,7 +26,7 @@ The trust-label rule has two implementations: the Rust one in `sweepky-core`, wh
 }
 ```
 
-- `roster` is a full `circle.json` record as [01](../docs/plan/01-records-and-discovery.md#records-v1) defines it. The admin is also listed in `members`.
+- `roster` is a full `circle.json` record as [01](../docs/plan/01-records-and-discovery.md#records-v1) defines it. The admin is also listed in `members`, which changes no expected value: the admin is in the roster either way.
 - A `bounties` entry, `{id, owner, status, credits}`, is a reduced test shape, not the bounty record from [01](../docs/plan/01-records-and-discovery.md#the-bounty-post). The real record has no `owner` or `id` field, because both come from its path (`pubky://<owner>/pub/sweepky/bounties/<id>.json`). This file inlines them so one file holds the whole case. `credits` is always present and can be empty.
 - `expected` has exactly one entry per pubky in the file, circle members included.
 
@@ -40,7 +40,7 @@ The rule comes from [01](../docs/plan/01-records-and-discovery.md#records-v1), p
 - `owners` is the number of distinct owners among those bounties.
 - `label` is `circle` if the pubky is in the roster, else `known` if `bounties` > 0, else `unknown`.
 
-"In the roster" and "roster member" mean listed in `members`: `admin` alone does not make a pubky a member, for the label or for counting an owner as trusted. `Circle::is_member` in `sweepky-core` applies this rule and P4's TypeScript badge must apply the same one; this file lists its admin in `members`, so it cannot catch the two disagreeing.
+"In the roster" and "roster member" mean the `admin` or an entry in `members`. 01 calls the whole `circle.json` record the roster, so the admin is in it whether or not `members` lists them too, both for the label and for counting an owner as trusted. `Circle::is_in_roster` in `sweepky-core` applies this rule and P4's TypeScript badge must apply the same one. This file lists its admin in `members`, so it cannot catch the two disagreeing about an admin left out of `members`; P1a's Rust tests build that roster in code.
 
 The status and owner filters belong in the trust-label function, not in its caller: each test passes the function the whole `bounties` list, including the open bounties and the bounty from an owner outside the roster.
 
@@ -48,7 +48,7 @@ The status and owner filters belong in the trust-label function, not in its call
 
 | Pubky (first 8 characters) | Role | Expected label, bounties / owners |
 |---|---|---|
-| `ybymzxgk` A | admin, also a member | `circle`, 0 / 0 |
+| `ybymzxgk` A | admin, also listed in `members` | `circle`, 0 / 0 |
 | `btyoe954` B | member | `circle`, 1 / 1 |
 | `5ymaqd61` D | member | `circle`, 1 / 1 (2 / 2 would mean the self-credit counted) |
 | `z5quft98` X | owner outside the roster | `unknown`, 0 / 0 |
