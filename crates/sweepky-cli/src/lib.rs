@@ -19,6 +19,8 @@
 //!   capability Sweepky asks for when it signs in through a grant.
 //! - `init <dir>`, the first command: it creates the directory, the `.sweepky`
 //!   marker and a `.gitignore` with `sweeps/`.
+//! - `clock::now()`, the current time for a record's time fields
+//!   (`createdAt`, `revokedAt`, ...), as RFC 3339 in UTC to the second.
 //!
 //! The rules that hold for everything here (see "Rust conventions" in
 //! `docs/plan/03-cli-and-skill.md`):
@@ -63,6 +65,7 @@
 )]
 
 mod cli;
+mod clock;
 mod init;
 mod network;
 
