@@ -4,7 +4,9 @@
 //!   [`AgeRecipient`], a public `age1…` key read with a strict parse that
 //!   refuses anything age's encryptor would panic on.
 //! - `padding`: [`PaddedPlaintext`], a sweep package padded with trailing
-//!   spaces to the next 64 KiB bucket, the only input [`encrypt`] takes.
+//!   spaces to the next 64 KiB bucket, the only input [`encrypt`] takes, and
+//!   the crate-internal `PaddingWriter`, which a sweep package serializes
+//!   straight into.
 //! - `seal`: [`encrypt`] to a list of recipients as binary age v1, and
 //!   [`decrypt`] with one identity, which bounds what a stranger's file can
 //!   make it do and returns the whole [`Plaintext`] or nothing.
@@ -20,6 +22,9 @@ mod seal;
 
 pub use keys::{AgeRecipient, DeviceIdentity, DeviceKeyError, IdentityError, RecipientError};
 pub use padding::{PADDING_BUCKET_BYTES, PaddedPlaintext, PaddingError};
+// `pub(crate)`: the package module needs it, and nothing outside the crate
+// may make a `PaddedPlaintext` any way but by padding.
+pub(crate) use padding::PaddingWriter;
 pub use seal::{
     DecryptError, EncryptError, MAX_CIPHERTEXT_BYTES, MAX_HEADER_BYTES, MAX_RECIPIENTS, Plaintext,
     decrypt, encrypt,

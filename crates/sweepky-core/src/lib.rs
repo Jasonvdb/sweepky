@@ -22,10 +22,11 @@
 //!   canonical form, so two different strings never name the same thing.
 //! - The names records carry that later become a path segment, a git argument
 //!   or a public label: [`Playbook`], [`TargetId`], [`DeviceId`], [`GitSha`],
-//!   [`Sha256Hex`], [`RepoName`] and [`RepoPath`]. Each is a `String` newtype
-//!   whose every constructor runs its check, so holding one means the value
-//!   passed. Only `Playbook`'s pattern comes from 01; the other limits are
-//!   P1a's choice and are set out on each type.
+//!   [`Sha256Hex`], [`RepoName`], [`RepoPath`] and (P1b) [`AttachmentPath`].
+//!   Each is a `String` newtype whose every constructor runs its check, so
+//!   holding one means the value passed. Only `Playbook`'s pattern comes from
+//!   01; the other limits are P1a's or P1b's choice and are set out on each
+//!   type.
 //! - Where records live and how they point at each other. The [`paths`]
 //!   module builds every path under `/pub/sweepky/` from a [`RecordId`] or a
 //!   [`DeviceId`], so no builder can leave that directory, and
@@ -105,6 +106,15 @@
 //!   have no `Display`, `Serialize` or `Clone`. Their errors,
 //!   [`PaddingError`], [`EncryptError`] and [`DecryptError`], hold no data,
 //!   and age's own errors are matched, never formatted.
+//! - The sweep package (P1b): [`SweepPackage`], the one JSON document inside
+//!   a sweep's `.age` file (a manifest, the findings, and [`Attachments`],
+//!   text files by [`AttachmentPath`], none of them [`FINDINGS_FILE`]).
+//!   [`SweepPackage::from_json`] reads one, padding included, through the
+//!   same capped, version-first parse as the records, with the
+//!   [`MAX_PACKAGE_BYTES`] cap; [`SweepPackage::to_padded`] writes one
+//!   straight into a padded buffer for [`encrypt`]. Its `Debug` prints the
+//!   manifest's and the findings' own redacted `Debug` and counts for the
+//!   rest, and its errors, [`PackageError`]s, hold no data.
 //! - The secret-holding types, re-exported so the CLI uses the same ones
 //!   without depending on `age` for them: [`SecretString`] and
 //!   [`ExposeSecret`] (age's re-export of `secrecy`) and [`Zeroizing`].
@@ -142,9 +152,10 @@
 //!   `[REDACTED]` and whose value is wiped when it is dropped. Two secrets are
 //!   never compared; if that is ever needed, it must be in constant time.
 //! - **Sealed content is never printed by accident.** What only the owner may
-//!   read (the findings, and the unknown fields of a manifest) has a
-//!   hand-written `Debug` that shows structure and counts but no content, so
-//!   a `{:?}` in a log line, an error or a panic message cannot leak it.
+//!   read (the findings, the attachments and the unknown fields of a package
+//!   or its manifest) has a hand-written `Debug` that shows structure and
+//!   counts but no content, so a `{:?}` in a log line, an error or a panic
+//!   message cannot leak it.
 
 // `forbid` is `deny` that nothing further down can switch back off: no
 // `unsafe` anywhere in this crate, with no exceptions.
@@ -178,6 +189,7 @@ mod findings;
 mod ids;
 mod names;
 mod open_enum;
+mod package;
 // A public module, unlike the rest, so callers write `paths::bounty(id)`: the
 // builders' short names (`key`, `bounty`) would say too little at the crate
 // root.
@@ -207,7 +219,10 @@ pub use findings::{
     Severity, from_cloudflare, is_cloudflare_shape, parse_audit_findings, to_cloudflare,
 };
 pub use ids::{EventCursor, RecordId};
-pub use names::{DeviceId, GitSha, Playbook, RepoName, RepoPath, Sha256Hex, TargetId};
+pub use names::{
+    AttachmentPath, DeviceId, GitSha, Playbook, RepoName, RepoPath, Sha256Hex, TargetId,
+};
+pub use package::{Attachments, FINDINGS_FILE, PackageError, SweepPackage};
 pub use pubky::Pubky;
 pub use records::{
     Bounty, BountyPlaybook, BountyStatus, Circle, CircleMember, DeviceKey, Discovered, Focus,

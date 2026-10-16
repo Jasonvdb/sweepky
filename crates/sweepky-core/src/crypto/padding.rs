@@ -6,6 +6,7 @@
 //! With it, the ciphertext says only which 64 KiB bucket the package fell in.
 
 use std::fmt;
+use std::io;
 
 use age::secrecy::ExposeSecret;
 use zeroize::Zeroizing;
@@ -46,8 +47,10 @@ pub enum PaddingError {
 /// [`PADDING_BUCKET_BYTES`], ready to encrypt.
 ///
 /// [`encrypt`](crate::encrypt) takes only this type, so an unpadded package
-/// cannot be encrypted by mistake: the only way to make one is
-/// [`pad`](Self::pad).
+/// cannot be encrypted by mistake: the only ways to make one are
+/// [`pad`](Self::pad) and
+/// [`SweepPackage::to_padded`](crate::SweepPackage::to_padded), which both
+/// pad.
 ///
 /// The package is sealed content, so this type is careful with it:
 ///
@@ -82,15 +85,7 @@ impl PaddedPlaintext {
     /// [`PaddingError::TooLarge`] when `package` is longer than
     /// [`MAX_PACKAGE_BYTES`]. A package of exactly that length pads to itself.
     pub fn pad(package: &[u8]) -> Result<Self, PaddingError> {
-        if package.len() > MAX_PACKAGE_BYTES {
-            return Err(PaddingError::TooLarge);
-        }
-        // `div_ceil` rounds up: 1 byte is one bucket, 64 KiB is one, 64 KiB + 1
-        // is two. `max(1)` gives the empty package its one bucket. The package
-        // is at most `MAX_PACKAGE_BYTES` here, a whole number of buckets, so
-        // the product is at most that too and the multiplication cannot
-        // overflow.
-        let padded_len = package.len().div_ceil(PADDING_BUCKET_BYTES).max(1) * PADDING_BUCKET_BYTES;
+        let padded_len = padded_len(package.len())?;
         // One allocation of exactly the final size. `extend_from_slice` and
         // `resize` below stay within that capacity, so the buffer never moves
         // (see the type's docs for why that matters). `Zeroizing` wraps the
@@ -117,6 +112,110 @@ impl PaddedPlaintext {
     }
 }
 
+/// The length a package of `len` bytes pads to: the next multiple of
+/// [`PADDING_BUCKET_BYTES`], and one bucket for an empty package.
+/// [`PaddingError::TooLarge`] when `len` is over [`MAX_PACKAGE_BYTES`].
+fn padded_len(len: usize) -> Result<usize, PaddingError> {
+    if len > MAX_PACKAGE_BYTES {
+        return Err(PaddingError::TooLarge);
+    }
+    // `div_ceil` rounds up: 1 byte is one bucket, 64 KiB is one, 64 KiB + 1
+    // is two. `max(1)` gives the empty package its one bucket. `len` is at
+    // most `MAX_PACKAGE_BYTES` here, a whole number of buckets, so the
+    // product is at most that too and the multiplication cannot overflow.
+    Ok(len.div_ceil(PADDING_BUCKET_BYTES).max(1) * PADDING_BUCKET_BYTES)
+}
+
+/// Writes a sweep package straight into the buffer it is padded in, so the
+/// package never sits in an unpadded copy first. Crate-internal: it is what
+/// [`SweepPackage::to_padded`](crate::SweepPackage::to_padded) serializes
+/// into.
+///
+/// It is made for an exact package length, counted beforehand, and
+/// allocates the whole padded buffer at once, wrapped in [`Zeroizing`]. It
+/// then takes at most that many bytes: a write that would pass them is
+/// refused whole, so the buffer never grows and never moves (see
+/// [`PaddedPlaintext`] for why that matters). [`finish`](Self::finish) pads
+/// with spaces only when exactly that many bytes arrived.
+///
+/// No `Debug`: nothing needs to print one, and it holds the package.
+pub(crate) struct PaddingWriter {
+    buffer: Zeroizing<Vec<u8>>,
+    /// The package's length, counted beforehand: the most the writer takes.
+    package_len: usize,
+    /// The length it pads to, and the buffer's capacity.
+    padded_len: usize,
+    /// Whether a write was refused for passing `package_len`.
+    overflowed: bool,
+}
+
+impl PaddingWriter {
+    /// A writer for a package of exactly `package_len` bytes, with its
+    /// padded buffer allocated.
+    ///
+    /// [`PaddingError::TooLarge`] when `package_len` is over
+    /// [`MAX_PACKAGE_BYTES`], before anything is allocated.
+    pub(crate) fn new(package_len: usize) -> Result<Self, PaddingError> {
+        let padded_len = padded_len(package_len)?;
+        Ok(Self {
+            buffer: Zeroizing::new(Vec::with_capacity(padded_len)),
+            package_len,
+            padded_len,
+            overflowed: false,
+        })
+    }
+
+    /// Pads what was written with spaces and hands it over as a
+    /// [`PaddedPlaintext`].
+    ///
+    /// `None` unless exactly `package_len` bytes were written and none was
+    /// refused: then the count was wrong, and the bytes are not a whole
+    /// package. The buffer is wiped as it drops.
+    // `self` by value: `finish` consumes the writer, so nothing can write to
+    // it afterwards. A struct with no `Drop` impl of its own can be taken
+    // apart like this, moving `buffer` out without a copy.
+    pub(crate) fn finish(self) -> Option<PaddedPlaintext> {
+        let Self {
+            mut buffer,
+            package_len,
+            padded_len,
+            overflowed,
+        } = self;
+        if overflowed || buffer.len() != package_len {
+            return None;
+        }
+        // `padded_len` is the capacity `new` allocated, so this fills the
+        // buffer without growing it.
+        buffer.resize(padded_len, PADDING_BYTE);
+        Some(PaddedPlaintext(buffer))
+    }
+}
+
+/// serde_json writes through `io::Write`, so implementing it is what lets
+/// `serde_json::to_writer` fill the padded buffer directly.
+impl io::Write for PaddingWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        // `buffer.len()` never passes `package_len` (a write that would is
+        // refused below), so this subtraction cannot underflow; `saturating_`
+        // says so without a panic path.
+        let room = self.package_len.saturating_sub(self.buffer.len());
+        if bytes.len() > room {
+            // Refused whole rather than taken in part: more bytes than were
+            // counted means the count was wrong, and taking them would mean
+            // growing the buffer. The error is built from its kind alone, so
+            // it allocates nothing and carries none of the bytes.
+            self.overflowed = true;
+            return Err(io::Error::from(io::ErrorKind::Other));
+        }
+        self.buffer.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// The padded bytes: the package, then the spaces.
 // `ExposeSecret` is the trait `SecretString` uses too, so reading any sealed
 // value is the same deliberate, greppable call. `[u8]` is the type it lends
@@ -139,9 +238,13 @@ impl fmt::Debug for PaddedPlaintext {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use age::secrecy::ExposeSecret;
 
-    use super::{MAX_PACKAGE_BYTES, PADDING_BUCKET_BYTES, PaddedPlaintext, PaddingError};
+    use super::{
+        MAX_PACKAGE_BYTES, PADDING_BUCKET_BYTES, PaddedPlaintext, PaddingError, PaddingWriter,
+    };
 
     const BUCKET: usize = PADDING_BUCKET_BYTES;
 
@@ -188,5 +291,61 @@ mod tests {
             // into: `with_capacity` gives exactly the capacity asked for.
             assert_eq!(padded.0.capacity(), expected, "{len}");
         }
+    }
+
+    #[test]
+    fn a_padding_writer_refuses_a_count_over_the_cap() {
+        // Refused before anything is allocated.
+        assert_eq!(
+            PaddingWriter::new(MAX_PACKAGE_BYTES + 1).err(),
+            Some(PaddingError::TooLarge)
+        );
+    }
+
+    #[test]
+    fn a_padding_writer_pads_exactly_the_counted_bytes() {
+        // The package, then spaces, in the one buffer allocated at the
+        // padded size.
+        for (len, expected) in [
+            (0, BUCKET),
+            (3, BUCKET),
+            (BUCKET, BUCKET),
+            (BUCKET + 1, 2 * BUCKET),
+        ] {
+            let package = vec![b'x'; len];
+            let mut writer = PaddingWriter::new(len).unwrap();
+            writer.write_all(&package).unwrap();
+            let padded = writer.finish().unwrap();
+            assert_eq!(padded.len(), expected, "{len}");
+            assert_eq!(padded.0.capacity(), expected, "{len}");
+            let (head, tail) = padded.expose_secret().split_at(len);
+            assert_eq!(head, &package[..]);
+            assert!(tail.iter().all(|&byte| byte == b' '), "{len}");
+        }
+    }
+
+    #[test]
+    fn a_padding_writer_refuses_bytes_past_the_count_without_growing() {
+        // The write that would pass the count is refused whole, so the
+        // buffer never grows.
+        let mut writer = PaddingWriter::new(3).unwrap();
+        writer.write_all(b"ab").unwrap();
+        assert!(writer.write_all(b"cd").is_err());
+        assert_eq!(writer.buffer.len(), 2);
+        assert_eq!(writer.buffer.capacity(), BUCKET);
+        // A write that fits after the refusal brings the length to the
+        // count, but the bytes are still not the package: `finish` gives
+        // nothing, because the refusal is remembered.
+        writer.write_all(b"c").unwrap();
+        assert_eq!(writer.buffer.len(), 3);
+        assert!(writer.finish().is_none());
+    }
+
+    #[test]
+    fn a_padding_writer_gives_nothing_for_fewer_bytes_than_counted() {
+        // The count was wrong, so the bytes are not a whole package.
+        let mut writer = PaddingWriter::new(3).unwrap();
+        writer.write_all(b"ab").unwrap();
+        assert!(writer.finish().is_none());
     }
 }

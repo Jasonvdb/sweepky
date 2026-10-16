@@ -124,8 +124,8 @@ struct VersionProbe {
 /// Parses a record of type `T` from bytes fetched from somewhere untrusted.
 ///
 /// 1. Refuses input longer than `limit` with [`RecordError::TooLarge`] before
-///    looking at a single byte of it. Callers pass [`MAX_RECORD_BYTES`] or
-///    [`MAX_FINDINGS_BYTES`].
+///    looking at a single byte of it. Callers pass [`MAX_RECORD_BYTES`],
+///    [`MAX_FINDINGS_BYTES`] or, for a sweep package, [`MAX_PACKAGE_BYTES`].
 /// 2. Reads `schemaVersion` alone and refuses a newer version with
 ///    [`RecordError::UnsupportedVersion`]. A v2 record may have renamed or
 ///    dropped v1 fields; parsing it straight into a v1 type would report a

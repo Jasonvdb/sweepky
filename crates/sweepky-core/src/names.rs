@@ -10,6 +10,7 @@
 //! | [`Sha256Hex`] | a sweep record's `sha256` | a public label |
 //! | [`RepoName`] | a target's `repo` | the git URL `https://<repo>` |
 //! | [`RepoPath`] | a repo target's `paths` | a git pathspec, and a path under the target |
+//! | [`AttachmentPath`] | a key of a sweep package's `attachments` | a file under the owner's copy of the sweep |
 //!
 //! Each type is a `String` newtype whose field is private, so code outside
 //! this module can make one only through `FromStr` (`"…".parse()`),
@@ -26,9 +27,9 @@
 //! lints in lib.rs refuse slicing outside tests.
 //!
 //! Only [`Playbook`]'s pattern comes from 01. The other limits are P1a's
-//! choice, set out on each type and in the P1a phase doc. A record from
-//! another client whose identifier breaks one is rejected whole, like any
-//! other malformed record.
+//! choice, set out on each type and in the P1a phase doc, except
+//! [`AttachmentPath`]'s, which are P1b's. A record from another client whose
+//! identifier breaks one is rejected whole, like any other malformed record.
 
 use serde::{Deserialize, Serialize};
 
@@ -462,60 +463,127 @@ pub struct RepoPath(String);
 
 impl RepoPath {
     /// The longest path accepted: 512 bytes.
-    pub const MAX_LEN: usize = 512;
+    pub const MAX_LEN: usize = MAX_RELATIVE_PATH_LEN;
 
     fn check(value: &str) -> Result<(), RecordError> {
-        let invalid = |reason| RecordError::Invalid {
+        check_relative_path(value).map_err(|reason| RecordError::Invalid {
             field: "repo path",
             reason,
-        };
-        if value.is_empty() {
-            return Err(invalid("is empty"));
-        }
-        // Here `len()` is bytes and stays bytes: a path may be any UTF-8, so
-        // the limit is in bytes, the unit a filesystem's own limit uses.
-        if value.len() > Self::MAX_LEN {
-            return Err(invalid("is longer than 512 bytes"));
-        }
-        if value.starts_with('/') {
-            return Err(invalid("is absolute (starts with '/')"));
-        }
-        if value.starts_with('-') {
-            return Err(invalid(
-                "starts with '-', which git would read as an option",
-            ));
-        }
-        if value.starts_with(':') {
-            return Err(invalid(
-                "starts with ':', which git would read as pathspec magic",
-            ));
-        }
-        // `chars()` decodes the UTF-8 into whole characters, so a check on
-        // one never lands inside a multi-byte sequence.
-        if value.chars().any(is_forbidden_in_path) {
-            return Err(invalid(
-                "has a backslash, a control character or a character that reorders or breaks text",
-            ));
-        }
-        // `strip_suffix` returns the path without one trailing `/`, or `None`
-        // when there is none. A second trailing `/` is left in place and then
-        // shows up as an empty component.
-        let body = value.strip_suffix('/').unwrap_or(value);
-        for component in body.split('/') {
-            if component.is_empty() {
-                return Err(invalid("has an empty component (a doubled '/')"));
-            }
-            if component == "." || component == ".." {
-                return Err(invalid("has a '.' or '..' component"));
-            }
-        }
-        Ok(())
+        })
     }
 }
 
 validated_string!(RepoPath);
 
-/// Whether `c` may not appear in a [`RepoPath`].
+/// The key of one attachment in a sweep package: the path of a text file
+/// relative to the sweep's directory, such as `REPORT.md` or
+/// `notes/triage.md` (01, "The sweep package": "relative file name → UTF-8
+/// text").
+///
+/// The sweeper writes these keys, and on an open bounty the sweeper is a
+/// stranger. The owner's CLI writes each attachment back out as a file under
+/// its copy of the sweep, so a key must name a file inside that directory and
+/// print as what it is. The limits are P1b's choice, since 01 says only
+/// "relative file name": everything a [`RepoPath`] refuses, and a trailing
+/// `/` as well, because an attachment is a file, never a directory. That is:
+/// at most 512 bytes of UTF-8, `/`-separated, with
+///
+/// - no empty, `.` or `..` component, so it cannot climb out of the
+///   directory or spell one file two ways (`a//b`, `./a`), and no trailing
+///   `/`;
+/// - no leading `/` (absolute), `-` (read as an option by a command handed
+///   the name) or `:` (meaningful only to git, but refused with the rest of
+///   [`RepoPath`]'s rules);
+/// - no backslash, no control character, and none of the characters that
+///   reorder text or break a line.
+///
+/// `findings.json` is a valid path. A sweep package's attachments map
+/// ([`Attachments`](crate::Attachments)) refuses that one name as a key,
+/// because in a package it is the findings ([`FINDINGS_FILE`](crate::FINDINGS_FILE)).
+///
+/// **What a lexical check cannot see.** Two keys that differ only in case,
+/// `notes.md` and `NOTES.md` (or `FINDINGS.json` and the findings), are one
+/// file on a case-insensitive filesystem, which is macOS's default; and a
+/// directory on the way may already exist as a symbolic link. The code that
+/// writes the files checks both (P2c).
+///
+/// Inside a package the paths are sealed content like the rest of it. Its
+/// `Debug` and `Display` print the path, so print one only on purpose, as
+/// `submit` does when it lists the files it is about to encrypt; a sweep
+/// package's own `Debug` counts its attachments instead.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String")]
+pub struct AttachmentPath(String);
+
+impl AttachmentPath {
+    /// The longest path accepted: 512 bytes, as for a [`RepoPath`].
+    pub const MAX_LEN: usize = MAX_RELATIVE_PATH_LEN;
+
+    fn check(value: &str) -> Result<(), RecordError> {
+        let invalid = |reason| RecordError::Invalid {
+            field: "attachment path",
+            reason,
+        };
+        // `RepoPath`'s rules first, so a value both refuse gives the same
+        // reason for both.
+        check_relative_path(value).map_err(invalid)?;
+        if value.ends_with('/') {
+            return Err(invalid("ends with '/', which names a directory"));
+        }
+        Ok(())
+    }
+}
+
+validated_string!(AttachmentPath);
+
+/// The longest [`RepoPath`] or [`AttachmentPath`]: 512 bytes.
+const MAX_RELATIVE_PATH_LEN: usize = 512;
+
+/// The lexical check [`RepoPath`] and [`AttachmentPath`] share, with the
+/// rules [`RepoPath`]'s docs set out: one trailing `/` passes here. The error
+/// is the reason alone; each type wraps it in a [`RecordError`] that names
+/// its own field.
+fn check_relative_path(value: &str) -> Result<(), &'static str> {
+    if value.is_empty() {
+        return Err("is empty");
+    }
+    // Here `len()` is bytes and stays bytes: a path may be any UTF-8, so the
+    // limit is in bytes, the unit a filesystem's own limit uses.
+    if value.len() > MAX_RELATIVE_PATH_LEN {
+        return Err("is longer than 512 bytes");
+    }
+    if value.starts_with('/') {
+        return Err("is absolute (starts with '/')");
+    }
+    if value.starts_with('-') {
+        return Err("starts with '-', which git would read as an option");
+    }
+    if value.starts_with(':') {
+        return Err("starts with ':', which git would read as pathspec magic");
+    }
+    // `chars()` decodes the UTF-8 into whole characters, so a check on one
+    // never lands inside a multi-byte sequence.
+    if value.chars().any(is_forbidden_in_path) {
+        return Err(
+            "has a backslash, a control character or a character that reorders or breaks text",
+        );
+    }
+    // `strip_suffix` returns the path without one trailing `/`, or `None`
+    // when there is none. A second trailing `/` is left in place and then
+    // shows up as an empty component.
+    let body = value.strip_suffix('/').unwrap_or(value);
+    for component in body.split('/') {
+        if component.is_empty() {
+            return Err("has an empty component (a doubled '/')");
+        }
+        if component == "." || component == ".." {
+            return Err("has a '.' or '..' component");
+        }
+    }
+    Ok(())
+}
+
+/// Whether `c` may not appear in a [`RepoPath`] or an [`AttachmentPath`].
 fn is_forbidden_in_path(c: char) -> bool {
     // `is_control` is Unicode's Cc category: U+0000 to U+001F, U+007F, and
     // U+0080 to U+009F. U+2028 and U+2029, the line and paragraph
@@ -544,7 +612,9 @@ mod tests {
     use serde::Serialize;
     use serde::de::DeserializeOwned;
 
-    use super::{DeviceId, GitSha, Playbook, RepoName, RepoPath, Sha256Hex, TargetId};
+    use super::{
+        AttachmentPath, DeviceId, GitSha, Playbook, RepoName, RepoPath, Sha256Hex, TargetId,
+    };
     use crate::error::RecordError;
 
     /// The Cloudflare skill's pinned commit (03): a real 40-character SHA-1.
@@ -862,6 +932,58 @@ mod tests {
     }
 
     #[test]
+    fn attachment_paths_are_clean_relative_paths() {
+        // A sweeper writes a package's attachment keys, and on an open bounty
+        // the sweeper is a stranger. The owner's CLI writes each attachment
+        // out as a file under that sweep's directory, so a key must name a
+        // file inside it and print as what it is.
+        let longest = "a".repeat(AttachmentPath::MAX_LEN);
+        for value in [
+            "REPORT.md",
+            "coverage-ledger.json",
+            "notes/triage.md",
+            "audit/findings.json",
+            // A valid path: only a package's attachments map refuses it as a
+            // key, because there that name is the findings.
+            "findings.json",
+            &longest,
+        ] {
+            assert_accepted(value, AttachmentPath::as_str);
+        }
+
+        let too_long = "a".repeat(AttachmentPath::MAX_LEN + 1);
+        for value in [
+            "",
+            // Climbing out, absolute, or one place spelled two ways.
+            "..",
+            "a/../b",
+            "/abs",
+            "a//b",
+            "./a",
+            // A directory, which a repo path may name but an attachment, a
+            // file, may not.
+            "a/",
+            // A backslash and control characters (C0, DEL, C1).
+            "a\\b",
+            "a\0b",
+            "a\nb",
+            "a\u{1b}[31m",
+            "a\u{7f}",
+            "a\u{85}",
+            // Characters that reorder text or break a line.
+            "a\u{202e}b",
+            "a\u{2066}b",
+            "a\u{2028}b",
+            // What a command would read as an option.
+            "-a",
+            &too_long,
+        ] {
+            assert_rejected::<AttachmentPath>(value, "attachment path");
+        }
+        assert_names_limit::<AttachmentPath>(&too_long, AttachmentPath::MAX_LEN);
+    }
+
+    #[test]
     fn checks_never_panic_on_multi_byte_input() {
         // Slicing a `str` panics when an offset lands inside a multi-byte
         // character, and a length limit is where code is tempted to slice.
@@ -890,6 +1012,7 @@ mod tests {
             let _ = input.parse::<Sha256Hex>();
             let _ = input.parse::<RepoName>();
             let _ = input.parse::<RepoPath>();
+            let _ = input.parse::<AttachmentPath>();
         }
     }
 
