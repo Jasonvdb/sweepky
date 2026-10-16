@@ -23,8 +23,13 @@
 //!   (`createdAt`, `revokedAt`, ...), as RFC 3339 in UTC to the second.
 //! - [`Dirs`], the config and data directories (`~/.config/sweepky/` and
 //!   `~/.local/share/sweepky/`, or both under `SWEEPKY_HOME`) and the paths
-//!   of the files in them, with [`IdentityName`], the checked name of a
-//!   dedicated identity.
+//!   of the files in them.
+//! - `identity`, the local material of `login --identity`: [`IdentityName`],
+//!   the checked name of a dedicated identity (lower case, at most 32
+//!   characters, so no key is ever a valid name); its secret, in Sweepky's
+//!   own `sweepky-identity/v1` file and never a Pubky recovery file; its
+//!   public details; and the classifier that refuses a recovery file, a raw
+//!   key or a recovery phrase with a one-line reason that never quotes it.
 //! - `private_fs`, the owner-only file primitives every secret or state file
 //!   goes through: directories 0700 and files 0600, each mode set when it is
 //!   created, files written to a temp file then renamed, no links followed,
@@ -87,6 +92,18 @@
 mod cli;
 mod clock;
 mod dirs;
+// The identity name, secret file, details file and refusal rules of
+// `login --identity`. `IdentityName` already has callers (`Dirs` and the
+// re-export below); the rest has none outside its tests until `login` lands,
+// so the same `expect(dead_code)` as `private_fs` below applies.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "login --identity, the next P2a step, is the first caller"
+    )
+)]
+mod identity;
 // The terminal sanitiser. Like `private_fs` below, nothing outside its tests
 // calls it yet, so the same `expect(dead_code)` applies.
 #[cfg_attr(
@@ -140,7 +157,8 @@ mod remote;
 mod test_support;
 
 pub use cli::{Cli, Command};
-pub use dirs::{Dirs, IdentityName};
+pub use dirs::Dirs;
+pub use identity::IdentityName;
 pub use network::{
     CLIENT_ID, Network, NetworkKind, NetworkSettings, PRODUCTION_HOMESERVER, SWEEPKY_CAPABILITY,
     TESTNET_HOMESERVER, TESTNET_RELAY_URL, select_kind,

@@ -39,11 +39,11 @@
 //! job, done by the command that first writes into it.
 
 use std::ffi::OsStr;
-use std::fmt;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 
 use anyhow::bail;
+
+use crate::identity::IdentityName;
 
 /// The config and data directories, resolved from `HOME` or `SWEEPKY_HOME`.
 ///
@@ -160,71 +160,6 @@ fn absolute(variable: &str, value: &OsStr) -> anyhow::Result<PathBuf> {
     Ok(path.to_path_buf())
 }
 
-/// The name of a dedicated identity, as in `login --identity <name>`, and the
-/// stem of its files in `config/identities/`.
-///
-/// 1 to 64 characters of `A-Z`, `a-z`, `0-9`, `-` and `_`, the first a letter
-/// or digit: the same rule as a device id, P2a's choice. So a name is always
-/// exactly one path segment: no `/`, never `.` or `..`, no hidden file, no
-/// leading `-`, nothing a terminal would interpret.
-///
-/// A `String` newtype whose field is private: the only way to get one is
-/// [`FromStr`] (`"name".parse()`), which runs the check, so holding an
-/// `IdentityName` is proof the check passed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IdentityName(String);
-
-impl IdentityName {
-    /// The longest name accepted, in bytes (every allowed character is one
-    /// byte).
-    pub const MAX_LEN: usize = 64;
-
-    /// The name as text.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl FromStr for IdentityName {
-    type Err = anyhow::Error;
-
-    fn from_str(value: &str) -> anyhow::Result<Self> {
-        // `bytes()` walks the UTF-8 bytes; every allowed character is ASCII,
-        // so any byte of a multi-byte character fails the checks below.
-        let Some(first) = value.bytes().next() else {
-            bail!("an identity name cannot be empty");
-        };
-        if !first.is_ascii_alphanumeric() {
-            bail!("an identity name starts with a letter or a digit; {value:?} does not");
-        }
-        if !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
-        {
-            bail!(
-                "an identity name has only letters, digits, '-' and '_'; {value:?} has something \
-                 else"
-            );
-        }
-        // Last, so the value is known to be ASCII here and its length in
-        // bytes is its length in characters, the unit the message names.
-        if value.len() > Self::MAX_LEN {
-            bail!(
-                "an identity name is at most {} characters; this one has {}",
-                Self::MAX_LEN,
-                value.len()
-            );
-        }
-        Ok(Self(value.to_owned()))
-    }
-}
-
-impl fmt::Display for IdentityName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
@@ -297,42 +232,5 @@ mod tests {
             dirs.identity_file(&name),
             Path::new("/x/config/identities/throwaway.json")
         );
-    }
-
-    #[test]
-    fn identity_name_accepts_letters_digits_dash_and_underscore() {
-        for good in ["a", "A", "0", "bot-1", "ci_runner", &"n".repeat(64)] {
-            let name: IdentityName = good.parse().expect(good);
-            assert_eq!(name.as_str(), good);
-        }
-    }
-
-    #[test]
-    fn identity_name_refuses_anything_but_one_safe_path_segment() {
-        // Each of these would leave `identities/`, hide the file, read as a
-        // command-line option, or not be one segment.
-        let too_long = "n".repeat(65);
-        for bad in [
-            "", ".", "..", "../x", "a/b", "a\\b", ".hidden", "-rf", "_x", "a b", "a.b", "a\0b",
-            "é", &too_long,
-        ] {
-            assert!(bad.parse::<IdentityName>().is_err(), "{bad:?}");
-        }
-    }
-
-    #[test]
-    fn identity_name_over_length_message_counts_characters() {
-        // 40 characters but 79 bytes: refused for the character, not for a
-        // "length" that would really be a count of bytes.
-        let err = format!("a{}", "é".repeat(39))
-            .parse::<IdentityName>()
-            .expect_err("not ASCII");
-        assert!(format!("{err:#}").contains("only letters"), "{err:#}");
-
-        let err = "n"
-            .repeat(65)
-            .parse::<IdentityName>()
-            .expect_err("too long");
-        assert!(format!("{err:#}").contains("this one has 65"), "{err:#}");
     }
 }
