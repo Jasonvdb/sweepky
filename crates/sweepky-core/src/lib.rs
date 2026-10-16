@@ -83,6 +83,17 @@
 //!   is bounded: a body over [`MAX_FEED_BODY_BYTES`] is a
 //!   [`FeedError::TooLarge`], and a line over [`MAX_FEED_LINE_BYTES`] is
 //!   malformed.
+//! - Keys (P1b): [`DeviceIdentity`], this install's secret age key, which
+//!   can be generated, give its recipient, and be turned into and read back
+//!   from a [`SecretString`]; [`AgeRecipient`], a public `age1…` key read
+//!   with a strict parse that refuses every string age's encryptor would
+//!   panic on; and [`DeviceKey::encryption_recipient`], which takes a
+//!   `keys/` record to a checked recipient only when its `alg` is exactly
+//!   `age-x25519` and it is not revoked. Their errors, [`RecipientError`],
+//!   [`IdentityError`] and [`DeviceKeyError`], hold no data at all.
+//! - The secret-holding types, re-exported so the CLI uses the same ones
+//!   without depending on `age` for them: [`SecretString`] and
+//!   [`ExposeSecret`] (age's re-export of `secrecy`) and [`Zeroizing`].
 //!
 //! The rules that hold for everything here (see "Rust conventions" in
 //! `docs/plan/03-cli-and-skill.md`):
@@ -109,7 +120,13 @@
 //!   against a documented cap first, and serde_json's recursion limit stays on.
 //! - **Errors never quote the input.** A [`RecordError`] holds numbers and
 //!   fixed text only, so a stranger's record cannot put its own words into the
-//!   CLI's output.
+//!   CLI's output. The key errors go further and hold nothing, so they can
+//!   never carry key material either.
+//! - **Secrets are never printed.** A type that holds a secret has no
+//!   `Debug`, `Display` or `Serialize` (and no `Clone` or `PartialEq`), and a
+//!   secret string travels only as a [`SecretString`], whose `Debug` writes
+//!   `[REDACTED]` and whose value is wiped when it is dropped. Two secrets are
+//!   never compared; if that is ever needed, it must be in constant time.
 
 // `forbid` is `deny` that nothing further down can switch back off: no
 // `unsafe` anywhere in this crate, with no exceptions.
@@ -136,6 +153,7 @@
     )
 )]
 
+mod crypto;
 mod error;
 mod feed;
 mod findings;
@@ -156,6 +174,7 @@ mod trust;
 mod url;
 mod validated_string;
 
+pub use crypto::{AgeRecipient, DeviceIdentity, DeviceKeyError, IdentityError, RecipientError};
 pub use error::{JsonCategory, RecordError};
 pub use feed::{
     FeedError, FeedEvent, FeedOp, FeedPage, MAX_FEED_BODY_BYTES, MAX_FEED_LINE_BYTES, parse_feed,
@@ -189,6 +208,17 @@ pub use url::{BountyRef, PubkyUrl, SweepRef};
 // reads the clock; the CLI may call it, this crate never does.
 #[doc(no_inline)]
 pub use pubky_timestamp::Timestamp;
+// The secret-holding types, re-exported so the CLI uses exactly the versions
+// this crate and age were built with, without a dependency of its own on
+// `age`, `secrecy` or `zeroize` for them. `SecretString` is age's own
+// re-export of `secrecy`, which is what `DeviceIdentity` hands out, so the two
+// cannot disagree. `ExposeSecret` is the trait whose `expose_secret()` reads
+// a secret: a method of a trait can only be called while the trait is in
+// scope, so callers `use sweepky_core::ExposeSecret;`.
+#[doc(no_inline)]
+pub use age::secrecy::{ExposeSecret, SecretString};
+#[doc(no_inline)]
+pub use zeroize::Zeroizing;
 
 /// This crate's version, `version` from Cargo.toml.
 ///

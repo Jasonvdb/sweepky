@@ -27,7 +27,9 @@ include-dev = true
 #
 # From P1a, sweepky-core's serde, serde_json and thiserror (and the crates they
 # pull in) use MIT, Apache-2.0 and Unicode-3.0 (unicode-ident's
-# `(MIT OR Apache-2.0) AND Unicode-3.0`). The other entries and the
+# `(MIT OR Apache-2.0) AND Unicode-3.0`). From P1b, `age` adds BSD-2-Clause
+# (zerocopy), BSD-3-Clause (x25519-dalek, curve25519-dalek and subtle) and
+# more Unicode-3.0 (tinystr). ISC, Zlib, CDLA-Permissive-2.0 and the
 # `option-ext` exception are not in use until P2a adds `pubky` and
 # `pubky-testnet`, so until then cargo-deny warns that they are not
 # encountered. Leave those warnings be: after P2a, `cargo deny check licenses`

@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::crypto::{AgeRecipient, DeviceKeyError};
 use crate::error::RecordError;
 use crate::open_enum::open_enum;
 use crate::schema::{MAX_RECORD_BYTES, SchemaVersion, UnknownFields, parse_record};
@@ -29,11 +30,13 @@ open_enum! {
 /// label, createdAt, revokedAt}`.
 ///
 /// A sweeper's CLI encrypts a sweep to every unrevoked key of the bounty's
-/// owner whose `alg` it knows. This type only reads and writes the record: it
-/// does not check `recipient`. Before encrypting, the CLI parses the recipient
-/// strictly for its `alg` (P1b), because anyone holding the owner's grant, or
-/// an active operator of the owner's homeserver, can write a record here
-/// (`docs/plan/02-encryption-and-safety.md`).
+/// owner whose `alg` it knows. Reading the record does not check `recipient`,
+/// so a key of a kind this build does not know still round-trips. Before
+/// encrypting, the CLI takes the key through
+/// [`encryption_recipient`](Self::encryption_recipient), which checks `alg`,
+/// `revokedAt` and the recipient strictly, because anyone holding the owner's
+/// grant, or an active operator of the owner's homeserver, can write a record
+/// here (`docs/plan/02-encryption-and-safety.md`).
 ///
 /// `alg` and `revokedAt` must both be present, as 01 requires of every
 /// `keys/*.json`; `revokedAt` is `null` while the key is in use. A record
@@ -46,7 +49,9 @@ pub struct DeviceKey {
     /// The kind of key `recipient` holds.
     pub alg: KeyAlg,
     /// The public key, in `alg`'s own text form: `age1…` for `age-x25519`.
-    /// Not checked here; parse it for its `alg` before using it.
+    /// Not checked when the record is read; use
+    /// [`encryption_recipient`](Self::encryption_recipient) to get a checked
+    /// key.
     pub recipient: String,
     /// A name for the install, such as the machine's. Untrusted text.
     pub label: String,
@@ -86,6 +91,37 @@ impl DeviceKey {
     pub fn is_revoked(&self) -> bool {
         self.revoked_at.is_some()
     }
+
+    /// The key to encrypt a sweep to, when this record is one this build may
+    /// use for that.
+    ///
+    /// Checks, in this order, and stops at the first that fails:
+    ///
+    /// 1. `alg` is exactly `age-x25519`: no other case, no whitespace, no
+    ///    other kind of key ([`DeviceKeyError::UnsupportedAlg`]);
+    /// 2. the key is not revoked ([`DeviceKeyError::Revoked`]);
+    /// 3. `recipient` passes [`AgeRecipient`]'s strict parse
+    ///    ([`DeviceKeyError::Recipient`]).
+    ///
+    /// An `Err` means "do not encrypt to this key", never "stop": the caller
+    /// skips the key and goes on with the owner's others.
+    pub fn encryption_recipient(&self) -> Result<AgeRecipient, DeviceKeyError> {
+        // A `match` with no `_ =>` arm: if a later build adds a known `alg`
+        // (say a post-quantum one), the compiler stops here until someone
+        // decides how to encrypt to it, instead of silently refusing or
+        // accepting it. `as_known` matches the exact string, so
+        // `"AGE-X25519"` or `" age-x25519"` is `None`.
+        match self.alg.as_known() {
+            Some(KnownKeyAlg::AgeX25519) => {}
+            None => return Err(DeviceKeyError::UnsupportedAlg),
+        }
+        if self.is_revoked() {
+            return Err(DeviceKeyError::Revoked);
+        }
+        // `?` turns a `RecipientError` into `DeviceKeyError::Recipient`
+        // through the `From` impl that `#[from]` wrote.
+        Ok(self.recipient.parse::<AgeRecipient>()?)
+    }
 }
 
 #[cfg(test)]
@@ -93,6 +129,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{DeviceKey, KnownKeyAlg};
+    use crate::crypto::{DeviceKeyError, RecipientError};
     use crate::error::{JsonCategory, RecordError};
 
     /// A synthetic age recipient: random bytes in age's bech32 form, with no
@@ -112,6 +149,13 @@ mod tests {
 
     fn parse(input: &Value) -> Result<DeviceKey, RecordError> {
         DeviceKey::from_json(input.to_string().as_bytes())
+    }
+
+    /// A parsed key record with this `alg`, `recipient` and `revokedAt`.
+    fn key_with(alg: &str, recipient: &str, revoked_at: Value) -> DeviceKey {
+        let mut input = key_json(alg, revoked_at);
+        input["recipient"] = json!(recipient);
+        parse(&input).unwrap()
     }
 
     #[test]
@@ -159,5 +203,61 @@ mod tests {
                 "{field}"
             );
         }
+    }
+
+    #[test]
+    fn encryption_recipient_requires_exactly_age_x25519() {
+        let usable = key_with("age-x25519", RECIPIENT, Value::Null);
+        assert_eq!(
+            usable.encryption_recipient().unwrap().to_string(),
+            RECIPIENT
+        );
+
+        // `alg` matches exactly: no other case, no whitespace, no other kind.
+        for alg in [
+            "AGE-X25519",
+            " age-x25519",
+            "age-x25519 ",
+            "x25519",
+            "mlkem768x25519",
+            "",
+        ] {
+            let key = key_with(alg, RECIPIENT, Value::Null);
+            assert_eq!(
+                key.encryption_recipient(),
+                Err(DeviceKeyError::UnsupportedAlg),
+                "{alg:?}"
+            );
+        }
+
+        let revoked = key_with("age-x25519", RECIPIENT, json!("2026-10-16T08:00:00Z"));
+        assert_eq!(revoked.encryption_recipient(), Err(DeviceKeyError::Revoked));
+
+        // The recipient goes through the strict parse.
+        let upper_case = key_with("age-x25519", &RECIPIENT.to_uppercase(), Value::Null);
+        assert!(matches!(
+            upper_case.encryption_recipient(),
+            Err(DeviceKeyError::Recipient(_))
+        ));
+        // The point u = 0, a public value with no private key behind it.
+        let low_order = "age1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq5cu47z";
+        let key = key_with("age-x25519", low_order, Value::Null);
+        assert_eq!(
+            key.encryption_recipient(),
+            Err(DeviceKeyError::Recipient(RecipientError::LowOrder))
+        );
+    }
+
+    #[test]
+    fn encryption_recipient_checks_alg_then_revocation_then_recipient() {
+        let revoked_at = json!("2026-10-16T08:00:00Z");
+        // Every check fails, so the first one decides.
+        let key = key_with("mlkem768x25519", "not a recipient", revoked_at.clone());
+        assert_eq!(
+            key.encryption_recipient(),
+            Err(DeviceKeyError::UnsupportedAlg)
+        );
+        let key = key_with("age-x25519", "not a recipient", revoked_at);
+        assert_eq!(key.encryption_recipient(), Err(DeviceKeyError::Revoked));
     }
 }
