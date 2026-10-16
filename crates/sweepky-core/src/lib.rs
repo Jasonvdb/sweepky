@@ -43,7 +43,8 @@
 //!   the rewrite `sweepky done` makes, which refuses to credit the owner;
 //!   [`Sweep`], a sweep record with its open-string [`SweepStatus`]; and
 //!   [`Manifest`], the part of a sweep package that names the sweeper, the
-//!   bounty and the targets' commits.
+//!   bounty and the targets' commits, whose `Debug` prints how many unknown
+//!   fields it has but not what they hold.
 //! - A bounty's targets: [`Target`], which keeps its open-string
 //!   [`TargetKind`] and its other fields as written, so a kind this build
 //!   does not know round-trips and is skipped; [`Target::known`], which
@@ -58,7 +59,8 @@
 //!   playbook established them. Findings are sealed content: they exist only
 //!   inside the encrypted package and the owner's decrypted copies, never in
 //!   a public record, and [`Findings::from_json`] reads them with the larger
-//!   [`MAX_FINDINGS_BYTES`] cap.
+//!   [`MAX_FINDINGS_BYTES`] cap. Their `Debug` prints counts, never a string
+//!   the agent wrote.
 //! - Reading what a sweeper's agent left: [`parse_audit_findings`] takes the
 //!   bytes of a `findings.json` in the common format or in Cloudflare's,
 //!   detected by shape, and says which with [`FindingsSource`].
@@ -139,6 +141,10 @@
 //!   secret string travels only as a [`SecretString`], whose `Debug` writes
 //!   `[REDACTED]` and whose value is wiped when it is dropped. Two secrets are
 //!   never compared; if that is ever needed, it must be in constant time.
+//! - **Sealed content is never printed by accident.** What only the owner may
+//!   read (the findings, and the unknown fields of a manifest) has a
+//!   hand-written `Debug` that shows structure and counts but no content, so
+//!   a `{:?}` in a log line, an error or a panic message cannot leak it.
 
 // `forbid` is `deny` that nothing further down can switch back off: no
 // `unsafe` anywhere in this crate, with no exceptions.

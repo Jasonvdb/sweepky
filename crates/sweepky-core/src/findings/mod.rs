@@ -7,6 +7,8 @@
 //! either format, the common one or Cloudflare's, which the `cloudflare`
 //! module converts.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -104,9 +106,17 @@ open_enum! {
 /// is world-readable, and even a severity count on a public repo is a
 /// disclosure (01). Errors from [`from_json`](Self::from_json) are
 /// [`RecordError`]s, which carry a category, a line and a column, never the
-/// text that failed. `Debug` is derived and prints the content, so never log
-/// a value of these types; show findings to the owner on purpose, not by
-/// accident.
+/// text that failed.
+///
+/// **`Debug` shows counts, not content.** The three types' `Debug` is written
+/// by hand: it prints the type's name, the schema version and how many
+/// findings, locations, `extra` fields and unknown fields there are, and `..`
+/// for the rest, so a `{:?}` in a log line, an error or a panic message
+/// carries no string an agent wrote, and no line number either. A failing
+/// `assert_eq!` on them prints the counts only; compare their
+/// `serde_json::to_value` to see what differs. Serializing still writes
+/// everything, so it is no way to log them either: show findings to the
+/// owner on purpose, not by accident.
 ///
 /// **Agents write this.** Every text field is whatever the sweeper's agent
 /// wrote after reading untrusted code, so it is untrusted text: show it,
@@ -124,7 +134,10 @@ open_enum! {
 /// `extra`.
 // `PartialEq` and `Eq` let tests compare whole documents; every field's
 // equality is total (a serde_json number is never NaN), as on the records.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// `Debug` is not derived, because the derived one prints every field: the
+// hand-written impl below prints counts only. The same goes for `Finding` and
+// `Location`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Findings {
     /// The document's `schemaVersion`.
@@ -149,7 +162,9 @@ pub struct Findings {
 
 /// One finding: `{id, title, severity, confidence, status, locations,
 /// description, fix?, extra?}`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Its `Debug` prints counts only, as on [`Findings`].
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Finding {
     /// An id local to the sweep that wrote it. Two sweeps may name one bug
@@ -206,7 +221,9 @@ pub struct Finding {
 }
 
 /// A place in the code a finding points at: `{file, line?, kind?, scope?}`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Its `Debug` prints counts only, as on [`Findings`].
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Location {
     /// The file, as the playbook wrote it, normally relative to the target's
@@ -252,6 +269,82 @@ impl Findings {
         // The findings cap, not `MAX_RECORD_BYTES`: findings carry Markdown
         // descriptions and fixes, and are far longer than a public record.
         parse_record(input, MAX_FINDINGS_BYTES)
+    }
+}
+
+// The three `Debug` impls below share one shape. Each first takes the value
+// apart with a `let Self { .. } = self;` that names every field and has no
+// `..` of its own, so a field added to the struct later is a compile error
+// here until someone decides whether it may print. The fields bound to `_`
+// are the ones that never print: text, open strings and line numbers, all
+// written by the sweeper's agent. `finish_non_exhaustive` writes the `..` that
+// says fields were left out.
+
+/// Prints `Findings { schema_version: SchemaVersion(1), findings: 2,
+/// locations: 3, unknown_fields: 0, .. }`: the schema version and counts,
+/// never the content. `locations` is the total over every finding.
+impl fmt::Debug for Findings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            schema_version,
+            playbook: _,
+            findings,
+            unknown,
+        } = self;
+        // The sum cannot overflow: every `Location` it counts is in memory,
+        // so there are far fewer than `usize::MAX` of them.
+        let locations: usize = findings.iter().map(|finding| finding.locations.len()).sum();
+        f.debug_struct("Findings")
+            .field("schema_version", schema_version)
+            .field("findings", &findings.len())
+            .field("locations", &locations)
+            .field("unknown_fields", &unknown.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Prints `Finding { locations: 2, extra_fields: Some(1), unknown_fields: 0,
+/// .. }`: how many locations, `extra` fields (`None` when there is no
+/// `extra`) and unknown fields it has, never the content. Not even `status`,
+/// `severity` or `confidence` print, since an agent writes those strings too.
+impl fmt::Debug for Finding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            id: _,
+            title: _,
+            severity: _,
+            confidence: _,
+            status: _,
+            locations,
+            description: _,
+            fix: _,
+            extra,
+            unknown,
+        } = self;
+        f.debug_struct("Finding")
+            .field("locations", &locations.len())
+            // `as_ref` borrows the map inside the `Option` instead of moving
+            // it out of `self`, and `Map::len` then counts its keys.
+            .field("extra_fields", &extra.as_ref().map(Map::len))
+            .field("unknown_fields", &unknown.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Prints `Location { unknown_fields: 0, .. }`: neither the file, the line,
+/// the kind nor the scope, which together say where the problem is.
+impl fmt::Debug for Location {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self {
+            file: _,
+            line: _,
+            kind: _,
+            scope: _,
+            unknown,
+        } = self;
+        f.debug_struct("Location")
+            .field("unknown_fields", &unknown.len())
+            .finish_non_exhaustive()
     }
 }
 
@@ -733,6 +826,83 @@ mod tests {
             );
             assert!(!err.to_string().contains(MARKER), "{err}");
             assert!(!format!("{err:?}").contains(MARKER), "{err:?}");
+        }
+    }
+
+    #[test]
+    fn debug_never_prints_finding_content() {
+        // P1a's carry-forward: decrypted findings are owner-only content, so a
+        // `{:?}` in a log line, an error or a panic message must not carry
+        // any. Every string an agent writes holds the marker here: each text
+        // field, each open string, and every key and value of `extra` (its
+        // `cloudflare` record included) and of the `unknown` maps. The line is
+        // not text, but it is content too, so it gets a marker of its own.
+        const MARKER: &str = "MARKER-7f3a";
+        const LINE: u64 = 987_654_321;
+        // `json!` takes an expression as a key, so `MARKER: MARKER` is a field
+        // named by the marker with the marker as its value.
+        let location = || {
+            json!({
+                "file": format!("src/{MARKER}.rs"),
+                "line": LINE,
+                "kind": MARKER,
+                "scope": format!("fn {MARKER}"),
+                MARKER: MARKER,
+            })
+        };
+        let finding = |locations: usize| {
+            json!({
+                "id": MARKER,
+                "title": MARKER,
+                "severity": MARKER,
+                "confidence": MARKER,
+                "status": MARKER,
+                "locations": vec![location(); locations],
+                "description": MARKER,
+                "fix": MARKER,
+                "extra": { "cloudflare": { "title": MARKER, MARKER: MARKER }, MARKER: MARKER },
+                MARKER: MARKER,
+            })
+        };
+        let input = json!({
+            "schemaVersion": 1,
+            "playbook": MARKER,
+            "findings": [finding(2), finding(1)],
+            MARKER: MARKER,
+        });
+        // The premise: the content is all there, and serializing (which is
+        // not a way to log it either) still writes every field of it.
+        let findings = round_trip(&input);
+
+        let finding = &findings.findings[0];
+        let location = &finding.locations[0];
+        // Each case: the `{:?}` and `{:#?}` output, and the exact `{:?}`
+        // output expected (the type, its counts and `..` for the fields left
+        // out). `{:#?}` is the same fields laid out one per line.
+        let cases = [
+            (
+                format!("{findings:?}"),
+                format!("{findings:#?}"),
+                "Findings { schema_version: SchemaVersion(1), findings: 2, locations: 3, \
+                 unknown_fields: 1, .. }",
+            ),
+            (
+                format!("{finding:?}"),
+                format!("{finding:#?}"),
+                "Finding { locations: 2, extra_fields: Some(2), unknown_fields: 1, .. }",
+            ),
+            (
+                format!("{location:?}"),
+                format!("{location:#?}"),
+                "Location { unknown_fields: 1, .. }",
+            ),
+        ];
+        for (compact, pretty, expected) in cases {
+            assert_eq!(compact, expected);
+            for debug in [compact, pretty] {
+                assert!(!debug.contains(MARKER), "{debug}");
+                assert!(!debug.contains(&LINE.to_string()), "{debug}");
+            }
         }
     }
 }

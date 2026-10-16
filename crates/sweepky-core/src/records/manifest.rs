@@ -1,6 +1,7 @@
 //! [`Manifest`], the part of a sweep package that says what it covers.
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
@@ -28,7 +29,15 @@ use crate::url::BountyRef;
 ///
 /// If one target id appears twice as a key of `targetShas`, the later entry
 /// wins; `submit` never writes that.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// **`Debug` counts the unknown fields.** It prints every typed field, which
+/// says no more than the public records already do (the sweep record and its
+/// path, and the revs the bounty pins), but of [`extra`](Self::extra) only how
+/// many fields it has: those are whatever a newer client sealed into the
+/// package, so they may be as private as the findings beside them.
+// `Debug` is not derived, because the derived one would print `extra` in
+// full; the hand-written impl is below.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Manifest {
     /// The sweeper, whose homeserver holds the sweep record and package.
@@ -53,6 +62,38 @@ pub struct Manifest {
     /// rewrite.
     #[serde(flatten)]
     pub extra: UnknownFields,
+}
+
+/// Prints the typed fields as a derived `Debug` would and, in place of
+/// `extra`, `extra_fields`: how many fields it holds, never what they hold.
+impl fmt::Debug for Manifest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Naming every field, with no `..`, makes a field added later a
+        // compile error here until someone decides whether it may print.
+        let Self {
+            sweeper,
+            bounty,
+            targets,
+            target_shas,
+            playbook,
+            started_at,
+            finished_at,
+            extra,
+        } = self;
+        // Every field is accounted for, `extra` by its count, so the output
+        // ends with `}` (`finish`), not with the `..` that would say a field
+        // was left out.
+        f.debug_struct("Manifest")
+            .field("sweeper", sweeper)
+            .field("bounty", bounty)
+            .field("targets", targets)
+            .field("target_shas", target_shas)
+            .field("playbook", playbook)
+            .field("started_at", started_at)
+            .field("finished_at", finished_at)
+            .field("extra_fields", &extra.len())
+            .finish()
+    }
 }
 
 #[cfg(test)]
@@ -119,6 +160,42 @@ mod tests {
             let mut input = manifest_json();
             input[field] = value;
             assert!(parse(&input).is_err(), "{input}");
+        }
+    }
+
+    #[test]
+    fn manifest_debug_counts_extra_fields() {
+        // `extra` holds whatever a newer client sealed into the package, so
+        // `{:?}` shows how many fields it has and nothing of them. The typed
+        // fields echo the public records and print as usual.
+        const MARKER: &str = "MARKER-7f3a";
+        let mut input = manifest_json();
+        input[format!("{MARKER}-key")] = json!("plain value");
+        input["addedLater"] = json!({ "by": format!("{MARKER}-value") });
+        let manifest = parse(&input).unwrap();
+        assert_eq!(manifest.extra.len(), 2);
+
+        let typed_values = [
+            SWEEPER,
+            OWNER,
+            BOUNTY_ID,
+            "\"t1\"",
+            "\"t2\"",
+            REV1,
+            REV2,
+            "cloudflare/security-audit@c1c8a8c",
+            "2026-10-16T08:00:00Z",
+            "2026-10-16T09:10:00Z",
+        ];
+        for debug in [format!("{manifest:?}"), format!("{manifest:#?}")] {
+            assert!(debug.starts_with("Manifest {"), "{debug}");
+            for hidden in [MARKER, "plain value", "addedLater"] {
+                assert!(!debug.contains(hidden), "{hidden} in {debug}");
+            }
+            assert!(debug.contains("extra_fields: 2"), "{debug}");
+            for value in typed_values {
+                assert!(debug.contains(value), "{value} not in {debug}");
+            }
         }
     }
 }
