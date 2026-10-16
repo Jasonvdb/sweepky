@@ -32,8 +32,8 @@ use anyhow::{Context as _, bail};
 use pubky::{PubkySession, PublicKey};
 use sweepky_core::paths::{self, SweepkyPath};
 use sweepky_core::{
-    DeviceId, DeviceIdentity, DeviceKey, ExposeSecret, KnownKeyAlg, MAX_RECORD_BYTES, RecordId,
-    RecordTime, SchemaVersion, SecretString, Timestamp, UnknownFields, Zeroizing,
+    AgeRecipient, DeviceId, DeviceIdentity, DeviceKey, ExposeSecret, KnownKeyAlg, MAX_RECORD_BYTES,
+    RecordId, RecordTime, SchemaVersion, SecretString, Timestamp, UnknownFields, Zeroizing,
 };
 
 use crate::Dirs;
@@ -76,16 +76,20 @@ pub(crate) fn new_device_id() -> anyhow::Result<DeviceId> {
         .context("could not make a device id from the clock")
 }
 
-/// The `keys/<deviceId>.json` record for `identity`, made at `created_at`:
-/// `alg` `age-x25519`, the identity's recipient, the fixed label, and
+/// The `keys/<deviceId>.json` record for the key `recipient`, made at
+/// `created_at`: `alg` `age-x25519`, the recipient, the fixed label, and
 /// `revokedAt` `null`.
-pub(crate) fn device_key_record(identity: &DeviceIdentity, created_at: RecordTime) -> DeviceKey {
+///
+/// It takes the public half alone (`DeviceIdentity::recipient()`), so a
+/// caller that already has it, such as `login` publishing a key again, need
+/// not keep the secret around to build the record.
+pub(crate) fn device_key_record(recipient: &AgeRecipient, created_at: RecordTime) -> DeviceKey {
     DeviceKey {
         schema_version: SchemaVersion::CURRENT,
         // `.into()` builds the open-string `KeyAlg` from the known value, so
         // the text is the one core matches on, `age-x25519`.
         alg: KnownKeyAlg::AgeX25519.into(),
-        recipient: identity.recipient().to_string(),
+        recipient: recipient.to_string(),
         label: DEVICE_KEY_LABEL.to_owned(),
         created_at,
         revoked_at: None,
@@ -128,16 +132,8 @@ pub(crate) fn create_device_key(dirs: &Dirs, identity: &DeviceIdentity) -> anyho
 }
 
 /// Reads this install's identity back from `device.key`, or `None` when
-/// there is no such file.
-// Only the tests read the key back so far. `expect` (rather than `allow`)
-// warns once there is a caller, so whoever adds it deletes this line.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "login's reuse of an existing key and pull, later steps, are the first callers"
-    )
-)]
+/// there is no such file. `login` reads it when it reuses this install's
+/// key; `pull` will, to open sweeps.
 pub(crate) fn read_device_key(dirs: &Dirs) -> anyhow::Result<Option<DeviceIdentity>> {
     let path = dirs.device_key_file();
     let Some(bytes) = read_private_file(&path, MAX_DEVICE_KEY_FILE_BYTES)? else {
@@ -210,11 +206,8 @@ impl KeyIds {
 /// to another thread.
 pub(crate) trait KeyStore {
     /// The signed-in user's own `keys/<id>.json`, at most
-    /// [`MAX_RECORD_BYTES`], or `None` when there is no such record.
-    #[expect(
-        dead_code,
-        reason = "login's reuse of an existing key, a later P2a step, is the first caller"
-    )]
+    /// [`MAX_RECORD_BYTES`], or `None` when there is no such record. The
+    /// bytes are the homeserver's: parse them with `DeviceKey::from_json`.
     async fn get_own_key(&self, id: &DeviceId) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>>;
 
     /// Writes `record` as the signed-in user's `keys/<id>.json`.
@@ -304,7 +297,7 @@ mod tests {
     fn device_key_record_shape() {
         let identity = DeviceIdentity::generate();
         let created_at = clock::now().expect("a time");
-        let record = device_key_record(&identity, created_at.clone());
+        let record = device_key_record(&identity.recipient(), created_at.clone());
         let bytes = device_key_bytes(&record).expect("serializes");
 
         // Exactly these fields: `revokedAt` is written as `null`, not left

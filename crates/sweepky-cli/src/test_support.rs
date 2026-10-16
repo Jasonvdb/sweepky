@@ -1,8 +1,9 @@
 //! Helpers that the unit tests of several modules share: a private temp
 //! directory, the [`Dirs`] under it and the file-mode checks around it, a
-//! random public key, a [`FakeKeyStore`] in place of a homeserver's `keys/`,
-//! and a compile-time check that a secret type implements none of the traits
-//! that would print or copy it.
+//! [`FileSnapshot`] that tells whether a file was written at all, a random
+//! public key, a [`FakeKeyStore`] in place of a homeserver's `keys/`, and a
+//! compile-time check that a secret type implements none of the traits that
+//! would print or copy it.
 //!
 //! Compiled only for `cargo test` (`#[cfg(test)]` on its `mod` line in
 //! `lib.rs`), so nothing here reaches the binary, and like any test code it
@@ -10,8 +11,9 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, Permissions};
-// `MetadataExt` adds `.mode()` to `Metadata`; `PermissionsExt` adds
-// `Permissions::from_mode`.
+use std::io::ErrorKind;
+// `MetadataExt` adds `.mode()` and `.ino()` to `Metadata`; `PermissionsExt`
+// adds `Permissions::from_mode`.
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Mutex;
@@ -91,6 +93,21 @@ impl FakeKeyStore {
         self.calls.lock().expect("lock").clone()
     }
 
+    /// The record the store holds as `keys/<id>.json`, if any. Not a call:
+    /// it is the test looking at the homeserver, so it is not logged.
+    pub(crate) fn record(&self, id: &DeviceId) -> Option<Vec<u8>> {
+        self.records.lock().expect("lock").get(id).cloned()
+    }
+
+    /// Puts `record` in place as `keys/<id>.json`, as someone writing to the
+    /// homeserver behind this install's back would. Not logged either.
+    pub(crate) fn set_record(&self, id: &DeviceId, record: Vec<u8>) {
+        self.records
+            .lock()
+            .expect("lock")
+            .insert(id.clone(), record);
+    }
+
     fn log(&self, call: KeyStoreCall) {
         self.calls.lock().expect("lock").push(call);
     }
@@ -99,8 +116,7 @@ impl FakeKeyStore {
 impl KeyStore for FakeKeyStore {
     async fn get_own_key(&self, id: &DeviceId) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
         self.log(KeyStoreCall::GetOwnKey(id.clone()));
-        let records = self.records.lock().expect("lock");
-        Ok(records.get(id).cloned().map(Zeroizing::new))
+        Ok(self.record(id).map(Zeroizing::new))
     }
 
     async fn put_key(&self, id: &DeviceId, record: Vec<u8>) -> pubky::Result<()> {
@@ -111,10 +127,7 @@ impl KeyStore for FakeKeyStore {
                 message: FAKE_SERVER_TEXT.to_owned(),
             }));
         }
-        self.records
-            .lock()
-            .expect("lock")
-            .insert(id.clone(), record);
+        self.set_record(id, record);
         Ok(())
     }
 
@@ -139,6 +152,34 @@ pub(crate) fn mode(path: &Path) -> u32 {
 /// Sets the permission bits of `path` to `mode`.
 pub(crate) fn chmod(path: &Path, mode: u32) {
     fs::set_permissions(path, Permissions::from_mode(mode)).expect("chmod");
+}
+
+/// What a file holds at one moment, and which inode holds it.
+///
+/// `private_fs` writes a file by renaming a new one over it, so a file
+/// written again has a new inode even when its bytes are the same: two equal
+/// snapshots mean the file was not written at all in between.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct FileSnapshot {
+    bytes: Vec<u8>,
+    inode: u64,
+}
+
+impl FileSnapshot {
+    /// The file at `path` now, or `None` when there is nothing there. Any
+    /// other error fails the test, so an unreadable file is never mistaken
+    /// for a missing one.
+    pub(crate) fn of(path: &Path) -> Option<Self> {
+        let meta = match fs::symlink_metadata(path) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == ErrorKind::NotFound => return None,
+            Err(error) => panic!("could not stat {}: {error}", path.display()),
+        };
+        Some(Self {
+            bytes: fs::read(path).expect("readable"),
+            inode: meta.ino(),
+        })
+    }
 }
 
 /// Fails to compile when `$type` implements any of the listed traits. A test

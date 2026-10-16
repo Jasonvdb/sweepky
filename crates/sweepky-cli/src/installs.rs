@@ -73,14 +73,17 @@ impl InstallList {
         self.owners.get(owner).map_or(&[], Vec::as_slice)
     }
 
-    /// Adds `id` to `owner`'s ids, unless it is there already.
-    fn add(&mut self, owner: Pubky, id: &DeviceId) {
+    /// Adds `id` to `owner`'s ids, unless it is there already. Returns
+    /// whether it added it, as `HashSet::insert` does.
+    fn add(&mut self, owner: Pubky, id: &DeviceId) -> bool {
         // `entry(..).or_default()` finds the owner's list, or puts an empty
         // one in first, and hands back `&mut` to it either way.
         let ids = self.owners.entry(owner).or_default();
-        if !ids.contains(id) {
-            ids.push(id.clone());
+        if ids.contains(id) {
+            return false;
         }
+        ids.push(id.clone());
+        true
     }
 
     /// Removes `id` from `owner`'s ids, and the owner with its last id.
@@ -127,13 +130,16 @@ fn write_installs(dirs: &Dirs, list: &InstallList) -> anyhow::Result<()> {
 }
 
 /// Records `id` as one of `owner`'s installs. Recording it again changes
-/// nothing.
+/// nothing: the file is not even written, so a later login that finds its
+/// id there leaves `installs.json` exactly as it was.
 ///
 /// A read, a change and a write: callers hold the writers' lock, so no other
 /// `sweepky` command changes the file in between.
 pub(crate) fn record_install(dirs: &Dirs, owner: Pubky, id: &DeviceId) -> anyhow::Result<()> {
     let mut list = read_installs(dirs)?;
-    list.add(owner, id);
+    if !list.add(owner, id) {
+        return Ok(());
+    }
     write_installs(dirs, &list)
 }
 
@@ -153,7 +159,7 @@ mod tests {
     use sweepky_core::DeviceId;
 
     use super::{forget_install, read_installs, record_install};
-    use crate::test_support::{dirs_in, mode, private_temp, random_pubky};
+    use crate::test_support::{FileSnapshot, dirs_in, mode, private_temp, random_pubky};
 
     fn id(text: &str) -> DeviceId {
         text.parse().expect("a valid device id")
@@ -181,8 +187,11 @@ mod tests {
         record_install(&dirs, owner, &id("install-a")).expect("records");
         record_install(&dirs, owner, &id("install-b")).expect("records");
         record_install(&dirs, other, &id("install-c")).expect("records");
-        // Recording an id again changes nothing.
+        // Recording an id again changes nothing, and does not even rewrite
+        // the file.
+        let before = FileSnapshot::of(&dirs.installs_file());
         record_install(&dirs, owner, &id("install-a")).expect("records");
+        assert_eq!(FileSnapshot::of(&dirs.installs_file()), before);
         assert_eq!(mode(&dirs.installs_file()), 0o600);
         assert_eq!(mode(dirs.config()), 0o700);
 

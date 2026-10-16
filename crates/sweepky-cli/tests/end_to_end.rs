@@ -23,7 +23,7 @@ use pubky::PublicKey;
 use pubky_testnet::EphemeralTestnet;
 use serde_json::{Value, json};
 use sweepky_cli::{Cli, Context, Dirs, Network, Report, StderrWriter, run};
-use sweepky_core::{DeviceIdentity, DeviceKey, MAX_RECORD_BYTES, SecretString};
+use sweepky_core::{DeviceIdentity, DeviceKey, MAX_RECORD_BYTES, SecretString, Zeroizing};
 
 /// What the context writes to standard error, kept where the test can read
 /// it. `Arc<Mutex<…>>` is one buffer with two owners, the context and the
@@ -62,6 +62,58 @@ fn mode(path: &Path) -> u32 {
 /// The JSON in `path`.
 fn json(path: &Path) -> Value {
     serde_json::from_slice(&fs::read(path).expect("readable")).expect("JSON")
+}
+
+/// The body of an anonymous `GET` of `path` under `user`, through a fresh
+/// client, read as the CLI reads one: the `Content-Length` and then every
+/// chunk are checked against `cap`, so the test never holds more than that.
+async fn get_capped(
+    testnet: &EphemeralTestnet,
+    user: &PublicKey,
+    path: &str,
+    cap: usize,
+) -> Vec<u8> {
+    let mut response = testnet
+        .sdk()
+        .expect("client")
+        .public_storage()
+        .get((user, path))
+        .await
+        .expect("the path is public");
+    if let Some(length) = response.content_length() {
+        assert!(
+            usize::try_from(length).expect("fits") <= cap,
+            "{path}: over the cap"
+        );
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.expect("the body reads") {
+        body.extend_from_slice(&chunk);
+        assert!(body.len() <= cap, "{path}: over the cap");
+    }
+    body
+}
+
+/// The entries of `user`'s `keys/`, from one anonymous `GET` of the
+/// directory: the request `remote::list_dir` sends, which this test cannot
+/// call because the module is private to the crate. The `GET` leaves out
+/// the CLI's `limit=100`, which is the homeserver's default page anyway
+/// (`DEFAULT_LIST_LIMIT` in pubky-homeserver 0.16.2). The body is read
+/// under the cap of such a page. The homeserver answers one URL per line,
+/// `pubky://<owner>/pub/sweepky/keys/<id>.json`.
+async fn list_keys(testnet: &EphemeralTestnet, user: &PublicKey) -> Vec<String> {
+    // The CLI's `ListLimits::DEFAULT` page: 100 lines of at most
+    // `MAX_LISTING_LINE_BYTES`, each with its `\r\n`.
+    const PAGE_ENTRIES: usize = 100;
+    const MAX_LINE_BYTES: usize = 4096;
+    const CAP: usize = PAGE_ENTRIES * (MAX_LINE_BYTES + "\r\n".len());
+    let body = get_capped(testnet, user, "/pub/sweepky/keys/", CAP).await;
+    String::from_utf8(body)
+        .expect("UTF-8")
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// A signup token in a form the homeserver rejects (400) before it looks at
@@ -141,29 +193,21 @@ async fn end_to_end() {
     let device_id = login["deviceId"].as_str().expect("a device id").to_owned();
     let device_key_file = dirs.device_key_file();
     assert_eq!(mode(&device_key_file), 0o600);
-    let secret = fs::read(&device_key_file).expect("readable");
-    assert_eq!(secret.len(), 74, "the identity string and nothing else");
-    let secret = SecretString::from(String::from_utf8(secret).expect("UTF-8"));
+    // Kept to compare with after the later logins, in a buffer that wipes
+    // itself when the test ends.
+    let device_key_bytes = Zeroizing::new(fs::read(&device_key_file).expect("readable"));
+    assert_eq!(
+        device_key_bytes.len(),
+        74,
+        "the identity string and nothing else"
+    );
+    let secret = SecretString::from(String::from_utf8(device_key_bytes.to_vec()).expect("UTF-8"));
     let device = DeviceIdentity::from_secret(&secret).expect("an age identity");
 
     // Anyone can read the record, anonymously, and it is read as the CLI
     // reads every record: never more than MAX_RECORD_BYTES.
     let path = format!("/pub/sweepky/keys/{device_id}.json");
-    let mut response = testnet
-        .sdk()
-        .expect("client")
-        .public_storage()
-        .get((&user, path.as_str()))
-        .await
-        .expect("the key record is public");
-    if let Some(length) = response.content_length() {
-        assert!(usize::try_from(length).expect("fits") <= MAX_RECORD_BYTES);
-    }
-    let mut record = Vec::new();
-    while let Some(chunk) = response.chunk().await.expect("the body reads") {
-        record.extend_from_slice(&chunk);
-        assert!(record.len() <= MAX_RECORD_BYTES, "over the record cap");
-    }
+    let record = get_capped(&testnet, &user, &path, MAX_RECORD_BYTES).await;
     let key = DeviceKey::from_json(&record).expect("a device key record");
     assert_eq!(key.revoked_at, None);
     assert_eq!(key.label, "sweepky-cli");
@@ -200,6 +244,25 @@ async fn end_to_end() {
     assert!(!report.text().contains("Signed up"), "{}", report.text());
     assert!(report.text().contains("still unspent"), "{}", report.text());
     assert_eq!(json(&details_file), details, "the details are unchanged");
+    // It reuses this install's device key too, after reading its record
+    // back: the same id in login.json, the same secret in device.key, and
+    // still one key under the identity's keys/.
+    assert!(
+        report.text().contains("Reusing this install's device key"),
+        "{}",
+        report.text()
+    );
+    assert_eq!(json(&dirs.login_file())["deviceId"], device_id.as_str());
+    // `assert!` rather than `assert_eq!`, which would print both secrets if
+    // it failed.
+    assert!(
+        *Zeroizing::new(fs::read(&device_key_file).expect("readable")) == *device_key_bytes,
+        "device.key was rewritten"
+    );
+    assert_eq!(
+        list_keys(&testnet, &user).await,
+        [format!("pubky://{pubky}/pub/sweepky/keys/{device_id}.json")]
+    );
 
     // The key file alone, as P2c's second install copies it: login rebuilds
     // the details from the key and the pkarr record, without a signup.

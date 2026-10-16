@@ -29,7 +29,12 @@
 //!    identity may write under `/pub/sweepky/` at all: a 403 or a 507 aborts
 //!    with its own message ([`crate::remote::write_error`]), and any failure
 //!    removes the key file and the install entry this run made, and nothing
-//!    else; the identity stays.
+//!    else; the identity stays. On a later login (`login.json` records a
+//!    device id) the tail reuses that key instead, one age key per install:
+//!    it reads `device.key`, reads `keys/<deviceId>.json` back, publishes it
+//!    again if it is gone, and refuses, changing nothing, when the file is
+//!    missing or the record is revoked or holds another key
+//!    ([`reuse_device_key`]).
 //! 7. **Record and sign out**: write `login.json`, with the device id, and
 //!    sign out again: every later command signs in and out on its own
 //!    ([`crate::session`]). The report ends with the reminder to back up the
@@ -44,12 +49,14 @@ use std::fmt;
 
 use anyhow::{Context as _, anyhow, bail};
 use pubky::{PubkySigner, PublicKey, StatusCode};
-use sweepky_core::{DeviceId, DeviceIdentity, ExposeSecret, Pubky, SecretString};
+use sweepky_core::{
+    AgeRecipient, DeviceId, DeviceIdentity, DeviceKey, ExposeSecret, Pubky, SecretString,
+};
 
 use crate::clock;
 use crate::device::{
     KeyStore, SessionKeyStore, create_device_key, device_key_bytes, device_key_record,
-    new_device_id, remove_device_key,
+    new_device_id, read_device_key, remove_device_key,
 };
 use crate::identity::{IdentityMeta, IdentityName, IdentitySecret, read_argument_file};
 use crate::installs::{forget_install, record_install};
@@ -359,26 +366,39 @@ async fn sign_up(
 enum DeviceKeyOutcome {
     /// This run made a new device key and published it under this id.
     Published(DeviceId),
-    /// `login.json` already records this install's device key, so the tail
-    /// did not run and nothing was made.
-    AlreadyRecorded,
+    /// `login.json` already records this install's key under this id, and
+    /// its published record holds this install's key: nothing was made or
+    /// written.
+    Reused(DeviceId),
+    /// `login.json` already records this install's key under this id, but
+    /// the record was gone, so this run published it again.
+    Republished(DeviceId),
 }
 
-/// Writes `login.json` for `state`, running the shared tail of `login` first
-/// when `state` records no device key yet: on this install's first login, or
-/// after an earlier tail rolled back.
+/// Writes `login.json` for `state`, running the shared tail of `login` first.
 ///
-/// `keys` is where `keys/<deviceId>.json` goes: the signed-in session in
-/// `login`, a fake in the tests. On any failure of the tail `login.json` is
-/// left as it was, so it never names a device key that is not published.
+/// - When `state` records no device key yet (this install's first login, or
+///   an earlier tail that rolled back), the tail makes and publishes one
+///   ([`publish_device_key`]).
+/// - When it records one, the tail reuses it ([`reuse_device_key`]): one
+///   age key per install (00), so a second login never makes another.
+///
+/// `keys` is where `keys/<deviceId>.json` is read and written: the
+/// signed-in session in `login`, a fake in the tests. On any failure of the
+/// tail `login.json` is left as it was, so it never names a device key that
+/// is not published.
 async fn record_login(
     dirs: &Dirs,
     keys: &impl KeyStore,
     mut state: LoginState,
 ) -> anyhow::Result<DeviceKeyOutcome> {
-    if state.device_id.is_some() {
+    // `if let Some(id) = &state.device_id` borrows the id inside `state`
+    // rather than moving it out, so `state` is still whole for the write
+    // below; both borrows are shared, which Rust allows at once.
+    if let Some(id) = &state.device_id {
+        let outcome = reuse_device_key(dirs, keys, state.pubky, id).await?;
         write_login_state(dirs, &state)?;
-        return Ok(DeviceKeyOutcome::AlreadyRecorded);
+        return Ok(outcome);
     }
     let id = publish_device_key(dirs, keys, state.pubky).await?;
     state.device_id = Some(id.clone());
@@ -417,7 +437,7 @@ async fn publish_device_key(
     let created_at = clock::now()?;
     let id = new_device_id()?;
     let identity = DeviceIdentity::generate();
-    let record = device_key_bytes(&device_key_record(&identity, created_at))?;
+    let record = device_key_bytes(&device_key_record(&identity.recipient(), created_at))?;
     // The secret is saved before anything is published, so a crash can
     // never leave a published key that nothing on this machine can open.
     create_device_key(dirs, &identity)?;
@@ -463,6 +483,180 @@ fn rolled_back(
              ({}); delete what is left by hand",
             left.join("; ")
         ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The shared tail on a later login: reusing this install's device key.
+
+/// Reuses the device key `login.json` records as `id`, on a later login of
+/// the same identity on this install. It never makes a second key, and never
+/// writes over or deletes `device.key`, which may be the only key that opens
+/// the sweeps encrypted to it:
+///
+/// 1. `device.key` must be there and hold an age identity, or login refuses
+///    before anything goes out ([`read_recorded_device_key`]).
+/// 2. `keys/<id>.json` is read back (the key store caps it at
+///    `MAX_RECORD_BYTES`):
+///    - gone: it is published again with this install's key
+///      ([`republish_device_key`]), which is the capability probe once more,
+///      so a 403 or 507 gets its message; a failure removes nothing;
+///    - this install's key, unrevoked: reused, with nothing written;
+///    - anything else is refused with nothing changed ([`check_own_record`]).
+/// 3. The id goes back into `installs.json` if it went missing there. That
+///    comes last, so a refusal leaves the file as it was, and when the id is
+///    there the file is not written.
+///
+/// A later step reads a passphrase-wrapped `device.key` here.
+async fn reuse_device_key(
+    dirs: &Dirs,
+    keys: &impl KeyStore,
+    owner: Pubky,
+    id: &DeviceId,
+) -> anyhow::Result<DeviceKeyOutcome> {
+    // Only the public half is needed from here on. `.recipient()` is called
+    // on the temporary identity, which is dropped (and wiped, by age) at the
+    // end of this statement, so the secret is not held while the requests
+    // below wait on the network.
+    let local = read_recorded_device_key(dirs, id)?.recipient();
+    let published = keys.get_own_key(id).await.with_context(|| {
+        format!("could not read back keys/{id}.json, this install's device key record")
+    })?;
+    let outcome = match published {
+        None => {
+            republish_device_key(dirs, keys, &local, id).await?;
+            DeviceKeyOutcome::Republished(id.clone())
+        }
+        Some(bytes) => {
+            check_own_record(id, &bytes, &local)?;
+            DeviceKeyOutcome::Reused(id.clone())
+        }
+    };
+    record_install(dirs, owner, id).with_context(|| {
+        format!("could not record this install's device id {id} in installs.json")
+    })?;
+    Ok(outcome)
+}
+
+/// Reads `device.key`, the secret of the key `login.json` records as `id`.
+///
+/// A missing or unreadable file is refused with the two ways out, restoring
+/// it or retiring the key, and nothing is written: the file may only be
+/// misplaced, and making a new key in its place would give this install a
+/// second published key while the sweeps encrypted to the first stay
+/// unopened.
+fn read_recorded_device_key(dirs: &Dirs, id: &DeviceId) -> anyhow::Result<DeviceIdentity> {
+    let path = dirs.device_key_file();
+    // `display()` borrows `path` as something `{}` can print; a path is not
+    // always UTF-8, so it has no `Display` of its own.
+    let shown = path.display();
+    match read_device_key(dirs) {
+        Ok(Some(identity)) => Ok(identity),
+        Ok(None) => bail!(
+            "{shown} is missing, but login.json records it as the secret of this install's device \
+             key keys/{id}.json, so login changed nothing: restore {shown} from your backup, or \
+             run `sweepky logout` to retire keys/{id}.json"
+        ),
+        // `read_device_key`'s own error says what is wrong with the file, in
+        // fixed words, and comes after this context in the printed chain.
+        Err(error) => Err(error.context(format!(
+            "could not read {shown}, the secret of this install's device key keys/{id}.json, so \
+             login changed nothing (if the file cannot be put right, restore it from your backup, \
+             or run `sweepky logout` to retire keys/{id}.json)"
+        ))),
+    }
+}
+
+/// Publishes `keys/<id>.json` again with `local`, this install's own key,
+/// after the homeserver turned out not to have it.
+///
+/// It is this install's key under this install's id, so writing it back
+/// grants nobody anything new. `createdAt` is now: the record's first time
+/// went with it. A refusal is mapped as the first login's probe is (403 and
+/// 507 to their messages, never the server's words), but nothing local is
+/// undone: `device.key` may open sweeps already encrypted to this key.
+async fn republish_device_key(
+    dirs: &Dirs,
+    keys: &impl KeyStore,
+    local: &AgeRecipient,
+    id: &DeviceId,
+) -> anyhow::Result<()> {
+    let record = device_key_bytes(&device_key_record(local, clock::now()?))?;
+    keys.put_key(id, record).await.map_err(|error| {
+        write_error(&error).context(format!(
+            "keys/{id}.json, this install's device key record, is missing and could not be \
+             published again, so login changed nothing and kept {}",
+            dirs.device_key_file().display()
+        ))
+    })
+}
+
+/// Checks that `bytes`, this install's own `keys/<id>.json` as its
+/// homeserver holds it, publishes `local`, this install's key, unrevoked.
+///
+/// Core parses the record ([`DeviceKey::from_json`], capped, version first)
+/// and turns it into a key with [`DeviceKey::encryption_recipient`], the only
+/// way to the key a sweeper's CLI would encrypt to, which also checks `alg`
+/// and the recipient's strict form. That key is then compared with `local`
+/// as [`AgeRecipient`] values, not as the record's text, so only a valid,
+/// canonical key can ever match.
+///
+/// - Revoked: refused, pointing at `logout`.
+/// - Not a record, not a usable key, or another key: this CLI wrote this
+///   install's key there, so someone else wrote this, and it is refused as
+///   an alarm (02, "Who can read a sweep").
+///
+/// The messages name the device id and never the record's recipient: that
+/// text is the homeserver's, and repeating it would only help a lookalike.
+/// Core's errors in the chain are fixed text too.
+fn check_own_record(id: &DeviceId, bytes: &[u8], local: &AgeRecipient) -> anyhow::Result<()> {
+    // `with_context` (anyhow's `Context` trait) turns core's typed error into
+    // an `anyhow::Error` with the alarm in front of it. It takes a closure, so
+    // the message is only built when there is an error.
+    let record = DeviceKey::from_json(bytes).with_context(|| not_this_installs_key(id))?;
+    if record.is_revoked() {
+        bail!(
+            "this install's device key keys/{id}.json is revoked, so sweeps are no longer \
+             encrypted to it, and login changed nothing. Run `sweepky logout` to retire it, which \
+             also forgets this identity: giving an identity a new device key on an install is \
+             not part of this build"
+        );
+    }
+    let published = record
+        .encryption_recipient()
+        .with_context(|| not_this_installs_key(id))?;
+    // `!=` on `AgeRecipient` is core's comparison of the two keys. These are
+    // public keys, so comparing them in variable time leaks nothing.
+    if published != *local {
+        bail!(not_this_installs_key(id));
+    }
+    Ok(())
+}
+
+/// The alarm for a `keys/<id>.json` of this install's that does not hold
+/// this install's key. Fixed text and the id.
+fn not_this_installs_key(id: &DeviceId) -> String {
+    format!(
+        "alarm: keys/{id}.json, this install's own device key record, does not hold this \
+         install's key: someone other than this install wrote it, with this identity's \
+         credentials or as an operator of its homeserver, and can read any sweep encrypted to the \
+         key it holds. login changed nothing. Run `sweepky logout` to revoke keys/{id}.json, and \
+         stop using this identity if its key file may have leaked"
+    )
+}
+
+/// What the report says about this install's device key, for each thing
+/// [`record_login`] can have done with it.
+fn device_key_report(dirs: &Dirs, outcome: &DeviceKeyOutcome) -> String {
+    match outcome {
+        DeviceKeyOutcome::Published(id) => published_key_report(dirs, id),
+        DeviceKeyOutcome::Reused(id) => {
+            format!("Reusing this install's device key, keys/{id}.json.\n")
+        }
+        DeviceKeyOutcome::Republished(id) => format!(
+            "keys/{id}.json was missing, so login published this install's device key there \
+             again; sweeps for you are encrypted to it.\n"
+        ),
     }
 }
 
@@ -594,9 +788,7 @@ async fn login_locked(
         "Logged in as {name}, pubky {}, on homeserver {}.\n",
         meta.pubky, meta.homeserver
     ));
-    if let DeviceKeyOutcome::Published(id) = device {
-        report.push_str(&published_key_report(&ctx.dirs, &id));
-    }
+    report.push_str(&device_key_report(&ctx.dirs, &device));
     Ok(Report::new(report))
 }
 
@@ -639,9 +831,10 @@ async fn resolve_homeserver(ctx: &Context, user: &PublicKey) -> anyhow::Result<O
 }
 
 /// Signs in, publishes this install's device key if `login.json` records
-/// none for this pubky ([`record_login`]), writes `login.json` for the
-/// identity `meta` describes ([`login_state_for`], which `current` is moved
-/// into), and signs out again.
+/// none for this pubky or checks the one it records ([`record_login`]),
+/// writes `login.json` for the identity `meta` describes
+/// ([`login_state_for`], which `current` is moved into), and signs out
+/// again.
 ///
 /// The sign-out runs whether that worked or not; the error is returned
 /// after it.
@@ -709,15 +902,15 @@ mod tests {
 
     use pubky::StatusCode;
     use pubky::errors::RequestError;
-    use sweepky_core::{DeviceId, DeviceIdentity, Pubky};
+    use serde_json::{Value, json};
+    use sweepky_core::{DeviceId, DeviceIdentity, DeviceKey, Pubky};
     use tempfile::TempDir;
 
     use super::{
-        Found, LoginPlan, PlanInput, ProductionWarning, SignupOutcome, plan_login, record_login,
-        signup_error, signup_outcome,
+        DeviceKeyOutcome, Found, LoginPlan, PlanInput, ProductionWarning, SignupOutcome,
+        plan_login, record_login, signup_error, signup_outcome,
     };
-    use crate::Dirs;
-    use crate::device::{create_device_key, read_device_key};
+    use crate::device::{create_device_key, device_key_bytes, device_key_record, read_device_key};
     use crate::identity::{IdentityMeta, IdentityName, IdentitySecret};
     use crate::installs::{read_installs, record_install};
     use crate::network::{NetworkKind, PRODUCTION_HOMESERVER, TESTNET_HOMESERVER};
@@ -727,8 +920,10 @@ mod tests {
         write_login_state,
     };
     use crate::test_support::{
-        FAKE_SERVER_TEXT, FakeKeyStore, KeyStoreCall, dirs_in, private_temp, random_pubky,
+        FAKE_SERVER_TEXT, FakeKeyStore, FileSnapshot, KeyStoreCall, dirs_in, private_temp,
+        random_pubky,
     };
+    use crate::{Dirs, clock};
 
     fn key(z32: &str) -> Pubky {
         z32.parse().expect("a valid key")
@@ -1140,5 +1335,266 @@ mod tests {
             [earlier]
         );
         assert_eq!(read_login_state(&dirs).expect("reads"), Some(state));
+    }
+
+    /// A temp `SWEEPKY_HOME` after this install's first login against
+    /// `keys`: the identity's two files, `device.key`, this one install in
+    /// `installs.json`, and `login.json` naming its device id, whose record
+    /// `keys` now holds. Returns the directory, its `Dirs`, the `login.json`
+    /// the next login starts from, and the device id.
+    async fn after_a_first_login(keys: &FakeKeyStore) -> (TempDir, Dirs, LoginState, DeviceId) {
+        let temp = private_temp();
+        let dirs = dirs_in(&temp);
+        let secret = IdentitySecret::generate();
+        let meta = IdentityMeta::new(throwaway(), secret.pubky(), random_pubky(), true);
+        create_identity(&dirs, &secret, &meta).expect("creates");
+        let state = LoginState::identity(meta.name.clone(), meta.pubky, meta.homeserver);
+        let outcome = record_login(&dirs, keys, state)
+            .await
+            .expect("the first login");
+        let DeviceKeyOutcome::Published(id) = outcome else {
+            panic!("expected a new key, got {outcome:?}");
+        };
+        let state = read_login_state(&dirs).expect("reads").expect("present");
+        assert_eq!(state.device_id.as_ref(), Some(&id));
+        (temp, dirs, state, id)
+    }
+
+    /// Snapshots of `device.key`, `installs.json` and `login.json`, the
+    /// local files a reuse of the device key could change: equal snapshots
+    /// mean a file was not written at all.
+    fn device_state(dirs: &Dirs) -> [Option<FileSnapshot>; 3] {
+        [
+            dirs.device_key_file(),
+            dirs.installs_file(),
+            dirs.login_file(),
+        ]
+        .map(|path| FileSnapshot::of(&path))
+    }
+
+    #[tokio::test]
+    async fn second_login_reuses_the_device_key() {
+        let keys = FakeKeyStore::default();
+        let (_temp, dirs, state, id) = after_a_first_login(&keys).await;
+        let published = keys.record(&id).expect("published");
+        let [device_key, installs, _] = device_state(&dirs);
+        let calls_before = keys.calls().len();
+
+        let outcome = record_login(&dirs, &keys, state.clone())
+            .await
+            .expect("the second login");
+        assert!(
+            matches!(&outcome, DeviceKeyOutcome::Reused(reused) if reused == &id),
+            "{outcome:?}"
+        );
+        // The second login's one remote call reads its own record back; it
+        // writes nothing there.
+        let calls = keys.calls();
+        assert_eq!(calls[calls_before..], [KeyStoreCall::GetOwnKey(id.clone())]);
+        assert_eq!(keys.record(&id), Some(published));
+        // device.key and installs.json are not written at all, and this
+        // owner has exactly the one install.
+        let [device_key_after, installs_after, _] = device_state(&dirs);
+        assert_eq!(device_key_after, device_key);
+        assert_eq!(installs_after, installs);
+        assert_eq!(
+            read_installs(&dirs).expect("reads").ids_of(&state.pubky),
+            [id]
+        );
+        // login.json still names the same key.
+        assert_eq!(read_login_state(&dirs).expect("reads"), Some(state));
+    }
+
+    #[tokio::test]
+    async fn second_login_republishes_a_missing_key_record() {
+        let (_temp, dirs, state, id) = after_a_first_login(&FakeKeyStore::default()).await;
+        let local = read_device_key(&dirs).expect("reads").expect("present");
+        let [device_key, installs, _] = device_state(&dirs);
+        // A homeserver that has lost the record: this store holds none.
+        let keys = FakeKeyStore::default();
+
+        let outcome = record_login(&dirs, &keys, state.clone())
+            .await
+            .expect("republished");
+        assert!(
+            matches!(&outcome, DeviceKeyOutcome::Republished(again) if again == &id),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            keys.calls(),
+            [
+                KeyStoreCall::GetOwnKey(id.clone()),
+                KeyStoreCall::PutKey(id.clone())
+            ]
+        );
+        // The same id, holding this install's own key again.
+        let record = DeviceKey::from_json(&keys.record(&id).expect("published")).expect("parses");
+        assert_eq!(record.revoked_at, None);
+        assert_eq!(
+            record.encryption_recipient().expect("usable"),
+            local.recipient()
+        );
+        // No new key and no second install.
+        let [device_key_after, installs_after, _] = device_state(&dirs);
+        assert_eq!(device_key_after, device_key);
+        assert_eq!(installs_after, installs);
+        assert_eq!(read_login_state(&dirs).expect("reads"), Some(state));
+    }
+
+    #[tokio::test]
+    async fn reuse_republish_refusal_keeps_the_device_key() {
+        for (status, message) in [
+            (StatusCode::FORBIDDEN, WRITE_FORBIDDEN),
+            (StatusCode::INSUFFICIENT_STORAGE, QUOTA_FULL),
+        ] {
+            let (_temp, dirs, state, id) = after_a_first_login(&FakeKeyStore::default()).await;
+            let before = device_state(&dirs);
+            // The record is gone and the homeserver refuses to take it back.
+            let keys = FakeKeyStore::refusing_puts(status);
+
+            let err = record_login(&dirs, &keys, state)
+                .await
+                .expect_err("login aborts");
+            assert_eq!(err.root_cause().to_string(), message, "{status}");
+            let shown = format!("{err:#}");
+            assert!(shown.contains(&format!("keys/{id}.json")), "{shown}");
+            assert!(!shown.contains(FAKE_SERVER_TEXT), "{shown}");
+            assert!(!format!("{err:?}").contains(FAKE_SERVER_TEXT), "{shown}");
+            assert_eq!(
+                keys.calls(),
+                [
+                    KeyStoreCall::GetOwnKey(id.clone()),
+                    KeyStoreCall::PutKey(id)
+                ]
+            );
+            // Unlike the first login's probe, nothing is rolled back: the
+            // key may open sweeps already encrypted to it.
+            assert_eq!(device_state(&dirs), before, "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn revoked_or_mismatched_own_key_is_refused_without_changes() {
+        for case in [
+            "revoked",
+            "another key",
+            "another alg",
+            "not a recipient",
+            "not a record",
+        ] {
+            let keys = FakeKeyStore::default();
+            let (_temp, dirs, state, id) = after_a_first_login(&keys).await;
+            let local = read_device_key(&dirs).expect("reads").expect("present");
+            let other = DeviceIdentity::generate();
+            let created_at = clock::now().expect("a time");
+            let ours = device_key_record(&local.recipient(), created_at.clone());
+            // What the homeserver holds as keys/<id>.json by the next login.
+            let tampered = |field: &str, value: Value| {
+                let mut json = serde_json::to_value(&ours).expect("JSON");
+                json[field] = value;
+                serde_json::to_vec(&json).expect("JSON")
+            };
+            let local_text = local.recipient().to_string();
+            let published = match case {
+                // As this install's own logout, or `keys revoke` from another
+                // install, leaves it.
+                "revoked" => tampered("revokedAt", json!(created_at.as_str())),
+                "another key" => {
+                    device_key_bytes(&device_key_record(&other.recipient(), created_at))
+                        .expect("JSON")
+                }
+                "another alg" => tampered("alg", json!("AGE-X25519")),
+                // The local key, but not in the one spelling age accepts.
+                "not a recipient" => tampered("recipient", json!(local_text.to_uppercase())),
+                "not a record" => b"{\"schemaVersion\":1,\"alg\":".to_vec(),
+                _ => unreachable!("{case}"),
+            };
+            keys.set_record(&id, published.clone());
+            let before = device_state(&dirs);
+            let calls_before = keys.calls().len();
+
+            let err = record_login(&dirs, &keys, state).await.expect_err(case);
+            let shown = format!("{err:#}");
+            // The device id, and never a recipient's text: neither this
+            // install's, nor the one in the record, in either case. (Core's
+            // fixed reason may name the "age1" prefix; that is no key.)
+            assert!(
+                shown.contains(&format!("keys/{id}.json")),
+                "{case}: {shown}"
+            );
+            for text in [local_text.as_str(), &other.recipient().to_string()] {
+                assert!(!shown.contains(text), "{case}: {shown}");
+                assert!(!shown.contains(&text.to_uppercase()), "{case}: {shown}");
+            }
+            if case == "revoked" {
+                assert!(shown.contains("revoked"), "{shown}");
+                assert!(shown.contains("`sweepky logout`"), "{shown}");
+                assert!(!shown.contains("alarm"), "{shown}");
+            } else {
+                assert!(shown.starts_with("alarm: "), "{case}: {shown}");
+                assert!(
+                    shown.contains("someone other than this install wrote it"),
+                    "{case}: {shown}"
+                );
+            }
+            // It read the record and changed nothing, here or there.
+            let calls = keys.calls();
+            assert_eq!(calls[calls_before..], [KeyStoreCall::GetOwnKey(id.clone())]);
+            assert_eq!(keys.record(&id), Some(published), "{case}");
+            assert_eq!(device_state(&dirs), before, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_device_key_file_is_refused_with_restore_hint() {
+        for case in ["missing", "not an age identity"] {
+            let keys = FakeKeyStore::default();
+            let (_temp, dirs, state, id) = after_a_first_login(&keys).await;
+            let path = dirs.device_key_file();
+            match case {
+                "missing" => fs::remove_file(&path).expect("remove"),
+                // Written over the 0600 file, which keeps its mode, so the
+                // refusal is about what it holds.
+                _ => fs::write(&path, b"synthetic damage").expect("write"),
+            }
+            let before = device_state(&dirs);
+            let calls_before = keys.calls().len();
+
+            let err = record_login(&dirs, &keys, state).await.expect_err(case);
+            let shown = format!("{err:#}");
+            for part in [
+                path.display().to_string(),
+                "from your backup".to_owned(),
+                "`sweepky logout`".to_owned(),
+                format!("keys/{id}.json"),
+            ] {
+                assert!(
+                    shown.contains(&part),
+                    "{case}: {part:?} missing from: {shown}"
+                );
+            }
+            assert!(!shown.contains("synthetic damage"), "{shown}");
+            // Refused before anything went out, with nothing written.
+            assert_eq!(keys.calls().len(), calls_before, "{case}");
+            assert_eq!(device_state(&dirs), before, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn reuse_records_an_install_entry_that_is_missing() {
+        // installs.json lost this install's id (deleted, or restored from an
+        // older copy): a login that finds the key and its record in order
+        // puts the id back, so the owner's own key never reads as unknown.
+        let keys = FakeKeyStore::default();
+        let (_temp, dirs, state, id) = after_a_first_login(&keys).await;
+        fs::remove_file(dirs.installs_file()).expect("remove");
+
+        record_login(&dirs, &keys, state.clone())
+            .await
+            .expect("the second login");
+        assert_eq!(
+            read_installs(&dirs).expect("reads").ids_of(&state.pubky),
+            [id]
+        );
     }
 }
