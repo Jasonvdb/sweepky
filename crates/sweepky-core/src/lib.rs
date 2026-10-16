@@ -38,6 +38,12 @@
 //!   its open-string [`KeyAlg`]; and [`Discovered`], an open bounty's
 //!   `bounties/<id>.discovered.json`. Each reads bytes with `from_json`, the
 //!   size-capped, version-first parse above.
+//! - The bounty and sweep records: [`Bounty`], a bounty post with its
+//!   open-string [`Focus`] and [`BountyStatus`], and [`Bounty::mark_done`],
+//!   the rewrite `sweepky done` makes, which refuses to credit the owner;
+//!   [`Sweep`], a sweep record with its open-string [`SweepStatus`]; and
+//!   [`Manifest`], the part of a sweep package that names the sweeper, the
+//!   bounty and the targets' commits.
 //! - A bounty's targets: [`Target`], which keeps its open-string
 //!   [`TargetKind`] and its other fields as written, so a kind this build
 //!   does not know round-trips and is skipped; [`Target::known`], which
@@ -119,7 +125,11 @@ pub use error::{JsonCategory, RecordError};
 pub use ids::{EventCursor, RecordId};
 pub use names::{DeviceId, GitSha, Playbook, RepoName, RepoPath, Sha256Hex, TargetId};
 pub use pubky::Pubky;
-pub use records::{Circle, CircleMember, DeviceKey, Discovered, KeyAlg, KnownKeyAlg};
+pub use records::{
+    Bounty, BountyPlaybook, BountyStatus, Circle, CircleMember, DeviceKey, Discovered, Focus,
+    KeyAlg, KnownBountyStatus, KnownFocus, KnownKeyAlg, KnownSweepStatus, Manifest, MarkDoneError,
+    Sweep, SweepStatus,
+};
 pub use schema::{MAX_FINDINGS_BYTES, MAX_RECORD_BYTES, SchemaVersion, UnknownFields};
 pub use scope::{CommitShape, TargetScope};
 pub use target::{
