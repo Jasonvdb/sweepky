@@ -38,6 +38,13 @@
 //!   its open-string [`KeyAlg`]; and [`Discovered`], an open bounty's
 //!   `bounties/<id>.discovered.json`. Each reads bytes with `from_json`, the
 //!   size-capped, version-first parse above.
+//! - A bounty's targets: [`Target`], which keeps its open-string
+//!   [`TargetKind`] and its other fields as written, so a kind this build
+//!   does not know round-trips and is skipped; [`Target::known`], which
+//!   checks a known kind's fields into [`PrTarget`], [`CommitTarget`] or
+//!   [`RepoTarget`]; and [`TargetScope`], what a sweep of each covers, as
+//!   `scope.json` hands it to the skill, built from those checked values
+//!   alone.
 //!
 //! The rules that hold for everything here (see "Rust conventions" in
 //! `docs/plan/03-cli-and-skill.md`):
@@ -102,6 +109,8 @@ pub mod paths;
 mod pubky;
 mod records;
 mod schema;
+mod scope;
+mod target;
 mod time;
 mod url;
 mod validated_string;
@@ -112,6 +121,11 @@ pub use names::{DeviceId, GitSha, Playbook, RepoName, RepoPath, Sha256Hex, Targe
 pub use pubky::Pubky;
 pub use records::{Circle, CircleMember, DeviceKey, Discovered, KeyAlg, KnownKeyAlg};
 pub use schema::{MAX_FINDINGS_BYTES, MAX_RECORD_BYTES, SchemaVersion, UnknownFields};
+pub use scope::{CommitShape, TargetScope};
+pub use target::{
+    CommitTarget, KnownTarget, KnownTargetKind, PrTarget, RepoTarget, Target, TargetError,
+    TargetKind,
+};
 pub use time::RecordTime;
 pub use url::{BountyRef, PubkyUrl, SweepRef};
 // Re-exported because `RecordId::from_timestamp` takes one: the CLI names it
