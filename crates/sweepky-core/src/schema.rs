@@ -18,6 +18,23 @@ pub const MAX_RECORD_BYTES: usize = 1024 * 1024;
 /// than a public record.
 pub const MAX_FINDINGS_BYTES: usize = 16 * 1024 * 1024;
 
+/// The most bytes a sweep package may have, before and after padding: 32 MiB.
+///
+/// The package is the one JSON document inside a sweep's `.age` file: the
+/// manifest, the findings (up to [`MAX_FINDINGS_BYTES`] on their own) and the
+/// text attachments. [`PaddedPlaintext::pad`](crate::PaddedPlaintext::pad)
+/// refuses a longer one, and [`decrypt`](crate::decrypt) stops reading once
+/// a plaintext passes it. It is a whole number of 64 KiB padding buckets, so a
+/// package at the cap pads to itself. P1b's choice; 01 and 02 set none. It is
+/// above 16.2 MiB so that the largest C2SP CCTV age vectors (258 chunks of
+/// 64 KiB) decrypt.
+pub const MAX_PACKAGE_BYTES: usize = 32 * 1024 * 1024;
+
+// Compile-time check (`const _` is evaluated while the crate compiles, so a
+// failed `assert!` is a compile error, not a run-time panic): a package holds
+// a whole findings document and more, so its cap is never the smaller one.
+const _: () = assert!(MAX_PACKAGE_BYTES >= MAX_FINDINGS_BYTES);
+
 /// A record's `schemaVersion`.
 ///
 /// 01's rule is to reject a record only when its major version is greater

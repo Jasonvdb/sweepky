@@ -91,6 +91,18 @@
 //!   `keys/` record to a checked recipient only when its `alg` is exactly
 //!   `age-x25519` and it is not revoked. Their errors, [`RecipientError`],
 //!   [`IdentityError`] and [`DeviceKeyError`], hold no data at all.
+//! - Sealing (P1b): [`PaddedPlaintext::pad`] copies a sweep package into a
+//!   buffer padded with trailing spaces to the next [`PADDING_BUCKET_BYTES`]
+//!   (64 KiB), refusing one over [`MAX_PACKAGE_BYTES`]; [`encrypt`] takes
+//!   only that padded type and writes binary age v1 to 1 to
+//!   [`MAX_RECIPIENTS`] distinct [`AgeRecipient`]s; and [`decrypt`] opens a
+//!   file with one [`DeviceIdentity`] into a [`Plaintext`], after checking
+//!   the file against [`MAX_CIPHERTEXT_BYTES`] and its header against
+//!   [`MAX_HEADER_BYTES`] before age parses anything. Both plaintext types
+//!   live in wiped buffers that never grow, print only their length, and
+//!   have no `Display`, `Serialize` or `Clone`. Their errors,
+//!   [`PaddingError`], [`EncryptError`] and [`DecryptError`], hold no data,
+//!   and age's own errors are matched, never formatted.
 //! - The secret-holding types, re-exported so the CLI uses the same ones
 //!   without depending on `age` for them: [`SecretString`] and
 //!   [`ExposeSecret`] (age's re-export of `secrecy`) and [`Zeroizing`].
@@ -174,7 +186,11 @@ mod trust;
 mod url;
 mod validated_string;
 
-pub use crypto::{AgeRecipient, DeviceIdentity, DeviceKeyError, IdentityError, RecipientError};
+pub use crypto::{
+    AgeRecipient, DecryptError, DeviceIdentity, DeviceKeyError, EncryptError, IdentityError,
+    MAX_CIPHERTEXT_BYTES, MAX_HEADER_BYTES, MAX_RECIPIENTS, PADDING_BUCKET_BYTES, PaddedPlaintext,
+    PaddingError, Plaintext, RecipientError, decrypt, encrypt,
+};
 pub use error::{JsonCategory, RecordError};
 pub use feed::{
     FeedError, FeedEvent, FeedOp, FeedPage, MAX_FEED_BODY_BYTES, MAX_FEED_LINE_BYTES, parse_feed,
@@ -192,7 +208,9 @@ pub use records::{
     KeyAlg, KnownBountyStatus, KnownFocus, KnownKeyAlg, KnownSweepStatus, Manifest, MarkDoneError,
     Sweep, SweepStatus,
 };
-pub use schema::{MAX_FINDINGS_BYTES, MAX_RECORD_BYTES, SchemaVersion, UnknownFields};
+pub use schema::{
+    MAX_FINDINGS_BYTES, MAX_PACKAGE_BYTES, MAX_RECORD_BYTES, SchemaVersion, UnknownFields,
+};
 pub use scope::{CommitShape, TargetScope};
 pub use target::{
     CommitTarget, KnownTarget, KnownTargetKind, PrTarget, RepoTarget, Target, TargetError,

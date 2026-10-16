@@ -1,17 +1,29 @@
 //! Sweepky's cryptography (P1b), built on age v1 with X25519 recipients.
 //!
-//! So far it holds the key types every later step uses, in `keys`:
-//! [`DeviceIdentity`], an install's secret age key, and [`AgeRecipient`], a
-//! public `age1…` key read with a strict parse that refuses anything age's
-//! encryptor would panic on.
+//! - `keys`: [`DeviceIdentity`], an install's secret age key, and
+//!   [`AgeRecipient`], a public `age1…` key read with a strict parse that
+//!   refuses anything age's encryptor would panic on.
+//! - `padding`: [`PaddedPlaintext`], a sweep package padded with trailing
+//!   spaces to the next 64 KiB bucket, the only input [`encrypt`] takes.
+//! - `seal`: [`encrypt`] to a list of recipients as binary age v1, and
+//!   [`decrypt`] with one identity, which bounds what a stranger's file can
+//!   make it do and returns the whole [`Plaintext`] or nothing.
 //!
 //! Nothing here rolls its own cryptography: age does the encryption, and this
-//! module only decides which keys age is handed and keeps secrets out of
-//! logs, errors and serialized output.
+//! module only decides which keys age is handed, what age may be made to
+//! parse, and keeps secrets and sealed content out of logs, errors and
+//! serialized output.
 
 mod keys;
+mod padding;
+mod seal;
 
 pub use keys::{AgeRecipient, DeviceIdentity, DeviceKeyError, IdentityError, RecipientError};
+pub use padding::{PADDING_BUCKET_BYTES, PaddedPlaintext, PaddingError};
+pub use seal::{
+    DecryptError, EncryptError, MAX_CIPHERTEXT_BYTES, MAX_HEADER_BYTES, MAX_RECIPIENTS, Plaintext,
+    decrypt, encrypt,
+};
 
 /// Fails to compile when `$type` implements any of the listed traits.
 /// Test-only: a test module states what a secret type must never implement

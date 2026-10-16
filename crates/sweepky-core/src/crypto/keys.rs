@@ -154,6 +154,13 @@ impl AgeRecipient {
     /// The length of every accepted recipient: 62 characters (`age1`, 52
     /// data characters for the 32-byte key, and a 6-character checksum).
     pub const LEN: usize = 62;
+
+    /// age's own recipient type, for the encryptor in `seal`. `pub(crate)`:
+    /// only this crate sees age's type, whose parser and `==` are laxer than
+    /// this one's, so a caller outside can never swap in an unchecked key.
+    pub(crate) fn as_age(&self) -> &age::x25519::Recipient {
+        &self.0
+    }
 }
 
 impl FromStr for AgeRecipient {
@@ -327,6 +334,12 @@ impl DeviceIdentity {
     /// [`ExposeSecret::expose_secret`].
     pub fn to_secret_string(&self) -> SecretString {
         self.0.to_string()
+    }
+
+    /// age's own identity, for the decryptor in `seal`. A borrow, so the key
+    /// is never copied; `pub(crate)`, so it never leaves this crate.
+    pub(crate) fn as_age(&self) -> &age::x25519::Identity {
+        &self.0
     }
 
     /// Reads an identity back from the string
