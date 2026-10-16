@@ -7,3 +7,7 @@ fixtures/target-repo.git/** binary
 # endings on purpose (`header_crlf`, `armor_crlf`) and the age file after each
 # vector's header is binary, so git must never convert their line endings.
 fixtures/cctv-age/** binary
+# The common run directory's `capture.bin` is the one fixture that must not be
+# UTF-8 text (it holds the byte 0xFF). Marked binary so git never converts its
+# bytes or diffs it as text, whatever the checkout's settings.
+fixtures/common/capture.bin binary

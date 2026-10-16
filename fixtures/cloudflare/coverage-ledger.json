@@ -1,0 +1,169 @@
+[
+  {
+    "coverage_id": "src%2Fauth%2Fhandler.rs%23handle_login::src%2Fauth%2Fhandler.rs%23safe_redirect::profile%2Fquick%2Fall-in-scope-subsystems::ATTACK-CLASSES.md%23Injection",
+    "canonical_refs": {
+      "surface": "src/auth/handler.rs#handle_login",
+      "boundary": "src/auth/handler.rs#safe_redirect",
+      "subsystem": "profile/quick/all-in-scope-subsystems",
+      "attack_class": "ATTACK-CLASSES.md#Injection"
+    },
+    "surface": "handle_login: the next query parameter",
+    "boundary": "safe_redirect",
+    "subsystem": "All in-scope subsystems",
+    "attack_class": "Injection",
+    "starting_paths": [
+      "src/auth/handler.rs"
+    ],
+    "ordinary_attack_class_block": "ATTACK-CLASSES.md#Injection",
+    "selected_companion_blocks": [],
+    "excluded_blocks": [],
+    "prior_status": "none",
+    "attempts": [],
+    "wave": 1,
+    "status": "candidate",
+    "agent_id": "hunter-3",
+    "reviewed_paths": [
+      "src/auth/handler.rs"
+    ],
+    "local_checks": [
+      {
+        "agent_id": "hunter-3",
+        "reviewed_paths": [
+          "src/auth/handler.rs"
+        ],
+        "invariant": "A sign-in redirect stays on this site.",
+        "method": "source",
+        "result": "next reaches the redirect only through safe_redirect.",
+        "artifact": null
+      }
+    ],
+    "result_fingerprints": [
+      "auth-unchecked-redirect"
+    ],
+    "unresolved": []
+  },
+  {
+    "coverage_id": "src%2Fauth%2Fhandler.rs%23handle_request::src%2Fauth%2Fsession.rs%23Session%3A%3Avalidate::profile%2Fquick%2Fall-in-scope-subsystems::ATTACK-CLASSES.md%23Business%20logic",
+    "canonical_refs": {
+      "surface": "src/auth/handler.rs#handle_request",
+      "boundary": "src/auth/session.rs#Session::validate",
+      "subsystem": "profile/quick/all-in-scope-subsystems",
+      "attack_class": "ATTACK-CLASSES.md#Business logic"
+    },
+    "surface": "handle_request: the Authorization header",
+    "boundary": "Session::validate",
+    "subsystem": "All in-scope subsystems",
+    "attack_class": "Business logic",
+    "starting_paths": [
+      "src/auth/handler.rs",
+      "src/auth/session.rs"
+    ],
+    "ordinary_attack_class_block": "ATTACK-CLASSES.md#Business logic",
+    "selected_companion_blocks": [],
+    "excluded_blocks": [],
+    "prior_status": "none",
+    "attempts": [],
+    "wave": 1,
+    "status": "candidate",
+    "agent_id": "hunter-1",
+    "reviewed_paths": [
+      "src/auth/handler.rs",
+      "src/auth/session.rs"
+    ],
+    "local_checks": [
+      {
+        "agent_id": "hunter-1",
+        "reviewed_paths": [
+          "src/auth/handler.rs",
+          "src/auth/session.rs"
+        ],
+        "invariant": "A session is refused from its expires_at second on.",
+        "method": "source",
+        "result": "is_expired compares with > where >= is meant.",
+        "artifact": null
+      }
+    ],
+    "result_fingerprints": [
+      "auth-expiry-inclusive"
+    ],
+    "unresolved": []
+  },
+  {
+    "coverage_id": "src%2Fauth%2Fhandler.rs%23handle_request::src%2Fauth%2Fsession.rs%23Session%3A%3Avalidate::profile%2Fquick%2Fall-in-scope-subsystems::ATTACK-CLASSES.md%23Cryptography%20and%20secrets",
+    "canonical_refs": {
+      "surface": "src/auth/handler.rs#handle_request",
+      "boundary": "src/auth/session.rs#Session::validate",
+      "subsystem": "profile/quick/all-in-scope-subsystems",
+      "attack_class": "ATTACK-CLASSES.md#Cryptography and secrets"
+    },
+    "surface": "handle_request: the Authorization header",
+    "boundary": "Session::validate",
+    "subsystem": "All in-scope subsystems",
+    "attack_class": "Cryptography and secrets",
+    "starting_paths": [
+      "src/auth/handler.rs",
+      "src/auth/session.rs"
+    ],
+    "ordinary_attack_class_block": "ATTACK-CLASSES.md#Cryptography and secrets",
+    "selected_companion_blocks": [],
+    "excluded_blocks": [],
+    "prior_status": "none",
+    "attempts": [],
+    "wave": 1,
+    "status": "candidate",
+    "agent_id": "hunter-2",
+    "reviewed_paths": [
+      "src/auth/handler.rs",
+      "src/auth/session.rs"
+    ],
+    "local_checks": [
+      {
+        "agent_id": "hunter-2",
+        "reviewed_paths": [
+          "src/auth/handler.rs",
+          "src/auth/session.rs"
+        ],
+        "invariant": "The session token is compared in constant time.",
+        "method": "source",
+        "result": "validate compares the token with == on byte slices.",
+        "artifact": null
+      }
+    ],
+    "result_fingerprints": [
+      "auth-token-compare-timing"
+    ],
+    "unresolved": [
+      "Whether the timing difference can be measured over the network needs the deployed service."
+    ]
+  },
+  {
+    "coverage_id": "src%2Fhttp.rs%23Request%3A%3Aheader::src%2Fhttp.rs%23find::profile%2Fquick%2Fall-in-scope-subsystems::ATTACK-CLASSES.md%23Injection",
+    "canonical_refs": {
+      "surface": "src/http.rs#Request::header",
+      "boundary": "src/http.rs#find",
+      "subsystem": "profile/quick/all-in-scope-subsystems",
+      "attack_class": "ATTACK-CLASSES.md#Injection"
+    },
+    "surface": "Request::header",
+    "boundary": "find",
+    "subsystem": "All in-scope subsystems",
+    "attack_class": "Injection",
+    "starting_paths": [
+      "src/http.rs"
+    ],
+    "ordinary_attack_class_block": "ATTACK-CLASSES.md#Injection",
+    "selected_companion_blocks": [],
+    "excluded_blocks": [],
+    "prior_status": "none",
+    "attempts": [],
+    "wave": 1,
+    "status": "out_of_scope",
+    "agent_id": null,
+    "reviewed_paths": [],
+    "local_checks": [],
+    "result_fingerprints": [],
+    "unresolved": [
+      "src/http.rs is outside the scoped path src/auth/."
+    ]
+  }
+]
