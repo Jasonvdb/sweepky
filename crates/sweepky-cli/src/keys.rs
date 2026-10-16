@@ -33,7 +33,8 @@
 //! `keys/<id>.json`, sets `revokedAt` to now unless it is set already, and
 //! writes it back with every field it does not know kept ([`revoke_key`]).
 //! Revoking this install's own key is allowed; the report then says to log
-//! out.
+//! out. `logout` revokes this install's own key with the same
+//! read-modify-write ([`revoke_if_published`]).
 
 use std::collections::BTreeSet;
 
@@ -412,9 +413,10 @@ pub(crate) async fn list(ctx: &Context) -> anyhow::Result<Report> {
 // ---------------------------------------------------------------------------
 // keys revoke
 
-/// What [`revoke_key`] did.
+/// What [`revoke_key`] and [`revoke_if_published`] did. `logout` reports
+/// it too.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Revocation {
+pub(crate) enum Revocation {
     /// It set `revokedAt` to this time and wrote the record back.
     Revoked(RecordTime),
     /// The record was revoked already, at this time (the record's text),
@@ -422,36 +424,52 @@ enum Revocation {
     AlreadyRevoked(RecordTime),
 }
 
+/// Revokes the signed-in user's own `keys/<id>.json` through `keys`, as
+/// [`revoke_if_published`] does, for `keys revoke`: a missing record is an
+/// error there, because the user named an id that has no record.
+async fn revoke_key(
+    keys: &impl KeyStore,
+    id: &DeviceId,
+    now: RecordTime,
+) -> anyhow::Result<Revocation> {
+    let Some(outcome) = revoke_if_published(keys, id, now).await? else {
+        bail!(
+            "keys/{id}.json does not exist, so there is nothing to revoke; `sweepky keys list` \
+             shows this identity's device keys"
+        );
+    };
+    Ok(outcome)
+}
+
 /// Revokes the signed-in user's own `keys/<id>.json` through `keys`:
 /// reads it (capped at `MAX_RECORD_BYTES`, by the key store), sets
 /// `revokedAt` to `now` unless it is set already, and writes it back.
+/// `Ok(None)` when there is no such record, so nothing to revoke: `logout`
+/// goes on then, and `keys revoke` ([`revoke_key`]) refuses.
 ///
 /// Every other field stays as it was. core's `DeviceKey` keeps the fields
 /// it does not know in a `#[serde(flatten)]` map, so a field a newer client
 /// added is written back too, and the ones it knows are written back with
 /// the values they were read with. A record that is already revoked is not
 /// written at all, so revoking twice changes nothing and keeps the first
-/// time. A missing record, or one this build cannot parse, is an error, and
-/// nothing is written.
-async fn revoke_key(
+/// time. A record this build cannot parse is an error, and nothing is
+/// written: it cannot be rewritten without losing what it holds.
+pub(crate) async fn revoke_if_published(
     keys: &impl KeyStore,
     id: &DeviceId,
     now: RecordTime,
-) -> anyhow::Result<Revocation> {
+) -> anyhow::Result<Option<Revocation>> {
     let Some(bytes) = keys.get_own_key(id).await? else {
-        bail!(
-            "keys/{id}.json does not exist, so there is nothing to revoke; `sweepky keys list` \
-             shows this identity's device keys"
-        );
+        return Ok(None);
     };
     let mut record = DeviceKey::from_json(&bytes).with_context(|| {
         format!(
-            "keys/{id}.json is not a device key record this build reads, so keys revoke left it \
-             as it is"
+            "keys/{id}.json is not a device key record this build reads, so Sweepky left it as \
+             it is"
         )
     })?;
     if let Some(at) = &record.revoked_at {
-        return Ok(Revocation::AlreadyRevoked(at.clone()));
+        return Ok(Some(Revocation::AlreadyRevoked(at.clone())));
     }
     record.revoked_at = Some(now.clone());
     let bytes = device_key_bytes(&record)?;
@@ -460,7 +478,7 @@ async fn revoke_key(
     keys.put_key(id, bytes)
         .await
         .map_err(|error| write_error(&error).context(format!("could not revoke keys/{id}.json")))?;
-    Ok(Revocation::Revoked(now))
+    Ok(Some(Revocation::Revoked(now)))
 }
 
 /// What `keys revoke` reports for `id`. `own` is whether `login.json`

@@ -112,6 +112,12 @@ impl FakeKeyStore {
             .insert(id.clone(), record);
     }
 
+    /// Deletes `keys/<id>.json`, as someone could behind this install's
+    /// back. Not logged either.
+    pub(crate) fn remove_record(&self, id: &DeviceId) {
+        self.records.lock().expect("lock").remove(id);
+    }
+
     fn log(&self, call: KeyStoreCall) {
         self.calls.lock().expect("lock").push(call);
     }

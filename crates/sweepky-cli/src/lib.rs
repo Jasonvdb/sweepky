@@ -69,6 +69,11 @@
 //!   its device id, and every string from a record sanitised; and the
 //!   revoke, which sets `revokedAt` under the writers' lock and keeps every
 //!   other field. `login` runs the same unknown-id check after its tail.
+//! - `logout` (`logout`): under the writers' lock, revokes this install's
+//!   device key while a fresh session is live, signs out, forgets the
+//!   dedicated identity, and only then deletes `device.key`, `login.json`
+//!   and this owner's entry in `installs.json`. When the key cannot be
+//!   revoked it deletes nothing.
 //! - `circle create|add|remove|show` (`circle`): the roster this identity
 //!   keeps as its admin, `/pub/sweepky/circle.json`. The three writes read
 //!   the record back under the writers' lock with a session of their own,
@@ -146,6 +151,9 @@ mod installs;
 mod keys;
 mod lock;
 mod login;
+// `logout`: revoke this install's key, sign out, forget the identity, then
+// delete this install's files, in that order.
+mod logout;
 mod network;
 // Owner-only files and directories, which every secret and state file goes
 // through.
@@ -157,7 +165,8 @@ mod private_fs;
 mod remote;
 // The per-command session: the writers' lock, a fresh sign-in and a sign-out
 // that is always attempted. `login` holds its lock; `keys revoke` is the
-// first command to run in a whole session.
+// first command to run in a whole session; `logout` runs the sign-in and the
+// sign-out itself, because it deletes files after the sign-out.
 mod session;
 mod state;
 // Fixtures the unit tests of several modules share. `cfg(test)` compiles it
@@ -287,6 +296,7 @@ pub async fn run(cli: Cli, ctx: &Context) -> anyhow::Result<Report> {
             )
             .await
         }
+        Command::Logout => logout::logout(ctx).await,
         Command::Keys { command } => match command {
             KeysCommand::List => keys::list(ctx).await,
             KeysCommand::Revoke { device_id } => keys::revoke(ctx, &device_id).await,

@@ -89,6 +89,12 @@ pub enum Command {
         signup_token: Option<SecretString>,
     },
 
+    /// Log out and retire this install: revoke its device key, sign out,
+    /// forget the dedicated identity, then delete this install's files.
+    /// Deletes nothing when the key cannot be revoked. Sweeps encrypted to
+    /// this install's key that were not pulled can no longer be opened.
+    Logout,
+
     /// This identity's published device keys, keys/DEVICE_ID.json, one per
     /// install: list them, or revoke one.
     Keys {

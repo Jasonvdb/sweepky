@@ -226,7 +226,7 @@ pub(crate) trait PublicKeys {
 
 /// Where the signed-in user's own `keys/<deviceId>.json` records are read
 /// and written: the seam between the commands that manage device keys
-/// (`login`, `keys revoke`, and `logout` next) and the homeserver.
+/// (`login`, `keys revoke` and `logout`) and the homeserver.
 ///
 /// `KeyStore: PublicKeys` makes [`PublicKeys`] a *supertrait*: every key
 /// store can also read public storage, so a command holding a `&impl

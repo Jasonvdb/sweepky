@@ -1,7 +1,7 @@
 //! The session a writing command runs in.
 //!
 //! Every command that writes to the homeserver (`keys revoke`, `circle`,
-//! `logout`, `post`, `run`, `submit`, `done`) runs its writes inside
+//! `post`, `run`, `submit`, `done`) runs its writes inside
 //! [`with_writer_session`]:
 //!
 //! 1. take the writers' lock ([`with_writers_lock`]), so no other `sweepky`
@@ -19,6 +19,11 @@
 //!
 //! P2d adds the Pubky Ring branch to step 2: restoring the saved grant token
 //! instead of signing in with a key.
+//!
+//! `logout` runs the same steps itself, under [`with_writers_lock`] with
+//! [`sign_in`] and [`WriterSession::sign_out`], because it deletes the
+//! identity and this install's files after the sign-out and before the lock
+//! is released, which a body of [`with_writer_session`] cannot do.
 //!
 //! **Never `{:?}` a session or a signer.** `PubkySession`'s `Debug` prints
 //! its credential's, and a signer holds the identity's keypair. Nothing here
@@ -109,6 +114,12 @@ impl WriterSession {
     pub(crate) fn login(&self) -> &LoginState {
         &self.login
     }
+
+    /// Signs the session out ([`sign_out`]): a failure is a warning on
+    /// standard error. `self` by value, so the session cannot be used after.
+    pub(crate) async fn sign_out(self, ctx: &Context) {
+        sign_out(ctx, self.session).await;
+    }
 }
 
 /// Runs `body` with a fresh session for this install's login, under the
@@ -130,16 +141,19 @@ pub(crate) async fn with_writer_session<T>(
         let signed_in = sign_in(ctx).await?;
         let result = body(&signed_in).await;
         // The body's borrow of `signed_in` ended with its future, so the
-        // session can be moved out and signed out now, success or failure.
-        let WriterSession { session, .. } = signed_in;
-        sign_out(ctx, session).await;
+        // session can be moved into the sign-out now, success or failure.
+        signed_in.sign_out(ctx).await;
         result
     })
     .await
 }
 
 /// Reads `login.json` and the identity it names, and signs in.
-async fn sign_in(ctx: &Context) -> anyhow::Result<WriterSession> {
+///
+/// The caller holds the writers' lock and must sign the session out
+/// ([`WriterSession::sign_out`]) whatever happens next; prefer
+/// [`with_writer_session`], which does both.
+pub(crate) async fn sign_in(ctx: &Context) -> anyhow::Result<WriterSession> {
     let (login, secret) = read_logged_in_identity(&ctx.dirs)?;
     // `keypair()` makes a keypair from the secret for the signer, which owns
     // it and wipes it when the signer is dropped at the end of this function.

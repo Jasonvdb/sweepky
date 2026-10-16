@@ -66,6 +66,19 @@ fn json(path: &Path) -> Value {
     serde_json::from_slice(&fs::read(path).expect("readable")).expect("JSON")
 }
 
+/// Asserts that nothing is at `path`, not even a dangling symlink:
+/// `symlink_metadata` is `lstat`, which does not follow a link.
+fn assert_gone(path: &Path) {
+    assert_eq!(
+        fs::symlink_metadata(path)
+            .map_err(|error| error.kind())
+            .err(),
+        Some(io::ErrorKind::NotFound),
+        "{} is still there",
+        path.display()
+    );
+}
+
 /// The body of an anonymous `GET` of `path` under `user`, through a fresh
 /// client, read as the CLI reads one: the `Content-Length` and then every
 /// chunk are checked against `cap`, so the test never holds more than that.
@@ -548,5 +561,46 @@ async fn end_to_end() {
     assert!(text.contains("Members (1):\n"), "{text}");
     assert!(text.contains(&format!("  {pubky} (admin)\n")), "{text}");
     assert!(!text.contains(&member_z32), "{text}");
+    assert_eq!(stderr.text(), "", "nothing on standard error");
+
+    // `logout`, the last of P2a's steps: it revokes this install's key while
+    // its session is live, signs out, forgets the identity and deletes this
+    // install's files.
+    let report = sweepky(&ctx, &["logout"]).await.expect("logout");
+    let text = report.text();
+    assert!(
+        text.contains(&format!("Revoked keys/{device_id}.json")),
+        "{text}"
+    );
+    // Anyone reading the record now sees it revoked, with the same key in
+    // it: sweepers no longer encrypt to it.
+    let own = get_capped(&testnet, &user, &path, MAX_RECORD_BYTES).await;
+    let own = DeviceKey::from_json(&own).expect("a device key record");
+    assert!(
+        own.revoked_at.is_some(),
+        "logout revoked this install's key"
+    );
+    assert_eq!(own.recipient, device.recipient().to_string());
+    // The throwaway identity is forgotten and this install's files are gone;
+    // the lock file stays, as it always does.
+    for gone in [
+        &key_file,
+        &details_file,
+        &device_key_file,
+        &dirs.login_file(),
+    ] {
+        assert_gone(gone);
+    }
+    assert_eq!(
+        json(&dirs.installs_file())["owners"].get(pubky.as_str()),
+        None,
+        "the owner's install entry is gone"
+    );
+    assert_eq!(mode(&dirs.credential_lock_file()), 0o600);
+    // Logged out: a command that needs the login says so.
+    let err = sweepky(&ctx, &["keys", "revoke", "x"])
+        .await
+        .expect_err("no login any more");
+    assert!(format!("{err:#}").contains("not logged in"), "{err:#}");
     assert_eq!(stderr.text(), "", "nothing on standard error");
 }

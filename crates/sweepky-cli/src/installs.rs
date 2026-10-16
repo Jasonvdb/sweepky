@@ -96,6 +96,13 @@ impl InstallList {
         }
     }
 
+    /// Removes `owner` with all its ids. Returns whether it had an entry.
+    fn remove_owner(&mut self, owner: &Pubky) -> bool {
+        // `BTreeMap::remove` hands back the removed value, if there was one;
+        // only whether there was is needed.
+        self.owners.remove(owner).is_some()
+    }
+
     /// The file's bytes: pretty-printed JSON and a newline.
     fn to_json(&self) -> anyhow::Result<Vec<u8>> {
         let mut json = serde_json::to_vec_pretty(self).context("could not write installs.json")?;
@@ -190,6 +197,18 @@ pub(crate) fn forget_install(dirs: &Dirs, owner: Pubky, id: &DeviceId) -> anyhow
     write_installs(dirs, &list)
 }
 
+/// Forgets every id of `owner`'s installs here: what `logout` does once it
+/// has forgotten the identity, whose ids nothing here compares against any
+/// more. Every other owner's entry, and every field a newer Sweepky wrote,
+/// stays. With no entry for `owner` the file is not written, nor created.
+pub(crate) fn forget_owner(dirs: &Dirs, owner: Pubky) -> anyhow::Result<()> {
+    let mut list = read_installs(dirs)?;
+    if !list.remove_owner(&owner) {
+        return Ok(());
+    }
+    write_installs(dirs, &list)
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -197,7 +216,7 @@ mod tests {
     use serde_json::{Map, Value, json};
     use sweepky_core::DeviceId;
 
-    use super::{forget_install, read_installs, record_install};
+    use super::{forget_install, forget_owner, read_installs, record_install};
     use crate::test_support::{FileSnapshot, dirs_in, mode, private_temp, random_pubky};
 
     fn id(text: &str) -> DeviceId {
@@ -262,5 +281,34 @@ mod tests {
         fs::write(dirs.installs_file(), newer.to_string()).expect("write");
         record_install(&dirs, other, &id("install-d")).expect("records");
         assert_eq!(raw(&dirs.installs_file())["addedLater"], "kept");
+    }
+
+    #[test]
+    fn forget_owner_drops_only_that_owners_ids() {
+        let temp = private_temp();
+        let dirs = dirs_in(&temp);
+        let owner = random_pubky();
+        let other = random_pubky();
+        // No file and no entry: nothing is written, not even an empty file.
+        forget_owner(&dirs, owner).expect("forgets");
+        assert_eq!(FileSnapshot::of(&dirs.installs_file()), None);
+
+        record_install(&dirs, owner, &id("install-a")).expect("records");
+        record_install(&dirs, owner, &id("install-b")).expect("records");
+        record_install(&dirs, other, &id("install-c")).expect("records");
+        let mut newer = raw(&dirs.installs_file());
+        newer["addedLater"] = json!("kept");
+        fs::write(dirs.installs_file(), newer.to_string()).expect("write");
+
+        // Every id of `owner` goes; the other owner and the newer field stay.
+        forget_owner(&dirs, owner).expect("forgets");
+        let list = read_installs(&dirs).expect("reads");
+        assert!(list.ids_of(&owner).is_empty());
+        assert_eq!(list.ids_of(&other), [id("install-c")]);
+        assert_eq!(raw(&dirs.installs_file())["addedLater"], "kept");
+        // Forgetting it again finds no entry and leaves the file as it is.
+        let before = FileSnapshot::of(&dirs.installs_file());
+        forget_owner(&dirs, owner).expect("forgets");
+        assert_eq!(FileSnapshot::of(&dirs.installs_file()), before);
     }
 }
