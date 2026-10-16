@@ -18,6 +18,46 @@ pub const MAX_RECORD_BYTES: usize = 1024 * 1024;
 /// than a public record.
 pub const MAX_FINDINGS_BYTES: usize = 16 * 1024 * 1024;
 
+/// The most bytes a sweep package may have, before and after padding: 32 MiB.
+///
+/// The package is the one JSON document inside a sweep's `.age` file: the
+/// manifest, the findings (up to [`MAX_FINDINGS_BYTES`] on their own) and the
+/// text attachments. [`PaddedPlaintext::pad`](crate::PaddedPlaintext::pad)
+/// refuses a longer one, and [`decrypt`](crate::decrypt) stops reading once
+/// a plaintext passes it. It is a whole number of 64 KiB padding buckets, so a
+/// package at the cap pads to itself. P1b's choice; 01 and 02 set none. It is
+/// above 16.2 MiB so that the largest C2SP CCTV age vectors (258 chunks of
+/// 64 KiB) decrypt.
+pub const MAX_PACKAGE_BYTES: usize = 32 * 1024 * 1024;
+
+// Compile-time check (`const _` is evaluated while the crate compiles, so a
+// failed `assert!` is a compile error, not a run-time panic): a package holds
+// a whole findings document and more, so its cap is never the smaller one.
+const _: () = assert!(MAX_PACKAGE_BYTES >= MAX_FINDINGS_BYTES);
+
+/// The most bytes the `findings.json` that
+/// [`SweepPackage::into_files`](crate::SweepPackage::into_files) writes may
+/// have: 128 MiB, four times [`MAX_PACKAGE_BYTES`].
+///
+/// That file is the findings pretty-printed, which puts every value on a line
+/// of its own, indented two spaces for each level it is nested, so it is
+/// longer than the findings' compact JSON in the package. At the depth of the
+/// two formats' own fields, the shapes measured come to at most four times
+/// as long: the Cloudflare fixture, converted, to 1.5 times; findings of
+/// nothing but locations with an empty `file` to 3.5 times; and a Cloudflare
+/// array of nothing but empty evidence entries, which conversion keeps twice
+/// (as locations and in `extra.cloudflare`), to 4 times, which is 8 times the
+/// file it was read from. A package's JSON is within [`MAX_PACKAGE_BYTES`],
+/// so the findings of every sweep `build` packages at that depth fit; four
+/// times [`MAX_FINDINGS_BYTES`] would not hold the last shape. Values nested
+/// far deeper, which a finding's `extra` and the unknown fields can hold,
+/// grow by far more: a number 100 arrays down is 2 bytes compact and over
+/// 200 pretty-printed, so a package within [`MAX_PACKAGE_BYTES`] could
+/// pretty-print to gigabytes. `into_files` stops counting at this cap and
+/// refuses such findings before it allocates anything for the file. P1b's
+/// choice; 01 and 02 set none.
+pub const MAX_FINDINGS_FILE_BYTES: usize = 4 * MAX_PACKAGE_BYTES;
+
 /// A record's `schemaVersion`.
 ///
 /// 01's rule is to reject a record only when its major version is greater
@@ -107,8 +147,8 @@ struct VersionProbe {
 /// Parses a record of type `T` from bytes fetched from somewhere untrusted.
 ///
 /// 1. Refuses input longer than `limit` with [`RecordError::TooLarge`] before
-///    looking at a single byte of it. Callers pass [`MAX_RECORD_BYTES`] or
-///    [`MAX_FINDINGS_BYTES`].
+///    looking at a single byte of it. Callers pass [`MAX_RECORD_BYTES`],
+///    [`MAX_FINDINGS_BYTES`] or, for a sweep package, [`MAX_PACKAGE_BYTES`].
 /// 2. Reads `schemaVersion` alone and refuses a newer version with
 ///    [`RecordError::UnsupportedVersion`]. A v2 record may have renamed or
 ///    dropped v1 fields; parsing it straight into a v1 type would report a

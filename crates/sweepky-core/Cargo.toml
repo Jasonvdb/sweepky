@@ -27,3 +27,24 @@ pubky-timestamp = { workspace = true, features = ["base32"] }
 # z-base32, the encoding of a pubky. Its `decode` returns `None` on bad input
 # rather than panicking.
 base32 = { workspace = true }
+# age v1 encryption (P1b). No `features` here, so only age's default set, which
+# is empty: never `plugin` (it would run external `age-plugin-*` programs, and
+# is the code path behind age's one advisory), never `ssh` (it pulls in an
+# `rsa` crate with an unpatched advisory) and never `armor` (sweep packages are
+# stored as binary). Its `secrecy` re-export, `age::secrecy`, is this crate's
+# only route to `SecretString`, so the two can never disagree on a version.
+age = { workspace = true }
+# `Zeroizing<T>`, a wrapper that overwrites its value with zeros when it is
+# dropped, for buffers that held plaintext or key material.
+zeroize = { workspace = true }
+
+# Crates for this crate's own tests only. Cargo builds `[dev-dependencies]` for
+# `cargo test`, never for a crate that depends on this one, so none of them
+# reaches the CLI binary.
+[dev-dependencies]
+# SHA-256 of the C2SP CCTV vectors' plaintexts, checked against their
+# `payload` lines (tests/cctv_age.rs).
+sha2 = { workspace = true }
+# zlib inflate for the CCTV vectors stored compressed. The test calls its
+# `_with_limit` function, which stops at a size cap.
+miniz_oxide = { workspace = true }

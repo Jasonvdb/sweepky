@@ -35,7 +35,7 @@ A global `--testnet` flag (or `SWEEPKY_TESTNET=1`) selects the testnet client, t
 
 Nine commands. There is no `watch`: the board is the live view, `pull` prints the state it finds, and the open-bounty homeserver watch list is a config entry. There is no `dev` group: `login --identity` doubles as the testnet stand-in for Ring. There is no `confirm`, `resolve` or `close`: triage is local. The public writes after `post` are `done` and the discovered-sweeps file.
 
-`run` and `submit` are deliberately not for the agent. Both touch the network and the CLI's secrets, and the sweep directory is written by an agent that has read untrusted code, so `submit` treats it as hostile: canonical path under `<init dir>/sweeps/`, marker present, no symlinks or hard links followed, regular files only, `agents/*/scratch/` and `target/` skipped, size caps, file list printed before encryption. `findings.json` (required; converted from Cloudflare's format when that is what `audit/` holds) becomes `findings`, and every other UTF-8 text file becomes an `attachments` entry keyed by its relative path. Non-text files are skipped with a warning.
+`run` and `submit` are deliberately not for the agent. Both touch the network and the CLI's secrets, and the sweep directory is written by an agent that has read untrusted code, so `submit` treats it as hostile: canonical path under `<init dir>/sweeps/`, marker present, no symlinks or hard links followed, regular files only, `agents/*/scratch/` and `target/` skipped, size caps, file list printed before encryption. `findings.json` (required; converted from Cloudflare's format when that is what `audit/` holds) becomes `findings`, and every other UTF-8 text file becomes an `attachments` entry keyed by its relative path, which must pass `sweepky-core`'s lexical path check (`AttachmentPath`). Non-text files, and files at a path that fails the check, are skipped with a warning.
 
 ## Two ways to log in
 
@@ -90,6 +90,8 @@ Exact pins, re-checked against crates.io and npm for P0 on 2026-10-15; each is t
 | `age` | =0.12.1 | default features only; never `plugin`, never `ssh` |
 | `secrecy` | =0.10.3 | use the `age::secrecy` re-export so the two agree |
 | `zeroize` | =1.9.1 | |
+| `sha2` | =0.10.9 | dev-dependency of `sweepky-core` (P1b), hashing the C2SP CCTV vectors' plaintexts; the release `age` itself uses at run time, so it adds no code. Not the newest: 0.11.1 is, and is in the graph too, through `rust-embed-utils` |
+| `miniz_oxide` | =0.9.1 | dev-dependency of `sweepky-core` (P1b), inflating the CCTV vectors stored with zlib; brings in only `adler2` |
 | `qrcode` | =0.14.1 | `default-features = false, features = ["svg"]`, so the image stack stays out |
 | `fd-lock` | =4.0.4 | the writers' lock file |
 | `clap` | =4.6.7 | |
@@ -107,6 +109,7 @@ No `paykit` or `locks` crates in v1: they pin `pubky` 0.15 and 0.11 (a git rev) 
 - Typed errors with `thiserror` in the library; `anyhow` only in the binary, which only needs a good message.
 - Secrets: `age::x25519::Identity` wipes itself on drop and has no `Debug`, so hold it directly; it does not implement `Zeroize`, so wrapping it in `SecretBox` would not compile. `SecretString` for the bech32 identity string, passphrases and the grant token (which the SDK hands back as a plain `String`, so move it in at once); `Zeroizing<Vec<u8>>` for file buffers.
 - Open enums (`kind`, `status`, `alg`) are newtype `String`s with `as_known() -> Option<Known>` helpers, never closed serde enums, so unknown values from newer clients are skipped rather than failing the whole feed.
+- Sealed content (findings, attachments, the unknown fields of a package or its manifest) never derives `Debug`. Its hand-written `Debug` prints structure and counts only, and destructures the value naming every field, with no `..` in the pattern, so a field added later does not compile until someone decides whether it may print. Types built from it, such as the finding groups and the merged report, print it through that `Debug`.
 - Unknown top-level fields are preserved with `#[serde(flatten)] extra: Map` so rewrites do not drop them. The findings types name that map `unknown`, because a finding has a real `extra` field. `done` is a rewrite, so this is tested from the start.
 - Pin `age` exactly: it is pre-1.0 and its docs call releases "beta". Leaving out `plugin` removes the code path behind its one security advisory (already patched in 0.12.1, so this is defence in depth).
 - Pubkys are a newtype that parses both `pubky<z32>` and raw z32 and compares by bytes ([01](01-records-and-discovery.md#compatibility-rules-every-client-follows)).

@@ -1,14 +1,17 @@
 //! Sweepky's core library: records, ids, paths, target pinning, trust labels,
 //! the events-feed parser, finding groups, age encryption, the package envelope
-//! and the manifest. P1a adds the records and parsing, P1b the encryption.
+//! and the manifest. P1a added the records and parsing; P1b the encryption,
+//! the package envelope, the manifest binding and the finding groups.
 //!
-//! So far it holds the machinery every record shares, and the first records:
+//! It holds the machinery every record shares, the records, and what P1b
+//! builds on them:
 //!
 //! - [`RecordError`], the error every parse here returns.
 //! - [`SchemaVersion`] and the parse every record goes through: check the
-//!   input's length against a cap ([`MAX_RECORD_BYTES`] or
-//!   [`MAX_FINDINGS_BYTES`]) before parsing anything, read `schemaVersion` on
-//!   its own, then read the whole record.
+//!   input's length against a cap ([`MAX_RECORD_BYTES`],
+//!   [`MAX_FINDINGS_BYTES`], or for a sweep package [`MAX_PACKAGE_BYTES`])
+//!   before parsing anything, read `schemaVersion` on its own, then read the
+//!   whole record.
 //! - [`UnknownFields`], which a record keeps with `#[serde(flatten)]` so that
 //!   rewriting it keeps the fields a newer client added.
 //! - Open-string enums (`kind`, `status`, `alg`, …): a `String` newtype with
@@ -22,10 +25,11 @@
 //!   canonical form, so two different strings never name the same thing.
 //! - The names records carry that later become a path segment, a git argument
 //!   or a public label: [`Playbook`], [`TargetId`], [`DeviceId`], [`GitSha`],
-//!   [`Sha256Hex`], [`RepoName`] and [`RepoPath`]. Each is a `String` newtype
-//!   whose every constructor runs its check, so holding one means the value
-//!   passed. Only `Playbook`'s pattern comes from 01; the other limits are
-//!   P1a's choice and are set out on each type.
+//!   [`Sha256Hex`], [`RepoName`], [`RepoPath`] and (P1b) [`AttachmentPath`].
+//!   Each is a `String` newtype whose every constructor runs its check, so
+//!   holding one means the value passed. Only `Playbook`'s pattern comes from
+//!   01; the other limits are P1a's or P1b's choice and are set out on each
+//!   type.
 //! - Where records live and how they point at each other. The [`paths`]
 //!   module builds every path under `/pub/sweepky/` from a [`RecordId`] or a
 //!   [`DeviceId`], so no builder can leave that directory, and
@@ -43,7 +47,13 @@
 //!   the rewrite `sweepky done` makes, which refuses to credit the owner;
 //!   [`Sweep`], a sweep record with its open-string [`SweepStatus`]; and
 //!   [`Manifest`], the part of a sweep package that names the sweeper, the
-//!   bounty and the targets' commits.
+//!   bounty and the targets' commits, whose `Debug` prints how many unknown
+//!   fields it has but not what they hold. [`Manifest::check_binding`]
+//!   (P1b) ties a decrypted manifest to the [`Sweep`] record and the
+//!   [`SweepRef`] path it was fetched with: the path's owner must be the
+//!   sweeper named inside, the bounty the record's, and the targets the
+//!   record's and the `targetShas` keys, as one set. Its [`BindingError`]
+//!   holds no data.
 //! - A bounty's targets: [`Target`], which keeps its open-string
 //!   [`TargetKind`] and its other fields as written, so a kind this build
 //!   does not know round-trips and is skipped; [`Target::known`], which
@@ -58,7 +68,8 @@
 //!   playbook established them. Findings are sealed content: they exist only
 //!   inside the encrypted package and the owner's decrypted copies, never in
 //!   a public record, and [`Findings::from_json`] reads them with the larger
-//!   [`MAX_FINDINGS_BYTES`] cap.
+//!   [`MAX_FINDINGS_BYTES`] cap. Their `Debug` prints counts, never a string
+//!   the agent wrote.
 //! - Reading what a sweeper's agent left: [`parse_audit_findings`] takes the
 //!   bytes of a `findings.json` in the common format or in Cloudflare's,
 //!   detected by shape, and says which with [`FindingsSource`].
@@ -83,6 +94,69 @@
 //!   is bounded: a body over [`MAX_FEED_BODY_BYTES`] is a
 //!   [`FeedError::TooLarge`], and a line over [`MAX_FEED_LINE_BYTES`] is
 //!   malformed.
+//! - Keys (P1b): [`DeviceIdentity`], this install's secret age key, which
+//!   can be generated, give its recipient, and be turned into and read back
+//!   from a [`SecretString`]; [`AgeRecipient`], a public `age1…` key read
+//!   with a strict parse that refuses every string age's encryptor would
+//!   panic on; and [`DeviceKey::encryption_recipient`], which takes a
+//!   `keys/` record to a checked recipient only when its `alg` is exactly
+//!   `age-x25519` and it is not revoked. Their errors, [`RecipientError`],
+//!   [`IdentityError`] and [`DeviceKeyError`], hold no data at all.
+//! - Sealing (P1b): [`PaddedPlaintext::pad`] copies a sweep package into a
+//!   buffer padded with trailing spaces to the next [`PADDING_BUCKET_BYTES`]
+//!   (64 KiB), refusing one over [`MAX_PACKAGE_BYTES`]; [`encrypt`] takes
+//!   only that padded type and writes binary age v1 to 1 to
+//!   [`MAX_RECIPIENTS`] distinct [`AgeRecipient`]s; and [`decrypt`] opens a
+//!   file with one [`DeviceIdentity`] into a [`Plaintext`], after checking
+//!   the file against [`MAX_CIPHERTEXT_BYTES`] and its header against
+//!   [`MAX_HEADER_BYTES`] before age parses anything. Both plaintext types
+//!   live in wiped buffers that never grow, print only their length, and
+//!   have no `Display`, `Serialize` or `Clone`. Their errors,
+//!   [`PaddingError`], [`EncryptError`] and [`DecryptError`], hold no data,
+//!   and age's own errors are matched, never formatted.
+//! - The sweep package (P1b): [`SweepPackage`], the one JSON document inside
+//!   a sweep's `.age` file (a manifest, the findings, and [`Attachments`],
+//!   text files by [`AttachmentPath`], none of them [`FINDINGS_FILE`]).
+//!   [`SweepPackage::from_json`] reads one, padding included, through the
+//!   same capped, version-first parse as the records, with the
+//!   [`MAX_PACKAGE_BYTES`] cap; [`SweepPackage::to_padded`] writes one
+//!   straight into a padded buffer for [`encrypt`]. Its `Debug` prints the
+//!   manifest's and the findings' own redacted `Debug` and counts for the
+//!   rest, and its errors, [`PackageError`]s, hold no data.
+//!   [`SweepPackage::build`] makes one from a manifest and the
+//!   [`SweepFile`]s the CLI read from a sweep directory: `findings.json`
+//!   becomes the findings (through [`parse_audit_findings`], so Cloudflare's
+//!   format is converted), every other UTF-8 file at a clean path an
+//!   attachment, and the rest come back as [`SkippedFile`]s with a
+//!   [`SkipReason`] in a [`BuiltPackage`], for the CLI to warn about.
+//!   [`SweepPackage::into_files`] splits one back into [`PackageFiles`], one
+//!   wiped buffer per path, `findings.json` exactly once and at most
+//!   [`MAX_FINDINGS_FILE_BYTES`].
+//! - Sealing and opening a package in one call each (P1b), so the CLI cannot
+//!   leave a step out: [`seal_package`] checks the manifest's targets, pads
+//!   and encrypts; [`open_package`] decrypts, parses with the package cap and
+//!   checks the manifest binding, and returns the package only when all
+//!   three pass. Their errors, [`SealError`] and [`OpenError`], say which
+//!   step failed and hold no data.
+//! - Finding groups (P1b): [`group_findings`] takes the decrypted sweeps of
+//!   a bounty as [`SweepFindings`] (the sweep, whether it is trusted, its
+//!   findings), in upload order, and groups their findings by the place they
+//!   point at: each finding's first sink, or else its first location, compared
+//!   by file plus scope where both give one, or else by lines at most
+//!   [`LINE_WINDOW`] apart, with an equal id joining findings only where
+//!   location cannot decide. The [`FindingGroups`] it returns keep every
+//!   sweep unchanged, and each [`FindingGroup`] lists its [`GroupMember`]s and
+//!   every sweeper who reported it, once each, in upload order, trusted or
+//!   not. [`FindingGroups::merged`] gives the merged report: a
+//!   [`MergedGroup`] per group with a trusted member, holding that group's
+//!   reporters, all of them, and as [`MergedFinding`]s its findings from
+//!   trusted sweeps only. [`FindingGroups::propose_credits`] gives the
+//!   credits `sweepky done` proposes: every sweeper other than the owner who
+//!   contributed to a group, trusted or not, once each, in upload order.
+//!   Groups stay local: nothing here is serialized.
+//! - The secret-holding types, re-exported so the CLI uses the same ones
+//!   without depending on `age` for them: [`SecretString`] and
+//!   [`ExposeSecret`] (age's re-export of `secrecy`) and [`Zeroizing`].
 //!
 //! The rules that hold for everything here (see "Rust conventions" in
 //! `docs/plan/03-cli-and-skill.md`):
@@ -109,7 +183,19 @@
 //!   against a documented cap first, and serde_json's recursion limit stays on.
 //! - **Errors never quote the input.** A [`RecordError`] holds numbers and
 //!   fixed text only, so a stranger's record cannot put its own words into the
-//!   CLI's output.
+//!   CLI's output. The key errors go further and hold nothing, so they can
+//!   never carry key material either.
+//! - **Secrets are never printed.** A type that holds a secret has no
+//!   `Debug`, `Display` or `Serialize` (and no `Clone` or `PartialEq`), and a
+//!   secret string travels only as a [`SecretString`], whose `Debug` writes
+//!   `[REDACTED]` and whose value is wiped when it is dropped. Two secrets are
+//!   never compared; if that is ever needed, it must be in constant time.
+//! - **Sealed content is never printed by accident.** What only the owner may
+//!   read (the findings, the attachments and the unknown fields of a package
+//!   or its manifest) has a hand-written `Debug` that shows structure and
+//!   counts but no content, so a `{:?}` in a log line, an error or a panic
+//!   message cannot leak it. The finding groups and the merged report print
+//!   their findings through that same `Debug`.
 
 // `forbid` is `deny` that nothing further down can switch back off: no
 // `unsafe` anywhere in this crate, with no exceptions.
@@ -136,12 +222,15 @@
     )
 )]
 
+mod crypto;
 mod error;
 mod feed;
 mod findings;
+mod groups;
 mod ids;
 mod names;
 mod open_enum;
+mod package;
 // A public module, unlike the rest, so callers write `paths::bounty(id)`: the
 // builders' short names (`key`, `bounty`) would say too little at the crate
 // root.
@@ -156,6 +245,11 @@ mod trust;
 mod url;
 mod validated_string;
 
+pub use crypto::{
+    AgeRecipient, DecryptError, DeviceIdentity, DeviceKeyError, EncryptError, IdentityError,
+    MAX_CIPHERTEXT_BYTES, MAX_HEADER_BYTES, MAX_RECIPIENTS, PADDING_BUCKET_BYTES, PaddedPlaintext,
+    PaddingError, Plaintext, RecipientError, decrypt, encrypt,
+};
 pub use error::{JsonCategory, RecordError};
 pub use feed::{
     FeedError, FeedEvent, FeedOp, FeedPage, MAX_FEED_BODY_BYTES, MAX_FEED_LINE_BYTES, parse_feed,
@@ -165,15 +259,28 @@ pub use findings::{
     KnownConfidence, KnownFindingStatus, KnownLocationKind, KnownSeverity, Location, LocationKind,
     Severity, from_cloudflare, is_cloudflare_shape, parse_audit_findings, to_cloudflare,
 };
+pub use groups::{
+    FindingGroup, FindingGroups, GroupMember, LINE_WINDOW, MergedFinding, MergedGroup,
+    SweepFindings, group_findings,
+};
 pub use ids::{EventCursor, RecordId};
-pub use names::{DeviceId, GitSha, Playbook, RepoName, RepoPath, Sha256Hex, TargetId};
+pub use names::{
+    AttachmentPath, DeviceId, GitSha, Playbook, RepoName, RepoPath, Sha256Hex, TargetId,
+};
+pub use package::{
+    Attachments, BuiltPackage, FINDINGS_FILE, OpenError, PackageError, PackageFiles, SealError,
+    SkipReason, SkippedFile, SweepFile, SweepPackage, open_package, seal_package,
+};
 pub use pubky::Pubky;
 pub use records::{
-    Bounty, BountyPlaybook, BountyStatus, Circle, CircleMember, DeviceKey, Discovered, Focus,
-    KeyAlg, KnownBountyStatus, KnownFocus, KnownKeyAlg, KnownSweepStatus, Manifest, MarkDoneError,
-    Sweep, SweepStatus,
+    BindingError, Bounty, BountyPlaybook, BountyStatus, Circle, CircleMember, DeviceKey,
+    Discovered, Focus, KeyAlg, KnownBountyStatus, KnownFocus, KnownKeyAlg, KnownSweepStatus,
+    Manifest, MarkDoneError, Sweep, SweepStatus,
 };
-pub use schema::{MAX_FINDINGS_BYTES, MAX_RECORD_BYTES, SchemaVersion, UnknownFields};
+pub use schema::{
+    MAX_FINDINGS_BYTES, MAX_FINDINGS_FILE_BYTES, MAX_PACKAGE_BYTES, MAX_RECORD_BYTES,
+    SchemaVersion, UnknownFields,
+};
 pub use scope::{CommitShape, TargetScope};
 pub use target::{
     CommitTarget, KnownTarget, KnownTargetKind, PrTarget, RepoTarget, Target, TargetError,
@@ -189,6 +296,17 @@ pub use url::{BountyRef, PubkyUrl, SweepRef};
 // reads the clock; the CLI may call it, this crate never does.
 #[doc(no_inline)]
 pub use pubky_timestamp::Timestamp;
+// The secret-holding types, re-exported so the CLI uses exactly the versions
+// this crate and age were built with, without a dependency of its own on
+// `age`, `secrecy` or `zeroize` for them. `SecretString` is age's own
+// re-export of `secrecy`, which is what `DeviceIdentity` hands out, so the two
+// cannot disagree. `ExposeSecret` is the trait whose `expose_secret()` reads
+// a secret: a method of a trait can only be called while the trait is in
+// scope, so callers `use sweepky_core::ExposeSecret;`.
+#[doc(no_inline)]
+pub use age::secrecy::{ExposeSecret, SecretString};
+#[doc(no_inline)]
+pub use zeroize::Zeroizing;
 
 /// This crate's version, `version` from Cargo.toml.
 ///

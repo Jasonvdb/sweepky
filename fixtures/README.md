@@ -1,16 +1,24 @@
 # Fixtures
 
-Synthetic test data for the Rust tests in `crates/` and the TypeScript tests in `web/`. The table below lists every file here and the tests that load it. [P1b](../docs/plan/phases/P1b-core-crypto.md) adds the synthetic run directories.
+Synthetic test data for the Rust tests in `crates/` and the TypeScript tests in `web/`. The table below lists every file here and the tests that load it. Two directories, [`cloudflare/`](#run-directories) and [`common/`](#run-directories), are the synthetic run directories [P1b](../docs/plan/phases/P1b-core-crypto.md) adds: what a sweeper's agent leaves for `submit` to package.
 
-Nothing real lands here. Every pubky, id, finding and commit is made up for the test that uses it. The local demo's audit report is read from a path in an environment variable and is never committed ([P5](../docs/plan/phases/P5-local-demo.md#inputs-environment-never-committed)).
+Nothing real lands here. Every pubky, id, finding and commit is made up for the test that uses it. The one set not made up here is [`cctv-age/`](#cctv-age): public test vectors copied from C2SP, whose keys are published test keys. The local demo's audit report is read from a path in an environment variable and is never committed ([P5](../docs/plan/phases/P5-local-demo.md#inputs-environment-never-committed)).
 
 | File | What it is | Loaded by |
 |---|---|---|
 | [`trust-labels.json`](trust-labels.json) | A roster, bounties with credits, and the trust label and credit tally every pubky in it should get | P1a's trust-label test (Rust), P4's trust-badge test (TypeScript) |
 | [`discovered.json`](discovered.json) | An open bounty's discovered-sweeps file: two strangers' sweeps and the feed cursors of two homeservers | P1a's `Discovered` round-trip test (Rust) |
-| [`cloudflare/findings.json`](cloudflare/findings.json) | A `findings.json` in the shape Cloudflare's `security-audit` skill writes: a `confirmed`, a `needs_validation` and a `rejected` record, sorted by fingerprint | P1a's Cloudflare converter tests (Rust) |
+| [`cloudflare/findings.json`](cloudflare/findings.json) | A `findings.json` in the shape Cloudflare's `security-audit` skill writes: a `confirmed`, a `needs_validation` and a `rejected` record, sorted by fingerprint. Also the findings of the Cloudflare-shaped run directory | P1a's Cloudflare converter tests and P1b's package-build tests in `sweepky-core`, [`run_dir_round_trip.rs`](../crates/sweepky-core/tests/run_dir_round_trip.rs) and [`fixture_groups.rs`](../crates/sweepky-core/tests/fixture_groups.rs) (Rust) |
+| [`cloudflare/REPORT.md`](cloudflare/REPORT.md) | The Cloudflare-shaped run directory's report, laid out the way Cloudflare's skill writes its `REPORT.md` | [`run_dir_round_trip.rs`](../crates/sweepky-core/tests/run_dir_round_trip.rs) (Rust) |
+| [`cloudflare/coverage-ledger.json`](cloudflare/coverage-ledger.json) | The Cloudflare-shaped run directory's coverage ledger: four units, valid against Cloudflare's own ledger validator | [`run_dir_round_trip.rs`](../crates/sweepky-core/tests/run_dir_round_trip.rs) (Rust) |
+| [`common/findings.json`](common/findings.json) | A hand-written `findings.json` in Sweepky's common format: one finding at the same sink as a Cloudflare record under another id, and one with a Cloudflare record's id at an unrelated sink | [`run_dir_round_trip.rs`](../crates/sweepky-core/tests/run_dir_round_trip.rs) and [`fixture_groups.rs`](../crates/sweepky-core/tests/fixture_groups.rs) (Rust) |
+| [`common/REPORT.md`](common/REPORT.md) | The common-format run directory's report | [`run_dir_round_trip.rs`](../crates/sweepky-core/tests/run_dir_round_trip.rs) (Rust) |
+| [`common/notes/triage.md`](common/notes/triage.md) | Triage notes one directory down, with a non-ASCII character (`→`) | [`run_dir_round_trip.rs`](../crates/sweepky-core/tests/run_dir_round_trip.rs) (Rust) |
+| [`common/capture.bin`](common/capture.bin) | 16 bytes that are not UTF-8: the one non-text file, which `submit` must report and leave out | [`run_dir_round_trip.rs`](../crates/sweepky-core/tests/run_dir_round_trip.rs) (Rust) |
 | [`target-repo.git/`](target-repo.git) | A tiny bare git repository (`HEAD`, `config`, four loose refs and one pack): a root commit with planted agent files, a normal commit with an annotated tag, a merge commit on `main`, and a PR head whose merge base is not the base tip | P1a's fixture check (Rust); P2b's fixture `TargetResolver` and the target tests of P2b and P3 |
 | [`make-target-repo.sh`](make-target-repo.sh) | The script that regenerates `target-repo.git/` | Run by hand ([Regenerating](#regenerating)) |
+| [`cctv-age/`](cctv-age) | The 147 age test vectors of C2SP's CCTV at commit `50a8ecf2a220f4c8bdc4f085789b8e85c26829e7`, byte for byte | P1b's CCTV test, [`cctv_age.rs`](../crates/sweepky-core/tests/cctv_age.rs) (Rust) |
+| [`fetch-cctv-age.sh`](fetch-cctv-age.sh) | The script that re-vendors `cctv-age/` from that commit | Run by hand ([Re-vendoring](#re-vendoring)) |
 
 ## `trust-labels.json`
 
@@ -81,12 +89,46 @@ The file is in the form `sweepky-core` writes: keys in raw z-base32 in the sweep
 
 ## `cloudflare/findings.json`
 
-A `findings.json` in the shape that Cloudflare's `security-audit` skill writes at the pinned commit `c1c8a8c1471069fb0e188eeaff69b8e8db6564a8`: a top-level array of records, each `confirmed`, `needs_validation` or `rejected`, sorted by `fingerprint`. It keeps the file name Cloudflare's skill uses, so a Cloudflare-shaped run directory can reuse it as it is.
+A `findings.json` in the shape that Cloudflare's `security-audit` skill writes at the pinned commit `c1c8a8c1471069fb0e188eeaff69b8e8db6564a8`: a top-level array of records, each `confirmed`, `needs_validation` or `rejected`, sorted by `fingerprint`. It keeps the file name Cloudflare's skill uses, so the Cloudflare-shaped [run directory](#run-directories) `cloudflare/` uses it as it is.
 
 - Every record is made up. The code paths, line numbers, scopes and text describe an imagined auth module, not any real audit. The locations point at `src/auth/session.rs` and `src/auth/handler.rs` in [`target-repo.git`](#target-repogit), where each line named holds the code its record describes, at every commit. `make-target-repo.sh` checks those lines when it builds the repository; no test reads them.
 - The `confirmed` record has `overall_severity` `informational`, which converts to `info`. The `needs_validation` and `rejected` records carry no severity or confidence, as Cloudflare's schema requires, so they convert with both `null`.
 - The converter test turns the file into common findings, writes them to bytes, reads them back and rebuilds the array from each finding's `extra.cloudflare`; the result must equal this file's JSON value exactly. `fix` comes from `remediation.strategy` alone, so the record's `code_changes` survive only in `extra.cloudflare`.
 - The file is valid against Cloudflare's own schema. After changing it, check it again: fetch `report-schema.json` and `validate-findings.cjs` from `skills/security-audit/` at the pinned commit into a scratch directory outside the repository (never commit them), then run `node <scratch>/validate-findings.cjs fixtures/cloudflare/findings.json` from the repository root. It prints `PASS: 3 findings valid`.
+
+## Run directories
+
+A run directory is what a sweeper's agent leaves behind for `submit` to package: `findings.json`, in Cloudflare's format or the common one, plus any other files the playbook wrote. `submit` walks it, reads each plain file, and hands the list to `SweepPackage::build` with paths relative to the directory ([01](../docs/plan/01-records-and-discovery.md#the-sweep-package)). These two are synthetic, and their findings point at [`target-repo.git`](#target-repogit).
+
+| Directory | Format | Sweeper | Files |
+|---|---|---|---|
+| `cloudflare/` | Cloudflare's `security-audit` output | B (`btyoe954`), a circle member | `findings.json` (P1a's fixture, unchanged), `REPORT.md`, `coverage-ledger.json` |
+| `common/` | Sweepky's common format, written by hand | C, the stranger S3 (`qwujy4ep`) | `findings.json`, `REPORT.md`, `notes/triage.md`, `capture.bin` |
+
+The pubkys are from [`trust-labels.json`](#who-is-who), with A (`ybymzxgk`) as the bounty's owner. The directories hold no keys, manifests or sweep records: [`run_dir_round_trip.rs`](../crates/sweepky-core/tests/run_dir_round_trip.rs) builds each sweep's manifest and sweep record in code (A's bounty, target `t1` at commit M), generates the age keys at run time, and takes each directory through build, seal, open and split. It lists each directory's files itself, because it reads them with `include_bytes!` when it compiles and never at run time, so a file added here is tested only once it is added to that list too.
+
+[`fixture_groups.rs`](../crates/sweepky-core/tests/fixture_groups.rs) groups the two directories' findings, B's converted from Cloudflare's format, with a sweep by the owner A built in code at the shared location, and checks the two cases below, the credits `done` proposes ({B, C}, never A), and that a sweep marked untrusted is attributed but kept out of the merged report. It reads only the two `findings.json` files, also with `include_bytes!`.
+
+[P2c](../docs/plan/phases/P2c-cli-pull-done.md)'s end-to-end test reuses these fixtures: B is the Cloudflare-format sweep and C the common-format one ([06](../docs/plan/06-verification-and-limits.md#verification)).
+
+### The shared location
+
+Each directory has a finding whose sink is `src/auth/session.rs` line 88, scope `fn is_expired`: the off-by-one in the expiry check. Cloudflare's record calls it `auth-expiry-inclusive` and the common one `session-expiry-off-by-one`. Ids are local to a sweep, so the owner's grouping goes by the sink's file and scope, and the two belong in one group reported by B and C.
+
+### The shared-id pair
+
+Each directory also has a finding with the id `auth-token-compare-timing`, at unrelated sinks. Cloudflare's is the token comparison at `src/auth/session.rs` line 120, scope `fn validate`; the common one is the header-name lookup at `src/http.rs` line 12, scope `fn header`. Equal ids are only a second hint, so these stay in two groups. Each common finding has its sink as its only location, so no entrypoint or evidence line of its own can tie it to another group.
+
+### The non-text file
+
+`common/capture.bin` is 16 bytes: `0xFF`, then the ASCII text `SWEEPKY FIXTURE`. `0xFF` never occurs in UTF-8, so `build` reports the file as `NotText` and leaves it out, and the test checks that it never comes back out of the split. The repository's [`.gitattributes`](../.gitattributes) marks it `binary`, so git never converts its bytes.
+
+### What the content keeps to
+
+- Every finding, text and line is made up. The common fixture's two lines exist at every commit of `target-repo.git` (R, A, B, T1, F1, F2 and M): line 88 of `src/auth/session.rs` is in `fn is_expired`, and line 12 of `src/http.rs`, the signature of `fn header`. `make-target-repo.sh` checks only the lines `cloudflare/findings.json` names, not these, and the repository is not regenerated to add them, since that would change its pack bytes. Check them by hand with `git --git-dir=fixtures/target-repo.git show <sha>:src/http.rs`.
+- `common/findings.json` is a static review, so both findings are `needs_validation` with `severity` and `confidence` `null`. Its `playbook` is the plain string `careful-review`. Each finding has a `fix` string: the common format leaves out a `fix` that is absent, so a `null` there would not come back from the split as written, and the test compares the split `findings.json` with this file as JSON values.
+- `cloudflare/coverage-ledger.json` is a `quick` run scoped to `src/auth/`: three units with candidates (one per fingerprint in `cloudflare/findings.json`) and `src/http.rs` as `out_of_scope`. It is valid against Cloudflare's own ledger validator. After changing it, check it again the way `cloudflare/findings.json` is checked: fetch `validate-coverage-ledger.cjs` from `skills/security-audit/` at the pinned commit into a scratch directory outside the repository, then run `node <scratch>/validate-coverage-ledger.cjs fixtures/cloudflare/coverage-ledger.json` from the repository root. It prints `PASS: 4 coverage units valid`.
+- The attachments are compared byte for byte after the split, and the split `findings.json` of `cloudflare/` must give back `cloudflare/findings.json` through `to_cloudflare`, value for value.
 
 ## `target-repo.git`
 
@@ -139,7 +181,7 @@ The root commit holds `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`, `.claude/sett
 ### Synthetic and inert
 
 - Every commit and the tag are by `Sweepky Fixture <fixture@example.invalid>`, at fixed times in August 2026 (UTC), and unsigned. The script runs git with no system or user config, so no real name, email or signing key reaches the objects.
-- The code is made up and never built or run. The lines `cloudflare/findings.json` points at hold the code its records describe at every commit, and the script checks them.
+- The code is made up and never built or run. The lines `cloudflare/findings.json` points at hold the code its records describe at every commit, and the script checks them. The two lines `common/findings.json` points at exist at every commit too, but the script does not check them ([Run directories](#run-directories)).
 - Nothing in the directory runs. There is no `hooks/`, and `config` is exactly `repositoryformatversion = 0`, `filemode = true` and `bare = true` under `[core]`: a repository's own config can name programs for git to run, and every test that fetches from it would run them. macOS's `git init` adds `ignorecase` and `precomposeunicode`, which the script removes.
 - The refs are loose files, not `packed-refs`: git accepts a directory as a repository only when `refs/` exists, and git cannot commit an empty directory.
 - The repository's [`.gitattributes`](../.gitattributes) marks everything under `target-repo.git/` as `binary`, so git never converts its line endings.
@@ -149,3 +191,35 @@ The root commit holds `CLAUDE.md`, `CLAUDE.local.md`, `AGENTS.md`, `.claude/sett
 Run `fixtures/make-target-repo.sh`, from any directory, with git 2.45 or later. It builds the repository in a temporary directory, checks it (the file list, the config, the lines `cloudflare/findings.json` names, and `git fsck --strict`), and only then replaces `target-repo.git/` and prints the SHAs.
 
 The commit and tag SHAs come out the same on every run, because the script fixes every name, email, date, message and file. The pack's name and bytes depend on the git version that compressed it, so regenerate only after changing what the script writes. Then copy the printed SHAs into the tables above, stage the new `.pack` and `.idx` by name, remove the old pair with `git rm`, and run `cargo nextest run -p sweepky-cli`.
+
+## `cctv-age`
+
+The age test vectors from C2SP's [CCTV](https://github.com/C2SP/CCTV) (Community Cryptography Test Vectors): every file of `age/testdata` at commit `50a8ecf2a220f4c8bdc4f085789b8e85c26829e7`, the `main` commit of 25 September 2026, copied byte for byte. That is 147 files, about 160 KB. [`crates/sweepky-core/tests/cctv_age.rs`](../crates/sweepky-core/tests/cctv_age.rs) reads them at run time. It is the one sweepky-core test that reads files; the library itself reads none.
+
+- **Licence.** CCTV's `age/README.md` offers the vectors under the Zero-Clause BSD licence (0BSD), CC0 1.0 or the Unlicense, at the user's choice. None of the three asks for attribution or a copy of its text, so nothing else is vendored with them.
+- **Format.** Each file is a few `key: value` lines, an empty line, then an age file, zlib-compressed when the file says `compressed: zlib`. CCTV's `age/README.md` at the pinned commit defines the eight keys and the expected results. CCTV says to ignore a file with any other key; the test fails on one instead, so a re-vendored set cannot drop vectors quietly.
+- **Not secrets.** The `identity:` lines hold `AGE-SECRET-KEY-1…` and `AGE-SECRET-KEY-PQ-1…` strings. They are CCTV's published test keys and protect nothing, but a secret scanner (gitleaks, GitHub push protection) may still flag them. These files are the one place the repository commits an age secret key: Sweepky's own source and tests generate their keys at run time ([P1b](../docs/plan/phases/P1b-core-crypto.md#notes)).
+- **Byte for byte.** The repository's [`.gitattributes`](../.gitattributes) marks everything under `cctv-age/` as `binary`. Some vectors (`header_crlf`, `armor_crlf`) hold CRLF line endings on purpose and every age file is binary, so git must never convert their line endings.
+
+### What the test does with them
+
+Every vector lands in exactly one group, and the test asserts each group's exact size, so no vector is skipped without the test failing:
+
+| Group | How many | Which | What the test checks |
+|---|---|---|---|
+| Hybrid | 19 | an `AGE-SECRET-KEY-PQ-` identity: the 18 `hybrid*` files and `armor_hybrid` | Skipped: age 0.12.1 has no hybrid post-quantum identity |
+| Armored | 36 | `armored: yes`, not hybrid | `decrypt` refuses each at the header, with the vector's X25519 identity or, for `armor_empty` and `armor_scrypt`, a generated one: `InvalidHeader`, or `HeaderTooLarge` for `armor_garbage_encoded`, which inflates past the 8 KiB header cap. Sweep packages are binary and age's `armor` feature is not compiled in. CCTV allows ignoring these; checking the refusal is stricter |
+| Scrypt | 24 | a passphrase and no identity | age's own `age::scrypt::Identity` with a maximum work factor of 16, so `scrypt_work_factor_23` is a header failure |
+| X25519 | 68 | the rest | `decrypt`, with the identity read by `DeviceIdentity::from_secret` (a generated one for `empty`, which has none) |
+
+In the scrypt and X25519 groups each `expect` value allows exactly one result: `success` is `Ok` with the plaintext's SHA-256 equal to `payload`; `no match`, `header failure`, `HMAC failure` and `payload failure` are `NoMatchingKey`, `InvalidHeader`, `InvalidMac` and `InvalidPayload`. `HeaderTooLarge` fails the test, since no header-failure vector is longer than 1,674 bytes. Compressed vectors are inflated with a 32 MiB limit; the largest inflates to 16,847,065 bytes.
+
+Two vectors are lenient. `stanza_missing_body` and `stanza_missing_final_line` expect a header failure, but age 0.12.1 still accepts stanzas in that older form and decrypts them, the same exception age's own CCTV test makes. The test allowlists exactly those two and asserts that they still decrypt, so it fails if a later age starts refusing them.
+
+Last, every vector, hybrid ones included, goes through `decrypt` once more with a key it was not written to. Each must be refused at the header, and none may panic.
+
+### Re-vendoring
+
+Run `fixtures/fetch-cctv-age.sh` from any directory, with `curl` and `tar`. It downloads `https://codeload.github.com/C2SP/CCTV/tar.gz/<commit>` into a new temporary directory, extracts only `age/testdata`, checks that it holds exactly 147 plain files with plain names, and only then replaces `cctv-age/`. It runs nothing from the download, and no test runs it, so the tests stay offline. Run again at the same commit, it leaves `git status` clean.
+
+To move the pin, change `commit` and `expected_files` in the script and run it, then review `git status fixtures/cctv-age`. Update the commit here and in the test's module docs, and the group counts and the lenient-vector list in the test, until `cargo nextest run -p sweepky-core` passes.

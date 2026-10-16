@@ -1,0 +1,40 @@
+{
+  "schemaVersion": 1,
+  "playbook": "careful-review",
+  "findings": [
+    {
+      "id": "session-expiry-off-by-one",
+      "title": "A session still counts as valid during its expiry second",
+      "severity": null,
+      "confidence": null,
+      "status": "needs_validation",
+      "locations": [
+        {
+          "file": "src/auth/session.rs",
+          "line": 88,
+          "kind": "sink",
+          "scope": "fn is_expired"
+        }
+      ],
+      "description": "`Session::is_expired` returns `now > self.expires_at`, so a session is not expired at `now == expires_at`. The doc comment above it says a session that expires at second `n` is valid for none of second `n`. Found by reading the code; no test was run.",
+      "fix": "Compare with `>=`:\n\n```rust\nnow >= self.expires_at\n```\n"
+    },
+    {
+      "id": "auth-token-compare-timing",
+      "title": "Header names looked up with a short-circuiting comparison",
+      "severity": null,
+      "confidence": null,
+      "status": "needs_validation",
+      "locations": [
+        {
+          "file": "src/http.rs",
+          "line": 12,
+          "kind": "sink",
+          "scope": "fn header"
+        }
+      ],
+      "description": "`Request::header` finds the `Authorization` header through `find`, which compares each header name with `==`. That comparison returns at the first byte that differs, so how long a lookup takes depends on the names the client sent. Header names are not secret, so this may reveal nothing; it needs a measurement to rule out.",
+      "fix": "None needed unless a measurement shows the lookup time reveals something the client does not already know."
+    }
+  ]
+}

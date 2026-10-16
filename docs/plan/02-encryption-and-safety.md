@@ -45,8 +45,8 @@ Three consequences to state plainly in the CLI:
 - **Format:** age v1 with X25519 recipients, stored as binary (no armor). Rust `age` 0.12.1 with default features; never `plugin` (removes that attack surface) and never `ssh` (pulls in an `rsa` crate with an unpatched advisory). No browser implementation in v1.
 - **Recipients at upload time:** every unrevoked `keys/*.json` of the bounty's owner, plus the sweeper's own device key.
 - **Sweeps are never re-encrypted.**
-- **Padding:** the plaintext JSON is padded with trailing whitespace to the next size bucket (64 KiB steps) before encryption. age rejects bytes after its payload, so the ciphertext itself is never padded; the test asserts on the final ciphertext length.
-- **Test vectors:** the Rust tests run the C2SP CCTV age vectors (skipping the hybrid post-quantum ones, which Rust age cannot run yet).
+- **Padding:** the plaintext JSON is padded with trailing whitespace to the next size bucket (64 KiB steps) before encryption. age rejects bytes after its payload, so the ciphertext itself is never padded; the test asserts on the final ciphertext length. That length is the header, then a 16-byte nonce, the bucket, and a 16-byte tag per 64 KiB chunk. age adds a random grease stanza of up to about 190 bytes to every header, so the header's length varies between encryptions and the test reads it from the ciphertext; the bucket alone sets the length after it.
+- **Test vectors:** the Rust tests run the C2SP CCTV age vectors (hybrid post-quantum ones skipped, which Rust age cannot run yet; armored ones checked to be refused, since packages are binary and armor is not compiled in).
 
 Why age: it encrypts to several recipients natively (an owner with two laptops, plus the sweeper), has a maintained Rust implementation, and has a browser implementation (typage) for the day the board learns to read. HPKE and sealed boxes are single-recipient, so multi-recipient would mean hand-rolling the key wrapping age already defines. `/priv/` cannot be shared with another user, and pubky-noise is the wrong shape (above).
 
@@ -55,7 +55,7 @@ Why age: it encrypts to several recipients natively (an owner with two laptops, 
 age has no sender authentication, and Pubky Ring signs nothing for apps. Authorship therefore rests on two facts:
 
 1. The record sits at the writer's own path on their own homeserver, which only their session can write, as reported by that homeserver. The homeserver operator is trusted for integrity and availability; confidentiality survives a passive operator, not an active one (above).
-2. The manifest inside the ciphertext echoes sweeper, bounty and targets, so a copied report does not check out anywhere else.
+2. The manifest inside the ciphertext echoes sweeper, bounty and targets, so a copied report does not check out under another sweeper, another bounty or other targets. The manifest has no sweep id, so a sweeper's own package uploaded again under another of their sweep records, for the same bounty and targets, does check out there.
 
 Clients reject records whose path owner does not match the sweeper named inside, and, for closed bounties, records from pubkys outside the roster.
 
