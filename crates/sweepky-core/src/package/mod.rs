@@ -3,8 +3,12 @@
 //!
 //! No archive format and no compression (01). Sealing goes
 //! [`SweepPackage::to_padded`], then [`encrypt`](crate::encrypt); opening
-//! goes [`decrypt`](crate::decrypt), then [`SweepPackage::from_json`]. Turning
-//! a sweep directory's files into a package and back is built on these.
+//! goes [`decrypt`](crate::decrypt), then [`SweepPackage::from_json`].
+//!
+//! The `build` module turns a sweep directory's files into a package
+//! ([`SweepPackage::build`]) and a package back into files
+//! ([`SweepPackage::into_files`]). It works on values only: the CLI walks the
+//! directory, reads the files and writes them back out.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -14,10 +18,14 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::crypto::{PaddedPlaintext, PaddingError, PaddingWriter};
 use crate::error::RecordError;
-use crate::findings::Findings;
+use crate::findings::{ConvertError, Findings};
 use crate::names::AttachmentPath;
 use crate::records::Manifest;
 use crate::schema::{MAX_PACKAGE_BYTES, SchemaVersion, UnknownFields, parse_record};
+
+mod build;
+
+pub use build::{BuiltPackage, PackageFiles, SkipReason, SkippedFile, SweepFile};
 
 /// `findings.json`: the file a sweep's findings are read from and written
 /// back to, and so the one name a package's [`Attachments`] refuse as a key.
@@ -29,27 +37,57 @@ use crate::schema::{MAX_PACKAGE_BYTES, SchemaVersion, UnknownFields, parse_recor
 /// is an ordinary attachment.
 pub const FINDINGS_FILE: &str = "findings.json";
 
-/// Why a sweep package could not be built or padded.
+/// Why a sweep package could not be built, padded or split into files.
 ///
-/// Like the padding and sealing errors, it holds no data, so it can never
-/// carry a byte of the package into a log line. Reading a package fails with
-/// a [`RecordError`] instead, like every other parse in this crate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+/// Every variant holds positions and fixed text only, never data from the
+/// package or the files it was built from: not a byte of content, and not a
+/// path, since an agent wrote those too. So an error can go into a log line
+/// or a terminal as it is. Reading a package fails with a [`RecordError`]
+/// instead, like every other parse in this crate.
+// Not `Copy`, unlike the padding and sealing errors: `Findings` holds a
+// `ConvertError`, which is only `Clone`. `Clone` and `PartialEq` are enough
+// for callers to keep and compare one.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PackageError {
     /// [`FINDINGS_FILE`] was given as an attachment's path.
     #[error("findings.json is the package's findings and cannot be an attachment")]
     ReservedName,
     /// The package's JSON is longer than [`MAX_PACKAGE_BYTES`] (32 MiB).
-    /// Counted before the padded buffer is allocated.
+    /// [`SweepPackage::build`] counts the attachments' text as it reads it,
+    /// then the whole package's JSON; [`SweepPackage::to_padded`] counts
+    /// before the padded buffer is allocated.
     #[error("the sweep package is larger than the 32 MiB limit")]
     TooLarge,
-    /// serde_json failed to write the package, or wrote a different length
-    /// the second time than it counted the first. Neither happens to these
-    /// types (every map key is a string, and writing to memory cannot fail);
-    /// the variant exists so that [`SweepPackage::to_padded`] returns an
-    /// error rather than panicking if one ever did.
+    /// serde_json failed to write the package (or, for
+    /// [`SweepPackage::into_files`], its findings), or wrote a different
+    /// length the second time than it counted the first; or the name
+    /// [`FINDINGS_FILE`] failed its own path check. None of these happens to
+    /// these types (every map key is a string, writing to memory cannot fail,
+    /// and the name is a constant a test checks); the variant exists so that
+    /// those functions return an error rather than panicking if one ever did.
     #[error("the sweep package could not be serialized")]
     Serialize,
+    /// [`SweepPackage::build`] was given no file at the path
+    /// [`FINDINGS_FILE`]. Every sweep has findings, an empty list included.
+    #[error("the sweep has no findings.json")]
+    MissingFindings,
+    /// [`SweepPackage::build`] was given two files with the same path. The
+    /// build refuses rather than keep either one.
+    #[error("file {index} has the same path as an earlier file")]
+    DuplicatePath {
+        /// The position of the second file with that path in the list
+        /// given, counting from 0.
+        index: usize,
+    },
+    /// [`SweepPackage::build`] could not read the [`FINDINGS_FILE`] it was
+    /// given, in the common format or in Cloudflare's: the
+    /// [`ConvertError`] says why, by position and field, never by content.
+    // `#[from]` writes the `From<ConvertError>` that lets `?` convert one,
+    // and makes the `ConvertError` this error's `source()`. The message
+    // leaves it out, so a caller that prints the chain of sources (anyhow's
+    // `{:#}` does) shows each part once.
+    #[error("findings.json could not be read")]
+    Findings(#[from] ConvertError),
 }
 
 /// A sweep package: `{schemaVersion, manifest, findings, attachments?}`
@@ -70,8 +108,10 @@ pub enum PackageError {
 ///
 /// **Not wiped.** The strings in a package (the findings' text, the
 /// attachments) are ordinary `String`s and are not zeroized when dropped.
-/// Only the byte buffers on the way in and out of age are:
-/// [`PaddedPlaintext`] and [`Plaintext`](crate::Plaintext).
+/// Only the byte buffers on the way in and out are: the [`SweepFile`]s
+/// [`build`](Self::build) takes, [`PaddedPlaintext`] and
+/// [`Plaintext`](crate::Plaintext) on either side of age, and the
+/// [`PackageFiles`] [`into_files`](Self::into_files) gives back.
 ///
 /// **Unknown fields** are kept in [`extra`](Self::extra) for a rewrite, like
 /// on the public records.
@@ -344,6 +384,46 @@ impl io::Write for ByteCounter {
     }
 }
 
+/// Synthetic values shared by the tests of this module and of `build.rs`, so
+/// both build their packages around the same manifest.
+// The module is private to `package`, and `pub(super)` makes an item visible
+// in `package` and every module inside it, so both test modules can import
+// it. `#[cfg(test)]` leaves the module, and its `unwrap`s, out of every
+// non-test build.
+#[cfg(test)]
+mod test_support {
+    use serde_json::{Value, json};
+
+    use crate::names::AttachmentPath;
+
+    /// Sweeper S1 and owner A from `fixtures/trust-labels.json`.
+    const SWEEPER: &str = "a8fyof86uespzzjc3hiryromqy6hgw1gem5htj76jn6sto4jokhy";
+    pub(super) const OWNER: &str = "ybymzxgk1zd3a7dm3i15gcuq7ewqkbimft6r1n8oc9o6uay8mqfo";
+    /// One of A's bounty ids.
+    const BOUNTY_ID: &str = "0035G87EK4XFE";
+    pub(super) const REV: &str = "4444444444444444444444444444444444444444";
+    /// Text no output may contain: errors and `Debug` never quote content.
+    pub(super) const MARKER: &str = "MARKER-7f3a";
+
+    /// The manifest of 01's sweep-package example, filled in with synthetic
+    /// values.
+    pub(super) fn manifest_json() -> Value {
+        json!({
+            "sweeper": SWEEPER,
+            "bounty": format!("pubky://{OWNER}/pub/sweepky/bounties/{BOUNTY_ID}.json"),
+            "targets": ["t1"],
+            "targetShas": { "t1": REV },
+            "playbook": "cloudflare/security-audit@c1c8a8c",
+            "startedAt": "2026-10-16T08:00:00Z",
+            "finishedAt": "2026-10-16T09:10:00Z",
+        })
+    }
+
+    pub(super) fn path(value: &str) -> AttachmentPath {
+        value.parse().unwrap()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -351,20 +431,12 @@ mod tests {
     use age::secrecy::ExposeSecret;
     use serde_json::{Value, json};
 
+    use super::test_support::{MARKER, OWNER, REV, manifest_json, path};
     use super::{Attachments, FINDINGS_FILE, PackageError, SweepPackage};
     use crate::crypto::PADDING_BUCKET_BYTES;
     use crate::error::{JsonCategory, RecordError};
     use crate::names::AttachmentPath;
     use crate::schema::{MAX_PACKAGE_BYTES, SchemaVersion};
-
-    /// Sweeper S1 and owner A from `fixtures/trust-labels.json`.
-    const SWEEPER: &str = "a8fyof86uespzzjc3hiryromqy6hgw1gem5htj76jn6sto4jokhy";
-    const OWNER: &str = "ybymzxgk1zd3a7dm3i15gcuq7ewqkbimft6r1n8oc9o6uay8mqfo";
-    /// One of A's bounty ids.
-    const BOUNTY_ID: &str = "0035G87EK4XFE";
-    const REV: &str = "4444444444444444444444444444444444444444";
-    /// Text no output may contain: errors and `Debug` never quote content.
-    const MARKER: &str = "MARKER-7f3a";
 
     /// 01's sweep-package example, filled in with synthetic values: a
     /// manifest, one finding in the common format, and the two attachments
@@ -372,15 +444,7 @@ mod tests {
     fn example() -> Value {
         json!({
             "schemaVersion": 1,
-            "manifest": {
-                "sweeper": SWEEPER,
-                "bounty": format!("pubky://{OWNER}/pub/sweepky/bounties/{BOUNTY_ID}.json"),
-                "targets": ["t1"],
-                "targetShas": { "t1": REV },
-                "playbook": "cloudflare/security-audit@c1c8a8c",
-                "startedAt": "2026-10-16T08:00:00Z",
-                "finishedAt": "2026-10-16T09:10:00Z",
-            },
+            "manifest": manifest_json(),
             "findings": {
                 "schemaVersion": 1,
                 "playbook": "cloudflare/security-audit@c1c8a8c",
@@ -408,10 +472,6 @@ mod tests {
 
     fn parse(input: &Value) -> Result<SweepPackage, RecordError> {
         SweepPackage::from_json(input.to_string().as_bytes())
-    }
-
-    fn path(value: &str) -> AttachmentPath {
-        value.parse().unwrap()
     }
 
     /// Asserts that `err` is a JSON shape error and that neither its message

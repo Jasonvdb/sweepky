@@ -522,10 +522,12 @@ impl<'a> Fields<'a> {
     }
 }
 
-/// The synthetic fixture and the playbook shared by the tests of this module
-/// and of `findings/mod.rs`, so both read the same file the same way.
-// `pub(crate)` lets the parent module's tests import these; `#[cfg(test)]`
-// leaves the module, and its `unwrap`s, out of every non-test build.
+/// The synthetic fixture and the playbook shared by the tests of this module,
+/// of `findings/mod.rs` and of `package/build.rs`, so all of them read the
+/// same file the same way.
+// `pub(crate)` lets the parent module's tests import these, and the parent
+// re-export them for the package tests; `#[cfg(test)]` leaves the module,
+// and its `unwrap`s, out of every non-test build.
 #[cfg(test)]
 pub(crate) mod test_support {
     use serde_json::Value;

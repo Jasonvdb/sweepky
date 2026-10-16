@@ -115,6 +115,14 @@
 //!   straight into a padded buffer for [`encrypt`]. Its `Debug` prints the
 //!   manifest's and the findings' own redacted `Debug` and counts for the
 //!   rest, and its errors, [`PackageError`]s, hold no data.
+//!   [`SweepPackage::build`] makes one from a manifest and the
+//!   [`SweepFile`]s the CLI read from a sweep directory: `findings.json`
+//!   becomes the findings (through [`parse_audit_findings`], so Cloudflare's
+//!   format is converted), every other UTF-8 file at a clean path an
+//!   attachment, and the rest come back as [`SkippedFile`]s with a
+//!   [`SkipReason`] in a [`BuiltPackage`], for the CLI to warn about.
+//!   [`SweepPackage::into_files`] splits one back into [`PackageFiles`], one
+//!   wiped buffer per path, `findings.json` exactly once.
 //! - The secret-holding types, re-exported so the CLI uses the same ones
 //!   without depending on `age` for them: [`SecretString`] and
 //!   [`ExposeSecret`] (age's re-export of `secrecy`) and [`Zeroizing`].
@@ -222,7 +230,10 @@ pub use ids::{EventCursor, RecordId};
 pub use names::{
     AttachmentPath, DeviceId, GitSha, Playbook, RepoName, RepoPath, Sha256Hex, TargetId,
 };
-pub use package::{Attachments, FINDINGS_FILE, PackageError, SweepPackage};
+pub use package::{
+    Attachments, BuiltPackage, FINDINGS_FILE, PackageError, PackageFiles, SkipReason, SkippedFile,
+    SweepFile, SweepPackage,
+};
 pub use pubky::Pubky;
 pub use records::{
     Bounty, BountyPlaybook, BountyStatus, Circle, CircleMember, DeviceKey, Discovered, Focus,

@@ -22,6 +22,10 @@ mod cloudflare;
 pub use cloudflare::{
     CloudflareField, ConvertError, from_cloudflare, is_cloudflare_shape, to_cloudflare,
 };
+// `cloudflare` is private, so its test fixture is re-exported here for the
+// package tests, which build packages from the same file.
+#[cfg(test)]
+pub(crate) use cloudflare::test_support;
 
 open_enum! {
     /// A finding's `status`: what the playbook concluded about it.
