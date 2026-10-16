@@ -48,7 +48,19 @@
 //!   to a length.
 //! - `login --identity <name>` (`login`): creates or reuses a dedicated
 //!   identity, signs it up on its homeserver the first time, signs in,
-//!   records the login in `login.json` and signs out again.
+//!   runs the shared tail on this install's first login, records the login
+//!   in `login.json` and signs out again. The shared tail makes this
+//!   install's age device key, records its id in `installs.json` and
+//!   publishes `keys/<deviceId>.json`, the write that checks the identity
+//!   may write under `/pub/sweepky/`; a refused write (403, 507 or any
+//!   other) removes what the tail made and aborts.
+//! - `device`, this install's device key: its secret in `device.key` (the
+//!   age identity string alone, 0600, never written over an existing key),
+//!   its public record, and `KeyStore`, the seam `keys/<deviceId>.json` is
+//!   read and written through, with a fake for the unit tests.
+//! - `installs`, `installs.json`: per owner, the device ids this owner's
+//!   installs created here, which `keys list` and `pull` compare `keys/`
+//!   against.
 //! - `state`, this install's own state files: `login.json` and a dedicated
 //!   identity's key and details files, read and written together.
 //! - `session`, the per-command session every writing command runs in: the
@@ -99,6 +111,10 @@
 
 mod cli;
 mod clock;
+// This install's device key: its secret in `device.key`, its public record
+// `keys/<deviceId>.json`, and the `KeyStore` seam that record is read and
+// written through.
+mod device;
 mod dirs;
 // The identity name, secret file, details file and refusal rules of
 // `login --identity`.
@@ -114,41 +130,35 @@ mod identity;
 )]
 mod display;
 mod init;
+// `installs.json`: the device ids this owner's own installs created.
+mod installs;
 mod lock;
 mod login;
 mod network;
-// Owner-only files and directories. `login` uses them through `state` and
-// `lock`; `remove_private_file` has no caller outside its tests yet, so a
-// build without tests would warn that it is unused, which CI's `-D warnings`
-// turns into an error. `expect` (rather than `allow`) says that warning is
-// wanted for now and warns in turn once every item has a caller, so whoever
-// adds the last one has to delete this line. On a `mod`, the attribute
-// covers everything inside it.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "logout, a later P2a step, is the first caller of remove_private_file"
-    )
-)]
+// Owner-only files and directories, which every secret and state file goes
+// through.
 mod private_fs;
 // Bounded reads of remote records and listings, and the write-error mapping.
-// `login` already uses `request_error` and `status_of`; the reads and the
-// write errors have no caller outside their tests yet, so the same
-// `expect(dead_code)` as `private_fs` above applies.
+// `login` uses the write errors, and its key store the reads of the user's
+// own records and the listing; `get_public`, for other owners' records, has
+// no caller outside its tests yet, so a build without tests would warn that
+// it is unused, which CI's `-D warnings` turns into an error. `expect`
+// (rather than `allow`) says that warning is wanted for now and warns in
+// turn once every item has a caller, so whoever adds the last one has to
+// delete this line. On a `mod`, the attribute covers everything inside it.
 #[cfg_attr(
     not(test),
     expect(
         dead_code,
-        reason = "login's shared tail, keys and circle, the next P2a steps, are the first callers"
+        reason = "get_public, for other owners' records, has no caller yet"
     )
 )]
 mod remote;
 // The per-command session. `login` already uses its lock and sign-out
 // helpers; `with_writer_session` has no caller outside its test until the
-// first writing command lands, so the same `expect(dead_code)` as
-// `private_fs` above applies. On a module, `expect` is fulfilled while any
-// item inside is unused, and the used ones are unaffected.
+// first writing command lands, so the same `expect(dead_code)` as `remote`
+// above applies. On a module, `expect` is fulfilled while any item inside is
+// unused, and the used ones are unaffected.
 #[cfg_attr(
     not(test),
     expect(

@@ -369,14 +369,6 @@ pub(crate) async fn get_public(
 /// Reads `path` of the signed-in user's own storage through `session`, at
 /// most `cap` bytes, or `None` when there is no such file. As for
 /// [`get_public`], `path` appears in the error message.
-// The same `expect(dead_code)` as on `get_public`, for the same reason.
-#[cfg_attr(
-    test,
-    expect(
-        dead_code,
-        reason = "only the testnet test calls it, and it has no caller yet"
-    )
-)]
 pub(crate) async fn get_own(
     session: &PubkySession,
     path: &str,
@@ -738,14 +730,6 @@ fn page_url(
 ///
 /// `dir` appears in the error message, so pass one of
 /// [`sweepky_core::paths`]' directories, never a stranger's text.
-// The same `expect(dead_code)` as on `get_public`, for the same reason.
-#[cfg_attr(
-    test,
-    expect(
-        dead_code,
-        reason = "only the testnet test calls it, and it has no caller yet"
-    )
-)]
 pub(crate) async fn list_dir(
     pubky: &Pubky,
     owner: &PublicKey,

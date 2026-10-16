@@ -3,9 +3,10 @@
 //!
 //! - [`LoginState`], `login.json`: which login this install uses. For a
 //!   dedicated identity, `{"schemaVersion":1,"kind":"identity","name":…,
-//!   "pubky":"<z32>","homeserver":"<z32>"}` plus any fields a newer Sweepky
-//!   added. It holds no secret, and no secret may ever be added to it: the
-//!   secret lives in its own file.
+//!   "pubky":"<z32>","homeserver":"<z32>","deviceId":"<id>"}` plus any
+//!   fields a newer Sweepky added; `deviceId` appears once this install's
+//!   device key is published. It holds no secret, and no secret may ever be
+//!   added to it: the secret lives in its own file.
 //! - A dedicated identity's two files, `identities/<name>.key` (the secret)
 //!   and `identities/<name>.json` (its public details), read together by
 //!   [`read_identity`] into a [`StoredIdentity`].
@@ -19,7 +20,7 @@ use std::path::Path;
 
 use anyhow::{Context as _, bail};
 use serde::{Deserialize, Serialize};
-use sweepky_core::{Pubky, RecordError, SchemaVersion, UnknownFields};
+use sweepky_core::{DeviceId, Pubky, RecordError, SchemaVersion, UnknownFields};
 
 use crate::Dirs;
 use crate::identity::{
@@ -81,9 +82,8 @@ impl From<KnownLoginKind> for LoginKind {
 
 /// `login.json`: which login this install uses.
 ///
-/// Holds public values only (a name, two public keys), so deriving `Debug`
-/// prints nothing secret. The device id this install publishes its key
-/// under joins it with the shared tail of `login`.
+/// Holds public values only (a name, two public keys, a device id), so
+/// deriving `Debug` prints nothing secret.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 // The Rust fields are snake_case; the JSON keys camelCase, as in records.
 #[serde(rename_all = "camelCase")]
@@ -101,13 +101,20 @@ pub(crate) struct LoginState {
     pub(crate) pubky: Pubky,
     /// Its homeserver, raw z-base32.
     pub(crate) homeserver: Pubky,
+    /// The id this install's device key is published under,
+    /// `keys/<deviceId>.json`. The shared tail of `login` sets it once that
+    /// write has gone through; until then it is `None`, which is not
+    /// written, so a login whose key write was refused records none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) device_id: Option<DeviceId>,
     /// Fields a newer Sweepky wrote, kept for the rewrite.
     #[serde(flatten)]
     pub(crate) extra: UnknownFields,
 }
 
 impl LoginState {
-    /// The state of a login with the dedicated identity `name`.
+    /// The state of a login with the dedicated identity `name`, before its
+    /// device key is recorded.
     pub(crate) fn identity(name: IdentityName, pubky: Pubky, homeserver: Pubky) -> Self {
         Self {
             schema_version: SchemaVersion::CURRENT,
@@ -115,6 +122,7 @@ impl LoginState {
             name: Some(name),
             pubky,
             homeserver,
+            device_id: None,
             extra: UnknownFields::new(),
         }
     }

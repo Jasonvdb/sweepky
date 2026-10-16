@@ -21,8 +21,9 @@ use std::sync::{Arc, Mutex};
 use clap::Parser;
 use pubky::PublicKey;
 use pubky_testnet::EphemeralTestnet;
-use serde_json::Value;
+use serde_json::{Value, json};
 use sweepky_cli::{Cli, Context, Dirs, Network, Report, StderrWriter, run};
+use sweepky_core::{DeviceIdentity, DeviceKey, MAX_RECORD_BYTES, SecretString};
 
 /// What the context writes to standard error, kept where the test can read
 /// it. `Arc<Mutex<…>>` is one buffer with two owners, the context and the
@@ -134,6 +135,54 @@ async fn end_to_end() {
     assert_eq!(login["name"], "throwaway");
     assert_eq!(login["pubky"], pubky.as_str());
 
+    // The shared tail: this install's device key, in a 0600 file that holds
+    // the identity string alone, published as `keys/<deviceId>.json`, the
+    // write that proves the identity may write under `/pub/sweepky/`.
+    let device_id = login["deviceId"].as_str().expect("a device id").to_owned();
+    let device_key_file = dirs.device_key_file();
+    assert_eq!(mode(&device_key_file), 0o600);
+    let secret = fs::read(&device_key_file).expect("readable");
+    assert_eq!(secret.len(), 74, "the identity string and nothing else");
+    let secret = SecretString::from(String::from_utf8(secret).expect("UTF-8"));
+    let device = DeviceIdentity::from_secret(&secret).expect("an age identity");
+
+    // Anyone can read the record, anonymously, and it is read as the CLI
+    // reads every record: never more than MAX_RECORD_BYTES.
+    let path = format!("/pub/sweepky/keys/{device_id}.json");
+    let mut response = testnet
+        .sdk()
+        .expect("client")
+        .public_storage()
+        .get((&user, path.as_str()))
+        .await
+        .expect("the key record is public");
+    if let Some(length) = response.content_length() {
+        assert!(usize::try_from(length).expect("fits") <= MAX_RECORD_BYTES);
+    }
+    let mut record = Vec::new();
+    while let Some(chunk) = response.chunk().await.expect("the body reads") {
+        record.extend_from_slice(&chunk);
+        assert!(record.len() <= MAX_RECORD_BYTES, "over the record cap");
+    }
+    let key = DeviceKey::from_json(&record).expect("a device key record");
+    assert_eq!(key.revoked_at, None);
+    assert_eq!(key.label, "sweepky-cli");
+    assert_eq!(key.recipient, device.recipient().to_string());
+    assert_eq!(
+        key.encryption_recipient().expect("usable"),
+        device.recipient()
+    );
+
+    // installs.json lists the id under this owner, and the report says to
+    // back the config directory up.
+    assert_eq!(mode(&dirs.installs_file()), 0o600);
+    assert_eq!(
+        json(&dirs.installs_file())["owners"][pubky.as_str()],
+        json!([device_id])
+    );
+    let reminder = format!("Back up {}", config.display());
+    assert!(report.text().contains(&reminder), "{}", report.text());
+
     // A second `login --identity throwaway` reuses the identity and does not
     // sign up again: the tripwire token would make a signup fail.
     let report = sweepky(
@@ -189,4 +238,12 @@ async fn end_to_end() {
     );
     assert_eq!(json(&details_file)["signedUp"], true);
     assert_eq!(stderr.text(), "", "no warning on the way");
+
+    // None of the logins after the first made another device key: login.json
+    // still names the first one, and it is the only install of this owner.
+    assert_eq!(json(&dirs.login_file())["deviceId"], device_id.as_str());
+    assert_eq!(
+        json(&dirs.installs_file())["owners"][pubky.as_str()],
+        json!([device_id])
+    );
 }

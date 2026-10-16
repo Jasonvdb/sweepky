@@ -9,6 +9,8 @@
 //!   could read, anything over a size cap, and links, into a buffer that
 //!   zeroes itself.
 //! - [`remove_private_file`] deletes one, a missing file counting as success.
+//! - [`lstat`] says what is at a path, a link itself rather than what it
+//!   points at, or `None` when nothing is.
 //! - [`open_private_lock_file`] opens the writers' lock file, creating it
 //!   empty and 0600, and never replaces or truncates it.
 //!
@@ -436,7 +438,7 @@ fn lock_file_options() -> OpenOptions {
 /// `symlink_metadata` is `lstat`: for a link it describes the link itself.
 /// `fs::metadata` would follow it and describe the target, which is exactly
 /// what must not decide where secrets are written or read.
-fn lstat(path: &Path) -> anyhow::Result<Option<Metadata>> {
+pub(crate) fn lstat(path: &Path) -> anyhow::Result<Option<Metadata>> {
     match fs::symlink_metadata(path) {
         Ok(meta) => Ok(Some(meta)),
         Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),

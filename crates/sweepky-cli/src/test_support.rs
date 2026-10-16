@@ -1,23 +1,28 @@
 //! Helpers that the unit tests of several modules share: a private temp
 //! directory, the [`Dirs`] under it and the file-mode checks around it, a
-//! random public key, and a compile-time check that a secret type implements
-//! none of the traits that would print or copy it.
+//! random public key, a [`FakeKeyStore`] in place of a homeserver's `keys/`,
+//! and a compile-time check that a secret type implements none of the traits
+//! that would print or copy it.
 //!
 //! Compiled only for `cargo test` (`#[cfg(test)]` on its `mod` line in
 //! `lib.rs`), so nothing here reaches the binary, and like any test code it
 //! may panic.
 
+use std::collections::BTreeMap;
 use std::fs::{self, Permissions};
 // `MetadataExt` adds `.mode()` to `Metadata`; `PermissionsExt` adds
 // `Permissions::from_mode`.
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
+use std::sync::Mutex;
 
-use pubky::Keypair;
-use sweepky_core::Pubky;
+use pubky::errors::RequestError;
+use pubky::{Keypair, PublicKey, StatusCode};
+use sweepky_core::{DeviceId, Pubky, Zeroizing};
 use tempfile::TempDir;
 
 use crate::Dirs;
+use crate::device::{KeyIds, KeyStore};
 
 /// A fresh private directory to work in, created 0700 (`tempfile` passes
 /// `permissions` to the `mkdir` itself; its default would follow the
@@ -40,6 +45,87 @@ pub(crate) fn dirs_in(home: &TempDir) -> Dirs {
 /// `Pubky` (the same 32 bytes).
 pub(crate) fn random_pubky() -> Pubky {
     Pubky::from_bytes(Keypair::random().public_key().to_bytes())
+}
+
+/// What the [`FakeKeyStore`] answers a write it refuses with: the server's
+/// own words, which a test checks never reach a message.
+pub(crate) const FAKE_SERVER_TEXT: &str = "fake homeserver: tenant quota and path policy say no";
+
+/// One call a [`FakeKeyStore`] was asked to make, with what it was asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum KeyStoreCall {
+    /// [`KeyStore::get_own_key`] of this id.
+    GetOwnKey(DeviceId),
+    /// [`KeyStore::put_key`] of this id, refused or not.
+    PutKey(DeviceId),
+    /// [`KeyStore::list_key_ids`] of this owner.
+    ListKeyIds(PublicKey),
+}
+
+/// A [`KeyStore`] in memory, in place of a homeserver: one owner's `keys/`
+/// records by device id, every call it was asked to make, in order, and, if
+/// set, the status it refuses every write with.
+///
+/// The methods take `&self`, as the trait's do, yet the fake has to change
+/// what it holds. A `Mutex` gives that "interior mutability": it hands out
+/// `&mut` access to one caller at a time, checked at run time.
+#[derive(Default)]
+pub(crate) struct FakeKeyStore {
+    records: Mutex<BTreeMap<DeviceId, Vec<u8>>>,
+    calls: Mutex<Vec<KeyStoreCall>>,
+    refuse_puts_with: Option<StatusCode>,
+}
+
+impl FakeKeyStore {
+    /// A store that refuses every write with `status` and the text
+    /// [`FAKE_SERVER_TEXT`], as the SDK reports a homeserver's non-2xx answer.
+    pub(crate) fn refusing_puts(status: StatusCode) -> Self {
+        Self {
+            refuse_puts_with: Some(status),
+            ..Self::default()
+        }
+    }
+
+    /// Every call so far, in order.
+    pub(crate) fn calls(&self) -> Vec<KeyStoreCall> {
+        self.calls.lock().expect("lock").clone()
+    }
+
+    fn log(&self, call: KeyStoreCall) {
+        self.calls.lock().expect("lock").push(call);
+    }
+}
+
+impl KeyStore for FakeKeyStore {
+    async fn get_own_key(&self, id: &DeviceId) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
+        self.log(KeyStoreCall::GetOwnKey(id.clone()));
+        let records = self.records.lock().expect("lock");
+        Ok(records.get(id).cloned().map(Zeroizing::new))
+    }
+
+    async fn put_key(&self, id: &DeviceId, record: Vec<u8>) -> pubky::Result<()> {
+        self.log(KeyStoreCall::PutKey(id.clone()));
+        if let Some(status) = self.refuse_puts_with {
+            return Err(pubky::Error::from(RequestError::Server {
+                status,
+                message: FAKE_SERVER_TEXT.to_owned(),
+            }));
+        }
+        self.records
+            .lock()
+            .expect("lock")
+            .insert(id.clone(), record);
+        Ok(())
+    }
+
+    async fn list_key_ids(&self, owner: &PublicKey) -> anyhow::Result<KeyIds> {
+        self.log(KeyStoreCall::ListKeyIds(owner.clone()));
+        let records = self.records.lock().expect("lock");
+        Ok(KeyIds {
+            ids: records.keys().cloned().collect(),
+            skipped: 0,
+        })
+    }
 }
 
 /// The permission bits of whatever is at `path`, not following a link.

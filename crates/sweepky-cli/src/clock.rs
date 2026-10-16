@@ -21,16 +21,6 @@ use sweepky_core::RecordTime;
 /// Fractions of a second are dropped, so the time is rounded down to the
 /// second. A clock set before 1970 or after the year 9999 is an error with a
 /// message, never a panic.
-// Until `login` and `logout` call this, only the test below does, so a build
-// without tests would warn that it is unused, which CI's `-D warnings` turns
-// into an error. `expect` (rather than `allow`) says that warning is wanted
-// for now, and warns in turn once a caller exists, so whoever adds the first
-// caller has to delete this line. `cfg_attr(not(test), ...)` applies it only
-// to builds without tests, where nothing calls it yet.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "login and logout, the next P2a steps, call it")
-)]
 pub(crate) fn now() -> anyhow::Result<RecordTime> {
     // `duration_since` returns an `Err` when the clock reads earlier than the
     // epoch. Its own message ("second time provided was later than self")

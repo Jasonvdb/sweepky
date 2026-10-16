@@ -20,9 +20,20 @@
 //! 4. **Sign up** if the details say it has not: `PubkySigner::signup`, then
 //!    `signedUp: true`. A 409 ("user already exists") counts as done.
 //! 5. **Sign in** with `signin_blocking`, which waits until the identity's
-//!    pkarr record is published, write `login.json`, and **sign out** again:
-//!    every later command signs in and out on its own
-//!    ([`crate::session`]).
+//!    pkarr record is published.
+//! 6. **The shared tail**, on this install's first login (`login.json`
+//!    records no device id for this pubky yet), with the session open
+//!    ([`record_login`]): a new age device key, its secret in `device.key`
+//!    (0600), its id in `installs.json` under this owner, and then the write
+//!    of `keys/<deviceId>.json`. That write is also the check that this
+//!    identity may write under `/pub/sweepky/` at all: a 403 or a 507 aborts
+//!    with its own message ([`crate::remote::write_error`]), and any failure
+//!    removes the key file and the install entry this run made, and nothing
+//!    else; the identity stays.
+//! 7. **Record and sign out**: write `login.json`, with the device id, and
+//!    sign out again: every later command signs in and out on its own
+//!    ([`crate::session`]). The report ends with the reminder to back up the
+//!    config directory when a new key was made.
 //!
 //! **The signup token is never printed.** The SDK puts it in the signup
 //! request's URL (`?signup_token=…`), and a transport error's `Display`
@@ -33,17 +44,23 @@ use std::fmt;
 
 use anyhow::{Context as _, anyhow, bail};
 use pubky::{PubkySigner, PublicKey, StatusCode};
-use sweepky_core::{ExposeSecret, Pubky, SecretString};
+use sweepky_core::{DeviceId, DeviceIdentity, ExposeSecret, Pubky, SecretString};
 
+use crate::clock;
+use crate::device::{
+    KeyStore, SessionKeyStore, create_device_key, device_key_bytes, device_key_record,
+    new_device_id, remove_device_key,
+};
 use crate::identity::{IdentityMeta, IdentityName, IdentitySecret, read_argument_file};
+use crate::installs::{forget_install, record_install};
 use crate::network::{NetworkKind, client_id};
-use crate::remote::{request_error, status_of};
+use crate::remote::{request_error, status_of, write_error};
 use crate::session::{sign_out, with_writers_lock};
 use crate::state::{
     LoginState, StoredIdentity, create_identity, read_identity, read_login_state,
     write_identity_meta, write_login_state,
 };
-use crate::{Context, Report};
+use crate::{Context, Dirs, Report};
 
 /// What `login` without `--identity` says until P2d builds the Ring sign-in.
 const RING_LOGIN_LATER: &str =
@@ -335,6 +352,137 @@ async fn sign_up(
 }
 
 // ---------------------------------------------------------------------------
+// The shared tail: this install's device key.
+
+/// What [`record_login`] did about this install's device key.
+#[derive(Debug)]
+enum DeviceKeyOutcome {
+    /// This run made a new device key and published it under this id.
+    Published(DeviceId),
+    /// `login.json` already records this install's device key, so the tail
+    /// did not run and nothing was made.
+    AlreadyRecorded,
+}
+
+/// Writes `login.json` for `state`, running the shared tail of `login` first
+/// when `state` records no device key yet: on this install's first login, or
+/// after an earlier tail rolled back.
+///
+/// `keys` is where `keys/<deviceId>.json` goes: the signed-in session in
+/// `login`, a fake in the tests. On any failure of the tail `login.json` is
+/// left as it was, so it never names a device key that is not published.
+async fn record_login(
+    dirs: &Dirs,
+    keys: &impl KeyStore,
+    mut state: LoginState,
+) -> anyhow::Result<DeviceKeyOutcome> {
+    if state.device_id.is_some() {
+        write_login_state(dirs, &state)?;
+        return Ok(DeviceKeyOutcome::AlreadyRecorded);
+    }
+    let id = publish_device_key(dirs, keys, state.pubky).await?;
+    state.device_id = Some(id.clone());
+    // The key is published by now and its secret is on disk, so a failure
+    // here undoes nothing: removing the secret of a published key would make
+    // the sweeps encrypted to it unreadable.
+    write_login_state(dirs, &state).with_context(|| {
+        format!(
+            "this install's device key {id} is published and its secret is in {}, but \
+             login.json could not record it",
+            dirs.device_key_file().display()
+        )
+    })?;
+    Ok(DeviceKeyOutcome::Published(id))
+}
+
+/// Makes this install's device key and publishes it, for `owner`: the
+/// shared tail's steps, in an order that never publishes a key whose secret
+/// is not saved, and never leaves the key unknown to this owner's list.
+///
+/// 1. a new age identity, from the operating system's random numbers;
+/// 2. its secret in `device.key`, refused (with nothing changed) when a key
+///    file is there already;
+/// 3. its id in `installs.json` under `owner`;
+/// 4. the record, `keys/<id>.json`, written through `keys`: the capability
+///    probe. A 403 or a 507 becomes its own message, never the server's.
+///
+/// On a failure after step 2 the key file and the install entry this run
+/// made are removed again, and nothing else: an existing key file is
+/// refused in step 2, before there is anything to undo.
+async fn publish_device_key(
+    dirs: &Dirs,
+    keys: &impl KeyStore,
+    owner: Pubky,
+) -> anyhow::Result<DeviceId> {
+    let created_at = clock::now()?;
+    let id = new_device_id()?;
+    let identity = DeviceIdentity::generate();
+    let record = device_key_bytes(&device_key_record(&identity, created_at))?;
+    // The secret is saved before anything is published, so a crash can
+    // never leave a published key that nothing on this machine can open.
+    create_device_key(dirs, &identity)?;
+    // The id is recorded before the write too, so this owner's own key never
+    // shows up as unknown under `keys/`.
+    if let Err(error) = record_install(dirs, owner, &id) {
+        return Err(rolled_back(error, [remove_device_key(dirs)]));
+    }
+    if let Err(error) = keys.put_key(&id, record).await {
+        // `write_error` gives 403 and 507 their messages, and every other
+        // failure fixed text and a status. The key file goes first: were
+        // only the install entry to go, the next login would find a key file
+        // that login.json does not record, and refuse. An array literal's
+        // elements are evaluated left to right, so both cleanups run, in that
+        // order, before `rolled_back` is called with their results.
+        return Err(rolled_back(
+            write_error(&error),
+            [remove_device_key(dirs), forget_install(dirs, owner, &id)],
+        ));
+    }
+    Ok(id)
+}
+
+/// `cause`, why the tail stopped, as the error `login` aborts with, saying
+/// what the rollback could not undo. `cleanups` are the results of the
+/// rollback's steps, run already: an array of one or two, which
+/// `impl IntoIterator` takes whatever its length.
+fn rolled_back(
+    cause: anyhow::Error,
+    cleanups: impl IntoIterator<Item = anyhow::Result<()>>,
+) -> anyhow::Error {
+    // `filter_map(Result::err)` keeps the errors and drops the successes.
+    let left: Vec<String> = cleanups
+        .into_iter()
+        .filter_map(Result::err)
+        .map(|error| format!("{error:#}"))
+        .collect();
+    if left.is_empty() {
+        cause.context("could not publish this install's device key, so login removed it again")
+    } else {
+        cause.context(format!(
+            "could not publish this install's device key, and could not remove all of it again \
+             ({}); delete what is left by hand",
+            left.join("; ")
+        ))
+    }
+}
+
+/// What the report adds once the tail has published `id`: where the key
+/// went, and the reminder to back it up, from 02 ("Who can read a sweep").
+///
+/// A `\` at the end of a line inside a string literal drops that line break
+/// and the next line's indentation; the `\n`s are the report's own line
+/// breaks, one after each sentence.
+fn published_key_report(dirs: &Dirs, id: &DeviceId) -> String {
+    format!(
+        "Published this install's device key as keys/{id}.json; sweeps for you are encrypted \
+         to it.\n\
+         Back up {} the way you would an SSH key: it holds this install's device key, and \
+         losing that file loses every sweep encrypted to it that you have not pulled yet.\n",
+        dirs.config().display()
+    )
+}
+
+// ---------------------------------------------------------------------------
 // The command.
 
 /// Runs `login`. `identity`, `homeserver` and `signup_token` are the flags,
@@ -439,12 +587,16 @@ async fn login_locked(
         ));
     }
 
-    // 5. Sign in, record the login, sign out.
-    sign_in_and_record(ctx, &signer, &meta, current).await?;
+    // 5. to 7. Sign in, publish this install's device key on its first
+    // login, record the login, sign out.
+    let device = sign_in_and_record(ctx, &signer, &meta, current).await?;
     report.push_str(&format!(
         "Logged in as {name}, pubky {}, on homeserver {}.\n",
         meta.pubky, meta.homeserver
     ));
+    if let DeviceKeyOutcome::Published(id) = device {
+        report.push_str(&published_key_report(&ctx.dirs, &id));
+    }
     Ok(Report::new(report))
 }
 
@@ -486,33 +638,49 @@ async fn resolve_homeserver(ctx: &Context, user: &PublicKey) -> anyhow::Result<O
     Ok(found.as_ref().map(pubky_of))
 }
 
-/// Signs in, writes `login.json` for the identity `meta` describes, and
-/// signs out again.
+/// Signs in, publishes this install's device key if `login.json` records
+/// none for this pubky ([`record_login`]), writes `login.json` for the
+/// identity `meta` describes ([`login_state_for`], which `current` is moved
+/// into), and signs out again.
 ///
-/// The sign-out runs whether the write worked or not; the write's error is
-/// returned after it. `current` is the `login.json` read before: it is moved
-/// in, because its unknown fields move into the new state.
+/// The sign-out runs whether that worked or not; the error is returned
+/// after it.
 async fn sign_in_and_record(
     ctx: &Context,
     signer: &PubkySigner,
     meta: &IdentityMeta,
     current: Option<LoginState>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<DeviceKeyOutcome> {
     let session = signer
         .signin_blocking(client_id()?)
         .await
         .map_err(|err| request_error(&err))
         .context("could not sign in to the homeserver")?;
+    let state = login_state_for(meta, current);
+    // The store borrows the session. That borrow ends when `record_login`'s
+    // future is done, so the session can then be moved into `sign_out`,
+    // which consumes it.
+    let keys = SessionKeyStore::new(&session, ctx.network.pubky());
+    let recorded = record_login(&ctx.dirs, &keys, state).await;
+    sign_out(ctx, session).await;
+    recorded
+}
+
+/// The `login.json` to write for the identity `meta` describes. `current`,
+/// the `login.json` read before, is moved in, because its unknown fields
+/// and its device id move into the new state.
+fn login_state_for(meta: &IdentityMeta, current: Option<LoginState>) -> LoginState {
     let mut state = LoginState::identity(meta.name.clone(), meta.pubky, meta.homeserver);
     // Logging in again as the same identity (the only case the plan lets
     // through when a login exists) keeps the fields this build does not know,
-    // as every rewrite does.
+    // as every rewrite does, and the device key this install recorded for it.
     if let Some(current) = current {
         state.extra = current.extra;
+        if current.pubky == meta.pubky {
+            state.device_id = current.device_id;
+        }
     }
-    let saved = write_login_state(&ctx.dirs, &state);
-    sign_out(ctx, session).await;
-    saved
+    state
 }
 
 /// `--homeserver`'s value as a key, parsed with the SDK, which also checks it
@@ -537,18 +705,30 @@ fn public_key_of(pubky: &Pubky) -> anyhow::Result<PublicKey> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use pubky::StatusCode;
     use pubky::errors::RequestError;
-    use sweepky_core::Pubky;
+    use sweepky_core::{DeviceId, DeviceIdentity, Pubky};
+    use tempfile::TempDir;
 
     use super::{
-        Found, LoginPlan, PlanInput, ProductionWarning, SignupOutcome, plan_login, signup_error,
-        signup_outcome,
+        Found, LoginPlan, PlanInput, ProductionWarning, SignupOutcome, plan_login, record_login,
+        signup_error, signup_outcome,
     };
-    use crate::identity::{IdentityMeta, IdentityName};
+    use crate::Dirs;
+    use crate::device::{create_device_key, read_device_key};
+    use crate::identity::{IdentityMeta, IdentityName, IdentitySecret};
+    use crate::installs::{read_installs, record_install};
     use crate::network::{NetworkKind, PRODUCTION_HOMESERVER, TESTNET_HOMESERVER};
-    use crate::state::LoginState;
-    use crate::test_support::random_pubky;
+    use crate::remote::{QUOTA_FULL, WRITE_FORBIDDEN};
+    use crate::state::{
+        LoginState, StoredIdentity, create_identity, read_identity, read_login_state,
+        write_login_state,
+    };
+    use crate::test_support::{
+        FAKE_SERVER_TEXT, FakeKeyStore, KeyStoreCall, dirs_in, private_temp, random_pubky,
+    };
 
     fn key(z32: &str) -> Pubky {
         z32.parse().expect("a valid key")
@@ -852,5 +1032,113 @@ mod tests {
             ..new_on(&name, NetworkKind::Testnet)
         };
         assert!(!plan(&input).signup);
+    }
+
+    /// A temp `SWEEPKY_HOME` holding what is there by the time the shared
+    /// tail runs: the identity's two files, a `login.json` without a device
+    /// id (as a build before the tail left it), and in `installs.json` an
+    /// earlier install of the same owner and another owner's. Returns the
+    /// directory, its `Dirs`, the state the tail is given, and that earlier
+    /// install's id.
+    fn before_the_tail() -> (TempDir, Dirs, LoginState, DeviceId) {
+        let temp = private_temp();
+        let dirs = dirs_in(&temp);
+        let name = throwaway();
+        let secret = IdentitySecret::generate();
+        let meta = IdentityMeta::new(name.clone(), secret.pubky(), random_pubky(), true);
+        create_identity(&dirs, &secret, &meta).expect("creates");
+        let state = LoginState::identity(name, meta.pubky, meta.homeserver);
+        write_login_state(&dirs, &state).expect("writes");
+        let earlier: DeviceId = "earlier-install".parse().expect("valid");
+        record_install(&dirs, meta.pubky, &earlier).expect("records");
+        record_install(
+            &dirs,
+            random_pubky(),
+            &"other-owner".parse().expect("valid"),
+        )
+        .expect("records");
+        (temp, dirs, state, earlier)
+    }
+
+    #[tokio::test]
+    async fn probe_refusal_rolls_back_local_device_state() {
+        // 403 and 507 get their own messages; any other refusal its status.
+        for (status, message) in [
+            (StatusCode::FORBIDDEN, WRITE_FORBIDDEN),
+            (StatusCode::INSUFFICIENT_STORAGE, QUOTA_FULL),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the homeserver answered 500 Internal Server Error",
+            ),
+        ] {
+            let (_temp, dirs, state, earlier) = before_the_tail();
+            let installs_before = fs::read(dirs.installs_file()).expect("readable");
+            let keys = FakeKeyStore::refusing_puts(status);
+
+            let err = record_login(&dirs, &keys, state.clone())
+                .await
+                .expect_err("login aborts");
+            // Our message, never the server's own text.
+            assert_eq!(err.root_cause().to_string(), message, "{status}");
+            let shown = format!("{err:#}");
+            assert!(!shown.contains(FAKE_SERVER_TEXT), "{shown}");
+            assert!(!format!("{err:?}").contains(FAKE_SERVER_TEXT), "{shown}");
+
+            // The probe was the run's one remote call: the PUT of a new
+            // `keys/<deviceId>.json`.
+            let calls = keys.calls();
+            let [KeyStoreCall::PutKey(probed)] = calls.as_slice() else {
+                panic!("expected one PUT, got {calls:?}");
+            };
+            assert_ne!(probed, &earlier);
+
+            // Nothing of the new key is left: no device.key, no install
+            // entry (the file is byte for byte what it was, the earlier
+            // install and the other owner included), and login.json is
+            // unchanged, with no device id.
+            assert!(fs::symlink_metadata(dirs.device_key_file()).is_err());
+            assert_eq!(
+                fs::read(dirs.installs_file()).expect("readable"),
+                installs_before
+            );
+            assert_eq!(
+                read_installs(&dirs).expect("reads").ids_of(&state.pubky),
+                [earlier]
+            );
+            let login = read_login_state(&dirs).expect("reads").expect("present");
+            assert_eq!(login, state);
+            assert_eq!(login.device_id, None);
+            // The identity and its details stay: its signup may have spent a
+            // token.
+            let name = state.name.as_ref().expect("a name");
+            assert!(matches!(
+                read_identity(&dirs, name).expect("reads"),
+                StoredIdentity::Complete { .. }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unrecorded_device_key_is_kept_and_nothing_is_published() {
+        // A device.key that login.json does not record, as a crash in an
+        // earlier run could leave: the tail refuses before it publishes
+        // anything, and the key it did not make is never deleted.
+        let (_temp, dirs, state, earlier) = before_the_tail();
+        let existing = DeviceIdentity::generate();
+        create_device_key(&dirs, &existing).expect("written");
+        let keys = FakeKeyStore::default();
+
+        let err = record_login(&dirs, &keys, state.clone())
+            .await
+            .expect_err("refused");
+        assert!(format!("{err:#}").contains("never replaces"), "{err:#}");
+        assert_eq!(keys.calls(), []);
+        let kept = read_device_key(&dirs).expect("reads").expect("kept");
+        assert_eq!(kept.recipient(), existing.recipient());
+        assert_eq!(
+            read_installs(&dirs).expect("reads").ids_of(&state.pubky),
+            [earlier]
+        );
+        assert_eq!(read_login_state(&dirs).expect("reads"), Some(state));
     }
 }
