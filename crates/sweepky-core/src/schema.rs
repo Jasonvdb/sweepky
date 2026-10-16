@@ -35,6 +35,29 @@ pub const MAX_PACKAGE_BYTES: usize = 32 * 1024 * 1024;
 // a whole findings document and more, so its cap is never the smaller one.
 const _: () = assert!(MAX_PACKAGE_BYTES >= MAX_FINDINGS_BYTES);
 
+/// The most bytes the `findings.json` that
+/// [`SweepPackage::into_files`](crate::SweepPackage::into_files) writes may
+/// have: 128 MiB, four times [`MAX_PACKAGE_BYTES`].
+///
+/// That file is the findings pretty-printed, which puts every value on a line
+/// of its own, indented two spaces for each level it is nested, so it is
+/// longer than the findings' compact JSON in the package. At the depth of the
+/// two formats' own fields, the shapes measured come to at most four times
+/// as long: the Cloudflare fixture, converted, to 1.5 times; findings of
+/// nothing but locations with an empty `file` to 3.5 times; and a Cloudflare
+/// array of nothing but empty evidence entries, which conversion keeps twice
+/// (as locations and in `extra.cloudflare`), to 4 times, which is 8 times the
+/// file it was read from. A package's JSON is within [`MAX_PACKAGE_BYTES`],
+/// so the findings of every sweep `build` packages at that depth fit; four
+/// times [`MAX_FINDINGS_BYTES`] would not hold the last shape. Values nested
+/// far deeper, which a finding's `extra` and the unknown fields can hold,
+/// grow by far more: a number 100 arrays down is 2 bytes compact and over
+/// 200 pretty-printed, so a package within [`MAX_PACKAGE_BYTES`] could
+/// pretty-print to gigabytes. `into_files` stops counting at this cap and
+/// refuses such findings before it allocates anything for the file. P1b's
+/// choice; 01 and 02 set none.
+pub const MAX_FINDINGS_FILE_BYTES: usize = 4 * MAX_PACKAGE_BYTES;
+
 /// A record's `schemaVersion`.
 ///
 /// 01's rule is to reject a record only when its major version is greater

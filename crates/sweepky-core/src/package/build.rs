@@ -16,11 +16,11 @@ use std::mem;
 
 use zeroize::{Zeroize, Zeroizing};
 
-use super::{Attachments, ByteCounter, FINDINGS_FILE, PackageError, SweepPackage};
+use super::{Attachments, FINDINGS_FILE, PackageError, SweepPackage};
 use crate::findings::{Findings, FindingsSource, parse_audit_findings};
 use crate::names::AttachmentPath;
 use crate::records::Manifest;
-use crate::schema::MAX_PACKAGE_BYTES;
+use crate::schema::{MAX_FINDINGS_FILE_BYTES, MAX_PACKAGE_BYTES};
 
 /// One file of a sweep directory, as the CLI read it: what
 /// [`SweepPackage::build`] takes.
@@ -249,13 +249,23 @@ impl SweepPackage {
     ///
     /// It consumes the package. Each attachment's text moves into its
     /// file's buffer without a copy, and the findings' JSON is written into
-    /// a buffer allocated once at its exact length; both are wiped when
-    /// dropped. The manifest and the unknown top-level fields are not files
-    /// and are dropped, so read them first.
+    /// a buffer allocated once at its exact length, which is at most
+    /// [`MAX_FINDINGS_FILE_BYTES`]; both are wiped when dropped. The
+    /// manifest and the unknown top-level fields are not files and are
+    /// dropped, so read them first.
+    ///
+    /// The work and the memory are bounded however the package is shaped.
+    /// Pretty-printing indents every value by how deep it is nested, so
+    /// values nested deep in a finding's `extra` or an unknown field could
+    /// make a package within [`MAX_PACKAGE_BYTES`] gigabytes long as
+    /// `findings.json`. Counting the bytes stops at the cap instead.
     ///
     /// # Errors
     ///
-    /// No files at all, rather than some, on either:
+    /// No files at all, rather than some, on any of:
+    /// [`PackageError::FindingsFileTooLarge`] when the findings
+    /// pretty-printed would be longer than [`MAX_FINDINGS_FILE_BYTES`],
+    /// found before the file's buffer is allocated;
     /// [`PackageError::Serialize`] if serde_json fails to write the
     /// findings, which these types never make it do; and
     /// [`PackageError::ReservedName`] if an attachment were at
@@ -460,17 +470,88 @@ fn wipe_attachments(attachments: &mut Attachments) {
 /// whoever reads the file, in a wiped buffer allocated once at its length.
 ///
 /// Two passes, as in [`SweepPackage::to_padded`]: the first counts the bytes
-/// and keeps none, the second writes them into a buffer of exactly that
-/// size, which never grows. A `Vec` that grows moves its bytes to a bigger
-/// allocation and frees the old one without wiping it.
+/// and keeps none, stopping at [`MAX_FINDINGS_FILE_BYTES`]; the second writes
+/// them into a buffer of exactly that size, which never grows. A `Vec` that
+/// grows moves its bytes to a bigger allocation and frees the old one
+/// without wiping it.
 fn serialize_findings(findings: &Findings) -> Result<Zeroizing<Vec<u8>>, PackageError> {
+    // At most the cap, so the buffer below is never larger.
+    let len = pretty_len(findings, MAX_FINDINGS_FILE_BYTES)?;
+    let mut writer = ExactWriter::new(len);
     // `map_err(|_| …)` drops serde_json's error, whose message could quote a
     // value, and keeps only the fact that it failed.
-    let mut counter = ByteCounter(0);
-    serde_json::to_writer_pretty(&mut counter, findings).map_err(|_| PackageError::Serialize)?;
-    let mut writer = ExactWriter::new(counter.0);
     serde_json::to_writer_pretty(&mut writer, findings).map_err(|_| PackageError::Serialize)?;
     writer.finish().ok_or(PackageError::Serialize)
+}
+
+/// The length of the findings' pretty-printed JSON, counted without keeping
+/// a byte of it, or [`PackageError::FindingsFileTooLarge`] as soon as the
+/// count would pass `cap`.
+///
+/// A deeply nested value is what makes the count large: a zero 100 arrays
+/// down takes 2 bytes in the package's compact JSON and over 200 here. So
+/// the count stops at `cap` rather than run on to its end, which for a
+/// hostile package is gigabytes later.
+// `cap` is a parameter rather than the constant so that the tests can check
+// the edge with findings of any size.
+fn pretty_len(findings: &Findings, cap: usize) -> Result<usize, PackageError> {
+    let mut counter = CappedCounter::new(cap);
+    // A writer's error is the only way to stop serde_json part way, and it
+    // returns the first one at once. Its error is dropped, as above, and the
+    // counter's flag says whether it was the cap or (never, for these types)
+    // a failure of serde_json's own. `&mut counter` lends the counter, so it
+    // can still be read once serde_json is done with it.
+    let written = serde_json::to_writer_pretty(&mut counter, findings);
+    match written {
+        Ok(()) => Ok(counter.len),
+        // A match guard: this arm is taken only when the `if` holds.
+        Err(_) if counter.over_cap => Err(PackageError::FindingsFileTooLarge),
+        Err(_) => Err(PackageError::Serialize),
+    }
+}
+
+/// An `io::Write` that keeps nothing and counts the bytes written to it, up
+/// to `cap`. The write that would pass `cap` is refused with an error, which
+/// stops serde_json there.
+///
+/// Unlike the package's `ByteCounter`, which `to_padded` runs over the
+/// compact JSON, this one has a cap, for the reason `pretty_len` gives.
+struct CappedCounter {
+    /// The bytes accepted so far: never more than `cap`.
+    len: usize,
+    cap: usize,
+    /// Whether a write was refused because it would have passed `cap`.
+    over_cap: bool,
+}
+
+impl CappedCounter {
+    fn new(cap: usize) -> Self {
+        Self {
+            len: 0,
+            cap,
+            over_cap: false,
+        }
+    }
+}
+
+impl io::Write for CappedCounter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        // `len` never passes `cap`, so this cannot underflow; `saturating_sub`
+        // says so without a panic path.
+        let room = self.cap.saturating_sub(self.len);
+        if bytes.len() > room {
+            self.over_cap = true;
+            // Built from its kind alone, so it carries none of the bytes.
+            return Err(io::Error::from(io::ErrorKind::Other));
+        }
+        // At most `cap` afterwards, so this never saturates either.
+        self.len = self.len.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// An `io::Write` into a [`Zeroizing`] buffer allocated once for exactly
@@ -523,9 +604,11 @@ impl io::Write for ExactWriter {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use serde_json::{Value, json};
 
-    use super::{BuiltPackage, SkipReason, SweepFile};
+    use super::{BuiltPackage, CappedCounter, SkipReason, SweepFile, pretty_len};
     use crate::error::RecordError;
     use crate::findings::test_support::{FIXTURE as CLOUDFLARE_FINDINGS, fixture};
     use crate::findings::{
@@ -534,7 +617,7 @@ mod tests {
     use crate::package::test_support::{MARKER, manifest_json, path};
     use crate::package::{FINDINGS_FILE, PackageError, SweepPackage};
     use crate::records::Manifest;
-    use crate::schema::{MAX_PACKAGE_BYTES, SchemaVersion};
+    use crate::schema::{MAX_FINDINGS_FILE_BYTES, MAX_PACKAGE_BYTES, SchemaVersion};
 
     fn manifest() -> Manifest {
         serde_json::from_value(manifest_json()).unwrap()
@@ -790,5 +873,71 @@ mod tests {
             })
             .collect();
         assert_eq!(build(files).unwrap().package, package);
+    }
+
+    /// How many arrays [`package_with_deep_extra`] wraps around its array of
+    /// zeros, so the zeros sit `DEPTH + 1` arrays down. With the package,
+    /// the findings, their list, the finding and its `extra` around them,
+    /// that is 106 levels, inside serde_json's recursion limit of 128, so
+    /// [`SweepPackage::from_json`] reads it.
+    const DEPTH: usize = 100;
+
+    /// `run_dir`'s package with `scalars` zeros in an array [`DEPTH`] more
+    /// arrays down in its finding's `extra`: small as compact JSON, but
+    /// every zero sits on a line of its own when pretty-printed, indented
+    /// two spaces per level.
+    fn package_with_deep_extra(scalars: usize) -> SweepPackage {
+        let mut deep = Value::Array(vec![Value::from(0); scalars]);
+        for _ in 0..DEPTH {
+            deep = Value::Array(vec![deep]);
+        }
+        let mut package = build(run_dir()).unwrap().package;
+        let extra = serde_json::Map::from_iter([("deep".to_owned(), deep)]);
+        package.findings.findings[0].extra = Some(extra);
+        package
+    }
+
+    #[test]
+    fn split_refuses_findings_that_pretty_print_past_the_cap() {
+        // Each zero is 2 bytes compact ("0,") and over 2 × DEPTH bytes of
+        // indentation alone pretty-printed, so these findings come to over
+        // twice the cap pretty-printed (286 MB, which a split without the
+        // cap would count to its end and then allocate).
+        let scalars = 2 * MAX_FINDINGS_FILE_BYTES / (2 * DEPTH);
+        let compact = serde_json::to_vec(&package_with_deep_extra(scalars)).unwrap();
+        // Small compact, far inside the package cap, and a package as
+        // `open_package` reads one: what a stranger can send.
+        assert!(compact.len() < MAX_PACKAGE_BYTES / 8, "{}", compact.len());
+        let package = SweepPackage::from_json(&compact).unwrap();
+        // The split counts only up to the cap and then refuses, before it
+        // allocates the buffer for the file.
+        assert_eq!(
+            package.into_files().unwrap_err(),
+            PackageError::FindingsFileTooLarge
+        );
+    }
+
+    #[test]
+    fn pretty_len_cap_is_inclusive() {
+        // Findings exactly at the cap pass, one byte over do not.
+        let findings = package_to_split().findings;
+        let len = serde_json::to_vec_pretty(&findings).unwrap().len();
+        assert_eq!(pretty_len(&findings, len), Ok(len));
+        assert_eq!(
+            pretty_len(&findings, len - 1),
+            Err(PackageError::FindingsFileTooLarge)
+        );
+    }
+
+    #[test]
+    fn capped_counter_refuses_the_write_that_would_pass_the_cap() {
+        // The counter keeps none of a refused write, so the count never
+        // passes the cap.
+        let mut counter = CappedCounter::new(4);
+        counter.write_all(b"abc").unwrap();
+        assert!(!counter.over_cap);
+        assert!(counter.write_all(b"de").is_err());
+        assert_eq!(counter.len, 3);
+        assert!(counter.over_cap);
     }
 }

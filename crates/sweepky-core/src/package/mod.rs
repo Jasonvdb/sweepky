@@ -93,6 +93,15 @@ pub enum PackageError {
     // `{:#}` does) shows each part once.
     #[error("findings.json could not be read")]
     Findings(#[from] ConvertError),
+    /// [`SweepPackage::into_files`] refused to write the findings as
+    /// [`FINDINGS_FILE`]: pretty-printed, they would be longer than
+    /// [`MAX_FINDINGS_FILE_BYTES`](crate::MAX_FINDINGS_FILE_BYTES) (128 MiB).
+    /// Only values nested far deeper than the formats' own fields, in a
+    /// finding's `extra` or an unknown field, make findings that fit in a
+    /// package that long; the constant's documentation says why. The count
+    /// stops at the cap, so nothing is allocated for the file.
+    #[error("findings.json would be larger than the 128 MiB limit once pretty-printed")]
+    FindingsFileTooLarge,
 }
 
 /// A sweep package: `{schemaVersion, manifest, findings, attachments?}`

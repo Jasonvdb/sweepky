@@ -130,7 +130,8 @@
 //!   attachment, and the rest come back as [`SkippedFile`]s with a
 //!   [`SkipReason`] in a [`BuiltPackage`], for the CLI to warn about.
 //!   [`SweepPackage::into_files`] splits one back into [`PackageFiles`], one
-//!   wiped buffer per path, `findings.json` exactly once.
+//!   wiped buffer per path, `findings.json` exactly once and at most
+//!   [`MAX_FINDINGS_FILE_BYTES`].
 //! - Sealing and opening a package in one call each (P1b), so the CLI cannot
 //!   leave a step out: [`seal_package`] checks the manifest's targets, pads
 //!   and encrypts; [`open_package`] decrypts, parses with the package cap and
@@ -277,7 +278,8 @@ pub use records::{
     Manifest, MarkDoneError, Sweep, SweepStatus,
 };
 pub use schema::{
-    MAX_FINDINGS_BYTES, MAX_PACKAGE_BYTES, MAX_RECORD_BYTES, SchemaVersion, UnknownFields,
+    MAX_FINDINGS_BYTES, MAX_FINDINGS_FILE_BYTES, MAX_PACKAGE_BYTES, MAX_RECORD_BYTES,
+    SchemaVersion, UnknownFields,
 };
 pub use scope::{CommitShape, TargetScope};
 pub use target::{
