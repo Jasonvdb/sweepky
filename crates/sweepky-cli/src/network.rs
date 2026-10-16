@@ -17,8 +17,8 @@
 
 use std::ffi::OsStr;
 
-use anyhow::{Context as _, bail};
-use pubky::{Pubky, PublicKey};
+use anyhow::{Context as _, anyhow, bail};
+use pubky::{ClientId, Pubky, PublicKey};
 
 /// The client id Sweepky presents when it asks for a grant.
 ///
@@ -26,6 +26,14 @@ use pubky::{Pubky, PublicKey};
 /// because a saved session is compared against it. The SDK accepts any
 /// non-empty string up to 253 characters (`pubky::ClientId::new`).
 pub const CLIENT_ID: &str = "sweepky-cli";
+
+/// [`CLIENT_ID`] as the SDK's type, for every sign-in.
+pub(crate) fn client_id() -> anyhow::Result<ClientId> {
+    // Our own constant, so this cannot fail in practice; the unit test
+    // `client_id_is_sweepky_cli` checks that the SDK accepts it. It returns
+    // an error rather than panicking anyway, as everything here does.
+    ClientId::new(CLIENT_ID).map_err(|_| anyhow!("the client id {CLIENT_ID} is not valid"))
+}
 
 /// The one capability Sweepky asks for: read and write under `/pub/sweepky/`.
 ///
@@ -259,9 +267,11 @@ mod tests {
     use std::ffi::OsStr;
     use std::str::FromStr;
 
-    use pubky::{Capability, ClientId, Keypair, StoragePath};
+    use pubky::{Capability, Keypair, StoragePath};
 
-    use super::{CLIENT_ID, NetworkKind, NetworkSettings, SWEEPKY_CAPABILITY, select_kind};
+    use super::{
+        CLIENT_ID, NetworkKind, NetworkSettings, SWEEPKY_CAPABILITY, client_id, select_kind,
+    };
 
     fn path(p: &str) -> StoragePath {
         StoragePath::new(p).expect("test path is valid")
@@ -307,7 +317,7 @@ mod tests {
     #[test]
     fn client_id_is_sweepky_cli() {
         assert_eq!(CLIENT_ID, "sweepky-cli");
-        let id = ClientId::new(CLIENT_ID).expect("the SDK accepts it");
+        let id = client_id().expect("the SDK accepts it");
         assert_eq!(id.as_str(), CLIENT_ID);
     }
 

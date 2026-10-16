@@ -9,7 +9,7 @@
 //! 3. resolves the config and data directories ([`Dirs`], from `HOME` or
 //!    `SWEEPKY_HOME`), builds the [`Network`] (production, or the local
 //!    testnet under `--testnet` / `SWEEPKY_TESTNET`) and the [`Context`]
-//!    around both;
+//!    around both and standard error;
 //! 4. runs the command and prints its report, or `error: ...` and exits with
 //!    status 1.
 //!
@@ -36,7 +36,7 @@ use std::io::Write;
 use std::process::ExitCode;
 
 use clap::Parser;
-use sweepky_cli::{Cli, Context, Dirs, Network, Report, run, select_kind};
+use sweepky_cli::{Cli, Context, Dirs, Network, Report, StderrWriter, run, select_kind};
 
 /// `#[tokio::main]` turns this `async fn main` into an ordinary `fn main`
 /// that starts tokio's multi-threaded runtime and blocks on the body. Returning
@@ -75,6 +75,9 @@ async fn execute(cli: Cli) -> anyhow::Result<Report> {
     let ctx = Context {
         network: Network::for_kind(kind)?,
         dirs,
+        // A command's warnings go straight to standard error, so they appear
+        // before it acts; its report goes to standard output at the end.
+        stderr: StderrWriter::new(std::io::stderr()),
     };
     run(cli, &ctx).await
 }

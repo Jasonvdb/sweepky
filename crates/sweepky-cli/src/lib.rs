@@ -46,6 +46,14 @@
 //! - `display`, the terminal sanitiser: a stranger's text with its control,
 //!   bidi and invisible characters written as visible `\u{..}` escapes, cut
 //!   to a length.
+//! - `login --identity <name>` (`login`): creates or reuses a dedicated
+//!   identity, signs it up on its homeserver the first time, signs in,
+//!   records the login in `login.json` and signs out again.
+//! - `state`, this install's own state files: `login.json` and a dedicated
+//!   identity's key and details files, read and written together.
+//! - `session`, the per-command session every writing command runs in: the
+//!   writers' lock, a fresh sign-in, the command's work, and a sign-out that
+//!   is always attempted.
 //!
 //! The rules that hold for everything here (see "Rust conventions" in
 //! `docs/plan/03-cli-and-skill.md`):
@@ -93,19 +101,10 @@ mod cli;
 mod clock;
 mod dirs;
 // The identity name, secret file, details file and refusal rules of
-// `login --identity`. `IdentityName` already has callers (`Dirs` and the
-// re-export below); the rest has none outside its tests until `login` lands,
-// so the same `expect(dead_code)` as `private_fs` below applies.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "login --identity, the next P2a step, is the first caller"
-    )
-)]
+// `login --identity`.
 mod identity;
-// The terminal sanitiser. Like `private_fs` below, nothing outside its tests
-// calls it yet, so the same `expect(dead_code)` applies.
+// The terminal sanitiser. Nothing outside its tests calls it yet, so the same
+// `expect(dead_code)` as `private_fs` below applies.
 #[cfg_attr(
     not(test),
     expect(
@@ -115,9 +114,41 @@ mod identity;
 )]
 mod display;
 mod init;
-// The writers' lock. Like `private_fs` below, nothing outside its tests calls
-// it yet, so the same `expect(dead_code)` applies until the first writing
-// command lands.
+mod lock;
+mod login;
+mod network;
+// Owner-only files and directories. `login` uses them through `state` and
+// `lock`; `remove_private_file` has no caller outside its tests yet, so a
+// build without tests would warn that it is unused, which CI's `-D warnings`
+// turns into an error. `expect` (rather than `allow`) says that warning is
+// wanted for now and warns in turn once every item has a caller, so whoever
+// adds the last one has to delete this line. On a `mod`, the attribute
+// covers everything inside it.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "logout, a later P2a step, is the first caller of remove_private_file"
+    )
+)]
+mod private_fs;
+// Bounded reads of remote records and listings, and the write-error mapping.
+// `login` already uses `request_error` and `status_of`; the reads and the
+// write errors have no caller outside their tests yet, so the same
+// `expect(dead_code)` as `private_fs` above applies.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "login's shared tail, keys and circle, the next P2a steps, are the first callers"
+    )
+)]
+mod remote;
+// The per-command session. `login` already uses its lock and sign-out
+// helpers; `with_writer_session` has no caller outside its test until the
+// first writing command lands, so the same `expect(dead_code)` as
+// `private_fs` above applies. On a module, `expect` is fulfilled while any
+// item inside is unused, and the used ones are unaffected.
 #[cfg_attr(
     not(test),
     expect(
@@ -125,36 +156,15 @@ mod init;
         reason = "keys, circle and logout, the next P2a steps, are the first callers"
     )
 )]
-mod lock;
-mod network;
-// Nothing outside its tests calls it yet, so a build without tests would warn
-// that it is unused, which CI's `-D warnings` turns into an error. `expect`
-// (rather than `allow`) says those warnings are wanted for now and warns in
-// turn once every item has a caller, so whoever adds the last one has to
-// delete this line. On a `mod`, the attribute covers everything inside it.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "login, keys and logout, the next P2a steps, are the first callers"
-    )
-)]
-mod private_fs;
-// Bounded reads of remote records and listings, and the write-error mapping.
-// Like `private_fs` above, nothing outside its tests calls it yet, so the
-// same `expect(dead_code)` applies.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "login, keys and circle, the next P2a steps, are the first callers"
-    )
-)]
-mod remote;
+mod session;
+mod state;
 // Fixtures the unit tests of several modules share. `cfg(test)` compiles it
 // only for `cargo test`, so it never reaches the binary.
 #[cfg(test)]
 mod test_support;
+
+use std::io::Write;
+use std::sync::{Mutex, PoisonError};
 
 pub use cli::{Cli, Command};
 pub use dirs::Dirs;
@@ -174,14 +184,57 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Everything a command needs from outside itself, handed in by the caller.
 ///
 /// The binary builds one from the arguments and the environment; a test builds
-/// one around a local testnet and a temporary `SWEEPKY_HOME`. Later commands
-/// add the standard input and error writers and the passphrase source here,
-/// so that no command reaches for a global.
+/// one around a local testnet, a temporary `SWEEPKY_HOME` and a buffer for
+/// what would go to standard error. Later commands add the standard input and
+/// the passphrase source here, so that no command reaches for a global.
 pub struct Context {
     /// The network every command talks to.
     pub network: Network,
     /// Where this install keeps its secrets and state.
     pub dirs: Dirs,
+    /// Where a command writes what it has to say before it is done: a
+    /// warning before it acts, or that it is waiting for another command.
+    pub stderr: StderrWriter,
+}
+
+/// Where a command writes the lines it says along the way, rather than in
+/// its [`Report`] at the end: standard error in the binary, a buffer in the
+/// tests, which then read what was said and when.
+///
+/// Warnings go here so they come out *before* the action they warn about;
+/// the report is printed only once the command has finished.
+///
+/// A command holds the [`Context`] by shared reference (`&Context`), but
+/// writing needs exclusive (`&mut`) access to the writer. The `Mutex` turns
+/// one into the other at run time, one caller at a time: Rust calls this
+/// interior mutability. `Box<dyn Write + Send>` is "any writer, chosen by
+/// whoever builds the context", and `Send` (it may move between threads)
+/// keeps the whole `Context` safe to share across tokio's worker threads.
+pub struct StderrWriter {
+    writer: Mutex<Box<dyn Write + Send>>,
+}
+
+impl StderrWriter {
+    /// Lines written to `writer`. The binary passes `std::io::stderr()`.
+    pub fn new(writer: impl Write + Send + 'static) -> Self {
+        Self {
+            writer: Mutex::new(Box::new(writer)),
+        }
+    }
+
+    /// Writes `text` and a newline, and flushes, so the line is out before
+    /// the command goes on.
+    pub(crate) fn line(&self, text: &str) -> anyhow::Result<()> {
+        // `lock` fails only if another thread panicked while holding the
+        // lock ("poisoned"). A writer has no state that a panic could leave
+        // half-changed, so the guard is taken back with `into_inner` rather
+        // than failing the command.
+        let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        writer.write_all(text.as_bytes())?;
+        writer.write_all(b"\n")?;
+        writer.flush()?;
+        Ok(())
+    }
 }
 
 /// What a command has to tell the user when it succeeds.
@@ -214,11 +267,24 @@ impl Report {
 /// injecting one. `async` because most commands wait on the network; `init`
 /// does only a few small file operations, which are fine to do directly here.
 pub async fn run(cli: Cli, ctx: &Context) -> anyhow::Result<Report> {
-    // `ctx` is unused until the first networked command lands; naming it in a
-    // `let _ =` keeps the signature honest without a lint exception.
-    let _ = ctx;
     match cli.command {
         Command::Init { dir } => init::init(&dir),
+        Command::Login {
+            identity,
+            homeserver,
+            signup_token,
+        } => {
+            // `as_deref` lends out an `Option<&str>` from an
+            // `Option<String>`; `as_ref` an `Option<&SecretString>`, so the
+            // token is borrowed, never copied.
+            login::login(
+                ctx,
+                identity.as_deref(),
+                homeserver.as_deref(),
+                signup_token.as_ref(),
+            )
+            .await
+        }
     }
 }
 

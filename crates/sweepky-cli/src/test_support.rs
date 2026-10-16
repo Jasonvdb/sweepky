@@ -1,7 +1,7 @@
 //! Helpers that the unit tests of several modules share: a private temp
-//! directory and the file-mode checks around it, and a compile-time check
-//! that a secret type implements none of the traits that would print or copy
-//! it.
+//! directory, the [`Dirs`] under it and the file-mode checks around it, a
+//! random public key, and a compile-time check that a secret type implements
+//! none of the traits that would print or copy it.
 //!
 //! Compiled only for `cargo test` (`#[cfg(test)]` on its `mod` line in
 //! `lib.rs`), so nothing here reaches the binary, and like any test code it
@@ -13,7 +13,11 @@ use std::fs::{self, Permissions};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 
+use pubky::Keypair;
+use sweepky_core::Pubky;
 use tempfile::TempDir;
+
+use crate::Dirs;
 
 /// A fresh private directory to work in, created 0700 (`tempfile` passes
 /// `permissions` to the `mkdir` itself; its default would follow the
@@ -25,6 +29,17 @@ pub(crate) fn private_temp() -> TempDir {
         .expect("temp dir");
     assert_eq!(mode(temp.path()), 0o700);
     temp
+}
+
+/// The directories under `home`, as `SWEEPKY_HOME=<home>` gives them.
+pub(crate) fn dirs_in(home: &TempDir) -> Dirs {
+    Dirs::resolve(None, Some(home.path().as_os_str())).expect("absolute temp dir")
+}
+
+/// A fresh public key, made from a random keypair and converted to core's
+/// `Pubky` (the same 32 bytes).
+pub(crate) fn random_pubky() -> Pubky {
+    Pubky::from_bytes(Keypair::random().public_key().to_bytes())
 }
 
 /// The permission bits of whatever is at `path`, not following a link.

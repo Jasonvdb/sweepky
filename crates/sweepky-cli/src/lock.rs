@@ -244,12 +244,7 @@ mod tests {
     use super::WritersLock;
     use crate::Dirs;
     use crate::private_fs::ensure_private_dir;
-    use crate::test_support::{chmod, mode, private_temp};
-
-    /// The directories under `home`, as `SWEEPKY_HOME=<home>` gives them.
-    fn dirs_in(home: &TempDir) -> Dirs {
-        Dirs::resolve(None, Some(home.path().as_os_str())).expect("absolute temp dir")
-    }
+    use crate::test_support::{chmod, dirs_in, mode, private_temp};
 
     // Done when: "the lock serialising two writers". Two tasks on a
     // multi-thread runtime, so they really do run at the same time, each

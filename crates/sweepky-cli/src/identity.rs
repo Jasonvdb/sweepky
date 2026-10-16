@@ -706,8 +706,9 @@ fn hex_value(digit: u8) -> (u8, u8) {
 // ---------------------------------------------------------------------------
 // The public details.
 
-/// The most Sweepky reads of an identity's details file.
-const MAX_IDENTITY_META_BYTES: usize = 64 * 1024;
+/// The most Sweepky reads of an identity's details file. A few hundred bytes
+/// in practice; the rest is room for fields a newer Sweepky adds.
+pub(crate) const MAX_IDENTITY_META_BYTES: usize = 64 * 1024;
 
 /// A dedicated identity's public details, `identities/<name>.json`.
 ///
