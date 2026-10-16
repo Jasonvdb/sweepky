@@ -134,6 +134,16 @@
 //!   checks the manifest binding, and returns the package only when all
 //!   three pass. Their errors, [`SealError`] and [`OpenError`], say which
 //!   step failed and hold no data.
+//! - Finding groups (P1b): [`group_findings`] takes the decrypted sweeps of
+//!   a bounty as [`SweepFindings`] (the sweep, whether it is trusted, its
+//!   findings), in upload order, and groups their findings by the place they
+//!   point at: each finding's first sink, or else its first location, compared
+//!   by file plus scope where both give one, or else by lines at most
+//!   [`LINE_WINDOW`] apart, with an equal id joining findings only where
+//!   location cannot decide. The [`FindingGroups`] it returns keep every
+//!   sweep unchanged, and each [`FindingGroup`] lists its [`GroupMember`]s and
+//!   every sweeper who reported it, once each, in upload order. Groups stay
+//!   local: nothing here is serialized.
 //! - The secret-holding types, re-exported so the CLI uses the same ones
 //!   without depending on `age` for them: [`SecretString`] and
 //!   [`ExposeSecret`] (age's re-export of `secrecy`) and [`Zeroizing`].
@@ -205,6 +215,7 @@ mod crypto;
 mod error;
 mod feed;
 mod findings;
+mod groups;
 mod ids;
 mod names;
 mod open_enum;
@@ -236,6 +247,9 @@ pub use findings::{
     CloudflareField, Confidence, ConvertError, Finding, FindingStatus, Findings, FindingsSource,
     KnownConfidence, KnownFindingStatus, KnownLocationKind, KnownSeverity, Location, LocationKind,
     Severity, from_cloudflare, is_cloudflare_shape, parse_audit_findings, to_cloudflare,
+};
+pub use groups::{
+    FindingGroup, FindingGroups, GroupMember, LINE_WINDOW, SweepFindings, group_findings,
 };
 pub use ids::{EventCursor, RecordId};
 pub use names::{
