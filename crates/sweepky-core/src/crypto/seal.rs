@@ -66,15 +66,17 @@ pub const MAX_RECIPIENTS: usize = 32;
 /// largest in the C2SP CCTV vectors is 3,184. P1b's choice; 02 sets none.
 pub const MAX_HEADER_BYTES: usize = 8 * 1024;
 
-/// The most bytes [`decrypt`] accepts at all: 33,570,832.
+/// The most bytes [`decrypt`] accepts at all: 33,570,881.
 ///
-/// It is [`MAX_HEADER_BYTES`], the payload's 16-byte nonce,
-/// [`MAX_PACKAGE_BYTES`], and the 16-byte tag age adds to each 64 KiB chunk
-/// of it. So any file whose header (MAC line included) fits in
-/// `MAX_HEADER_BYTES` and whose plaintext fits in `MAX_PACKAGE_BYTES` fits
-/// too. Longer input is refused on its length alone; the CLI uses this as
-/// its download cap for `.age` files (P2c).
-pub const MAX_CIPHERTEXT_BYTES: usize = MAX_HEADER_BYTES
+/// It is the longest header the header check lets through, the payload's
+/// 16-byte nonce, [`MAX_PACKAGE_BYTES`], and the 16-byte tag age adds to
+/// each 64 KiB chunk of it. That header is [`MAX_HEADER_BYTES`] before the
+/// MAC line, then the newline that starts the MAC line and the 48-byte MAC
+/// line itself. So any file whose MAC line starts within `MAX_HEADER_BYTES`
+/// and whose plaintext fits in `MAX_PACKAGE_BYTES` fits too. Longer input is
+/// refused on its length alone; the CLI uses this as its download cap for
+/// `.age` files (P2c).
+pub const MAX_CIPHERTEXT_BYTES: usize = header_end(MAX_HEADER_BYTES)
     + AGE_NONCE_BYTES
     + MAX_PACKAGE_BYTES
     + AGE_TAG_BYTES * (MAX_PACKAGE_BYTES / AGE_CHUNK_BYTES);
@@ -102,6 +104,15 @@ const BASE64_32_BYTES: usize = 43;
 /// The MAC line itself, after the marker's newline: `--- `, the MAC, and a
 /// newline.
 const MAC_LINE_BYTES: usize = "--- ".len() + BASE64_32_BYTES + 1;
+
+/// Where a header ends, given `mac_line`, the index of the newline that
+/// starts its MAC line: just past that newline and the MAC line after it.
+/// [`MAX_CIPHERTEXT_BYTES`] and [`ends_in_empty_chunk`] both use it, so the
+/// cap and the check that reads a real header cannot disagree on where it
+/// ends. Being a `const fn` is what lets a constant call it.
+const fn header_end(mac_line: usize) -> usize {
+    mac_line + 1 + MAC_LINE_BYTES
+}
 
 /// The longest header [`encrypt`] can write: the first line, one X25519
 /// stanza per recipient (`-> X25519 `, the ephemeral key and a newline, then
@@ -418,7 +429,7 @@ fn file_key_error(error: age::DecryptError) -> DecryptError {
 /// on an open bounty is written by the stranger.
 fn ends_in_empty_chunk(ciphertext_len: usize, mac_line: usize) -> bool {
     // `mac_line` is at most `MAX_HEADER_BYTES`, so this cannot overflow.
-    let payload_start = mac_line + 1 + MAC_LINE_BYTES + AGE_NONCE_BYTES;
+    let payload_start = header_end(mac_line) + AGE_NONCE_BYTES;
     // `checked_sub` is `None` instead of wrapping below zero.
     let Some(payload_len) = ciphertext_len.checked_sub(payload_start) else {
         return false;
@@ -474,10 +485,11 @@ mod tests {
 
     use super::{
         DecryptError, EncryptError, MAX_CIPHERTEXT_BYTES, MAX_HEADER_BYTES, MAX_RECIPIENTS,
-        Plaintext, decrypt, encrypt,
+        Plaintext, check_size_caps, decrypt, encrypt,
     };
     use crate::crypto::keys::{AgeRecipient, DeviceIdentity};
     use crate::crypto::padding::{PaddedPlaintext, PaddingError};
+    use crate::schema::MAX_PACKAGE_BYTES;
 
     /// age's chunk size, which is also the padding bucket: 64 KiB, written
     /// out so the tests do not lean on the modules' own constants.
@@ -703,6 +715,77 @@ mod tests {
                 input.len()
             );
         }
+    }
+
+    #[test]
+    fn the_size_checks_stop_exactly_at_both_limits() {
+        // The largest file the size checks must let through: its MAC line
+        // starts exactly MAX_HEADER_BYTES bytes in, and its payload holds
+        // MAX_PACKAGE_BYTES of plaintext. That is MAX_CIPHERTEXT_BYTES
+        // exactly, so one byte more, in the header or in all, is refused.
+        let reader = DeviceIdentity::generate();
+        let ciphertext = encrypt(&pad(b"{}"), &[reader.recipient()]).unwrap();
+        // The real header, cut where the MAC line's marker starts: the
+        // stanzas before it, then the marker's newline and the 48-byte MAC
+        // line, which end the header. The assertion checks the cut landed on
+        // the marker. `split_at` borrows the two halves; it copies nothing.
+        let header = &ciphertext[..header_len(&ciphertext)];
+        let (stanzas, mac_line) = header.split_at(header.len() - (1 + 48));
+        assert!(mac_line.starts_with(b"\n--- "));
+
+        // The real stanzas, then one that no key opens, which age skips,
+        // with an argument long enough that the marker's newline lands at
+        // index `marker_at`. Its body is empty, so the line that ends it is
+        // that newline. Then the MAC line, a zero nonce and `payload_len`
+        // zero bytes of payload.
+        let file = |marker_at: usize, payload_len: usize| {
+            let mut input = stanzas.to_vec();
+            input.extend_from_slice(b"\n-> filler ");
+            // The argument fills up to the newline that ends its line, the
+            // byte just before the marker's.
+            input.resize(marker_at - 1, b'a');
+            input.push(b'\n');
+            input.extend_from_slice(mac_line);
+            input.resize(input.len() + 16 + payload_len, 0);
+            input
+        };
+        // MAX_PACKAGE_BYTES of plaintext and a 16-byte tag per 64 KiB chunk.
+        let payload_len = MAX_PACKAGE_BYTES + 16 * (MAX_PACKAGE_BYTES / CHUNK);
+
+        let at_limits = file(MAX_HEADER_BYTES, payload_len);
+        assert_eq!(at_limits.len(), MAX_CIPHERTEXT_BYTES);
+        // The figure the constant's docs give.
+        assert_eq!(MAX_CIPHERTEXT_BYTES, 33_570_881);
+        assert_eq!(check_size_caps(&at_limits), Ok(Some(MAX_HEADER_BYTES)));
+        // So age is given it: it parses the header and opens the real
+        // stanza, then finds the MAC wrong, since the filler stanza was added
+        // after the MAC was computed.
+        assert_eq!(
+            decrypt(&at_limits, &reader).err(),
+            Some(DecryptError::InvalidMac)
+        );
+
+        // One byte more in the header and one less in the payload: the same
+        // length, but the MAC line starts one byte too late.
+        let long_header = file(MAX_HEADER_BYTES + 1, payload_len - 1);
+        assert_eq!(long_header.len(), MAX_CIPHERTEXT_BYTES);
+        assert_eq!(
+            check_size_caps(&long_header),
+            Err(DecryptError::HeaderTooLarge)
+        );
+        assert_eq!(
+            decrypt(&long_header, &reader).err(),
+            Some(DecryptError::HeaderTooLarge)
+        );
+
+        // One byte more in all: refused on its length.
+        let mut one_over = at_limits;
+        one_over.push(0);
+        assert_eq!(check_size_caps(&one_over), Err(DecryptError::TooLarge));
+        assert_eq!(
+            decrypt(&one_over, &reader).err(),
+            Some(DecryptError::TooLarge)
+        );
     }
 
     #[test]
