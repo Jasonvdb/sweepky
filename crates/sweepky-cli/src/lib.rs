@@ -32,6 +32,15 @@
 //! - `lock`, the writers' lock: an exclusive `flock` on `credential.lock`,
 //!   waited for without blocking the async runtime, which every command that
 //!   opens a session holds around the session restore and its writes.
+//! - `remote`, the network helpers every command shares: reads of public
+//!   records and of the user's own (a 404 is no record), directory listings
+//!   (a 404 is an empty directory), every body capped before it is buffered
+//!   and every listing capped by line, page and total; and the messages for
+//!   a refused write (403 and 507) and every other SDK error, which never
+//!   quote the server or the request URL.
+//! - `display`, the terminal sanitiser: a stranger's text with its control,
+//!   bidi and invisible characters written as visible `\u{..}` escapes, cut
+//!   to a length.
 //!
 //! The rules that hold for everything here (see "Rust conventions" in
 //! `docs/plan/03-cli-and-skill.md`):
@@ -78,6 +87,16 @@
 mod cli;
 mod clock;
 mod dirs;
+// The terminal sanitiser. Like `private_fs` below, nothing outside its tests
+// calls it yet, so the same `expect(dead_code)` applies.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "keys list and circle show, the next P2a steps, are the first callers"
+    )
+)]
+mod display;
 mod init;
 // The writers' lock. Like `private_fs` below, nothing outside its tests calls
 // it yet, so the same `expect(dead_code)` applies until the first writing
@@ -104,6 +123,17 @@ mod network;
     )
 )]
 mod private_fs;
+// Bounded reads of remote records and listings, and the write-error mapping.
+// Like `private_fs` above, nothing outside its tests calls it yet, so the
+// same `expect(dead_code)` applies.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "login, keys and circle, the next P2a steps, are the first callers"
+    )
+)]
+mod remote;
 // Fixtures the unit tests of several modules share. `cfg(test)` compiles it
 // only for `cargo test`, so it never reaches the binary.
 #[cfg(test)]
@@ -140,8 +170,8 @@ pub struct Context {
 ///
 /// The binary prints [`Report::text`] as it is. A report must never carry text
 /// a stranger wrote without it going through the terminal sanitiser first
-/// (which arrives with the first command that reads remote data); `init`'s
-/// report is fixed text plus the user's own path.
+/// (`display::sanitize`); `init`'s report is fixed text plus the user's own
+/// path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Report {
     text: String,

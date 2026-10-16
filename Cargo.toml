@@ -60,6 +60,11 @@ zeroize = "=1.9.1"
 qrcode = { version = "=0.14.1", default-features = false, features = ["svg"] }
 # The writers' lock file (P2a).
 fd-lock = "=4.0.4"
+# URLs, for sweepky-cli's bounded directory listing (P2a): the SDK's
+# `PubkyResource::to_transport_url` returns a `url::Url` and
+# `from_transport_url` takes one. pubky already brings this exact release into
+# the graph, so naming it here adds no new code.
+url = "=2.5.8"
 clap = "=4.6.7"
 tokio = "=1.53.3"
 serde = "=1.0.229"

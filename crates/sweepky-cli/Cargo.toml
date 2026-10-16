@@ -41,6 +41,10 @@ serde_json = { workspace = true }
 # The writers' lock: an exclusive `flock` on `credential.lock`, made through
 # rustix, so this crate needs no `unsafe` and no `libc` of its own for it.
 fd-lock = { workspace = true }
+# The `Url` the SDK's transport URLs come in, named here so the directory
+# listing can add its query and parse `https://` listing lines. The release
+# pubky itself uses, so it adds no code.
+url = { workspace = true }
 
 # Crates for this crate's own tests only; none of them reaches the binary.
 [dev-dependencies]

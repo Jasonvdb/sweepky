@@ -95,6 +95,7 @@ Exact pins, re-checked against crates.io and npm for P0 on 2026-10-15; each is t
 | `tempfile` | =3.27.0 | dev-dependency of `sweepky-cli` (P2a), temporary directories for its tests; the release `pubky-testnet` already brings into the graph, so it adds no code |
 | `qrcode` | =0.14.1 | `default-features = false, features = ["svg"]`, so the image stack stays out |
 | `fd-lock` | =4.0.4 | the writers' lock file |
+| `url` | =2.5.8 | `sweepky-cli` (P2a): the SDK's `PubkyResource` transport URLs are `url::Url`s, which the bounded directory listing adds its query to and parses `https://` listing lines with; the release `pubky` already brings into the graph, so it adds no code |
 | `clap` | =4.6.7 | |
 | `tokio` | =1.53.3 | |
 | `serde` / `serde_json` | =1.0.229 / =1.0.154 | |
