@@ -1,10 +1,13 @@
 //! Finding groups: the findings of several sweeps, grouped by the place in the
-//! code they point at, with every sweeper who reported each group.
+//! code they point at, with every sweeper who reported each group; the merged
+//! report's content, from trusted sweeps only; and the credits `done`
+//! proposes.
 //!
-//! The rule is on [`group_findings`], because this module is private and only
-//! the re-exported items appear in the crate's docs. The `matching` module
-//! finds each finding's anchor and joins the findings that match, into the
-//! sets of `disjoint_sets`; this one turns those sets into groups.
+//! The rules are on [`group_findings`], [`FindingGroups::merged`] and
+//! [`FindingGroups::propose_credits`], because this module is private and
+//! only the re-exported items appear in the crate's docs. The `matching`
+//! module finds each finding's anchor and joins the findings that match, into
+//! the sets of `disjoint_sets`; this one turns those sets into groups.
 
 use std::collections::{HashMap, HashSet};
 
@@ -42,9 +45,11 @@ pub struct SweepFindings {
     /// [`Manifest::check_binding`]: crate::Manifest::check_binding
     pub sweep: SweepRef,
     /// Whether the sweep's content may enter the owner's merged report
-    /// (01, "Attribution and content are two different steps"). Grouping
-    /// does not read it: an untrusted sweep groups, and is attributed, like
-    /// any other.
+    /// (01, "Attribution and content are two different steps"). Only
+    /// [`FindingGroups::merged`] reads it, to leave an untrusted sweep's
+    /// findings out. Grouping, `reported_by` and
+    /// [`FindingGroups::propose_credits`] do not: an untrusted sweep groups,
+    /// and is attributed, like any other.
     pub trusted: bool,
     /// The sweep's findings, exactly as decrypted.
     pub findings: Findings,
@@ -94,6 +99,10 @@ impl FindingGroup {
 /// groups come in the order of their first member, which makes the result the
 /// same on every run for the same input.
 ///
+/// [`merged`](Self::merged) gives the merged report's content, from trusted
+/// sweeps only, and [`propose_credits`](Self::propose_credits) the credits
+/// `sweepky done` proposes, from every sweep.
+///
 /// **Local only.** Groups say which sweepers reported the same place, which
 /// is sealed content: nothing here goes into a public record. That is why
 /// this type has no `Serialize`; the CLI's local triage files (P2c) get a
@@ -128,6 +137,164 @@ impl FindingGroups {
             .get(member.sweep)
             .and_then(|sweep| sweep.findings.findings.get(member.finding))
     }
+
+    /// The groups of the owner's merged report: each group's findings from
+    /// trusted sweeps only, in the order of [`groups`](Self::groups), with
+    /// every group that no trusted sweep reported left out. That is 01's
+    /// "Attribution and content are two different steps" and 02's
+    /// "Untrusted reports are data": a stranger's findings never enter the
+    /// merged report.
+    ///
+    /// Only the content is filtered. A merged group's
+    /// [`reported_by`](MergedGroup::reported_by) is the whole group's,
+    /// untrusted sweepers included, because attribution counts every sweep.
+    /// An untrusted sweep's findings are still under its sweep in
+    /// [`sweeps`](Self::sweeps), where `pull` (P2c) finds what it writes to
+    /// `untrusted/` for the owner's agent to summarise without applying.
+    ///
+    /// Grouping reads no trusted flag, so an untrusted finding can still have
+    /// joined two trusted ones into one group (single linkage, see
+    /// [`group_findings`]); the owner confirms or splits the groups.
+    // `'_` in the return type is the borrow of `self`: the merged groups
+    // point into this `FindingGroups`, so they cannot outlive it, and
+    // building them copies no finding.
+    pub fn merged(&self) -> Vec<MergedGroup<'_>> {
+        self.groups
+            .iter()
+            .filter_map(|group| self.merged_group(group))
+            .collect()
+    }
+
+    /// `group` with its findings from trusted sweeps only and all its
+    /// reporters, or `None` when no trusted sweep reported it: such a group
+    /// has no content to merge.
+    // One named lifetime for both borrows: the result points at `group`'s
+    // reporters and at findings inside `self`, so it may live only as long
+    // as both. Elision alone would tie the result to `self` and refuse
+    // `&group.reported_by`, a borrow the compiler cannot see is as long.
+    fn merged_group<'a>(&'a self, group: &'a FindingGroup) -> Option<MergedGroup<'a>> {
+        let findings: Vec<MergedFinding<'a>> = group
+            .members
+            .iter()
+            .filter_map(|&member| self.trusted_finding(member))
+            .collect();
+        if findings.is_empty() {
+            return None;
+        }
+        Some(MergedGroup {
+            reported_by: &group.reported_by,
+            findings,
+        })
+    }
+
+    /// The finding `member` points at, with the member, when its sweep is
+    /// trusted; `None` for an untrusted sweep's finding.
+    // The `?` on an `Option` returns `None` early, as on a `Result` it
+    // returns the error. Members built by `group_findings` always point at a
+    // finding, so the lookups give `None` only for an untrusted sweep, but a
+    // lookup still never panics.
+    fn trusted_finding(&self, member: GroupMember) -> Option<MergedFinding<'_>> {
+        let sweep = self.sweeps.get(member.sweep)?;
+        if !sweep.trusted {
+            return None;
+        }
+        let finding = sweep.findings.findings.get(member.finding)?;
+        Some(MergedFinding { member, finding })
+    }
+
+    /// The credits `sweepky done` proposes: every sweeper other than `owner`
+    /// who contributed to at least one group, each once, in upload order (by
+    /// the first of their sweeps with a finding, as in
+    /// [`reported_by`](FindingGroup::reported_by)).
+    ///
+    /// - **Every sweep counts.** Trusted or not, and whatever their findings'
+    ///   `status`, so a stranger who reported the same place as a circle
+    ///   member is proposed with them (01), and so are two sweepers who
+    ///   found the same issue.
+    /// - **Never the owner.** An owner may sweep their own bounty, and their
+    ///   findings group like anyone's, but 01's no-self-credit rule keeps
+    ///   them out of the proposal. Sweepers are compared by their key bytes
+    ///   ([`Pubky`]'s `==`), so `owner` is left out whichever of its two
+    ///   spellings it was parsed from.
+    /// - **Empty when nobody else helped.** A sweep with no findings is in no
+    ///   group, so it proposes no one, and a bounty that only its owner
+    ///   reported on gets an empty list, which
+    ///   [`Bounty::mark_done`](crate::Bounty::mark_done) accepts.
+    ///
+    /// It is a proposal: the owner trims it, and `mark_done` refuses the
+    /// owner whatever list it is given.
+    pub fn propose_credits(&self, owner: Pubky) -> Vec<Pubky> {
+        // A set beside the list, so each sweeper is added once without
+        // searching the list each time.
+        let mut proposed_already: HashSet<Pubky> = HashSet::new();
+        let mut proposed: Vec<Pubky> = Vec::new();
+        for sweep in &self.sweeps {
+            // Every finding is in exactly one group (see `group_findings`),
+            // so a sweep contributed to a group exactly when it has a
+            // finding. Walking the sweeps rather than the groups keeps the
+            // upload order: the groups come in the order of their first
+            // member, which can put a later sweeper first.
+            if sweep.findings.findings.is_empty() {
+                continue;
+            }
+            let sweeper = sweep.sweep.sweeper;
+            // `&&` stops at the first `false`, so `insert`, which records
+            // the sweeper, runs only for someone other than the owner.
+            if sweeper != owner && proposed_already.insert(sweeper) {
+                proposed.push(sweeper);
+            }
+        }
+        proposed
+    }
+}
+
+/// One group of the owner's merged report, from [`FindingGroups::merged`]:
+/// every sweeper who reported the group, and its findings from trusted sweeps
+/// only, at least one.
+// The fields are private, so a merged group can only come from `merged`,
+// which is what filters its findings.
+//
+// The `'a` is the borrow of the `FindingGroups` this came from: a merged
+// group points at the reporters and findings held there instead of copying
+// them, and the compiler refuses any use of it once they are gone.
+//
+// `Debug` is derived: `Pubky` and `GroupMember` are public data, and each
+// `&Finding` prints through the redacted `Debug` of `Finding`, counts only, so
+// no derived `Debug` here prints a string an agent wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergedGroup<'a> {
+    reported_by: &'a [Pubky],
+    findings: Vec<MergedFinding<'a>>,
+}
+
+impl<'a> MergedGroup<'a> {
+    /// Every sweeper who reported the group, trusted or not, each once, in
+    /// upload order: the whole group's
+    /// [`reported_by`](FindingGroup::reported_by). Attribution counts every
+    /// sweep; only the findings below are filtered.
+    // Returns `&'a`, the borrow of the `FindingGroups`, rather than a borrow
+    // of this merged group, so the list may outlive the `MergedGroup`.
+    pub fn reported_by(&self) -> &'a [Pubky] {
+        self.reported_by
+    }
+
+    /// The group's findings from trusted sweeps, at least one, in upload
+    /// order: by sweep, then by their order in the sweep.
+    pub fn findings(&self) -> &[MergedFinding<'a>] {
+        &self.findings
+    }
+}
+
+/// A finding in the merged report, and where it is.
+// `Copy`, since it is an index pair and a shared reference, both of which
+// copy for free; the finding itself is never copied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MergedFinding<'a> {
+    /// Where the finding is in [`FindingGroups::sweeps`]. Its sweep is
+    /// trusted.
+    pub member: GroupMember,
+    /// The finding, exactly as decrypted.
+    pub finding: &'a Finding,
 }
 
 /// Groups the findings of several sweeps by the place in the code they point
@@ -164,7 +331,8 @@ impl FindingGroups {
 /// A finding's `status` is not read, so a `rejected` finding groups like any
 /// other, and neither is the sweep's `trusted` flag. A group's
 /// [`reported_by`](FindingGroup::reported_by) lists each sweeper once, in
-/// upload order, trusted or not: attribution counts every sweep.
+/// upload order, trusted or not: attribution counts every sweep. The flag
+/// decides only what [`FindingGroups::merged`] gives.
 ///
 /// The strings compared are agent-written and untrusted. They are only
 /// compared, never parsed, run or used as a path. The work is near-linear in
@@ -270,8 +438,10 @@ mod tests {
     use crate::pubky::Pubky;
     use crate::url::SweepRef;
 
-    /// Sweepers B and C of P2c's end-to-end test (roster member B and the
-    /// stranger S3 in fixtures/trust-labels.json), and roster member D.
+    /// The owner A, sweepers B and C of P2c's end-to-end test (the admin A,
+    /// roster member B and the stranger S3 in fixtures/trust-labels.json),
+    /// and roster member D.
+    const A: &str = "ybymzxgk1zd3a7dm3i15gcuq7ewqkbimft6r1n8oc9o6uay8mqfo";
     const B: &str = "btyoe954e99wb6sp7csdipt9ki8ca3iyus1tfi3171zqdixb5csy";
     const C: &str = "qwujy4epafpmfei7bxn8fccfm1shzqp516sbenxi7qr6gua4n77o";
     const D: &str = "5ymaqd61szab6j1qmry9jfo6ft81echtzscdbfs9sq8p3temcyco";
@@ -361,6 +531,15 @@ mod tests {
                     .map(|member| (member.sweep, member.finding))
                     .collect()
             })
+            .collect()
+    }
+
+    /// Each group's reporters, in the result's order.
+    fn reporter_lists(groups: &FindingGroups) -> Vec<&[Pubky]> {
+        groups
+            .groups()
+            .iter()
+            .map(|group| group.reported_by())
             .collect()
     }
 
@@ -532,12 +711,7 @@ mod tests {
             ),
         ]);
         assert_eq!(member_sets(&groups), vec![vec![(0, 0)], vec![(1, 0)]]);
-        let reporters: Vec<&[Pubky]> = groups
-            .groups()
-            .iter()
-            .map(|group| group.reported_by())
-            .collect();
-        assert_eq!(reporters, [[pubky(B)], [pubky(C)]]);
+        assert_eq!(reporter_lists(&groups), [[pubky(B)], [pubky(C)]]);
 
         // One id in one file, in different scopes, at close lines.
         assert_eq!(
@@ -814,10 +988,61 @@ mod tests {
                 vec![sink("src/secret.rs", 4242, "fn secret")],
             )],
         )]);
-        let printed = format!("{groups:?}");
-        for content in ["secret", "4242", "A synthetic finding", "Synthetic."] {
-            assert!(!printed.contains(content), "{content} printed");
+        // The merged output's Debug goes through the same redacted Debug of
+        // each `Finding` it holds.
+        for printed in [format!("{groups:?}"), format!("{:?}", groups.merged())] {
+            for content in ["secret", "4242", "A synthetic finding", "Synthetic."] {
+                assert!(!printed.contains(content), "{content} printed");
+            }
         }
+    }
+
+    #[test]
+    fn a_bounty_nobody_else_helped_with_proposes_no_one() {
+        // Only the owner A reported anything: B's sweep has no findings, so
+        // B contributed to no group.
+        let owner_only = group_findings(vec![
+            sweep(B, ID1, vec![]),
+            sweep(
+                A,
+                ID2,
+                vec![finding("f", vec![sink("src/a.rs", 10, "fn a")])],
+            ),
+        ]);
+        assert_eq!(owner_only.groups().len(), 1);
+        assert!(owner_only.propose_credits(pubky(A)).is_empty());
+        // No sweep has findings, or there are no sweeps at all.
+        let empty = group_findings(vec![sweep(B, ID1, vec![]), sweep(C, ID2, vec![])]);
+        assert!(empty.propose_credits(pubky(A)).is_empty());
+        assert!(group_findings(vec![]).propose_credits(pubky(A)).is_empty());
+    }
+
+    #[test]
+    fn propose_credits_lists_each_contributor_once_in_upload_order() {
+        // B and D report `x`, and C and B report `y`. The groups come in the
+        // order of their first member, so their reporters read B, D, C; the
+        // credits come in upload order, by each sweeper's first sweep with a
+        // finding, so C's empty first sweep does not put C first. C's second
+        // sweep is untrusted, and C is proposed all the same.
+        let x = || finding("x", vec![sink("src/a.rs", 10, "fn x")]);
+        let y = || finding("y", vec![sink("src/b.rs", 10, "fn y")]);
+        let mut untrusted = sweep(C, ID3, vec![y()]);
+        untrusted.trusted = false;
+        let groups = group_findings(vec![
+            sweep(C, ID1, vec![]),
+            sweep(B, ID2, vec![x()]),
+            untrusted,
+            sweep(D, ID1, vec![x()]),
+            sweep(B, ID3, vec![y()]),
+        ]);
+        assert_eq!(
+            reporter_lists(&groups),
+            [[pubky(B), pubky(D)], [pubky(C), pubky(B)]]
+        );
+        assert_eq!(
+            groups.propose_credits(pubky(A)),
+            [pubky(B), pubky(C), pubky(D)]
+        );
     }
 
     /// A finding's anchor as the reference rule below reads it: the file,

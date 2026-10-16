@@ -1,14 +1,17 @@
 //! Sweepky's core library: records, ids, paths, target pinning, trust labels,
 //! the events-feed parser, finding groups, age encryption, the package envelope
-//! and the manifest. P1a adds the records and parsing, P1b the encryption.
+//! and the manifest. P1a added the records and parsing; P1b the encryption,
+//! the package envelope, the manifest binding and the finding groups.
 //!
-//! So far it holds the machinery every record shares, and the first records:
+//! It holds the machinery every record shares, the records, and what P1b
+//! builds on them:
 //!
 //! - [`RecordError`], the error every parse here returns.
 //! - [`SchemaVersion`] and the parse every record goes through: check the
-//!   input's length against a cap ([`MAX_RECORD_BYTES`] or
-//!   [`MAX_FINDINGS_BYTES`]) before parsing anything, read `schemaVersion` on
-//!   its own, then read the whole record.
+//!   input's length against a cap ([`MAX_RECORD_BYTES`],
+//!   [`MAX_FINDINGS_BYTES`], or for a sweep package [`MAX_PACKAGE_BYTES`])
+//!   before parsing anything, read `schemaVersion` on its own, then read the
+//!   whole record.
 //! - [`UnknownFields`], which a record keeps with `#[serde(flatten)]` so that
 //!   rewriting it keeps the fields a newer client added.
 //! - Open-string enums (`kind`, `status`, `alg`, …): a `String` newtype with
@@ -142,8 +145,14 @@
 //!   [`LINE_WINDOW`] apart, with an equal id joining findings only where
 //!   location cannot decide. The [`FindingGroups`] it returns keep every
 //!   sweep unchanged, and each [`FindingGroup`] lists its [`GroupMember`]s and
-//!   every sweeper who reported it, once each, in upload order. Groups stay
-//!   local: nothing here is serialized.
+//!   every sweeper who reported it, once each, in upload order, trusted or
+//!   not. [`FindingGroups::merged`] gives the merged report: a
+//!   [`MergedGroup`] per group with a trusted member, holding that group's
+//!   reporters, all of them, and as [`MergedFinding`]s its findings from
+//!   trusted sweeps only. [`FindingGroups::propose_credits`] gives the
+//!   credits `sweepky done` proposes: every sweeper other than the owner who
+//!   contributed to a group, trusted or not, once each, in upload order.
+//!   Groups stay local: nothing here is serialized.
 //! - The secret-holding types, re-exported so the CLI uses the same ones
 //!   without depending on `age` for them: [`SecretString`] and
 //!   [`ExposeSecret`] (age's re-export of `secrecy`) and [`Zeroizing`].
@@ -184,7 +193,8 @@
 //!   read (the findings, the attachments and the unknown fields of a package
 //!   or its manifest) has a hand-written `Debug` that shows structure and
 //!   counts but no content, so a `{:?}` in a log line, an error or a panic
-//!   message cannot leak it.
+//!   message cannot leak it. The finding groups and the merged report print
+//!   their findings through that same `Debug`.
 
 // `forbid` is `deny` that nothing further down can switch back off: no
 // `unsafe` anywhere in this crate, with no exceptions.
@@ -249,7 +259,8 @@ pub use findings::{
     Severity, from_cloudflare, is_cloudflare_shape, parse_audit_findings, to_cloudflare,
 };
 pub use groups::{
-    FindingGroup, FindingGroups, GroupMember, LINE_WINDOW, SweepFindings, group_findings,
+    FindingGroup, FindingGroups, GroupMember, LINE_WINDOW, MergedFinding, MergedGroup,
+    SweepFindings, group_findings,
 };
 pub use ids::{EventCursor, RecordId};
 pub use names::{
