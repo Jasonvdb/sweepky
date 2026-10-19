@@ -113,15 +113,19 @@
 //!   error never quotes git. `ls-remote` and `fetch` name their repository
 //!   only through a checked `git::Remote`. With it, the parser of
 //!   `git ls-remote`'s output.
-//! - `targets`, where `post` and `run` get a target's repository from. So
-//!   far the host policy (`targets::host`): `is_public`, the pure
-//!   classifier that refuses loopback, private, link-local and otherwise
-//!   reserved addresses, IPv6 forms that carry such an IPv4 address
-//!   included; the `ResolveHost` seam, over the system resolver; and
-//!   `HttpsRemote`, the `https://<repo>` remote that git's network commands
-//!   take, made only for a host whose every address is public. And
-//!   `LocalRemote`, the fixture source's repository on this disk, which
-//!   only that source can make.
+//! - `targets`, where `post` and `run` get a target's repository from:
+//!   the `TargetResolver` seam, which pins a revision to a full SHA with
+//!   an anonymous `git ls-remote` (annotated tags peeled), gives a pull
+//!   request's base, head and merge base, names the remote `run` fetches
+//!   from and applies the target policy; [`TargetSource`], the context's
+//!   choice of source; the real source, over https only, and the fixture
+//!   source over the bare repository under `fixtures/`, for the tests; the
+//!   checked revision; and the host policy (`targets::host`): `is_public`,
+//!   the pure classifier that refuses loopback, private, link-local and
+//!   otherwise reserved addresses, IPv6 forms that carry such an IPv4
+//!   address included, the `ResolveHost` seam, over the system resolver,
+//!   and `HttpsRemote`, the `https://<repo>` remote that git's network
+//!   commands take, made only for a host whose every address is public.
 //!
 //! The rules that hold for everything here (see "Rust conventions" in
 //! `docs/plan/03-cli-and-skill.md`):
@@ -212,7 +216,8 @@ mod remote;
 mod session;
 mod state;
 // Where `post` and `run` get a target's repository from, and the network
-// policy for its host.
+// policy for its host. `TargetSource` is public, for the context, and so is
+// the fixture source, for the end-to-end test only.
 mod targets;
 // Fixtures the unit tests of several modules share. `cfg(test)` compiles it
 // only for `cargo test`, so it never reaches the binary.
@@ -235,6 +240,11 @@ pub use network::{
 };
 pub use passphrase::Passphrase;
 pub use prompt::StdinReader;
+// `targets` is a private module, but an item declared `pub` inside it can
+// still be re-exported here as part of the library's public API.
+pub use targets::TargetSource;
+#[doc(hidden)]
+pub use targets::fixture::FixtureTargets;
 
 /// This crate's version, `version` from Cargo.toml, which `sweepky --version`
 /// prints.
@@ -278,6 +288,10 @@ pub struct Context {
     /// [`GitEnv::capture`]. Every git that `post` and `run` start gets these
     /// and the runner's own fixed values, nothing else.
     pub git_env: GitEnv,
+    /// Where `post` and `run` get targets' repositories from:
+    /// [`TargetSource::Real`] in the binary, the fixture repository in the
+    /// tests.
+    pub targets: TargetSource,
 }
 
 /// Where a command writes the lines it says along the way, rather than in

@@ -6,7 +6,9 @@
 //! what it writes to standard error, the [`GitEnv`] the tests run git with
 //! and the inert fixture repository they run it against, a
 //! [`FakeResolver`] in place of DNS and the [`checked_remote`] made
-//! through it, a [`FakeKeyStore`] in place of a homeserver's `keys/`, the
+//! through it, a [`RecordingGit`] in place of git, the fixture source over
+//! that repository ([`fixture_targets`]) and the SHAs `fixtures/README.md`
+//! records for it, a [`FakeKeyStore`] in place of a homeserver's `keys/`, the
 //! passphrase the tests wrap secret files with and a byte search to check
 //! a wrapped file shows none of its secret, and a compile-time check that a
 //! secret type implements none of the traits that would print or copy it.
@@ -27,10 +29,13 @@ use std::sync::{Arc, Mutex};
 
 use pubky::errors::RequestError;
 use pubky::{Keypair, PubkyHttpClient, PublicKey, StatusCode};
-use sweepky_core::{DeviceId, Pubky, Zeroizing};
+use sweepky_core::{DeviceId, GitSha, Pubky, RepoName, Zeroizing};
 use tempfile::TempDir;
 
 use crate::device::{KeyIds, KeyStore, PublicKeys};
+use crate::git::{AllowedProtocols, GitCommand, GitFailed, RunGit, git_argv};
+use crate::targets::TargetSource;
+use crate::targets::fixture::FixtureTargets;
 use crate::targets::host::{HttpsRemote, ResolveHost};
 use crate::{Context, Dirs, GitEnv, Network, StderrWriter, StdinReader};
 
@@ -111,11 +116,13 @@ impl Write for SharedBuffer {
 /// A [`Context`] for a test, and the buffer that keeps what it writes to
 /// standard error: `network`, the directories under `home` (as
 /// `SWEEPKY_HOME=<home>` gives them), `home` itself as the working
-/// directory, `stdin` as standard input, no passphrase, and
-/// [`test_git_env`] for git.
+/// directory, `stdin` as standard input, no passphrase, [`test_git_env`]
+/// for git, and a fixture source that maps no repository, so no test
+/// reaches a repository host by default.
 ///
 /// The fields are public, so a test that needs another working directory
-/// sets `ctx.cwd` afterwards.
+/// sets `ctx.cwd` afterwards, and one that needs targets sets
+/// `ctx.targets` to [`fixture_targets`].
 pub(crate) fn test_context(
     network: Network,
     home: &TempDir,
@@ -132,6 +139,7 @@ pub(crate) fn test_context(
         stderr: StderrWriter::new(stderr.clone()),
         passphrase: None,
         git_env: test_git_env(),
+        targets: TargetSource::Fixture(FixtureTargets::new([])),
     };
     (ctx, stderr)
 }
@@ -207,6 +215,56 @@ pub(crate) fn inert_target_repo() -> PathBuf {
         "exactly one pack and its index: {packs:?}"
     );
     dir
+}
+
+/// The synthetic name the fixture source serves `fixtures/target-repo.git`
+/// under in the tests.
+const FIXTURE_REPO: &str = "example.invalid/sweepky/target-repo";
+
+/// [`FIXTURE_REPO`], parsed.
+pub(crate) fn fixture_repo() -> RepoName {
+    FIXTURE_REPO.parse().expect("a repo name")
+}
+
+/// The fixture source with [`FIXTURE_REPO`] mapped to the inert fixture
+/// repository ([`inert_target_repo`], so its check comes first).
+pub(crate) fn fixture_targets() -> FixtureTargets {
+    FixtureTargets::new([(fixture_repo(), inert_target_repo())])
+}
+
+/// The SHAs `fixtures/README.md` records in its `target-repo.git` section,
+/// by name: the commits R, A, T1, B, F1, F2 and M, and the tag object
+/// `v0.1.0`. It reads every table row of the form ``| name | `<sha>` |
+/// …``, as `tests/fixture_target_repo.rs` does, so the README stays the
+/// one place the SHAs are written; a unit test cannot call an integration
+/// test's code, so the reader is written again here.
+pub(crate) fn recorded_fixture_shas() -> BTreeMap<String, GitSha> {
+    let readme =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/README.md"))
+            .expect("fixtures/README.md");
+    let section = readme
+        .split("\n## ")
+        .find(|section| section.starts_with("`target-repo.git`"))
+        .expect("fixtures/README.md has a `target-repo.git` section");
+    let mut shas = BTreeMap::new();
+    for line in section.lines() {
+        // "| R | `abc…` | none | …" splits on '|' into
+        // ["", " R ", " `abc…` ", …]; a slice pattern takes the second
+        // and third cells of a row that has them.
+        let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+        let &[_, name, sha, ..] = cells.as_slice() else {
+            continue;
+        };
+        let Some(sha) = sha.strip_prefix('`').and_then(|sha| sha.strip_suffix('`')) else {
+            continue;
+        };
+        // A SHA: the other backticked cells in the section are ref names.
+        if let Ok(sha) = sha.parse::<GitSha>() {
+            let previous = shas.insert(name.trim_matches('`').to_owned(), sha);
+            assert!(previous.is_none(), "the README records {name} twice");
+        }
+    }
+    shas
 }
 
 /// Every regular file under `dir`, `/`-separated and relative to it.
@@ -413,6 +471,61 @@ impl ResolveHost for FakeResolver {
         self.answer
             .clone()
             .ok_or_else(|| anyhow::anyhow!(FAKE_LOOKUP_TEXT))
+    }
+}
+
+/// A [`RunGit`] in place of git: it records the argv git would have been
+/// started with, through [`git_argv`] and the protocols it was made with,
+/// and answers every run with the same scripted exit status and output.
+/// Exit status 0 hands back `stdout`; any other is a [`GitFailed`] with
+/// that code and `stderr`, as the real runner gives. A command whose argv
+/// [`git_argv`] refuses is not recorded, as the real runner would start no
+/// git for it. The `Mutex` is there for the same reason as in
+/// [`FakeKeyStore`].
+pub(crate) struct RecordingGit {
+    protocols: AllowedProtocols,
+    code: i32,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    argv: Mutex<Vec<Vec<String>>>,
+}
+
+impl RecordingGit {
+    /// Answers every run with success and `stdout`.
+    pub(crate) fn succeeding(protocols: AllowedProtocols, stdout: &[u8]) -> Self {
+        Self::answering(protocols, 0, stdout, b"")
+    }
+
+    /// Answers every run with exit status `code` and `stderr`.
+    pub(crate) fn failing(protocols: AllowedProtocols, code: i32, stderr: &[u8]) -> Self {
+        Self::answering(protocols, code, b"", stderr)
+    }
+
+    fn answering(protocols: AllowedProtocols, code: i32, stdout: &[u8], stderr: &[u8]) -> Self {
+        Self {
+            protocols,
+            code,
+            stdout: stdout.to_vec(),
+            stderr: stderr.to_vec(),
+            argv: Mutex::default(),
+        }
+    }
+
+    /// The argv of every run so far, in order.
+    pub(crate) fn argv(&self) -> Vec<Vec<String>> {
+        self.argv.lock().expect("lock").clone()
+    }
+}
+
+impl RunGit for RecordingGit {
+    async fn run(&self, command: &GitCommand) -> anyhow::Result<Vec<u8>> {
+        let argv = git_argv(command, self.protocols)?;
+        self.argv.lock().expect("lock").push(argv);
+        if self.code == 0 {
+            Ok(self.stdout.clone())
+        } else {
+            Err(GitFailed::for_tests(command, self.code, self.stderr.clone()).into())
+        }
     }
 }
 

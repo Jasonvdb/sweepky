@@ -229,7 +229,7 @@ pub(crate) struct Limits {
 
 /// The most standard error a git run may write: 64 KiB. git writes a line
 /// or two; the rest is room for `remote:` lines.
-const STDERR_CAP: usize = 64 * 1024;
+pub(crate) const STDERR_CAP: usize = 64 * 1024;
 
 /// The most lines [`parse_ls_remote`] reads: 1024. `post` asks for a
 /// handful of refs by name, so a server that answers more is refused.
@@ -297,6 +297,9 @@ pub(crate) enum LocalSubcommand {
     Config,
     /// `git rev-parse`.
     RevParse,
+    /// `git merge-base`: the fixture source finds a pull request's merge
+    /// base with it, in the fixture's bare repository.
+    MergeBase,
 }
 
 impl LocalSubcommand {
@@ -306,6 +309,7 @@ impl LocalSubcommand {
             Self::Init => "init",
             Self::Config => "config",
             Self::RevParse => "rev-parse",
+            Self::MergeBase => "merge-base",
         }
     }
 }
@@ -389,7 +393,9 @@ impl GitCommand {
     }
 
     /// Runs git in `dir`, which must be a repository this command made, so
-    /// git's search for one stops there.
+    /// git's search for one stops there. The one other directory is the
+    /// fixture source's bare repository, which git finds at `dir` itself
+    /// and so never searches above.
     pub(crate) fn in_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.dir = Some(dir.into());
         self
@@ -541,6 +547,18 @@ pub(crate) struct GitFailed {
 }
 
 impl GitFailed {
+    /// The failure a fake [`RunGit`] answers `command` with: exit `code`
+    /// and `stderr`, as if git had written it. `cfg(test)`, so only a test
+    /// can make one without running git.
+    #[cfg(test)]
+    pub(crate) fn for_tests(command: &GitCommand, code: i32, stderr: Vec<u8>) -> Self {
+        Self {
+            subcommand: command.subcommand,
+            code: Some(code),
+            stderr,
+        }
+    }
+
     /// git's exit code, or `None` when a signal stopped it.
     pub(crate) fn code(&self) -> Option<i32> {
         self.code

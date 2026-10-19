@@ -17,7 +17,8 @@
 //!    variables git may see ([`GitEnv`]: `PATH` and the proxy and CA
 //!    variables), builds the [`Network`] (production, or the local testnet
 //!    under `--testnet` / `SWEEPKY_TESTNET`) and the [`Context`] around them,
-//!    standard input and standard error, then runs the command;
+//!    standard input, standard error and the real [`TargetSource`], then
+//!    runs the command;
 //! 5. prints the command's report, or `error: ...` and exits with status 1.
 //!
 //! `anyhow` is used here and in the library alike: this crate only has to
@@ -47,8 +48,8 @@ use std::process::ExitCode;
 use anyhow::Context as _;
 use clap::Parser;
 use sweepky_cli::{
-    Cli, Context, Dirs, GitEnv, Network, Passphrase, Report, StderrWriter, StdinReader, run,
-    run_without_context, select_kind,
+    Cli, Context, Dirs, GitEnv, Network, Passphrase, Report, StderrWriter, StdinReader,
+    TargetSource, run, run_without_context, select_kind,
 };
 
 /// `#[tokio::main]` turns this `async fn main` into an ordinary `fn main`
@@ -122,6 +123,9 @@ async fn execute(cli: Cli) -> anyhow::Result<Report> {
         // so that the library reads none: `capture` asks `var_os` for each
         // name on its fixed list and keeps the ones that are set.
         git_env: GitEnv::capture(std::env::var_os),
+        // Real repositories, over https alone. The binary never builds the
+        // fixture source, the one that allows git's `file` transport.
+        targets: TargetSource::Real,
     };
     run(cli, &ctx).await
 }

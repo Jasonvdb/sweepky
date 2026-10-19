@@ -23,10 +23,11 @@ use pubky::{ClientId, Keypair, PublicKey};
 use pubky_testnet::EphemeralTestnet;
 use serde_json::{Value, json};
 use sweepky_cli::{
-    CLIENT_ID, Cli, Context, Dirs, GitEnv, Network, Report, StderrWriter, StdinReader, run,
+    CLIENT_ID, Cli, Context, Dirs, FixtureTargets, GitEnv, Network, Report, StderrWriter,
+    StdinReader, TargetSource, run,
 };
 use sweepky_core::{
-    Circle, DeviceIdentity, DeviceKey, MAX_RECORD_BYTES, Pubky, SecretString, Zeroizing,
+    Circle, DeviceIdentity, DeviceKey, MAX_RECORD_BYTES, Pubky, RepoName, SecretString, Zeroizing,
 };
 
 /// What the context writes to standard error, kept where the test can read
@@ -184,6 +185,23 @@ fn identity_seed(key_file: &Path) -> Zeroizing<[u8; 32]> {
     seed
 }
 
+/// The synthetic name the fixture source serves `fixtures/target-repo.git`
+/// under: a host under `example.invalid`, which no resolver answers.
+const FIXTURE_REPO: &str = "example.invalid/sweepky/target-repo";
+
+/// The fixture source the test's targets come from: [`FIXTURE_REPO`] mapped
+/// to `fixtures/target-repo.git`, whose files `tests/fixture_target_repo.rs`
+/// checks are inert. `env!` reads `CARGO_MANIFEST_DIR` when the test is
+/// compiled, so the path holds whatever directory the test runs in.
+fn fixture_targets() -> TargetSource {
+    let repo: RepoName = FIXTURE_REPO.parse().expect("a repo name");
+    let path = fs::canonicalize(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/target-repo.git"),
+    )
+    .expect("the fixture repository");
+    TargetSource::Fixture(FixtureTargets::new([(repo, path)]))
+}
+
 /// A signup token in a form the homeserver rejects (400) before it looks at
 /// anything else, so a `login` that sent a signup with it would fail. Passed
 /// where `login` must not sign up, it proves that no signup was sent.
@@ -225,6 +243,9 @@ async fn end_to_end() {
                 None
             }
         }),
+        // Targets from the fixture repository, so nothing reaches a real
+        // repository host.
+        targets: fixture_targets(),
     };
     // The test looks at the files through the context's own `Dirs`.
     let dirs = &ctx.dirs;
