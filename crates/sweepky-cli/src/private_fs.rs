@@ -17,6 +17,9 @@
 //!   points at, or `None` when nothing is.
 //! - [`open_private_lock_file`] opens the writers' lock file, creating it
 //!   empty and 0600, and never replaces or truncates it.
+//! - [`temp_path_beside`], [`write_synced`] and [`open_seen_file`] are steps
+//!   the functions above are built from. `init` uses them too, for the files
+//!   it writes into a project, which are not private.
 //!
 //! The rules, and why:
 //!
@@ -178,9 +181,10 @@ fn create_private_temp(temp: &Path) -> anyhow::Result<File> {
 /// they are on disk.
 ///
 /// Takes the `File` by value, so it is closed when this returns, before the
-/// rename. `mut file` makes only this function's own binding mutable, which
-/// `write_all` needs; the caller has already handed the file over.
-fn write_synced(temp: &Path, mut file: File, bytes: &[u8]) -> anyhow::Result<()> {
+/// rename (or `init`'s hard link). `mut file` makes only this function's own
+/// binding mutable, which `write_all` needs; the caller has already handed
+/// the file over.
+pub(crate) fn write_synced(temp: &Path, mut file: File, bytes: &[u8]) -> anyhow::Result<()> {
     file.write_all(bytes)
         .with_context(|| format!("could not write {}", temp.display()))?;
     // `sync_all` waits until the bytes are on disk, so a crash after the
@@ -189,13 +193,15 @@ fn write_synced(temp: &Path, mut file: File, bytes: &[u8]) -> anyhow::Result<()>
         .with_context(|| format!("could not write {}", temp.display()))
 }
 
-/// A temp file name next to `path`, in the same directory so the rename stays
-/// on one filesystem: `.<name>.<pid>.<nanos>.<n>.tmp`.
+/// A temp file name next to `path`, in the same directory so a rename or a
+/// hard link stays on one filesystem: `.<name>.<pid>.<nanos>.<n>.tmp`. The
+/// leading dot hides it; a name that already starts with one, such as
+/// `init`'s `.sweepky`, gets no second.
 ///
 /// The process id, the clock and a counter keep two writers, or two writes in
 /// one process, from picking the same name; `create_new` refuses a clash
 /// anyway. Nothing secret depends on the name, so no random number is needed.
-fn temp_path_beside(path: &Path) -> anyhow::Result<PathBuf> {
+pub(crate) fn temp_path_beside(path: &Path) -> anyhow::Result<PathBuf> {
     // A `static` lives for the whole program and is shared by every call;
     // an atomic integer can be bumped from any thread without a lock.
     // `Relaxed` is enough because only the number's uniqueness matters, not
@@ -213,7 +219,12 @@ fn temp_path_beside(path: &Path) -> anyhow::Result<PathBuf> {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| since.as_nanos());
     // `OsString`, not `String`: the file name need not be UTF-8.
-    let mut temp = OsString::from(".");
+    // `as_encoded_bytes` views it as bytes, whatever its encoding, to test
+    // its first one.
+    let mut temp = OsString::new();
+    if !name.as_encoded_bytes().starts_with(b".") {
+        temp.push(".");
+    }
     temp.push(name);
     temp.push(format!(".{}.{nanos}.{count}.tmp", std::process::id()));
     Ok(path.with_file_name(temp))
@@ -300,7 +311,7 @@ fn refuse_unless_regular(path: &Path, meta: &Metadata) -> anyhow::Result<()> {
 /// `open` follows symlinks, and std has no portable "do not follow" flag, so
 /// the check is by device and inode: if the path was swapped for a link in
 /// between, the numbers differ and the file is refused before it is used.
-fn open_seen_file(
+pub(crate) fn open_seen_file(
     path: &Path,
     seen: &Metadata,
     options: &OpenOptions,
@@ -499,7 +510,7 @@ mod tests {
 
     use super::{
         create_private_temp, ensure_private_dir, read_private_file, remove_private_file,
-        replace_with, write_private_file,
+        replace_with, temp_path_beside, write_private_file,
     };
     use crate::test_support::{chmod, mode, private_temp};
 
@@ -595,6 +606,22 @@ mod tests {
         let file = create_private_temp(&probe).expect("created");
         assert_eq!(file.metadata().expect("stat").len(), 0);
         assert_eq!(mode(&probe), 0o600);
+    }
+
+    #[test]
+    fn temp_name_is_hidden_beside_its_file() {
+        // A leading dot hides the temp name, and a name that already starts
+        // with one gets no second.
+        for (file, prefix) in [("device.key", ".device.key."), (".sweepky", ".sweepky.")] {
+            let temp = temp_path_beside(&Path::new("/dir").join(file)).expect("a name");
+            assert_eq!(temp.parent(), Some(Path::new("/dir")), "{file}");
+            let name = temp
+                .file_name()
+                .and_then(|name| name.to_str())
+                .expect("UTF-8 name");
+            assert!(name.starts_with(prefix), "{name}");
+            assert!(name.ends_with(".tmp"), "{name}");
+        }
     }
 
     #[test]

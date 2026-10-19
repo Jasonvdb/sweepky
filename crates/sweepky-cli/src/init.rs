@@ -10,30 +10,39 @@
 //! already hold files, so it never writes through a link and never replaces
 //! anything:
 //!
-//! - New files are opened with `create_new`, which is `O_CREAT | O_EXCL`: the
+//! - A new file is created all or nothing. Its bytes go into a temp file
+//!   beside it, opened with `create_new`, which is `O_CREAT | O_EXCL`: the
 //!   open fails if anything at all is at that path, a symlink included (even
 //!   one that points nowhere), so it can neither follow a link nor truncate a
-//!   file.
+//!   file. Once the bytes are on disk, a hard link gives the temp file its
+//!   real name, which fails in the same way if anything is there, and the
+//!   temp name is removed. A failure at any step removes the temp file, so
+//!   the real name never shows an empty or half-written file.
 //! - An existing `.gitignore` is only ever appended to, and only when it is a
 //!   regular file; a symlink is refused, because appending through one would
 //!   write into whatever file it points at. It is not appended to when it has
 //!   other hard links either, which share its contents.
-//! - The marker is written last, so its presence means a finished `init`; a
-//!   second run sees it and changes nothing.
+//! - The marker is written last, so its presence means a finished `init`. A
+//!   second run reads it and changes nothing when it is a marker this build
+//!   reads; any other file at that name is refused, never taken for a
+//!   finished `init`.
 
-use std::fs::{self, File, Metadata, OpenOptions};
+use std::fs::{self, Metadata, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
-// `MetadataExt` is a Unix-only extension trait that adds `dev()`, `ino()` and
-// `nlink()` to `fs::Metadata`. A trait's methods are callable only while the
-// trait is in scope, hence the `use`.
+// `MetadataExt` is a Unix-only extension trait that adds `nlink()` to
+// `fs::Metadata`. A trait's methods are callable only while the trait is in
+// scope, hence the `use`.
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
-use anyhow::{Context as _, bail};
-use serde::Serialize;
-use sweepky_core::SchemaVersion;
+use anyhow::{Context as _, anyhow, bail};
+use serde::{Deserialize, Serialize};
+use sweepky_core::{RecordError, SchemaVersion, UnknownFields};
 
 use crate::Report;
+// File steps shared with the secret files' writer: the temp name, the synced
+// write, the open that checks it got the file it inspected, the capped read.
+use crate::private_fs::{open_seen_file, read_up_to_cap, temp_path_beside, write_synced};
 
 /// The project marker's file name, directly inside the project directory.
 pub(crate) const MARKER: &str = ".sweepky";
@@ -46,12 +55,25 @@ const GITIGNORE: &str = ".gitignore";
 const SWEEPS_LINE: &[u8] = b"sweeps/";
 
 /// The marker's contents. Serialized with `serde` so that adding a field later
-/// is one line here.
-#[derive(Serialize)]
+/// is one line here, and read back with it to tell a marker from any other
+/// file at that name.
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ProjectMarker {
+    /// The format's version, 1. Reading one refuses a newer version, as a
+    /// record's does.
     schema_version: SchemaVersion,
+    /// Fields a newer Sweepky wrote. `flatten` collects every key not named
+    /// above into this map instead of failing, so a marker a later phase
+    /// added fields to still reads as a marker.
+    #[serde(flatten)]
+    extra: UnknownFields,
 }
+
+/// The most bytes a marker may have: 64 KiB. The one init writes is 20; the
+/// cap leaves room for fields later phases add, and keeps init from reading a
+/// huge file someone left at that name into memory.
+const MAX_MARKER_BYTES: usize = 64 * 1024;
 
 /// Runs `sweepky init <dir>`.
 pub(crate) fn init(dir: &Path) -> anyhow::Result<Report> {
@@ -77,13 +99,17 @@ pub(crate) fn init(dir: &Path) -> anyhow::Result<Report> {
     )))
 }
 
-/// Whether a finished `init` already left its marker at `marker`. Anything
-/// there other than a regular file is an error, because init would have to
-/// write through it or replace it.
+/// Whether a finished `init` already left its marker at `marker`. A regular
+/// file there counts only when it holds a marker this build reads (see
+/// [`check_marker`]). Anything else there is an error, because init would
+/// have to write through it or replace it.
 fn is_initialised(marker: &Path) -> anyhow::Result<bool> {
     match existing(marker)? {
         Existing::Missing => Ok(false),
-        Existing::File(_) => Ok(true),
+        Existing::File(seen) => {
+            check_marker(marker, &seen)?;
+            Ok(true)
+        }
         Existing::Symlink => bail!(
             "{} is a symbolic link; init never writes through a link. Remove it and run init \
              again",
@@ -94,6 +120,53 @@ fn is_initialised(marker: &Path) -> anyhow::Result<bool> {
             marker.display()
         ),
     }
+}
+
+/// Refuses the regular file at `marker`, which `seen` describes, unless it
+/// holds a marker this build reads (see [`check_marker_bytes`]). An empty or
+/// half-written file, or someone else's file of that name, is not a finished
+/// `init`, so it is refused rather than reported as one, and left as it is.
+fn check_marker(marker: &Path, seen: &Metadata) -> anyhow::Result<()> {
+    // Were the file swapped for a FIFO between the `lstat` and this `open`,
+    // the open would wait for a writer. That needs someone who can write the
+    // directory and costs a hung command, nothing more, so it is left at
+    // that, as the `--identity` argument's read does. `(mut file, _)` keeps
+    // the open file and drops its metadata, which nothing here needs.
+    let (mut file, _) = open_seen_file(marker, seen, OpenOptions::new().read(true))?;
+    // One byte past the cap is enough to tell that the file is too long,
+    // without reading a huge one. The crate's bounded read hands back a
+    // buffer that wipes itself; nothing here is secret, it simply comes so.
+    let bytes = read_up_to_cap(&mut file, MAX_MARKER_BYTES + 1)
+        .with_context(|| format!("could not read {}", marker.display()))?;
+    // `map_err` turns only the `Err` side into an `anyhow::Error`, adding the
+    // path; an `Ok(())` passes through untouched.
+    check_marker_bytes(&bytes).map_err(|fault| {
+        anyhow!(
+            "{} is not a Sweepky project marker ({fault}); move it away and run init again",
+            marker.display()
+        )
+    })
+}
+
+/// Checks that `bytes` are a marker this build reads: at most
+/// [`MAX_MARKER_BYTES`] long, JSON whose `schemaVersion` is at most 1, any
+/// other fields allowed. The `Err` says what is wrong, for the caller's
+/// message.
+///
+/// It never quotes `bytes`. serde_json's own messages can, so a parse error
+/// goes through core's `RecordError`, which keeps only the kind of fault and
+/// where it is, as every record parse does.
+fn check_marker_bytes(bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() > MAX_MARKER_BYTES {
+        return Err(format!(
+            "it is longer than the {MAX_MARKER_BYTES} bytes a marker may have"
+        ));
+    }
+    // `::<ProjectMarker>` (the "turbofish") names the type to parse into,
+    // since the result is only checked, never bound to a typed variable.
+    serde_json::from_slice::<ProjectMarker>(bytes)
+        .map(|_| ())
+        .map_err(|err| RecordError::from(err).to_string())
 }
 
 /// What was at a path, as `symlink_metadata` saw it.
@@ -135,6 +208,7 @@ fn existing(path: &Path) -> anyhow::Result<Existing> {
 fn marker_bytes() -> anyhow::Result<Vec<u8>> {
     let marker = ProjectMarker {
         schema_version: SchemaVersion::CURRENT,
+        extra: UnknownFields::new(),
     };
     let mut bytes = serde_json::to_vec(&marker).context("could not write the marker")?;
     bytes.push(b'\n');
@@ -180,7 +254,11 @@ fn ensure_gitignore(path: &Path) -> anyhow::Result<GitignoreChange> {
 /// Appends `sweeps/` to the existing regular file at `path` unless one of its
 /// lines already reads exactly that. Every existing byte is kept.
 fn append_sweeps_line(path: &Path, seen: &Metadata) -> anyhow::Result<GitignoreChange> {
-    let (mut file, opened) = open_seen_file(path, seen)?;
+    // `append(true)` sends every write to the end of the file, whatever the
+    // read position, so no existing byte can be overwritten; reading still
+    // starts at the beginning. Opening never truncates without `truncate`.
+    let (mut file, opened) =
+        open_seen_file(path, seen, OpenOptions::new().read(true).append(true))?;
 
     // Bytes, not a `String`: a `.gitignore` need not be UTF-8, and its other
     // lines are left exactly as they are.
@@ -206,34 +284,6 @@ fn append_sweeps_line(path: &Path, seen: &Metadata) -> anyhow::Result<GitignoreC
     Ok(GitignoreChange::Appended)
 }
 
-/// Opens the file at `path` to read and append, and checks it is the very
-/// file `seen` describes. Returns the open file and its own metadata.
-fn open_seen_file(path: &Path, seen: &Metadata) -> anyhow::Result<(File, Metadata)> {
-    // `append(true)` sends every write to the end of the file, whatever the
-    // read position, so no existing byte can be overwritten; reading still
-    // starts at the beginning. Opening never truncates without `truncate`.
-    let file = OpenOptions::new()
-        .read(true)
-        .append(true)
-        .open(path)
-        .with_context(|| format!("could not open {}", path.display()))?;
-
-    // `open` follows symlinks, so check that it opened the very file
-    // `symlink_metadata` looked at: same device, same inode. If the path was
-    // swapped for a link in between, the numbers differ and nothing is
-    // written.
-    let opened = file
-        .metadata()
-        .with_context(|| format!("could not inspect {}", path.display()))?;
-    if opened.dev() != seen.dev() || opened.ino() != seen.ino() {
-        bail!(
-            "{} changed while init was reading it; run init again",
-            path.display()
-        );
-    }
-    Ok((file, opened))
-}
-
 /// Whether one of the lines of `contents`, split on `\n`, reads exactly
 /// `sweeps/`.
 fn has_sweeps_line(contents: &[u8]) -> bool {
@@ -255,29 +305,69 @@ fn sweeps_line_after(contents: &[u8]) -> Vec<u8> {
     addition
 }
 
-/// Creates the file at `path` with `bytes`, failing if anything is already
-/// there (see the module comment on `create_new`).
+/// Creates the file at `path` with `bytes`, all or nothing, failing if
+/// anything is already there.
+///
+/// Opening `path` itself and writing into it would let a failed write (a full
+/// disk, say) leave an empty or half-written file under the real name, which
+/// the next run would refuse as not a marker or, cut off just before the
+/// final newline, take for a finished `init`. So the bytes go into a temp
+/// file beside it first, named by [`temp_path_beside`] (in the same
+/// directory, since a hard link cannot cross filesystems); see
+/// [`create_with`].
 fn write_new(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    let mut file = OpenOptions::new()
+    create_with(&temp_path_beside(path)?, path, bytes)
+}
+
+/// Creates `temp` with `bytes`, gives that finished file its real name,
+/// `path`, with a hard link, and removes the name `temp` again.
+///
+/// - `temp` is opened with `create_new` (see the module comment), so a file
+///   someone else left at that name is refused, and is neither reused nor
+///   removed.
+/// - [`write_synced`] waits until the bytes are on disk, and closes the file,
+///   before the link, so not even a crash can leave `path` naming a file
+///   without them.
+/// - `fs::hard_link` is `link(2)`: it adds a second name for the same file,
+///   and fails if anything at all is at `path`, a dangling symlink included,
+///   without following it. So, like `create_new`, it never replaces a file and
+///   never writes through a link, and `path` appears only once the file is
+///   whole. `rename` is one step too, but it would replace whatever is at
+///   `path`.
+///
+/// The name `temp` is removed whether the link worked or not, so a failure
+/// leaves the directory as it was. A filesystem without hard links, such as
+/// FAT, fails at the link, and nothing is created.
+fn create_with(temp: &Path, path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    let file = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(path)
-        .with_context(|| format!("could not create {}", path.display()))?;
-    file.write_all(bytes)
-        .with_context(|| format!("could not write {}", path.display()))?;
-    Ok(())
+        .open(temp)
+        .with_context(|| format!("could not create {}", temp.display()))?;
+    // `and_then` runs the link only when the write worked, so `linked` holds
+    // the first error, if any.
+    let linked = write_synced(temp, file, bytes).and_then(|()| {
+        fs::hard_link(temp, path).with_context(|| format!("could not create {}", path.display()))
+    });
+    // From the link on, `path` keeps the file by itself.
+    let removed =
+        fs::remove_file(temp).with_context(|| format!("could not remove {}", temp.display()));
+    // `and` keeps the first error: the write's or the link's when one failed
+    // (a failed removal then goes unreported, as in `private_fs`), otherwise
+    // the removal's, which names the stray file.
+    linked.and(removed)
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
     use std::fs;
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{MetadataExt, symlink};
     use std::path::{Path, PathBuf};
 
     use tempfile::TempDir;
 
-    use super::{GITIGNORE, MARKER, init};
+    use super::{GITIGNORE, MARKER, create_with, init, write_new};
 
     /// A new, empty directory `name` inside `temp`.
     fn project_dir(temp: &TempDir, name: &str) -> PathBuf {
@@ -322,10 +412,69 @@ mod tests {
             "sweeps/\n"
         );
 
+        // Each file was made through a temp file and a hard link, and the
+        // temp name is gone again, so each has the one name.
+        for name in [MARKER, GITIGNORE] {
+            let meta = fs::symlink_metadata(dir.join(name)).expect("lstat");
+            assert_eq!(meta.nlink(), 1, "{name}");
+        }
+
         // Nested directories are created too.
         let nested = temp.path().join("a").join("b");
         init(&nested).expect("init succeeds");
         assert_eq!(entries(&nested), names(&[MARKER, GITIGNORE]));
+    }
+
+    #[test]
+    fn a_new_file_is_created_whole_leaving_no_temp_file() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let dir = project_dir(&temp, "create");
+
+        write_new(&dir.join(MARKER), b"whole\n").expect("created");
+        assert_eq!(fs::read(dir.join(MARKER)).expect("read"), b"whole\n");
+        assert_eq!(entries(&dir), names(&[MARKER]));
+        let meta = fs::symlink_metadata(dir.join(MARKER)).expect("lstat");
+        assert_eq!(meta.nlink(), 1);
+    }
+
+    #[test]
+    fn a_failed_create_removes_its_temp_file_and_replaces_nothing() {
+        let temp = tempfile::tempdir().expect("temp dir");
+
+        // The link fails when a file is already at the target: that file
+        // keeps its bytes and the temp file is removed again.
+        let dir = project_dir(&temp, "taken");
+        let target = dir.join(MARKER);
+        fs::write(&target, "first\n").expect("write");
+        assert!(create_with(&dir.join("marker.tmp"), &target, b"second\n").is_err());
+        assert_eq!(fs::read_to_string(&target).expect("read"), "first\n");
+        assert_eq!(entries(&dir), names(&[MARKER]));
+
+        // A dangling symlink at the target counts as something there: the
+        // link is not followed, so nothing appears where it points, and it is
+        // left as it was.
+        let dir = project_dir(&temp, "dangling");
+        let target = dir.join(MARKER);
+        let nowhere = temp.path().join("nowhere");
+        symlink(&nowhere, &target).expect("symlink");
+        assert!(create_with(&dir.join("marker.tmp"), &target, b"never\n").is_err());
+        assert!(!nowhere.exists());
+        let meta = fs::symlink_metadata(&target).expect("lstat");
+        assert!(meta.file_type().is_symlink());
+        assert_eq!(entries(&dir), names(&[MARKER]));
+
+        // A temp name someone else already holds is refused by `create_new`
+        // before anything is written, and that file is not this run's to
+        // remove, so it stays, and no target appears.
+        let dir = project_dir(&temp, "temp-taken");
+        let temp_file = dir.join("marker.tmp");
+        fs::write(&temp_file, "someone else's\n").expect("write");
+        assert!(create_with(&temp_file, &dir.join(MARKER), b"never\n").is_err());
+        assert_eq!(
+            fs::read_to_string(&temp_file).expect("read"),
+            "someone else's\n"
+        );
+        assert_eq!(entries(&dir), names(&["marker.tmp"]));
     }
 
     #[test]
@@ -456,6 +605,71 @@ mod tests {
         fs::create_dir_all(dir.join(GITIGNORE)).expect("mkdir");
         assert!(init(&dir).is_err());
         assert_eq!(entries(&dir), names(&[GITIGNORE]));
+    }
+
+    #[test]
+    fn init_refuses_a_marker_that_is_not_a_marker() {
+        let temp = tempfile::tempdir().expect("temp dir");
+
+        // A regular `.sweepky` that is not the document init writes is not a
+        // finished init: an empty one, as a write cut short by a full disk
+        // left before markers were written all or nothing, a cut-off one,
+        // other JSON, a newer version and a file over the cap. Each is
+        // refused, left as it is, and nothing else is written. The planted
+        // word sits where serde_json's own message would quote it.
+        let too_long = format!("{{\"schemaVersion\":1,\"pad\":\"{}\"}}", "x".repeat(70_000));
+        let cases: [(&str, &[u8]); 8] = [
+            ("empty", b""),
+            ("cut-off", b"{\"schemaVersion\":"),
+            ("not-json", b"PLANTED-7f3a\n"),
+            ("not-an-object", b"[\"PLANTED-7f3a\"]\n"),
+            ("no-version", b"{\"name\":\"PLANTED-7f3a\"}\n"),
+            ("wrong-type", b"{\"schemaVersion\":\"PLANTED-7f3a\"}\n"),
+            ("newer", b"{\"schemaVersion\":2}\n"),
+            ("too-long", too_long.as_bytes()),
+        ];
+        for (name, contents) in cases {
+            let dir = project_dir(&temp, name);
+            fs::write(dir.join(MARKER), contents).expect("write");
+            let err = init(&dir).expect_err(name);
+            let message = format!("{err:#}");
+            assert!(
+                message.contains(&dir.join(MARKER).display().to_string()),
+                "{name}: {message}"
+            );
+            assert!(
+                message.contains("is not a Sweepky project marker"),
+                "{name}: {message}"
+            );
+            assert!(!message.contains("PLANTED"), "{name}: {message}");
+            assert!(!message.contains("already"), "{name}: {message}");
+            assert_eq!(
+                fs::read(dir.join(MARKER)).expect("read"),
+                contents,
+                "{name}"
+            );
+            assert_eq!(entries(&dir), names(&[MARKER]), "{name}");
+        }
+    }
+
+    #[test]
+    fn init_accepts_a_marker_a_newer_sweepky_added_fields_to() {
+        let temp = tempfile::tempdir().expect("temp dir");
+
+        // Later phases add fields to the marker the way records grow, so a
+        // marker with fields this build does not know, pretty-printed or not,
+        // still means a finished init. Nothing changes.
+        let dir = project_dir(&temp, "newer-fields");
+        let marker: &[u8] = b"{\n  \"schemaVersion\": 1,\n  \"addedLater\": {\"x\": [1]}\n}\n";
+        fs::write(dir.join(MARKER), marker).expect("write");
+        let report = init(&dir).expect("init succeeds");
+        assert!(
+            report.text().contains("already initialised"),
+            "{}",
+            report.text()
+        );
+        assert_eq!(fs::read(dir.join(MARKER)).expect("read"), marker);
+        assert_eq!(entries(&dir), names(&[MARKER]));
     }
 
     #[test]
