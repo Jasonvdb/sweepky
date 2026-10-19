@@ -50,7 +50,8 @@
 //!   `Pubky` and the SDK's `PublicKey`.
 //! - `display`, the terminal sanitiser: a stranger's text with its control,
 //!   bidi and invisible characters written as visible `\u{..}` escapes, cut
-//!   to a length.
+//!   to a length; a multi-line form that keeps newlines and tabs; and where
+//!   either would first change a text.
 //! - `login --identity <name>` (`login`): creates or reuses a dedicated
 //!   identity, signs it up on its homeserver the first time, signs in,
 //!   runs the shared tail on this install's first login, records the login
@@ -126,6 +127,11 @@
 //!   address included, the `ResolveHost` seam, over the system resolver,
 //!   and `HttpsRemote`, the `https://<repo>` remote that git's network
 //!   commands take, made only for a host whose every address is public.
+//! - `post`, its first half: the bounty draft (`post <draft.json>`), read
+//!   with a cap and checked as strictly as a stranger's record, its public
+//!   text held to what the sanitiser prints unchanged; and the bounty built
+//!   from it, every target checked against the target policy and then
+//!   pinned through the context's target source.
 //!
 //! The rules that hold for everything here (see "Rust conventions" in
 //! `docs/plan/03-cli-and-skill.md`):
@@ -199,6 +205,8 @@ mod network;
 // `--passphrase-file` and the one way every secret file is written and read,
 // wrapped with that passphrase or plain.
 mod passphrase;
+// `post`: the bounty draft, checked and pinned into the bounty it publishes.
+mod post;
 // Owner-only files and directories, which every secret and state file goes
 // through.
 mod private_fs;
