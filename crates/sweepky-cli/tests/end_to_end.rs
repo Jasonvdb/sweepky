@@ -171,8 +171,11 @@ fn identity_seed(key_file: &Path) -> Zeroizing<[u8; 32]> {
         .and_then(|rest| rest.strip_suffix(b"\n"))
         .expect("a v1 identity file");
     assert_eq!(hex.len(), 64, "a 32-byte seed");
+    // `as_chunks::<2>()` views the digits as pairs typed `[u8; 2]`, each one
+    // byte of the seed, plus a remainder, which is empty because 64 is even.
+    let (pairs, _remainder) = hex.as_chunks::<2>();
     let mut seed = Zeroizing::new([0_u8; 32]);
-    for (byte, pair) in seed.iter_mut().zip(hex.chunks_exact(2)) {
+    for (byte, pair) in seed.iter_mut().zip(pairs) {
         let digits = std::str::from_utf8(pair).expect("hex digits");
         *byte = u8::from_str_radix(digits, 16).expect("hex digits");
     }

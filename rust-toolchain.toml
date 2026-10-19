@@ -1,10 +1,18 @@
 # rustup reads this file and uses the toolchain it names for every cargo and
 # rustc command run inside the repository, locally and in CI.
 [toolchain]
-# Plain `stable`, not a pinned release: rustup uses the stable toolchain the
-# machine has installed (`rustup update` moves it to the newest release), or
-# installs the current one if there is none. Edition 2024 needs 1.85 or later.
-channel = "stable"
+# A pinned release, not plain `stable`. With `stable`, CI used whatever release
+# was newest on the day it ran while this machine kept the one it had, so a
+# clippy lint added in a newer release could fail CI's `-D warnings` gate with
+# nothing in the repository changed. Pinned, CI and local runs use the same
+# compiler and the same clippy, and a new lint arrives only when someone moves
+# the pin on purpose.
+#
+# To move it: change the version here, run each job's `run:` commands from
+# .github/workflows/ci.yml locally (rustup installs the new release on first
+# use), fix what they report, and update the Tooling line in
+# docs/plan/03-cli-and-skill.md in the same change.
+channel = "1.96.0"
 # `minimal` installs only rustc, cargo and rust-std; rustfmt and clippy, which
 # the fmt and clippy gates run, are added by name.
 profile = "minimal"
