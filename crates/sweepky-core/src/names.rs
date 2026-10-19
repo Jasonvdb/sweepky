@@ -151,7 +151,8 @@ fn check_playbook_revision(revision: &str) -> Result<(), &'static str> {
 /// Two ids that differ only in case, `t1` and `T1`, are different values here
 /// but the same directory on a case-insensitive filesystem, which is macOS's
 /// default. Code that makes a directory per target must refuse a bounty whose
-/// ids collide that way.
+/// ids collide that way; [`eq_ignore_ascii_case`](Self::eq_ignore_ascii_case)
+/// finds them.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String")]
 pub struct TargetId(String);
@@ -159,6 +160,16 @@ pub struct TargetId(String);
 impl TargetId {
     /// The longest id accepted: 32 characters.
     pub const MAX_LEN: usize = 32;
+
+    /// Whether the two ids are equal when ASCII case is ignored, as `t1` and
+    /// `T1` are: one directory on a case-insensitive filesystem.
+    // A target id is ASCII only, and on ASCII text Unicode's case folding,
+    // which a case-insensitive filesystem applies, only maps `A`-`Z` to
+    // `a`-`z`. So ignoring ASCII case finds every pair of ids such a
+    // filesystem treats as one name. Not constant-time; ids are public.
+    pub fn eq_ignore_ascii_case(&self, other: &Self) -> bool {
+        self.0.eq_ignore_ascii_case(&other.0)
+    }
 
     fn check(value: &str) -> Result<(), RecordError> {
         check_segment_id(
@@ -319,8 +330,9 @@ fn is_lower_hex(value: &str) -> bool {
 ///
 /// - a host in lower-case DNS form: two or more `.`-separated labels of
 ///   `a-z`, `0-9` and `-`, each 1 to 63 characters, none starting or ending
-///   with `-`, and the last not all digits, so an IPv4 address such as
-///   `127.0.0.1` cannot stand in for a host;
+///   with `-`, and the last not starting with a digit, so an IPv4 address in
+///   any form a resolver accepts (`127.0.0.1`, or a hex or mixed one such as
+///   `127.0x1`) cannot stand in for a host;
 /// - then `/` and one or more `/`-separated segments of `A-Z`, `a-z`, `0-9`,
 ///   `.`, `_` and `-`, none of them empty, `.` or `..`, or starting with `-`.
 ///   So there is no trailing `/`.
@@ -386,9 +398,17 @@ fn check_host(host: &str) -> Result<(), &'static str> {
     for label in host.split('.') {
         check_host_label(label)?;
     }
-    // Every label is non-empty by now, so `all` here never sees an empty one.
-    if last_label.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err("has a host whose last label is all digits, such as an IP address");
+    // A URL parser or the system resolver may read a host written as numbers
+    // as an IPv4 address: decimal (`127.0.0.1`), hex (`127.0x1`,
+    // `0x7f.0x0.0x0.0x1`) or octal parts, and fewer than four of them too
+    // (`127.1`); the WHATWG URL parser looks at the last label alone. In
+    // every such form the last label starts with a digit, and no top-level
+    // domain does (RFC 1123, section 2.1, expects it to be alphabetic), so
+    // this one rule closes every numeric form and refuses no real host.
+    if last_label.starts_with(|c: char| c.is_ascii_digit()) {
+        return Err(
+            "has a host whose last label starts with a digit, which a resolver may read as an IP address",
+        );
     }
     Ok(())
 }
@@ -780,6 +800,19 @@ mod tests {
     }
 
     #[test]
+    fn target_ids_that_differ_only_in_case_are_equal_ignoring_ascii_case() {
+        // One directory on a case-insensitive filesystem, so `run` must be
+        // able to tell that `t1` and `T1` collide.
+        let id = |text: &str| text.parse::<TargetId>().unwrap();
+        let (lower, upper, other) = (id("t1"), id("T1"), id("t2"));
+        assert!(lower.eq_ignore_ascii_case(&upper));
+        assert!(upper.eq_ignore_ascii_case(&lower));
+        assert!(!lower.eq_ignore_ascii_case(&other));
+        // `==` still compares the exact spelling.
+        assert_ne!(lower, upper);
+    }
+
+    #[test]
     fn git_shas_are_full_lower_case_hex() {
         assert_accepted(SHA1, GitSha::as_str);
         assert_accepted(SHA256, GitSha::as_str);
@@ -875,6 +908,34 @@ mod tests {
             assert_rejected::<RepoName>(value, "repo name");
         }
         assert_names_limit::<RepoName>(&too_long, RepoName::MAX_LEN);
+    }
+
+    #[test]
+    fn a_host_a_resolver_could_read_as_ipv4_is_refused_without_quoting_it() {
+        // Hex and mixed IPv4 forms, which a URL parser or `inet_aton` reads
+        // as an address, and a last label that merely starts with a digit.
+        for value in [
+            "127.0x1/org/name",
+            "0x7f.0x0.0x0.0x1/org/name",
+            "10.0.0.0xa/org/name",
+            "example.9lives/org/name",
+        ] {
+            assert_rejected::<RepoName>(value, "repo name");
+            let err = value.parse::<RepoName>().unwrap_err();
+            let (host, _) = value.split_once('/').unwrap();
+            for printed in [err.to_string(), format!("{err:?}")] {
+                assert!(printed.contains("starts with a digit"), "{printed}");
+                assert!(!printed.contains(host), "{printed}");
+            }
+        }
+        // A digit elsewhere in the host is still fine.
+        for value in [
+            "example.invalid/org/name",
+            "github.com/org/name",
+            "git.example-1.org/a/b",
+        ] {
+            assert_accepted(value, RepoName::as_str);
+        }
     }
 
     #[test]
