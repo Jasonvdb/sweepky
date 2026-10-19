@@ -92,13 +92,6 @@ pub(crate) trait PublicRecords {
     /// record whose id is at or below it ends the listing, and is not in it
     /// (`remote::ListOrder::NewestFirst`). `None` lists the whole
     /// directory, newest first.
-    // No caller outside the tests yet, so outside them the compiler would
-    // warn that the method is never used. `expect` (not `allow`) silences
-    // that only while it is true: `pull`, its first caller, must remove it.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "pull, its first caller, comes in a later step")
-    )]
     async fn list_newest_first(
         &self,
         owner: Pubky,
@@ -112,10 +105,6 @@ pub(crate) trait PublicRecords {
     /// body. [`Conditional::Absent`] when there is no such file. As for
     /// [`get_record`](Self::get_record), `path` comes from
     /// `sweepky_core::paths`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "pull, its first caller, comes in a later step")
-    )]
     async fn get_record_if_changed(
         &self,
         owner: Pubky,
@@ -126,6 +115,9 @@ pub(crate) trait PublicRecords {
     /// The encrypted package of `sweep`, `sweeps/<id>.age` of its sweeper,
     /// at most [`MAX_CIPHERTEXT_BYTES`](sweepky_core::MAX_CIPHERTEXT_BYTES),
     /// or `None` when there is none.
+    // No caller outside the tests yet, so outside them the compiler would
+    // warn that the method is never used. `expect` (not `allow`) silences
+    // that only while it is true: `pull`, its first caller, must remove it.
     #[cfg_attr(
         not(test),
         expect(dead_code, reason = "pull, its first caller, comes in a later step")
@@ -208,7 +200,7 @@ pub(crate) trait PublicRecords {
 /// The message for bytes at `path` of `owner` that are not a `kind`
 /// record: the path and the owner, which this build built and checked, and
 /// never the bytes. Core's `RecordError` follows it as the cause.
-fn not_a_record(kind: &str, path: &str, owner: Pubky) -> String {
+pub(crate) fn not_a_record(kind: &str, path: &str, owner: Pubky) -> String {
     format!("{path} of {owner} is not a {kind} record this build reads")
 }
 

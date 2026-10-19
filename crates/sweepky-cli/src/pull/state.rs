@@ -59,9 +59,10 @@
 //!
 //! **What the poll state holds came from other people's records.** A
 //! status is an open string, and credits and targets are lists, so a
-//! summary is as long as its record makes it. The cap keeps the file
-//! finite; `pull` bounds how many summaries it keeps, and what a record
-//! may carry into one, so that strangers' records cannot fill it.
+//! summary is as long as its record makes it. `pull` bounds how many
+//! records it reads a run and what a record may carry into a summary
+//! (`pull::roster`), so that one run cannot fill it; the cap keeps the file
+//! finite, and is the backstop for how many summaries it holds.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -261,6 +262,19 @@ impl BountySummary {
             extra: UnknownFields::new(),
         }
     }
+
+    /// Brings this summary up to date with `bounty`, read again with the
+    /// new tag `etag`, keeping the fields a newer Sweepky wrote here.
+    pub(crate) fn update(&mut self, bounty: &Bounty, etag: Option<ETag>) {
+        // `..Self::new(..)` fills in every field not named before it, so a
+        // field added to the summary later is filled in here too.
+        // `mem::take` moves the map out and leaves an empty one in its
+        // place, so nothing is copied.
+        *self = Self {
+            extra: std::mem::take(&mut self.extra),
+            ..Self::new(bounty, etag)
+        };
+    }
 }
 
 /// What `pull` keeps of a sweep record between runs: what it sweeps
@@ -294,6 +308,17 @@ impl SweepSummary {
             pulled: false,
             extra: UnknownFields::new(),
         }
+    }
+
+    /// Brings this summary up to date with `sweep`, read again with the new
+    /// tag `etag`, keeping whether its package was pulled and the fields a
+    /// newer Sweepky wrote here.
+    pub(crate) fn update(&mut self, sweep: &Sweep, etag: Option<ETag>) {
+        *self = Self {
+            pulled: self.pulled,
+            extra: std::mem::take(&mut self.extra),
+            ..Self::new(sweep, etag)
+        };
     }
 }
 
@@ -711,6 +736,49 @@ mod tests {
         let mut expected = file;
         expected["owners"][owner.to_string()]["sweeps"][sweep.to_string()]["pulled"] = json!(true);
         assert_eq!(raw(&dirs.poll_state_file()), expected);
+    }
+
+    #[test]
+    fn an_update_takes_the_record_s_fields_and_keeps_pulled_and_unknown_fields() {
+        let bounty = BountyRef {
+            owner: random_pubky(),
+            id: record_id(10),
+        };
+        let sweeper = random_pubky();
+        // Summaries as a newer Sweepky could have written them.
+        let mut bounty_summary: BountySummary = serde_json::from_value(json!({
+            "status": "open", "open": true, "credits": [], "etag": "\"b-1\"", "seen": "kept",
+        }))
+        .expect("a summary");
+        let mut sweep_summary: SweepSummary = serde_json::from_value(json!({
+            "bounty": bounty.to_string(), "targets": ["t1"], "status": "running",
+            "etag": "\"s-1\"", "pulled": true, "progress": "kept",
+        }))
+        .expect("a summary");
+
+        let mut done = bounty_json(json!([repo_target_json("t1")]));
+        done["status"] = json!("done");
+        done["credits"] = json!([sweeper.to_string()]);
+        let done = Bounty::from_json(&json_bytes(&done)).expect("a bounty");
+        bounty_summary.update(&done, Some(tag("\"b-2\"")));
+        assert_eq!(
+            serde_json::to_value(&bounty_summary).expect("JSON"),
+            json!({
+                "status": "done", "open": false, "credits": [sweeper.to_string()],
+                "etag": "\"b-2\"", "seen": "kept",
+            })
+        );
+
+        let finished = sweep_json(bounty, &["t1", "t2"], "done");
+        let finished = Sweep::from_json(&json_bytes(&finished)).expect("a sweep");
+        sweep_summary.update(&finished, None);
+        assert_eq!(
+            serde_json::to_value(&sweep_summary).expect("JSON"),
+            json!({
+                "bounty": bounty.to_string(), "targets": ["t1", "t2"], "status": "done",
+                "etag": null, "pulled": true, "progress": "kept",
+            })
+        );
     }
 
     #[test]

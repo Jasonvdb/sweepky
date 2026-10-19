@@ -508,13 +508,6 @@ pub(crate) enum Conditional {
     /// A 2xx: the record as it is now, at most
     /// [`MAX_RECORD_BYTES`], and the tag to send next time, when the
     /// answer gave one [`ETag::parse`] accepts.
-    // Outside the tests nothing reads the fields yet, so the compiler would
-    // warn. `expect` (not `allow`) silences that only while it is true:
-    // `pull`, the first reader, must remove it.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "pull, the first reader, comes in a later step")
-    )]
     Changed {
         /// The record's bytes.
         body: Zeroizing<Vec<u8>>,

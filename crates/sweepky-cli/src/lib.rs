@@ -297,11 +297,12 @@ mod pins;
 // `post`: the bounty draft, checked and pinned into a bounty, shown, and
 // published once the owner says yes.
 mod post;
-// `pull`: so far only the local state it keeps between runs, whose feed
-// cursors `post --open` already writes. The command comes in a later step,
-// so outside the tests most of the module is unused yet and the compiler
-// would warn of dead code. `expect` (not `allow`) silences that only while
-// it is true: the step that wires the command in must remove it.
+// `pull`: so far the local state it keeps between runs, whose feed cursors
+// `post --open` already writes, and the roster polling with its homeserver
+// lookups. The command comes in a later step, so outside the tests most of
+// the module is unused yet and the compiler would warn of dead code.
+// `expect` (not `allow`) silences that only while it is true: the step that
+// wires the command in must remove it.
 #[cfg_attr(
     not(test),
     expect(

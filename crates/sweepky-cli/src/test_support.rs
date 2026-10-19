@@ -6,7 +6,8 @@
 //! what it writes to standard error, the [`GitEnv`] the tests run git with
 //! and the inert fixture repository they run it against, a
 //! [`FakeResolver`] in place of DNS and the [`checked_remote`] made
-//! through it, a [`RecordingGit`] in place of git, a [`FakeGitHub`] in
+//! through it, a [`FakeHomeservers`] in place of pkarr's homeserver
+//! records, a [`RecordingGit`] in place of git, a [`FakeGitHub`] in
 //! place of GitHub's API, the fixture source over
 //! that repository ([`fixture_targets`]) and the SHAs `fixtures/README.md`
 //! records for it, a [`FakeKeyStore`] in place of a homeserver's `keys/`, a
@@ -53,6 +54,7 @@ use crate::device::{KeyIds, KeyStore, PublicKeys};
 use crate::events::EventsFeed;
 use crate::git::{AllowedProtocols, GitCommand, GitFailed, RunGit, git_argv};
 use crate::own_storage::OwnStorage;
+use crate::pull::resolve::ResolveHomeserver;
 use crate::records::PublicRecords;
 use crate::remote::{Conditional, ETag, ListOrder, Listing, ListingError};
 use crate::sweep_state::SweepSnapshot;
@@ -624,6 +626,8 @@ pub(crate) struct FakePublicRecords {
     files: BTreeMap<(Pubky, String), Vec<u8>>,
     broken_listings: BTreeSet<(Pubky, String)>,
     asked: Mutex<Vec<(Pubky, String)>>,
+    /// Every conditional read, with the tag it sent.
+    conditional: Mutex<Vec<(Pubky, String, Option<ETag>)>>,
 }
 
 impl FakePublicRecords {
@@ -633,6 +637,19 @@ impl FakePublicRecords {
     pub(crate) fn with_file(mut self, owner: Pubky, path: &str, bytes: Vec<u8>) -> Self {
         self.files.insert((owner, path.to_owned()), bytes);
         self
+    }
+
+    /// The same fake, with nothing at `path` of `owner`'s storage any more,
+    /// as after its owner deleted it.
+    pub(crate) fn without_file(mut self, owner: Pubky, path: &str) -> Self {
+        self.files.remove(&(owner, path.to_owned()));
+        self
+    }
+
+    /// The owner, the path and the tag sent of every conditional read so
+    /// far, in order. Each is in [`asked`](Self::asked) too.
+    pub(crate) fn conditional_asked(&self) -> Vec<(Pubky, String, Option<ETag>)> {
+        self.conditional.lock().expect("lock").clone()
     }
 
     /// The same fake, holding `record` as JSON at `path` of `owner`'s
@@ -734,6 +751,10 @@ impl PublicRecords for FakePublicRecords {
         path: &str,
         etag: Option<&ETag>,
     ) -> anyhow::Result<Conditional> {
+        self.conditional
+            .lock()
+            .expect("lock")
+            .push((owner, path.to_owned(), etag.cloned()));
         let Some(bytes) = self.file(owner, path) else {
             return Ok(Conditional::Absent);
         };
@@ -1259,6 +1280,71 @@ impl ResolveHost for FakeResolver {
         self.answer
             .clone()
             .ok_or_else(|| anyhow::anyhow!(FAKE_LOOKUP_TEXT))
+    }
+}
+
+/// The homeserver every key is at in a [`FakeHomeservers`] that was given
+/// no answers for it.
+pub(crate) const FAKE_HOMESERVER: Pubky = Pubky::from_bytes([9; 32]);
+
+/// How a [`FakeHomeservers`] answers one lookup of a key.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum FakeLookup {
+    /// The key's pkarr record names this homeserver.
+    At(Pubky),
+    /// The key has no pkarr record, or one that names no homeserver.
+    NoRecord,
+    /// The lookup fails, with [`FAKE_LOOKUP_TEXT`].
+    Fails,
+}
+
+/// A [`ResolveHomeserver`] in place of pkarr: each key's lookups are
+/// answered in the order a test gave, the last one again for every lookup
+/// after it, and a key given no answers is at [`FAKE_HOMESERVER`]. It keeps
+/// every key it was asked for, in order. The `Mutex` is there for the same
+/// reason as in [`FakeKeyStore`].
+#[derive(Default)]
+pub(crate) struct FakeHomeservers {
+    answers: BTreeMap<Pubky, Vec<FakeLookup>>,
+    asked: Mutex<Vec<Pubky>>,
+}
+
+impl FakeHomeservers {
+    /// The same fake, answering the lookups of `user` with `answers`, in
+    /// order.
+    pub(crate) fn with_answers(mut self, user: Pubky, answers: &[FakeLookup]) -> Self {
+        self.answers.insert(user, answers.to_vec());
+        self
+    }
+
+    /// Every key looked up so far, in order.
+    pub(crate) fn asked(&self) -> Vec<Pubky> {
+        self.asked.lock().expect("lock").clone()
+    }
+
+    /// How many times `user` was looked up so far.
+    pub(crate) fn times_asked(&self, user: Pubky) -> usize {
+        self.asked().iter().filter(|&&asked| asked == user).count()
+    }
+}
+
+impl ResolveHomeserver for FakeHomeservers {
+    async fn homeserver_of(&self, user: Pubky) -> anyhow::Result<Option<Pubky>> {
+        let earlier = self.times_asked(user);
+        self.asked.lock().expect("lock").push(user);
+        let answer = match self.answers.get(&user) {
+            None => FakeLookup::At(FAKE_HOMESERVER),
+            // The answer for this lookup, or the last one once they run out.
+            Some(answers) => *answers
+                .get(earlier)
+                .or(answers.last())
+                .expect("at least one answer"),
+        };
+        match answer {
+            FakeLookup::At(homeserver) => Ok(Some(homeserver)),
+            FakeLookup::NoRecord => Ok(None),
+            FakeLookup::Fails => Err(anyhow::anyhow!(FAKE_LOOKUP_TEXT)),
+        }
     }
 }
 

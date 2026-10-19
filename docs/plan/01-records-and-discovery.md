@@ -123,8 +123,8 @@ The CLI writes the scope as a small `scope.json` in the sweep directory. Cloudfl
 
 **Circle.** Poll each roster member's `/pub/sweepky/` every 30–60 s:
 
-- Resolve each member's homeserver once, cache it, and re-resolve hourly or on failure. The pkarr relay is rate-limited per IP.
-- List `bounties/`, `sweeps/` and `keys/` with `reverse=true` and an explicit limit, paging by cursor until an id already seen. The default page is 100 entries and `sweeps/` holds two files per sweep, so an unpaged list silently stops at 50 sweeps. A 404 on a listing means the directory is empty, not that the member is unreachable.
+- Resolve each member's homeserver once, cache it, and re-resolve hourly or on failure. The pkarr relay is rate-limited per IP. A one-shot `pull` resolves each key once per run, and once more after a read of it fails; re-resolving hourly is for a poller that keeps running, such as the board.
+- `pull` lists `bounties/` and `sweeps/` with `reverse=true` and an explicit limit, paging by cursor until an id already seen. The default page is 100 entries and `sweeps/` holds two files per sweep, so an unpaged list silently stops at 50 sweeps. A 404 on a listing means the directory is empty, not that the member is unreachable. `keys/` is read where it is used: `pull` reads the owner's own for the alarm, and `submit` reads a bounty owner's to encrypt to.
 - A listing returns names only, so a status change inside a record needs a re-GET. Re-fetch only records that can still change: open bounties and `running` sweeps, with `If-None-Match`, so unchanged records answer 304.
 - Credits ride on the bounty records, so reputation needs no extra fetch. For a circle of under ~30 this stays cheap, and a sweep takes an hour, so 30 s is live.
 
