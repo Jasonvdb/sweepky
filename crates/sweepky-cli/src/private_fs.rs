@@ -13,7 +13,8 @@
 //!   same kind of buffer. It is for the files a user's argument names
 //!   (`--identity`, `--passphrase-file`), which are not Sweepky's own, so
 //!   each caller makes its own checks before it reads.
-//! - [`remove_private_file`] deletes one, a missing file counting as success.
+//! - [`remove_private_file`] deletes one, then syncs the directory, a
+//!   missing file counting as success.
 //! - [`lstat`] says what is at a path, a link itself rather than what it
 //!   points at, or `None` when nothing is.
 //! - [`open_private_lock_file`] opens the writers' lock file, creating it
@@ -179,7 +180,8 @@ fn replace_with(temp: &Path, target: &Path, bytes: &[u8]) -> anyhow::Result<()> 
 }
 
 /// Waits until the directory that holds `path` is on disk, so the name a
-/// rename just gave `path` survives a crash.
+/// rename just gave `path`, or the unlink that just took it away, survives a
+/// crash.
 ///
 /// [`write_synced`]'s `sync_all` on the temp file makes its bytes durable,
 /// not the directory entry that names it. On filesystems that keep the two
@@ -188,7 +190,7 @@ fn replace_with(temp: &Path, target: &Path, bytes: &[u8]) -> anyhow::Result<()> 
 /// `login`'s signup, say, or once a device key is published). An `fsync` on
 /// a handle to the directory itself, which Linux and macOS both allow, closes
 /// that gap. Its failure is an error, never ignored, for the same reason: the
-/// caller is about to rely on the file.
+/// caller is about to rely on the file, or on its being gone.
 ///
 /// The directory is opened read-only, which is all a sync needs, and only
 /// once an `lstat` has shown a real directory at its path
@@ -200,18 +202,23 @@ pub(crate) fn sync_parent(path: &Path) -> anyhow::Result<()> {
     let dir = parent_dir(path)?;
     let Some(seen) = lstat(dir)? else {
         bail!(
-            "{} is gone, so Sweepky could not make sure {} is saved; check it and try again",
+            "{} is gone, so Sweepky could not make sure the change to {} is saved; check it and \
+             try again",
             dir.display(),
             path.display()
         );
     };
-    refuse_unless_dir(dir, &seen)
-        .with_context(|| format!("could not make sure {} is saved", path.display()))?;
+    refuse_unless_dir(dir, &seen).with_context(|| {
+        format!(
+            "could not make sure the change to {} is saved",
+            path.display()
+        )
+    })?;
     let (handle, _) = open_seen_file(dir, &seen, OpenOptions::new().read(true))?;
     handle.sync_all().with_context(|| {
         format!(
-            "{} is written, but its directory {} could not be synced to disk, so a crash could \
-             still lose it",
+            "the change to {} is made, but its directory {} could not be synced to disk, so a \
+             crash could still undo it",
             path.display(),
             dir.display()
         )
@@ -468,16 +475,29 @@ pub(crate) fn read_up_to_cap(file: &mut File, cap: usize) -> io::Result<Zeroizin
     Ok(bytes)
 }
 
-/// Deletes the file at `path`. Nothing there counts as success, so `logout`
-/// can tidy up after a login that left only some of its files.
+/// Deletes the file at `path`, then syncs the directory that held it
+/// ([`sync_parent`]). Nothing there counts as success, so `logout` can tidy
+/// up after a login that left only some of its files.
 ///
 /// A symlink at `path` is removed itself; `unlink` never follows it to the
-/// file it points at. The bytes are not overwritten first: on SSDs and
-/// copy-on-write filesystems an overwrite need not reach the old blocks, so
-/// it would promise more than it does.
+/// file it points at. The unlink changes the directory, not the file, and
+/// like a rename it is durable only once the directory is synced: without
+/// the sync, a power loss just after `logout` reported an identity secret
+/// forgotten could bring the file back. A missing file changed nothing, so
+/// nothing is synced. A failed sync is an error, with the file already gone,
+/// because the caller must not report a deletion it cannot vouch for.
+///
+/// The bytes are not overwritten first: on SSDs and copy-on-write
+/// filesystems an overwrite need not reach the old blocks, so it would
+/// promise more than it does.
 pub(crate) fn remove_private_file(path: &Path) -> anyhow::Result<()> {
     match fs::remove_file(path) {
-        Ok(()) => Ok(()),
+        Ok(()) => sync_parent(path).with_context(|| {
+            format!(
+                "{} is deleted, but Sweepky could not make sure it stays deleted",
+                path.display()
+            )
+        }),
         Err(err) if err.kind() == ErrorKind::NotFound => Ok(()),
         Err(err) => Err(err).with_context(|| format!("could not delete {}", path.display())),
     }
@@ -942,5 +962,29 @@ mod tests {
         remove_private_file(&path).expect("removed");
         assert!(fs::symlink_metadata(&path).is_err());
         remove_private_file(&path).expect("and again");
+    }
+
+    #[test]
+    fn removal_is_refused_at_the_sync_when_its_directory_is_a_link() {
+        let temp = private_temp();
+        let real = temp.path().join("real");
+        ensure_private_dir(&real).expect("created");
+        write_private_file(&real.join("device.key"), b"key").expect("written");
+        let link = temp.path().join("link");
+        symlink(&real, &link).expect("symlink");
+        let through_link = link.join("device.key");
+
+        // The unlink resolves the link, as every path lookup does, but the
+        // directory sync after it refuses the link rather than follow it. So
+        // the file is gone, and the error says the deletion is not known to
+        // be on disk.
+        let err = remove_private_file(&through_link).expect_err("the sync refuses a link");
+        assert!(format!("{err:#}").contains("is deleted"), "{err:#}");
+        assert!(format!("{err:#}").contains("symbolic link"), "{err:#}");
+        assert!(fs::symlink_metadata(real.join("device.key")).is_err());
+
+        // A second removal finds nothing there, so nothing changed and
+        // nothing is synced: the link is never looked at.
+        remove_private_file(&through_link).expect("missing is fine");
     }
 }
