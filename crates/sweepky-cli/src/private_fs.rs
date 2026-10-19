@@ -22,7 +22,8 @@
 //! - [`temp_path_beside`], [`write_synced`], [`open_seen_file`] and
 //!   [`sync_parent`] are steps the functions above are built from. `init`
 //!   uses them too, for the files it writes into a project, which are not
-//!   private.
+//!   private, and `run` uses [`write_synced`] and [`refuse_unless_dir`] for
+//!   a sweep's directory and files.
 //!
 //! The rules, and why:
 //!
@@ -123,7 +124,8 @@ fn check_private_dir(path: &Path, meta: &Metadata) -> anyhow::Result<()> {
 
 /// Refuses `path` unless `meta`, its `lstat`, is a directory: a symlink there,
 /// dangling or not, is refused, as is anything else that is not a directory.
-fn refuse_unless_dir(path: &Path, meta: &Metadata) -> anyhow::Result<()> {
+/// `run` checks a project's `sweeps/` with it too.
+pub(crate) fn refuse_unless_dir(path: &Path, meta: &Metadata) -> anyhow::Result<()> {
     let kind = meta.file_type();
     if kind.is_symlink() {
         bail!(

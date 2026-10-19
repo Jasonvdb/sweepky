@@ -141,15 +141,20 @@
 //! - `records`, `PublicRecords`: the seam through which `run` reads
 //!   anyone's public bounty, circle and sweep records, with no session,
 //!   each capped and parsed by core, with a fake for the unit tests.
-//! - `run`, so far its checking half: the `init` project it must be run
-//!   in, its marker read through `init`'s own reader with the playbook a
-//!   later `init` records; the bounty's `pubky://` URL, anything else
-//!   refused unquoted; whether this sweeper may run the bounty (status
-//!   `open`, then `open: true` or the owner's own circle listing the
-//!   sweeper, or with `--circle` both in that circle); which targets it
-//!   sweeps (every one this build can, or `--target`'s, case-colliding ids
-//!   and the target policy refused); and what it shows of the bounty, its
-//!   title and focus sanitised and never its brief.
+//! - `run`, so far its checking half and its fetching half: the `init`
+//!   project it must be run in, its marker read through `init`'s own
+//!   reader with the playbook a later `init` records; the bounty's
+//!   `pubky://` URL, anything else refused unquoted; whether this sweeper
+//!   may run the bounty (status `open`, then `open: true` or the owner's
+//!   own circle listing the sweeper, or with `--circle` both in that
+//!   circle); which targets it sweeps (every one this build can, or
+//!   `--target`'s, case-colliding ids and the target policy refused); what
+//!   it shows of the bounty, its title and focus sanitised and never its
+//!   brief; and the fetch: each target by its exact SHA, at depth 2, into
+//!   `./sweeps/<id>/target/<tid>/`, links checked out as plain files, the
+//!   agent-instruction files stripped at every depth and in any case, and
+//!   `scope.json` and `brief.md` written beside them, the half-made sweep
+//!   directory removed if any step fails.
 //!
 //! The rules that hold for everything here (see "Rust conventions" in
 //! `docs/plan/03-cli-and-skill.md`):
@@ -243,7 +248,8 @@ mod records;
 // anyone's public records and the listing.
 mod remote;
 // `run`: so far its checking half, the init project it needs, the bounty
-// URL, whether this sweeper may run the bounty and which targets it sweeps.
+// URL, whether this sweeper may run the bounty and which targets it sweeps,
+// and its fetching half, the targets fetched, stripped and scoped.
 mod run;
 // The per-command session: the writers' lock, a fresh sign-in and a sign-out
 // that is always attempted. `login` holds its lock; `keys revoke` is the

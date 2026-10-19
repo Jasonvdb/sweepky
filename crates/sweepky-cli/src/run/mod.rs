@@ -1,5 +1,6 @@
 //! `run`, the terminal command a sweeper runs before the agent: so far its
-//! checking half, which reads and decides and writes nothing.
+//! checking half, which reads and decides and writes nothing, and its
+//! fetching half, which puts the chosen targets in the project.
 //!
 //! - [`require_project`]: `run` must be run inside an `init` project, in
 //!   the directory that holds its `.sweepky` marker, which `init`'s own
@@ -18,6 +19,15 @@
 //!   its title and focus through the terminal sanitiser, why it may be run,
 //!   and each target with the commit it reviews. Never the brief, which the
 //!   agent reads from a file.
+//! - `fetch`: the check that `./sweeps/<id>/` can be made, which `run`
+//!   makes before it publishes anything (`check_sweep_dir`), and the fetch
+//!   (`fetch_sweep`): each chosen target by its exact SHA, at depth 2, from
+//!   its one checked remote, into `./sweeps/<id>/target/<tid>/`, checked out
+//!   with every link written as a plain file; `strip` takes the
+//!   agent-instruction files out of each copy at every depth and in any
+//!   case; `scope_file` writes `scope.json`, rebuilt from the bounty's
+//!   checked targets, and `brief.md`. A failure removes the half-made sweep
+//!   directory.
 //!
 //! **Which circle, and why** (00's trust row: whose bounties a sweeper
 //! works on is "the sweeper's own allowlist (circle by default) + the
@@ -43,7 +53,10 @@
     )
 )]
 
+mod fetch;
+mod scope_file;
 mod select;
+mod strip;
 
 use std::path::Path;
 

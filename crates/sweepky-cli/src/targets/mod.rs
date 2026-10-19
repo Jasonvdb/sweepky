@@ -100,13 +100,6 @@ pub(crate) trait TargetResolver {
     /// applies [`check_policy`](Self::check_policy) first, and the real
     /// source checks the host's addresses before it names an
     /// [`HttpsRemote`].
-    // `run`, later in P2b, is the first caller outside the tests, and
-    // removes this line. `allow`, not the crate's usual `expect`, because
-    // an `expect` here is never met: it marks the method as used, and then
-    // `TargetSource`'s own `fetch_remote`, which calls the two sources'
-    // ones, really is a use of it. `TargetRemote`, which only this method
-    // makes, needs nothing of its own for the same reason.
-    #[cfg_attr(not(test), allow(dead_code))]
     async fn fetch_remote(
         &self,
         kind: KnownTargetKind,

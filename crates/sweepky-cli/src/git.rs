@@ -63,19 +63,6 @@
 //! `GitSha` also accepts 64. Killing git does not kill a helper it started
 //! (`git-remote-https`); the helper dies when its pipes close.
 
-// `post` runs `ls-remote` and `merge-base` through the runner, but nothing
-// fetches yet: `run`, later in P2b, is the first caller of the fetch and of
-// what only it uses, so outside the tests the compiler would warn that
-// those are dead code. `expect` (not `allow`) silences that only while it
-// is true, and that caller removes it.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "run, later in P2b, is the first caller of the fetch"
-    )
-)]
-
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
@@ -296,11 +283,23 @@ pub(crate) enum LocalSubcommand {
     Init,
     /// `git config`.
     Config,
-    /// `git rev-parse`.
+    /// `git rev-parse`: the tests read a repository's `HEAD` and objects
+    /// with it.
+    // No command runs it, so outside the tests the compiler would warn that
+    // the variant is never built. `expect` (not `allow`) silences that only
+    // while it is true: the first command to run it must remove this.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "only the tests run git rev-parse")
+    )]
     RevParse,
     /// `git merge-base`: the fixture source finds a pull request's merge
     /// base with it, in the fixture's bare repository.
     MergeBase,
+    /// `git checkout`: `run` checks out a target's fetched commit.
+    Checkout,
+    /// `git rev-list`: `run` counts a commit target's parents.
+    RevList,
 }
 
 impl LocalSubcommand {
@@ -311,6 +310,8 @@ impl LocalSubcommand {
             Self::Config => "config",
             Self::RevParse => "rev-parse",
             Self::MergeBase => "merge-base",
+            Self::Checkout => "checkout",
+            Self::RevList => "rev-list",
         }
     }
 }
