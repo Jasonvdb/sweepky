@@ -11,8 +11,9 @@
 //! that repository ([`fixture_targets`]) and the SHAs `fixtures/README.md`
 //! records for it, a [`FakeKeyStore`] in place of a homeserver's `keys/`, a
 //! [`FakeOwnStorage`] in place of the signed-in user's own storage, a
-//! [`FakePublicRecords`] in place of everyone's public storage and the
-//! synthetic bounty and circle records the tests put there, the
+//! [`FakePublicRecords`] in place of everyone's public storage and its
+//! listings, and the synthetic bounty, circle and sweep records the tests
+//! put there, the
 //! passphrase the tests wrap secret files with and a byte search to check
 //! a wrapped file shows none of its secret, and a compile-time check that a
 //! secret type implements none of the traits that would print or copy it.
@@ -34,13 +35,15 @@ use std::sync::{Arc, Mutex};
 use pubky::errors::RequestError;
 use pubky::{Keypair, PubkyHttpClient, PublicKey, StatusCode};
 use serde_json::{Value, json};
-use sweepky_core::{DeviceId, GitSha, Pubky, RecordId, RepoName, Zeroizing};
+use sweepky_core::paths::SweepkyPath;
+use sweepky_core::{BountyRef, DeviceId, GitSha, Pubky, RecordId, RepoName, Timestamp, Zeroizing};
 use tempfile::TempDir;
 
 use crate::device::{KeyIds, KeyStore, PublicKeys};
 use crate::git::{AllowedProtocols, GitCommand, GitFailed, RunGit, git_argv};
 use crate::own_storage::OwnStorage;
 use crate::records::PublicRecords;
+use crate::remote::{Listing, ListingError};
 use crate::targets::TargetSource;
 use crate::targets::fixture::FixtureTargets;
 use crate::targets::github::GitHubApi;
@@ -499,13 +502,17 @@ impl OwnStorage for FakeOwnStorage {
 }
 
 /// A [`PublicRecords`] in memory, in place of everyone's homeservers: files
-/// by owner and path, and every read it was asked for, in order. It hands
-/// a file back whole, whatever its size: the cap is the real reader's
-/// business, and the record parsers check it again themselves. The
-/// `Mutex` is there for the same reason as in [`FakeKeyStore`].
+/// by owner and path, the directories whose listing it refuses, and every
+/// read and listing it was asked for, in order (a listing by its directory,
+/// which ends with `/`). It hands a file back whole, whatever its size, and
+/// lists a directory whole, in path order: the caps and the listing limits
+/// are the real reader's business, and the record parsers check the cap
+/// again themselves. The `Mutex` is there for the same reason as in
+/// [`FakeKeyStore`].
 #[derive(Default)]
 pub(crate) struct FakePublicRecords {
     files: BTreeMap<(Pubky, String), Vec<u8>>,
+    broken_listings: BTreeSet<(Pubky, String)>,
     asked: Mutex<Vec<(Pubky, String)>>,
 }
 
@@ -518,7 +525,21 @@ impl FakePublicRecords {
         self
     }
 
-    /// The owner and path of every read so far, in order.
+    /// The same fake, holding `record` as JSON at `path` of `owner`'s
+    /// storage too.
+    pub(crate) fn with_record(self, owner: Pubky, path: &str, record: &Value) -> Self {
+        self.with_file(owner, path, json_bytes(record))
+    }
+
+    /// The same fake, refusing the listing of `dir` of `owner`'s storage as
+    /// the real reader refuses one that breaks the protocol: a page with
+    /// more entries than were asked for.
+    pub(crate) fn with_broken_listing(mut self, owner: Pubky, dir: &str) -> Self {
+        self.broken_listings.insert((owner, dir.to_owned()));
+        self
+    }
+
+    /// The owner and path of every read and listing so far, in order.
     pub(crate) fn asked(&self) -> Vec<(Pubky, String)> {
         self.asked.lock().expect("lock").clone()
     }
@@ -538,6 +559,28 @@ impl PublicRecords for FakePublicRecords {
         self.asked.lock().expect("lock").push(key);
         Ok(found)
     }
+
+    async fn list(&self, owner: Pubky, dir: &str) -> anyhow::Result<Listing> {
+        let key = (owner, dir.to_owned());
+        let broken = self.broken_listings.contains(&key);
+        self.asked.lock().expect("lock").push(key);
+        if broken {
+            return Err(anyhow::Error::new(ListingError::PageOverLimit)
+                .context(format!("could not list {dir} of {owner}")));
+        }
+        // The Sweepky files in `dir`, as the real listing keeps them: the
+        // map's order is the paths' byte order, a homeserver's order too.
+        let entries = self
+            .files
+            .keys()
+            .filter(|(file_owner, path)| *file_owner == owner && path.starts_with(dir))
+            .filter_map(|(_, path)| SweepkyPath::parse(path))
+            .collect();
+        Ok(Listing {
+            entries,
+            skipped: 0,
+        })
+    }
 }
 
 /// A word the tests plant in a stranger's text, where serde_json's own
@@ -550,6 +593,12 @@ pub(crate) const SYNTHETIC_SHA: &str = "1111111111111111111111111111111111111111
 /// The record id of a synthetic bounty or sweep.
 pub(crate) fn bounty_id() -> RecordId {
     "0035G87EK4XFE".parse().expect("a record id")
+}
+
+/// The record id of timestamp `n`: ids order as their timestamps do, so a
+/// test makes an older record with a smaller `n`.
+pub(crate) fn record_id(n: u64) -> RecordId {
+    RecordId::from_timestamp(Timestamp::from(n))
 }
 
 /// The bytes of `value`, as a homeserver would hand them back.
@@ -579,6 +628,19 @@ pub(crate) fn bounty_json(targets: Value) -> Value {
         "credits": [],
         "createdAt": "2026-10-19T08:00:00Z",
         "doneAt": null,
+    })
+}
+
+/// A sweep record of `targets` of `bounty`, with `status`, as `run` writes
+/// one.
+pub(crate) fn sweep_json(bounty: BountyRef, targets: &[&str], status: &str) -> Value {
+    json!({
+        "schemaVersion": 1,
+        "bounty": bounty.to_string(),
+        "targets": targets,
+        "playbook": "cloudflare/security-audit@c1c8a8c",
+        "status": status,
+        "startedAt": "2026-10-19T09:00:00Z",
     })
 }
 

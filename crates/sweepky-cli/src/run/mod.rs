@@ -7,15 +7,17 @@
 //!
 //! 1. **Check, writing nothing.** The working directory must be an `init`
 //!    project ([`require_project`]), whose marker may name a playbook. The
-//!    argument must be a bounty's `pubky://` URL ([`parse_bounty_url`]);
-//!    without one, `run` says that picking a bounty from the circle comes
-//!    in a later build. `--circle` must be a pubky, and this install must
-//!    be logged in: the pubky `login.json` names is the sweeper.
+//!    argument, if any, must be a bounty's `pubky://` URL
+//!    ([`parse_bounty_url`]); `--target` needs one. `--circle` must be a
+//!    pubky, and this install must be logged in: the pubky `login.json`
+//!    names is the sweeper. Without a URL, `pick` picks the bounty and the
+//!    target, from the circle `--circle` names or else the sweeper's own,
+//!    with no session, and its pick and warnings go to standard error.
 //!    [`check_bounty`] reads the bounty and the one circle that decides,
-//!    with no session, and chooses the targets; [`CheckedBounty::summary`]
-//!    goes to standard error. The git runner is made, and the sweep's id,
-//!    and `fetch::check_sweep_dir` checks that `./sweeps/<id>/` can be
-//!    made.
+//!    with no session, and chooses the targets, a picked target as if
+//!    `--target` named it; [`CheckedBounty::summary`] goes to standard
+//!    error. The git runner is made, and the sweep's id, and
+//!    `fetch::check_sweep_dir` checks that `./sweeps/<id>/` can be made.
 //! 2. **Publish `running`.** `sweeps/<id>.json`, under the writers' lock
 //!    with a fresh session, signed out again at once
 //!    ([`LockedSessionPublisher`]). A refused write ends the run here: no
@@ -48,7 +50,8 @@
 //!
 //! - [`require_project`], [`parse_bounty_url`], [`check_bounty`] and
 //!   [`CheckedBounty::summary`]: the checking half (above), with `select`,
-//!   which decides from the records alone.
+//!   which decides from the records alone, and `pick`, which picks the
+//!   bounty and target without a URL through `select`'s own rules.
 //! - `fetch`: the check that `./sweeps/<id>/` can be made, and the fetch:
 //!   each chosen target by its exact SHA, at depth 2, from its one checked
 //!   remote, into `./sweeps/<id>/target/<tid>/`, checked out with every
@@ -71,11 +74,12 @@
 //! who pastes the URL, which is the consent, and the sandbox bounds what a
 //! hostile bounty's targets can do. `--circle <admin>` is the stricter
 //! check, for any bounty, open or closed: both the owner and the sweeper
-//! must be in that circle. Picking a bounty without a URL, a later step,
-//! picks from this install's own circle by default.
+//! must be in that circle. Picking without a URL picks from this install's
+//! own circle by default, and from the one `--circle` names when given.
 
 mod fetch;
 mod marker;
+mod pick;
 mod scope_file;
 mod select;
 mod strip;
@@ -92,6 +96,7 @@ use sweepky_core::{
 
 use self::fetch::{FetchedSweep, check_sweep_dir, fetch_sweep};
 use self::marker::SweepMarker;
+use self::pick::{NOTHING_OPEN, pick_target};
 use self::select::{Acceptance, ChosenTarget, ChosenTargets};
 use crate::circle::parse_pubky;
 use crate::display::sanitize;
@@ -107,12 +112,9 @@ use crate::state::read_login_state;
 use crate::targets::TargetResolver;
 use crate::{Context, Dirs, Report, clock};
 
-/// What `run` says when it is given no bounty URL, until picking one is
-/// built.
-const PICKING_LATER: &str = "run needs a bounty's URL, \
-                             pubky://<owner>/pub/sweepky/bounties/<id>.json as `sweepky post` \
-                             printed it; picking a bounty from your circle without one comes in \
-                             a later build";
+/// What `run` says when it is given `--target` and no bounty URL.
+const TARGET_NEEDS_URL: &str = "--target names a target of one bounty, so it needs that \
+                                bounty's URL; without a URL, run picks the target itself";
 
 /// The playbook a sweep record names when the project's `init` recorded
 /// none, as P2a's `init` never does: core's `Sweep` needs one, this passes
@@ -143,20 +145,44 @@ pub(crate) async fn run(
     circle: Option<&str>,
 ) -> anyhow::Result<Report> {
     let project_marker = require_project(&ctx.cwd)?;
-    let Some(bounty_url) = bounty_url else {
-        bail!(PICKING_LATER);
-    };
-    let request = RunRequest {
-        bounty: parse_bounty_url(bounty_url)?,
-        // `map` parses only a `Some`, and `transpose` turns the
-        // `Option<Result<..>>` into the `Result<Option<..>>` that `?` takes.
-        circle: circle
-            .map(|admin| parse_pubky(admin, "run --circle"))
-            .transpose()?,
-        sweeper: logged_in_sweeper(&ctx.dirs)?,
-        target,
-    };
+    // `map` parses only a `Some`, and `transpose` turns the
+    // `Option<Result<..>>` into the `Result<Option<..>>` that `?` takes.
+    let bounty = bounty_url.map(parse_bounty_url).transpose()?;
+    if bounty.is_none() && target.is_some() {
+        bail!(TARGET_NEEDS_URL);
+    }
+    let circle = circle
+        .map(|admin| parse_pubky(admin, "run --circle"))
+        .transpose()?;
+    let sweeper = logged_in_sweeper(&ctx.dirs)?;
     let records = PublicRecordReader::new(ctx.network.pubky());
+    // Declared here and given a value only when there is no URL: the
+    // request borrows the picked target's id from it, so it must live as
+    // long as the request does, past the `match` that fills it.
+    let picked;
+    let request = match bounty {
+        Some(bounty) => RunRequest {
+            bounty,
+            sweeper,
+            circle,
+            target,
+        },
+        None => {
+            let pick = pick_target(&records, &ctx.targets, sweeper, circle).await?;
+            ctx.stderr.write_flushed(&pick.summary())?;
+            // anyhow's `context` works on an `Option` too: `None` becomes
+            // this error.
+            picked = pick.choice.context(NOTHING_OPEN)?;
+            // Checked from here on exactly as for its URL and `--target`,
+            // the bounty read again.
+            RunRequest {
+                bounty: picked.bounty,
+                sweeper,
+                circle,
+                target: Some(picked.target.as_str()),
+            }
+        }
+    };
     let checked = check_bounty(&records, &ctx.targets, &request).await?;
     ctx.stderr.write_flushed(&checked.summary())?;
     // Made before anything is published, so a machine where git cannot run
@@ -442,7 +468,8 @@ fn bounty_of_url(text: &str) -> anyhow::Result<BountyRef> {
 }
 
 /// What `run` was asked to check: the bounty, who sweeps it, and the two
-/// flags that narrow it.
+/// flags that narrow it. Without a URL, the bounty and the target are the
+/// ones `pick` picked.
 #[derive(Debug)]
 pub(crate) struct RunRequest<'a> {
     /// The bounty, from [`parse_bounty_url`].
@@ -591,9 +618,10 @@ mod tests {
         BountyRef, KnownSweepStatus, MAX_RECORD_BYTES, Playbook, Pubky, Sweep, SweepRef,
     };
 
+    use super::pick::pick_target;
     use super::select::Acceptance;
     use super::{
-        ABORTED, CheckedBounty, NOT_ABORTED, NewSweep, PICKING_LATER, PublishRecord, RunRequest,
+        ABORTED, CheckedBounty, NOT_ABORTED, NewSweep, PublishRecord, RunRequest, TARGET_NEEDS_URL,
         abort, check_bounty, parse_bounty_url, put_record, record_bytes, require_project, run,
         running_record, start_sweep,
     };
@@ -607,7 +635,7 @@ mod tests {
         FakeOwnStorage, FakePublicRecords, PLANTED, RecordingGit, SYNTHETIC_SHA, bounty_id,
         bounty_json, circle_json, dirs_in, fixture_repo, fixture_targets, json_bytes,
         offline_network, private_temp, random_pubky, recorded_fixture_shas, repo_target_json,
-        test_context, test_git_env,
+        sweep_json, test_context, test_git_env,
     };
 
     #[test]
@@ -1120,16 +1148,72 @@ mod tests {
         assert_eq!(storage.puts(), [path.as_str()]);
     }
 
+    // -----------------------------------------------------------------------
+    // No URL: picking from the circle.
+
     #[tokio::test]
-    async fn run_without_a_url_says_picking_comes_later() {
+    async fn run_without_a_url_takes_no_target_flag() {
         let home = private_temp();
         let (mut ctx, _stderr) = test_context(offline_network(), &home, io::empty());
         let project = home.path().join("project");
         init::init(&project).expect("init");
         ctx.cwd = project;
 
-        let error = run(&ctx, None, None, None).await.expect_err("no URL");
+        // Refused before anything is read, and the flag is not quoted.
+        let error = run(&ctx, None, Some(PLANTED), None)
+            .await
+            .expect_err("refused");
 
-        assert_eq!(format!("{error:#}"), PICKING_LATER);
+        assert_eq!(format!("{error:#}"), TARGET_NEEDS_URL);
+    }
+
+    #[tokio::test]
+    async fn a_picked_target_is_one_check_bounty_accepts_as_for_its_url() {
+        let (sweeper, owner) = (random_pubky(), random_pubky());
+        let bounty = BountyRef {
+            owner,
+            id: bounty_id(),
+        };
+        // A closed bounty of two targets, the first swept already, whose
+        // owner is in the sweeper's circle and the sweeper in the owner's.
+        let records = FakePublicRecords::default()
+            .with_record(sweeper, paths::circle(), &circle_json(sweeper, &[owner]))
+            .with_record(owner, paths::circle(), &circle_json(owner, &[sweeper]))
+            .with_record(
+                owner,
+                &paths::bounty(bounty.id),
+                &bounty_json(json!([repo_target_json("t1"), repo_target_json("t2")])),
+            )
+            .with_record(
+                owner,
+                &paths::sweep_record(bounty_id()),
+                &sweep_json(bounty, &["t1"], "done"),
+            );
+
+        let choice = pick_target(&records, &TargetSource::Real, sweeper, None)
+            .await
+            .expect("picked")
+            .choice
+            .expect("a target");
+        // The request `run` makes of the pick: the bounty, and its target
+        // as --target.
+        let request = RunRequest {
+            bounty: choice.bounty,
+            sweeper,
+            circle: None,
+            target: Some(choice.target.as_str()),
+        };
+        let checked = check_bounty(&records, &TargetSource::Real, &request)
+            .await
+            .expect("accepted");
+
+        assert_eq!(checked.bounty_ref, bounty);
+        assert_eq!(checked.acceptance, Acceptance::OwnersCircle);
+        let ids: Vec<&str> = checked
+            .targets
+            .iter()
+            .map(|chosen| chosen.id.as_str())
+            .collect();
+        assert_eq!(ids, ["t2"]);
     }
 }

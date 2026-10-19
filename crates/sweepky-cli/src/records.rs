@@ -1,13 +1,18 @@
 //! [`PublicRecords`], the seam through which `run` reads anyone's public
 //! Sweepky records: a bounty, a circle and a sweep record, each from the
-//! storage of the key that owns it, with no session.
+//! storage of the key that owns it, and the bounty and sweep records a key's
+//! storage lists, with no session.
 //!
-//! - [`PublicRecords::get_record`] is the one method an implementation
-//!   writes: the bytes of one public file, at most [`MAX_RECORD_BYTES`], or
-//!   `None` when there is none (a 404). [`PublicRecordReader`] is the real
-//!   one, through `remote::get_public`, which finds the owner's homeserver
-//!   through pkarr, asks it anonymously, refuses an answer that came through
-//!   a redirect and caps the body before it is buffered. The unit tests use
+//! - [`PublicRecords::get_record`] and [`PublicRecords::list`] are the two
+//!   methods an implementation writes: the bytes of one public file, at most
+//!   [`MAX_RECORD_BYTES`], or `None` when there is none (a 404); and the
+//!   Sweepky files one directory lists. [`PublicRecordReader`] is the real
+//!   one, through `remote::get_public` and `remote::list_dir`, which find
+//!   the owner's homeserver through pkarr, ask it anonymously, refuse an
+//!   answer that came through a redirect and cap every body before it is
+//!   buffered; a listing is read within [`ListLimits::DEFAULT`], at most
+//!   1000 entries in 11 pages, and refused whole past them or when a page
+//!   breaks the protocol. The unit tests use
 //!   `test_support::FakePublicRecords`, which keeps files in memory.
 //! - [`get_bounty`](PublicRecords::get_bounty),
 //!   [`get_circle`](PublicRecords::get_circle) and
@@ -16,6 +21,10 @@
 //!   its path with `sweepky_core::paths` and parses the bytes with the
 //!   record type's `from_json`, core's capped, version-first parse, which
 //!   refuses more than `MAX_RECORD_BYTES` again before it parses anything.
+//!   [`list_bounties`](PublicRecords::list_bounties) and
+//!   [`list_sweeps`](PublicRecords::list_sweeps) keep the record ids of a
+//!   listing of `bounties/` or `sweeps/`, and drop the other files there
+//!   (an open bounty's `<id>.discovered.json`, a sweep's `<id>.age`).
 //!
 //! **A record is parsed, not trusted.** Holding a `Circle` means the bytes
 //! had a circle's shape, nothing more: its `admin` may not be the key whose
@@ -25,17 +34,16 @@
 //! **Errors never quote the record.** Bytes that do not parse are refused
 //! through core's `RecordError`, which keeps only the kind of fault and where
 //! it is; the message names the path and the owner, which this build built
-//! and checked, and never the bytes.
-//!
-//! The listings `run` picks a bounty from without a URL come with that step.
+//! and checked, and never the bytes. A listing's refusal is
+//! `remote::ListingError`'s fixed text under the directory and the owner.
 
 use anyhow::Context as _;
-use sweepky_core::paths;
+use sweepky_core::paths::{self, SweepkyPath};
 use sweepky_core::{
-    Bounty, BountyRef, Circle, MAX_RECORD_BYTES, Pubky, Sweep, SweepRef, Zeroizing,
+    Bounty, BountyRef, Circle, MAX_RECORD_BYTES, Pubky, RecordId, Sweep, SweepRef, Zeroizing,
 };
 
-use crate::remote::{get_public, public_key_of};
+use crate::remote::{ListLimits, Listing, get_public, list_dir, public_key_of};
 
 /// Anyone's public Sweepky records, read with no session: the seam between
 /// `run` and everyone's homeservers.
@@ -60,6 +68,12 @@ pub(crate) trait PublicRecords {
         owner: Pubky,
         path: &str,
     ) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>>;
+
+    /// The Sweepky files `dir` of `owner`'s public storage lists, in the
+    /// order listed; an empty directory, or none (a 404), lists nothing.
+    /// `dir` is one of `sweepky_core::paths`' directories, which ends with
+    /// `/`: an error names it.
+    async fn list(&self, owner: Pubky, dir: &str) -> anyhow::Result<Listing>;
 
     /// The bounty `bounty` points at, `bounties/<id>.json` of its owner, or
     /// `None` when there is none.
@@ -94,16 +108,6 @@ pub(crate) trait PublicRecords {
 
     /// The sweep record `sweep` points at, `sweeps/<id>.json` of its
     /// sweeper, or `None` when there is none.
-    // Picking a bounty, later in P2b, is the first caller outside the
-    // tests: `expect` (not `allow`) silences the dead-code warning only
-    // while that is true, and that caller removes it.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "picking a bounty, later in P2b, is the first caller"
-        )
-    )]
     async fn get_sweep(&self, sweep: SweepRef) -> anyhow::Result<Option<Sweep>> {
         let path = paths::sweep_record(sweep.id);
         let found = self.get_record(sweep.sweeper, &path).await?;
@@ -111,6 +115,36 @@ pub(crate) trait PublicRecords {
             .map(|bytes| Sweep::from_json(&bytes))
             .transpose()
             .with_context(|| not_a_record("sweep", &path, sweep.sweeper))
+    }
+
+    /// The ids of the bounty records `owner`'s `bounties/` lists, in the
+    /// order listed.
+    async fn list_bounties(&self, owner: Pubky) -> anyhow::Result<Vec<RecordId>> {
+        let listing = self.list(owner, paths::BOUNTIES_DIR).await?;
+        // `filter_map` keeps what the closure gives as `Some`: here the id
+        // of each `Bounty` entry, and nothing for any other file.
+        Ok(listing
+            .entries
+            .into_iter()
+            .filter_map(|entry| match entry {
+                SweepkyPath::Bounty(id) => Some(id),
+                _ => None,
+            })
+            .collect())
+    }
+
+    /// The ids of the sweep records `owner`'s `sweeps/` lists, in the order
+    /// listed.
+    async fn list_sweeps(&self, owner: Pubky) -> anyhow::Result<Vec<RecordId>> {
+        let listing = self.list(owner, paths::SWEEPS_DIR).await?;
+        Ok(listing
+            .entries
+            .into_iter()
+            .filter_map(|entry| match entry {
+                SweepkyPath::SweepRecord(id) => Some(id),
+                _ => None,
+            })
+            .collect())
     }
 }
 
@@ -147,6 +181,11 @@ impl PublicRecords for PublicRecordReader<'_> {
         let key = public_key_of(&owner)?;
         get_public(self.client, &key, path, MAX_RECORD_BYTES).await
     }
+
+    async fn list(&self, owner: Pubky, dir: &str) -> anyhow::Result<Listing> {
+        let key = public_key_of(&owner)?;
+        list_dir(self.client, &key, dir, ListLimits::DEFAULT).await
+    }
 }
 
 #[cfg(test)]
@@ -158,17 +197,16 @@ mod tests {
     use super::PublicRecords;
     use crate::test_support::{
         FakePublicRecords, PLANTED, bounty_id, bounty_json, circle_json, json_bytes, random_pubky,
+        record_id, sweep_json,
     };
 
-    fn sweep_json(owner: Pubky) -> Value {
-        json!({
-            "schemaVersion": 1,
-            "bounty": BountyRef { owner, id: bounty_id() }.to_string(),
-            "targets": ["t1"],
-            "playbook": "cloudflare/security-audit@c1c8a8c",
-            "status": "running",
-            "startedAt": "2026-10-19T09:00:00Z",
-        })
+    /// A running sweep of target t1 of `owner`'s synthetic bounty.
+    fn running_sweep_json(owner: Pubky) -> Value {
+        let bounty = BountyRef {
+            owner,
+            id: bounty_id(),
+        };
+        sweep_json(bounty, &["t1"], "running")
     }
 
     #[tokio::test]
@@ -180,7 +218,7 @@ mod tests {
         let records = FakePublicRecords::default()
             .with_file(owner, &bounty_path, json_bytes(&bounty_json(json!([]))))
             .with_file(owner, paths::circle(), json_bytes(&circle_json(owner, &[])))
-            .with_file(sweeper, &sweep_path, json_bytes(&sweep_json(owner)));
+            .with_file(sweeper, &sweep_path, json_bytes(&running_sweep_json(owner)));
 
         let bounty = records
             .get_bounty(BountyRef {
@@ -286,7 +324,7 @@ mod tests {
             let err = records.get_circle(owner).await.expect_err("refused");
             assert_refused_unquoted(&err, "circle");
         }
-        for body in bad_bodies(sweep_json(owner)) {
+        for body in bad_bodies(running_sweep_json(owner)) {
             let records = FakePublicRecords::default().with_file(
                 owner,
                 &paths::sweep_record(bounty_id()),
@@ -294,6 +332,54 @@ mod tests {
             );
             let err = records.get_sweep(sweep).await.expect_err("refused");
             assert_refused_unquoted(&err, "sweep");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_listings_give_the_owner_s_record_ids_and_drop_other_files() {
+        let (owner, other) = (random_pubky(), random_pubky());
+        let records = FakePublicRecords::default()
+            .with_file(owner, &paths::bounty(record_id(2)), Vec::new())
+            .with_file(owner, &paths::discovered(record_id(2)), Vec::new())
+            .with_file(owner, &paths::bounty(record_id(1)), Vec::new())
+            .with_file(owner, &paths::sweep_record(record_id(3)), Vec::new())
+            .with_file(owner, &paths::sweep_package(record_id(3)), Vec::new())
+            .with_file(owner, paths::circle(), Vec::new())
+            .with_file(other, &paths::bounty(record_id(4)), Vec::new());
+
+        let bounties = records.list_bounties(owner).await.expect("listed");
+        assert_eq!(bounties, [record_id(1), record_id(2)]);
+        let sweeps = records.list_sweeps(owner).await.expect("listed");
+        assert_eq!(sweeps, [record_id(3)]);
+        // One listing each, of the owner's own directory.
+        assert_eq!(
+            records.asked(),
+            [
+                (owner, paths::BOUNTIES_DIR.to_owned()),
+                (owner, paths::SWEEPS_DIR.to_owned()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_listing_refused_is_an_error_that_names_the_directory() {
+        let owner = random_pubky();
+        let records = FakePublicRecords::default()
+            .with_broken_listing(owner, paths::BOUNTIES_DIR)
+            .with_broken_listing(owner, paths::SWEEPS_DIR);
+        for err in [
+            records.list_bounties(owner).await.expect_err("refused"),
+            records.list_sweeps(owner).await.expect_err("refused"),
+        ] {
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("could not list /pub/sweepky/"),
+                "{message}"
+            );
+            assert!(
+                message.contains("more entries than were asked for"),
+                "{message}"
+            );
         }
     }
 

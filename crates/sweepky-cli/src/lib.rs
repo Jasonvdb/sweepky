@@ -139,9 +139,10 @@
 //!   them back, with a fake for the unit tests that can refuse a chosen
 //!   write.
 //! - `records`, `PublicRecords`: the seam through which `run` reads
-//!   anyone's public bounty, circle and sweep records, with no session,
-//!   each capped and parsed by core, with a fake for the unit tests.
-//! - `run <bounty-url> [--target <tid>] [--circle <admin>]` (`run`): in
+//!   anyone's public bounty, circle and sweep records, and lists their
+//!   bounties and sweeps, with no session, each capped and parsed by core,
+//!   each listing bounded, with a fake for the unit tests.
+//! - `run [<bounty-url>] [--target <tid>] [--circle <admin>]` (`run`): in
 //!   the `init` project it must be run in, whose marker may name a
 //!   playbook, it checks the bounty's `pubky://` URL (anything else refused
 //!   unquoted), whether this sweeper may run the bounty (status `open`,
@@ -157,8 +158,10 @@
 //!   writes `scope.json` and `brief.md` beside them, and last the marker
 //!   `sweeps/<id>/.sweepky/sweep.json`. If any of that fails, the sweep
 //!   directory is removed and the record flipped to `aborted`. The report
-//!   says what to run next. Without a URL it says that picking a bounty
-//!   comes in a later build.
+//!   says what to run next. Without a URL it first picks, from the open
+//!   bounties of the circle's members (`--circle`'s, else this install's
+//!   own circle), the target their sweep records name least, reading
+//!   within fixed bounds, and then runs it as for its URL and `--target`.
 //!
 //! The rules that hold for everything here (see "Rust conventions" in
 //! `docs/plan/03-cli-and-skill.md`):
