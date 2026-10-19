@@ -8,10 +8,11 @@
 //! from a local `EphemeralTestnet` instead ([`Network::injected`]), so the same
 //! code runs against a throwaway network with nothing reaching production.
 //!
-//! What is here so far (P2a):
+//! What is here so far (P2a, then P2b):
 //!
-//! - [`Cli`] and [`Command`], the arguments, parsed with clap. `--testnet` is a
-//!   global flag, so it goes before or after the command.
+//! - [`Cli`] and [`Command`], the arguments, parsed with clap. `--testnet`,
+//!   `--passphrase-file` and `--no-input` are global flags, so each goes
+//!   before or after the command.
 //! - [`Network`], its pure [`NetworkSettings`] and [`NetworkKind`], and
 //!   [`select_kind`], which turns the flag and the variable into a kind and
 //!   refuses a value it does not know instead of falling back to production.
@@ -22,7 +23,8 @@
 //!   the binary runs it through [`run_without_context`] before it reads
 //!   HOME or the passphrase file or builds a network.
 //! - `clock::now()`, the current time for a record's time fields
-//!   (`createdAt`, `revokedAt`, ...), as RFC 3339 in UTC to the second.
+//!   (`createdAt`, `revokedAt`, ...), as RFC 3339 in UTC to the second, and
+//!   `clock::new_record_id()`, the id of a new bounty, sweep or device key.
 //! - [`Dirs`], the config and data directories (`~/.config/sweepky/` and
 //!   `~/.local/share/sweepky/`, or both under `SWEEPKY_HOME`) and the paths
 //!   of the files in them.
@@ -96,6 +98,11 @@
 //!   unwrapped on read whenever a file starts with an age header, a wrapped
 //!   file read without the passphrase being an error that says how to give
 //!   it.
+//! - `prompt`, standard input and the one question a command asks on it:
+//!   [`StdinReader`], the context's standard input, and `confirm`, a
+//!   yes-or-no question on standard error whose answer is one line of at
+//!   most 1 KiB, `y` or `yes` in any case being yes and anything else no.
+//!   Under the global `--no-input` it fails at once and reads nothing.
 //!
 //! The rules that hold for everything here (see "Rust conventions" in
 //! `docs/plan/03-cli-and-skill.md`):
@@ -170,6 +177,8 @@ mod passphrase;
 // Owner-only files and directories, which every secret and state file goes
 // through.
 mod private_fs;
+// Standard input, and the one yes-or-no question a command asks on it.
+mod prompt;
 // Bounded reads of remote records and listings, the write-error mapping and
 // the key conversions. `login` and `keys` use the write errors and the
 // conversions, and the key stores the reads of the user's own records, of
@@ -187,6 +196,7 @@ mod state;
 mod test_support;
 
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::{Mutex, PoisonError};
 
 use anyhow::bail;
@@ -199,6 +209,7 @@ pub use network::{
     TESTNET_HOMESERVER, TESTNET_RELAY_URL, select_kind,
 };
 pub use passphrase::Passphrase;
+pub use prompt::StdinReader;
 
 /// This crate's version, `version` from Cargo.toml, which `sweepky --version`
 /// prints.
@@ -210,14 +221,23 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Everything a command needs from outside itself, handed in by the caller.
 ///
 /// The binary builds one from the arguments and the environment; a test builds
-/// one around a local testnet, a temporary `SWEEPKY_HOME` and a buffer for
-/// what would go to standard error. Later commands add the standard input
-/// here, so that no command reaches for a global.
+/// one around a local testnet, a temporary `SWEEPKY_HOME`, the answers it
+/// gives and a buffer for what would go to standard error. The working
+/// directory and standard input are here too, so that no command reaches
+/// for a global.
 pub struct Context {
     /// The network every command talks to.
     pub network: Network,
     /// Where this install keeps its secrets and state.
     pub dirs: Dirs,
+    /// The directory the command was run in, as an absolute path: the one
+    /// `main.rs` reads with `std::env::current_dir()`, or one a test
+    /// chooses. `run` and `submit` find their `init` project from it;
+    /// nothing below `main.rs` asks the process for it.
+    pub cwd: PathBuf,
+    /// Where a command reads the answer to a question it asks (see
+    /// [`StdinReader`]): standard input in the binary, fixed bytes in a test.
+    pub stdin: StdinReader,
     /// Where a command writes what it has to say before it is done: a
     /// warning before it acts, or that it is waiting for another command.
     pub stderr: StderrWriter,
@@ -258,13 +278,19 @@ impl StderrWriter {
     /// Writes `text` and a newline, and flushes, so the line is out before
     /// the command goes on.
     pub(crate) fn line(&self, text: &str) -> anyhow::Result<()> {
+        self.write_flushed(&format!("{text}\n"))
+    }
+
+    /// Writes `text` as it is, adding no newline, and flushes: how a
+    /// question is asked (`prompt::confirm`), so the answer is typed on the
+    /// same line.
+    pub(crate) fn write_flushed(&self, text: &str) -> anyhow::Result<()> {
         // `lock` fails only if another thread panicked while holding the
         // lock ("poisoned"). A writer has no state that a panic could leave
         // half-changed, so the guard is taken back with `into_inner` rather
         // than failing the command.
         let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
         writer.write_all(text.as_bytes())?;
-        writer.write_all(b"\n")?;
         writer.flush()?;
         Ok(())
     }
@@ -326,8 +352,10 @@ pub fn run_without_context(cli: &Cli) -> Option<anyhow::Result<Report>> {
 ///
 /// The caller has already chosen the network: the binary from
 /// [`Cli::testnet`] and `SWEEPKY_TESTNET` through [`select_kind`], a test by
-/// injecting one. `async` because most commands wait on the network; `init`
-/// does only a few small file operations, which are fine to do directly here.
+/// injecting one. [`Cli::no_input`] is not in the context: `run` hands it,
+/// as a `prompt::Prompting`, to each command that asks a question. `async`
+/// because most commands wait on the network; `init` does only a few small
+/// file operations, which are fine to do directly here.
 /// (The binary runs `init` through [`run_without_context`] instead, so it
 /// never builds a context for it.)
 pub async fn run(cli: Cli, ctx: &Context) -> anyhow::Result<Report> {
@@ -427,9 +455,19 @@ mod tests {
             &["circle", "show"],
         ];
         for args in commands {
-            let cli = Cli::try_parse_from(std::iter::once("sweepky").chain(args.iter().copied()))
+            // With and without `--no-input`, which changes nothing here: the
+            // commands that ask a question all run with the context. An
+            // `Option` is an iterator of zero or one items, so `chain(flag)`
+            // adds the flag only when it is `Some`.
+            for flag in [None, Some("--no-input")] {
+                let cli = Cli::try_parse_from(
+                    std::iter::once("sweepky")
+                        .chain(args.iter().copied())
+                        .chain(flag),
+                )
                 .expect("parses");
-            assert!(run_without_context(&cli).is_none(), "{args:?}");
+                assert!(run_without_context(&cli).is_none(), "{args:?} {flag:?}");
+            }
         }
     }
 

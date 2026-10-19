@@ -44,6 +44,17 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "FILE")]
     pub passphrase_file: Option<PathBuf>,
 
+    /// Never stop to ask a question. Where a command needs an answer, such
+    /// as `post` confirming a bounty's title and brief, or `submit` finding
+    /// keys the owner added since the last submit, it fails instead and says
+    /// what it would have asked.
+    //
+    // Global, like --testnet. `run` hands it, as a `prompt::Prompting`, to
+    // each command that asks; the context does not carry it, so this field
+    // is the one place it lives.
+    #[arg(long, global = true)]
+    pub no_input: bool,
+
     /// The command to run.
     #[command(subcommand)]
     pub command: Command,
@@ -281,6 +292,22 @@ mod tests {
         }
         let cli = Cli::try_parse_from(["sweepky", "logout"]).expect("parses");
         assert_eq!(cli.passphrase_file, None);
+    }
+
+    #[test]
+    fn no_input_is_a_global_flag_off_by_default() {
+        // Before or after the command, as for --testnet, and with any
+        // command: `run` hands it to the commands that ask a question.
+        for args in [
+            ["sweepky", "--no-input", "keys", "list"],
+            ["sweepky", "keys", "list", "--no-input"],
+            ["sweepky", "--no-input", "init", "d"],
+        ] {
+            let cli = Cli::try_parse_from(args).expect("parses");
+            assert!(cli.no_input, "{args:?}");
+        }
+        let cli = Cli::try_parse_from(["sweepky", "keys", "list"]).expect("parses");
+        assert!(!cli.no_input);
     }
 
     #[test]

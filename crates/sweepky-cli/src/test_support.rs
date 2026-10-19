@@ -1,10 +1,13 @@
 //! Helpers that the unit tests of several modules share: a private temp
 //! directory, the [`Dirs`] under it and the file-mode checks around it, a
 //! [`FileSnapshot`] that tells whether a file was written at all, a random
-//! public key, a [`FakeKeyStore`] in place of a homeserver's `keys/`, the
-//! passphrase the tests wrap secret files with and a byte search to check a
-//! wrapped file shows none of its secret, and a compile-time check that a
-//! secret type implements none of the traits that would print or copy it.
+//! public key, a [`Context`] for a test ([`test_context`], on an
+//! [`offline_network`] or a testnet's) with a [`SharedBuffer`] that keeps
+//! what it writes to standard error, a [`FakeKeyStore`] in place of a
+//! homeserver's `keys/`, the passphrase the tests wrap secret files with and
+//! a byte search to check a wrapped file shows none of its secret, and a
+//! compile-time check that a secret type implements none of the traits that
+//! would print or copy it.
 //!
 //! Compiled only for `cargo test` (`#[cfg(test)]` on its `mod` line in
 //! `lib.rs`), so nothing here reaches the binary, and like any test code it
@@ -12,20 +15,20 @@
 
 use std::collections::BTreeMap;
 use std::fs::{self, Permissions};
-use std::io::ErrorKind;
+use std::io::{self, BufRead, ErrorKind, Write};
 // `MetadataExt` adds `.mode()` and `.ino()` to `Metadata`; `PermissionsExt`
 // adds `Permissions::from_mode`.
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use pubky::errors::RequestError;
-use pubky::{Keypair, PublicKey, StatusCode};
+use pubky::{Keypair, PubkyHttpClient, PublicKey, StatusCode};
 use sweepky_core::{DeviceId, Pubky, Zeroizing};
 use tempfile::TempDir;
 
-use crate::Dirs;
 use crate::device::{KeyIds, KeyStore, PublicKeys};
+use crate::{Context, Dirs, Network, StderrWriter, StdinReader};
 
 /// A fresh private directory to work in, created 0700 (`tempfile` passes
 /// `permissions` to the `mkdir` itself; its default would follow the
@@ -48,6 +51,83 @@ pub(crate) fn dirs_in(home: &TempDir) -> Dirs {
 /// `Pubky` (the same 32 bytes).
 pub(crate) fn random_pubky() -> Pubky {
     Pubky::from_bytes(Keypair::random().public_key().to_bytes())
+}
+
+/// Where nothing listens: port 1 of the loopback address. Any request sent
+/// there fails at once, without leaving the machine.
+const NOWHERE: &str = "http://127.0.0.1:1/";
+
+/// A network that reaches nothing, for a test that needs a [`Context`] but
+/// no homeserver.
+///
+/// Its client has no DHT and one pkarr relay, at [`NOWHERE`] (a client with
+/// neither cannot be built), so building it contacts nothing and any
+/// request it made would fail. Its auth relay and default homeserver are
+/// just as unreachable.
+pub(crate) fn offline_network() -> Network {
+    let client = PubkyHttpClient::builder()
+        .pkarr(|pkarr| {
+            pkarr
+                .no_dht()
+                .relays(&[NOWHERE])
+                .expect("a valid relay URL")
+        })
+        .build()
+        .expect("an offline client");
+    Network::injected(
+        pubky::Pubky::with_client(client),
+        format!("{NOWHERE}inbox"),
+        Keypair::random().public_key(),
+    )
+}
+
+/// A writer the test keeps a handle on: the context writes into it, the
+/// test reads what was written. `Arc<Mutex<…>>` is shared ownership of one
+/// buffer, which both sides lock to use.
+#[derive(Clone, Default)]
+pub(crate) struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
+
+impl SharedBuffer {
+    /// Everything written so far.
+    pub(crate) fn text(&self) -> String {
+        String::from_utf8(self.0.lock().expect("lock").clone()).expect("UTF-8")
+    }
+}
+
+impl Write for SharedBuffer {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.lock().expect("lock").write(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A [`Context`] for a test, and the buffer that keeps what it writes to
+/// standard error: `network`, the directories under `home` (as
+/// `SWEEPKY_HOME=<home>` gives them), `home` itself as the working
+/// directory, `stdin` as standard input, and no passphrase.
+///
+/// The fields are public, so a test that needs another working directory
+/// sets `ctx.cwd` afterwards.
+pub(crate) fn test_context(
+    network: Network,
+    home: &TempDir,
+    stdin: impl BufRead + Send + 'static,
+) -> (Context, SharedBuffer) {
+    let stderr = SharedBuffer::default();
+    let ctx = Context {
+        network,
+        dirs: dirs_in(home),
+        cwd: home.path().to_path_buf(),
+        stdin: StdinReader::new(stdin),
+        // A clone of the handle: the context writes into the same buffer
+        // the test reads.
+        stderr: StderrWriter::new(stderr.clone()),
+        passphrase: None,
+    };
+    (ctx, stderr)
 }
 
 /// The passphrase the tests wrap secret files with, through

@@ -22,7 +22,7 @@ use clap::Parser;
 use pubky::{ClientId, Keypair, PublicKey};
 use pubky_testnet::EphemeralTestnet;
 use serde_json::{Value, json};
-use sweepky_cli::{CLIENT_ID, Cli, Context, Dirs, Network, Report, StderrWriter, run};
+use sweepky_cli::{CLIENT_ID, Cli, Context, Dirs, Network, Report, StderrWriter, StdinReader, run};
 use sweepky_core::{
     Circle, DeviceIdentity, DeviceKey, MAX_RECORD_BYTES, Pubky, SecretString, Zeroizing,
 };
@@ -205,6 +205,10 @@ async fn end_to_end() {
     let ctx = Context {
         network: Network::injected(testnet.sdk().expect("client"), relay, homeserver.clone()),
         dirs: Dirs::resolve(None, Some(home.path().as_os_str())).expect("absolute"),
+        cwd: home.path().to_path_buf(),
+        // An empty standard input: P2a's commands ask nothing, and a
+        // question would read the end of the input, which is no.
+        stdin: StdinReader::new(io::empty()),
         stderr: StderrWriter::new(stderr.clone()),
         // No --passphrase-file: the secret files are written plain, as the
         // test reads them.
