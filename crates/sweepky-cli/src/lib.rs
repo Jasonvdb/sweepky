@@ -44,8 +44,10 @@
 //! - `remote`, the network helpers every command shares: reads of public
 //!   records and of the user's own (a 404 is no record), directory listings
 //!   (a 404 is an empty directory), every body capped before it is buffered
-//!   and every listing capped by line, page and total; and the messages for
-//!   a refused write (403 and 507) and every other SDK error, which never
+//!   and every listing capped by line, page and total, and every request
+//!   Sweepky sends itself refusing an answer that came through a redirect;
+//!   the messages for a refused write (403 and 507), a refused upload of a
+//!   sweep package (413, 429 and 507) and every other SDK error, which never
 //!   quote the server or the request URL; and the conversions between core's
 //!   `Pubky` and the SDK's `PublicKey`.
 //! - `display`, the terminal sanitiser: a stranger's text with its control,
@@ -120,8 +122,9 @@
 //! - `targets`, where `post` and `run` get a target's repository from:
 //!   the `TargetResolver` seam, which pins a revision to a full SHA with
 //!   an anonymous `git ls-remote` (annotated tags peeled), gives a pull
-//!   request's base, head and merge base, names the remote `run` fetches
-//!   from and applies the target policy; [`TargetSource`], the context's
+//!   request's base, head and merge base (from GitHub's unauthenticated
+//!   API, for the real source), names the remote `run` fetches from and
+//!   applies the target policy; [`TargetSource`], the context's
 //!   choice of source; the real source, over https only, and the fixture
 //!   source over the bare repository under `fixtures/`, for the tests; the
 //!   checked revision; and the host policy (`targets::host`): `is_public`,
@@ -170,13 +173,14 @@
 //!   caps, and reads `audit/`; reads the sweep's own record, which must say
 //!   `running`, and its bounty; builds the manifest from those two alone
 //!   and the package from `audit/`, Cloudflare's findings converted; checks
-//!   the owner's keys against their pin, asking about new ones; prints the
-//!   file list; and seals the package to the owner's keys and this
-//!   install's own. Then, under the writers' lock with a fresh session, it
-//!   reads the record back, writes the pin, uploads `sweeps/<id>.age` and
-//!   flips the record to `done`; a refused upload flips it to `aborted`,
-//!   which is final, and a 429 or a network error leaves it `running`.
-//!   Last, it stamps the sweep directory as submitted.
+//!   the owner's keys against their pin, asking about new ones (or failing
+//!   under `--no-input`); prints the file list; and seals the package to
+//!   the owner's keys and this install's own. Then, under the writers' lock
+//!   with a fresh session, it reads the record back, writes the pin,
+//!   uploads `sweeps/<id>.age` and flips the record to `done`; a refused
+//!   upload flips it to `aborted`, which is final, and a 429 or a network
+//!   error leaves it `running`. Last, it stamps the sweep directory as
+//!   submitted.
 //!
 //! The rules that hold for everything here (see "Rust conventions" in
 //! `docs/plan/03-cli-and-skill.md`):
@@ -265,14 +269,16 @@ mod private_fs;
 // Standard input, and the one yes-or-no question a command asks on it.
 mod prompt;
 // `PublicRecords`: anyone's public bounty, circle and sweep records, read
-// with a cap and parsed by core, with a fake for the unit tests.
+// with a cap and parsed by core, and bounded listings of their bounties and
+// sweeps, with a fake for the unit tests.
 mod records;
 // Bounded reads of remote records and listings, the write-error mapping and
 // the key conversions. `login` and `keys` use the write errors and the
 // conversions, and the key stores the reads of the user's own records, of
 // anyone's public records and the listing.
 mod remote;
-// `run`: the bounty checked, the sweep published as running, the targets
+// `run`: the bounty checked (or, without a URL, a target picked from the
+// circle's open bounties), the sweep published as running, the targets
 // fetched, stripped and scoped, and the per-sweep marker written last; or
 // the sweep aborted.
 mod run;

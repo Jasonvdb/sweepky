@@ -305,12 +305,64 @@ fn logged_in(ctx: &Context) -> Pubky {
         .expect("a pubky")
 }
 
+/// The ids of the sweep directories in `sweeps`, a project's `sweeps/`.
+fn sweep_ids(sweeps: &Path) -> Vec<RecordId> {
+    fs::read_dir(sweeps)
+        .expect("sweeps/")
+        .map(|entry| {
+            let name = entry.expect("an entry").file_name();
+            name.to_str().expect("UTF-8").parse().expect("a record id")
+        })
+        .collect()
+}
+
+/// Has `ctx` run `bounty` once more in its project, whose `sweeps/` is
+/// `sweeps`, and fills the new sweep's `audit/` from `fixtures/cloudflare/`,
+/// as Cloudflare's skill would leave it. Returns the new sweep's id.
+async fn cloudflare_sweep(ctx: &Context, bounty: &BountyRef, sweeps: &Path) -> RecordId {
+    let before = sweep_ids(sweeps);
+    sweepky(ctx, &["run", &bounty.to_string()])
+        .await
+        .expect("the bounty runs");
+    let id = sweep_ids(sweeps)
+        .into_iter()
+        .find(|id| !before.contains(id))
+        .expect("a new sweep directory");
+    let audit = sweeps.join(id.to_string()).join("audit");
+    fs::create_dir(&audit).expect("audit/");
+    for name in CLOUDFLARE_FILES {
+        fs::copy(cloudflare_fixture(name), audit.join(name)).expect("copy");
+    }
+    id
+}
+
+/// `user`'s sweep record `id`, read anonymously within the record cap.
+async fn read_sweep(testnet: &EphemeralTestnet, user: &PublicKey, id: RecordId) -> Sweep {
+    let record = get_capped(testnet, user, &paths::sweep_record(id), MAX_RECORD_BYTES).await;
+    Sweep::from_json(&record).expect("a sweep record")
+}
+
+/// Whether anyone can see `user`'s package of the sweep `id`.
+async fn package_exists(testnet: &EphemeralTestnet, user: &PublicKey, id: RecordId) -> bool {
+    testnet
+        .sdk()
+        .expect("client")
+        .public_storage()
+        .exists((user, paths::sweep_package(id).as_str()))
+        .await
+        .expect("the path is public")
+}
+
 /// A signup token in a form the homeserver rejects (400) before it looks at
 /// anything else, so a `login` that sent a signup with it would fail. Passed
 /// where `login` must not sign up, it proves that no signup was sent.
 const TRIPWIRE_TOKEN: &str = "not-a-signup-code";
 
-#[tokio::test]
+// `multi_thread`: tokio's runtime with worker threads, the kind
+// `#[tokio::main]` builds for the binary, rather than `#[tokio::test]`'s
+// default of one thread, so the two `submit`s P2b runs at once run as they
+// would in the binary.
+#[tokio::test(flavor = "multi_thread")]
 #[pubky_testnet::test]
 async fn end_to_end() {
     let testnet = EphemeralTestnet::builder()
@@ -1142,4 +1194,133 @@ async fn end_to_end() {
     let record = Sweep::from_json(&record).expect("a sweep record");
     assert_eq!(record.status.as_known(), Some(KnownSweepStatus::Running));
     assert_eq!(fs::read(&pins_file).expect("the pins"), pins_before);
+
+    // ----- P2b: a key added under A's keys/ makes B's next submit warn -----
+
+    // A second key under A's keys/, written with A's own root key, standing
+    // in for an operator of A's homeserver or someone holding A's grant.
+    // Its identity is made for this run, and its secret is written nowhere.
+    let added_id = "added-by-the-test";
+    let added_key = DeviceIdentity::generate();
+    publish_as(
+        &testnet,
+        &a.dirs.config().join("identities/a.key"),
+        &format!("/pub/sweepky/keys/{added_id}.json"),
+        &json!({
+            "schemaVersion": 1,
+            "alg": "age-x25519",
+            "recipient": added_key.recipient().to_string(),
+            "label": "added by the test",
+            "createdAt": "2026-10-19T09:00:00Z",
+            "revokedAt": null,
+        }),
+    )
+    .await;
+    let a_recipient = a_device.recipient().to_string();
+    let added_recipient = added_key.recipient().to_string();
+
+    // Run 2, its planted links gone, now holds Cloudflare's output.
+    for name in CLOUDFLARE_FILES {
+        fs::copy(cloudflare_fixture(name), run2_audit.join(name)).expect("copy");
+    }
+
+    // Under --no-input, B's submit of run 2 fails on the new key. The
+    // warning is the error, which the binary prints on standard error: it
+    // names the new record by its device id and holds no key.
+    // `String::split_off` keeps what was said from `mark` on.
+    let mark = b_stderr.text().len();
+    let no_input_args = [&run2_args[..], &["--no-input"]].concat();
+    let error = sweepky(&b, &no_input_args)
+        .await
+        .expect_err("--no-input refuses a new key");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains(&format!("keys/{added_id}.json")),
+        "{message}"
+    );
+    assert!(message.contains("--no-input"), "{message}");
+    let shown = b_stderr.text().split_off(mark);
+    for recipient in [&a_recipient, &added_recipient] {
+        assert!(!message.contains(recipient.as_str()), "{message}");
+        assert!(!shown.contains(recipient.as_str()), "{shown}");
+    }
+    // Nothing was uploaded, the record still says running and the pin is
+    // as it was.
+    assert!(!package_exists(&testnet, &b_user, run2).await);
+    assert_eq!(
+        read_sweep(&testnet, &b_user, run2).await.status.as_known(),
+        Some(KnownSweepStatus::Running)
+    );
+    assert_eq!(fs::read(&pins_file).expect("the pins"), pins_before);
+
+    // The same submit answered yes: B is warned and asked once, and goes
+    // on. B's context is `mut`, so its standard input can be given the
+    // answer.
+    b.stdin = StdinReader::new(Cursor::new(b"y\n".to_vec()));
+    let mark = b_stderr.text().len();
+    sweepky(&b, &run2_args)
+        .await
+        .expect("B submits run 2 after a yes");
+    let shown = b_stderr.text().split_off(mark);
+    assert!(
+        shown.contains("warning: the bounty's owner has keys"),
+        "{shown}"
+    );
+    assert!(shown.contains(&format!("keys/{added_id}.json")), "{shown}");
+    assert_eq!(shown.matches("[y/N] ").count(), 1, "{shown}");
+    for recipient in [&a_recipient, &added_recipient] {
+        assert!(!shown.contains(recipient.as_str()), "{shown}");
+    }
+    let record = read_sweep(&testnet, &b_user, run2).await;
+    assert_eq!(record.status.as_known(), Some(KnownSweepStatus::Done));
+    assert!(package_exists(&testnet, &b_user, run2).await);
+
+    // B's pin, still 0600, now holds both of A's keys, in device-id order.
+    assert_eq!(mode(&pins_file), 0o600);
+    let a_device_id = json(&a.dirs.login_file())["deviceId"]
+        .as_str()
+        .expect("a device id")
+        .to_owned();
+    // The two recipients move into the pairs: this is their last use.
+    let mut a_keys = [
+        (a_device_id, a_recipient),
+        (added_id.to_owned(), added_recipient),
+    ];
+    a_keys.sort();
+    let a_keys: Vec<Value> = a_keys
+        .iter()
+        .map(|(id, recipient)| json!({ "deviceId": id, "recipient": recipient }))
+        .collect();
+    assert_eq!(
+        json(&pins_file),
+        json!({ "schemaVersion": 1, "owners": { a_pubky.to_string(): a_keys } })
+    );
+
+    // ----- P2b: two submits of two separate runs, at the same time -----
+
+    // Runs 3 and 4, each holding Cloudflare's output.
+    let run3 = cloudflare_sweep(&b, &posted, &sweeps).await;
+    let run4 = cloudflare_sweep(&b, &posted, &sweeps).await;
+    let (run3_dir, run4_dir) = (format!("sweeps/{run3}"), format!("sweeps/{run4}"));
+    let run3_args = ["submit", "--run-dir", &run3_dir, "--playbook", PLAYBOOK];
+    let run4_args = ["submit", "--run-dir", &run4_dir, "--playbook", PLAYBOOK];
+
+    // `tokio::join!` polls both submits in this one task until both are
+    // done, so each goes on while the other waits on the network or on the
+    // writers' lock. Both only borrow B's context (`&b`), and any number of
+    // shared borrows can be alive at once. Each takes the lock with its own
+    // open of `credential.lock`, so the two exclude each other as two
+    // processes would; that the lock serialises them is P2a's lock test.
+    let mark = b_stderr.text().len();
+    let (third, fourth) = tokio::join!(sweepky(&b, &run3_args), sweepky(&b, &run4_args));
+    third.expect("run 3 is submitted");
+    fourth.expect("run 4 is submitted");
+    // Neither asked a question: A's keys are as pinned.
+    let shown = b_stderr.text().split_off(mark);
+    assert!(!shown.contains("[y/N]"), "{shown}");
+    for run in [run3, run4] {
+        let record = read_sweep(&testnet, &b_user, run).await;
+        assert_eq!(record.status.as_known(), Some(KnownSweepStatus::Done));
+        assert!(package_exists(&testnet, &b_user, run).await);
+    }
 }
