@@ -18,7 +18,9 @@
 //! - [`CLIENT_ID`] and [`SWEEPKY_CAPABILITY`], the client id and the
 //!   capability Sweepky asks for when it signs in through a grant.
 //! - `init <dir>`, the first command: it creates the directory, the `.sweepky`
-//!   marker and a `.gitignore` with `sweeps/`.
+//!   marker and a `.gitignore` with `sweeps/`. It needs no [`Context`], so
+//!   the binary runs it through [`run_without_context`] before it reads
+//!   HOME or the passphrase file or builds a network.
 //! - `clock::now()`, the current time for a record's time fields
 //!   (`createdAt`, `revokedAt`, ...), as RFC 3339 in UTC to the second.
 //! - [`Dirs`], the config and data directories (`~/.config/sweepky/` and
@@ -291,12 +293,43 @@ impl Report {
     }
 }
 
+/// Runs `cli` when its command needs nothing from a [`Context`], and hands
+/// back `None` for every other command, which the caller then runs with
+/// [`run`].
+///
+/// `init <dir>` is the one such command so far: it works only in the
+/// directory it is given. The binary calls this before it builds the
+/// context, so `init` runs with HOME unset and no SWEEPKY_HOME, never opens
+/// the `--passphrase-file` (it writes no secret file, so there is nothing to
+/// wrap), and never builds a Pubky client: a production client starts a DHT
+/// node that contacts public servers, which a local command has no reason
+/// to do. [`run`] still runs `init` when given a context, so a caller that
+/// always builds one, such as the end-to-end test, can run every command
+/// through [`run`] alone.
+///
+/// `Option<Result<…>>` keeps the two answers apart: `None` is "not one of
+/// mine, build the context and call [`run`]", and `Some` carries the
+/// command's own success or failure.
+pub fn run_without_context(cli: &Cli) -> Option<anyhow::Result<Report>> {
+    // Every variant is named, with no `_` arm, so a command added later does
+    // not compile until someone decides whether it needs the context.
+    // Matching on `&cli.command` borrows it, so `dir` is a `&PathBuf`.
+    match &cli.command {
+        Command::Init { dir } => Some(init::init(dir)),
+        Command::Login { .. } | Command::Logout | Command::Keys { .. } | Command::Circle { .. } => {
+            None
+        }
+    }
+}
+
 /// Runs one parsed command.
 ///
 /// The caller has already chosen the network: the binary from
 /// [`Cli::testnet`] and `SWEEPKY_TESTNET` through [`select_kind`], a test by
 /// injecting one. `async` because most commands wait on the network; `init`
 /// does only a few small file operations, which are fine to do directly here.
+/// (The binary runs `init` through [`run_without_context`] instead, so it
+/// never builds a context for it.)
 pub async fn run(cli: Cli, ctx: &Context) -> anyhow::Result<Report> {
     // The flag is read by the caller into `ctx.passphrase` (see `Context`).
     // A caller that forgot would have `login` write the user's secrets
@@ -342,7 +375,63 @@ pub async fn run(cli: Cli, ctx: &Context) -> anyhow::Result<Report> {
 
 #[cfg(test)]
 mod tests {
-    use super::VERSION;
+    use std::ffi::OsStr;
+
+    use clap::Parser;
+
+    use super::{Cli, VERSION, run_without_context};
+
+    #[test]
+    fn init_runs_with_no_context() {
+        // `run_without_context` is given the parsed arguments and nothing
+        // else: no `Dirs`, so it cannot have read HOME or SWEEPKY_HOME; no
+        // `Network`, so it cannot have built a Pubky client; and no
+        // `Passphrase`. The `--passphrase-file` here names a file that does
+        // not exist, so init succeeding shows the file is never opened.
+        let temp = tempfile::tempdir().expect("temp dir");
+        let dir = temp.path().join("project");
+        let missing = temp.path().join("no-passphrase-here");
+        let cli = Cli::try_parse_from([
+            OsStr::new("sweepky"),
+            OsStr::new("--passphrase-file"),
+            missing.as_os_str(),
+            OsStr::new("init"),
+            dir.as_os_str(),
+        ])
+        .expect("parses");
+
+        let report = run_without_context(&cli)
+            .expect("init needs no context")
+            .expect("init succeeds");
+
+        assert!(report.text().starts_with("Initialised "), "{report:?}");
+        assert!(dir.join(super::init::MARKER).is_file());
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn every_other_command_needs_the_context() {
+        // `None` hands the command back to the caller, which builds the
+        // context (and so reads HOME and the passphrase file, and builds the
+        // network) before `run`. One command line for every command but
+        // `init`, down to each `keys` and `circle` subcommand. A slice of
+        // slices, so adding a line needs no count updated by hand.
+        let commands: &[&[&str]] = &[
+            &["login", "--identity", "x"],
+            &["logout"],
+            &["keys", "list"],
+            &["keys", "revoke", "id"],
+            &["circle", "create", "name"],
+            &["circle", "add", "pk"],
+            &["circle", "remove", "pk"],
+            &["circle", "show"],
+        ];
+        for args in commands {
+            let cli = Cli::try_parse_from(std::iter::once("sweepky").chain(args.iter().copied()))
+                .expect("parses");
+            assert!(run_without_context(&cli).is_none(), "{args:?}");
+        }
+    }
 
     #[test]
     fn version_is_major_minor_patch() {

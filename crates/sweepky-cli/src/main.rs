@@ -1,18 +1,21 @@
 //! The `sweepky` binary: a thin layer over the `sweepky_cli` library.
 //!
-//! It does four things and nothing else:
+//! It does five things and nothing else:
 //!
 //! 1. parses the arguments ([`Cli`]);
-//! 2. reads the environment. This file is the only place that does, with
-//!    `std::env::var_os`, and it passes each value in, so the library and
-//!    its tests never depend on the process environment;
-//! 3. resolves the config and data directories ([`Dirs`], from `HOME` or
+//! 2. runs `init <dir>` at once, through [`run_without_context`]: it needs
+//!    only its directory, so it reads no environment variable, never opens
+//!    the `--passphrase-file` and builds no network client, and works with
+//!    HOME unset;
+//! 3. for every other command, reads the environment. This file is the only
+//!    place that does, with `std::env::var_os`, and it passes each value in,
+//!    so the library and its tests never depend on the process environment;
+//! 4. resolves the config and data directories ([`Dirs`], from `HOME` or
 //!    `SWEEPKY_HOME`), reads the passphrase when `--passphrase-file` names
 //!    one ([`Passphrase::from_file`]), builds the [`Network`] (production, or
 //!    the local testnet under `--testnet` / `SWEEPKY_TESTNET`) and the
-//!    [`Context`] around them and standard error;
-//! 4. runs the command and prints its report, or `error: ...` and exits with
-//!    status 1.
+//!    [`Context`] around them and standard error, then runs the command;
+//! 5. prints the command's report, or `error: ...` and exits with status 1.
 //!
 //! `anyhow` is used here and in the library alike: this crate only has to
 //! turn an error into a good message for the user. `sweepky-core` returns
@@ -38,7 +41,8 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use sweepky_cli::{
-    Cli, Context, Dirs, Network, Passphrase, Report, StderrWriter, run, select_kind,
+    Cli, Context, Dirs, Network, Passphrase, Report, StderrWriter, run, run_without_context,
+    select_kind,
 };
 
 /// `#[tokio::main]` turns this `async fn main` into an ordinary `fn main`
@@ -61,9 +65,17 @@ async fn main() -> ExitCode {
     }
 }
 
-/// Builds the context from the arguments and the environment, then runs the
-/// command.
+/// Runs `init` with no context, or builds the context from the arguments and
+/// the environment and then runs the command.
 async fn execute(cli: Cli) -> anyhow::Result<Report> {
+    // `init <dir>` first, before anything below can fail or reach out: it
+    // takes no HOME, no passphrase and no network, so a missing HOME, an
+    // unreadable passphrase file or a bad SWEEPKY_TESTNET cannot stop it, and
+    // it never starts the DHT node a production client would. Every other
+    // command comes back as `None` and goes on to the steps below.
+    if let Some(result) = run_without_context(&cli) {
+        return result;
+    }
     // `var_os` returns the raw value, or `None` when the variable is unset. It
     // never fails on a value that is not UTF-8; `select_kind` refuses that.
     let testnet_env = std::env::var_os("SWEEPKY_TESTNET");
