@@ -8,7 +8,7 @@
 //! from a local `EphemeralTestnet` instead ([`Network::injected`]), so the same
 //! code runs against a throwaway network with nothing reaching production.
 //!
-//! What is here so far (P2a, then P2b):
+//! What is here so far (P2a, then P2b, then P2c):
 //!
 //! - [`Cli`] and [`Command`], the arguments, parsed with clap. `--testnet`,
 //!   `--passphrase-file` and `--no-input` are global flags, so each goes
@@ -186,6 +186,14 @@
 //!   a sweep, each target's pins and the commit checked out, kept where
 //!   the agent cannot write, which `submit` builds the manifest's
 //!   `targetShas` from and removes once the record is final.
+//! - `pull` (P2c), so far only the local state it keeps between runs in the
+//!   data directory, one entry per owner: `feed-cursors.json`, each watched
+//!   homeserver's feed cursor, set after a batch or lowered to a bounty's
+//!   starting cursor; and `poll-state.json`, the roster poll's newest ids
+//!   seen, bounty and sweep summaries with their `ETag`s, the `ETag` of each
+//!   own `discovered.json`, the strangers' sweeps accepted and the
+//!   deletions confirmed. Both are capped, owner-only and keep the fields a
+//!   newer Sweepky adds.
 //!
 //! The rules that hold for everything here (see "Rust conventions" in
 //! `docs/plan/03-cli-and-skill.md`):
@@ -268,6 +276,19 @@ mod pins;
 // `post`: the bounty draft, checked and pinned into a bounty, shown, and
 // published once the owner says yes.
 mod post;
+// `pull`: so far only the local state it keeps between runs. The command
+// comes in a later step, so outside the tests nothing uses the module yet
+// and the compiler would warn of dead code. `expect` (not `allow`) silences
+// that only while it is true: the step that wires the command in must
+// remove it.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the pull command, its first user, comes in a later step"
+    )
+)]
+mod pull;
 // Owner-only files and directories, which every secret and state file goes
 // through.
 mod private_fs;

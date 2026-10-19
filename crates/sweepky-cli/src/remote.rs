@@ -83,6 +83,7 @@ use anyhow::{Context as _, anyhow, bail};
 // takes a closure rather than a response (see `read_capped`).
 use pubky::errors::RequestError;
 use pubky::{Method, Pubky, PubkyHttpClient, PubkyResource, PubkySession, PublicKey, StatusCode};
+use serde::{Deserialize, Serialize};
 use sweepky_core::paths::{self, SweepkyPath};
 use sweepky_core::{MAX_CIPHERTEXT_BYTES, MAX_RECORD_BYTES, RecordId, Zeroizing};
 use url::Url;
@@ -446,7 +447,14 @@ pub(crate) const MAX_ETAG_BYTES: usize = 128;
 /// gives its length alone. Two tags are compared exactly, as the homeserver
 /// compares them; nothing about a tag is secret, so no constant-time
 /// comparison is needed.
-#[derive(Clone, PartialEq, Eq)]
+///
+/// It is kept between runs in `pull`'s poll state, so it is `Serialize`,
+/// written as its text, and `Deserialize`, read back through
+/// [`ETag::parse`]'s check (`try_from = "String"` reads a string, then
+/// calls the `TryFrom<String>` below), so a tag from that file is held to
+/// the same rule as one from a server.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String")]
 pub(crate) struct ETag(String);
 
 impl ETag {
@@ -471,6 +479,16 @@ impl ETag {
     /// The tag as it came, to send back in `If-None-Match`.
     pub(crate) fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+/// So `#[serde(try_from = "String")]` can run [`ETag::parse`]. The error is
+/// fixed text: it never quotes the tag.
+impl TryFrom<String> for ETag {
+    type Error = &'static str;
+
+    fn try_from(text: String) -> Result<Self, Self::Error> {
+        Self::parse(text.as_bytes()).ok_or("is not an entity tag Sweepky sends back")
     }
 }
 

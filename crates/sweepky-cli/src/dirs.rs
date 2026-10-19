@@ -26,9 +26,15 @@
 //! | `git-home-<id>/` | git's `HOME` while one command (`post`, `run`) runs it: new, empty and 0700, removed when the command ends (`crate::git`) |
 //! | `staging/<id>/` | the sweep directory `run` builds before it moves it into the project's `sweeps/<id>/`: new and 0700, removed when `run` ends (`run::fetch`) |
 //! | `sweeps/<id>.json` | what `run` fetched for sweep `id`, which `submit` builds the manifest's commits from: written by `run`, removed once the sweep's record says `done` or `aborted` (`crate::sweep_state`) |
+//! | `feed-cursors.json` | per owner and watched homeserver, how far `pull` has read its `/events/` feed (`crate::pull`) |
+//! | `poll-state.json` | per owner, what `pull`'s roster polling learnt: the newest ids seen, bounty and sweep summaries with their `ETag`s, the strangers' sweeps accepted and the deletions confirmed (`crate::pull`) |
+//! | `<id>/` | what `pull` decrypted of the owner's bounty `id`, with `untrusted/` for the strangers' sweeps |
 //!
-//! The data directory's other subtrees (P2c) come later. Every file here
-//! is written with [`crate::private_fs`]: directories 0700, files 0600;
+//! A bounty's id is 13 characters of `0-9` and upper-case `A-Z`, and no
+//! other name here is, in either case: each is shorter or has a `-` or a
+//! `.` in it. So a pulled bounty's directory never takes another entry's
+//! name, even on a file system that ignores case. Every file here is
+//! written with [`crate::private_fs`]: directories 0700, files 0600;
 //! the one exception is what git checks out under `staging/<id>/`, which
 //! that 0700 directory keeps from other users.
 //!
@@ -193,6 +199,47 @@ impl Dirs {
     }
 }
 
+/// The data directory's files that `pull` keeps (`crate::pull`).
+// Nothing outside the tests calls these yet, so outside them the compiler
+// would warn that they are never used. `expect` (not `allow`) silences that
+// only while it is true, for every method in this block: the step that
+// wires the `pull` command in must remove it.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the pull command, their first caller, comes in a later step"
+    )
+)]
+impl Dirs {
+    /// `data/feed-cursors.json`: per owner and watched homeserver, how far
+    /// `pull` has read that homeserver's `/events/` feed.
+    pub(crate) fn feed_cursors_file(&self) -> PathBuf {
+        self.data.join("feed-cursors.json")
+    }
+
+    /// `data/poll-state.json`: per owner, what `pull`'s roster polling
+    /// learnt, which its next run starts from.
+    pub(crate) fn poll_state_file(&self) -> PathBuf {
+        self.data.join("poll-state.json")
+    }
+
+    /// `data/<id>/`: what `pull` decrypted of the owner's bounty `id`, 03's
+    /// `~/.local/share/sweepky/<bounty>/`. A [`RecordId`] is 13 characters
+    /// of `0-9` and upper-case `A-Z`, so the name is one plain path segment
+    /// and never that of another entry here, none of which is 13 such
+    /// characters, in either case (the module docs).
+    pub(crate) fn pulled_bounty_dir(&self, id: &RecordId) -> PathBuf {
+        self.data.join(id.to_string())
+    }
+
+    /// `data/<id>/untrusted/`: the strangers' sweeps of bounty `id`, kept
+    /// apart from the merged report (02, "Sweeper safety").
+    pub(crate) fn pulled_untrusted_dir(&self, id: &RecordId) -> PathBuf {
+        self.pulled_bounty_dir(id).join("untrusted")
+    }
+}
+
 /// `value` as a path, if it is non-empty and absolute; `variable` names it in
 /// the error.
 fn absolute(variable: &str, value: &OsStr) -> anyhow::Result<PathBuf> {
@@ -292,6 +339,22 @@ mod tests {
         assert_eq!(
             dirs.sweep_snapshot_file(&id),
             Path::new("/x/share/sweeps/0035G87EK4XFE.json")
+        );
+        assert_eq!(
+            dirs.feed_cursors_file(),
+            Path::new("/x/share/feed-cursors.json")
+        );
+        assert_eq!(
+            dirs.poll_state_file(),
+            Path::new("/x/share/poll-state.json")
+        );
+        assert_eq!(
+            dirs.pulled_bounty_dir(&id),
+            Path::new("/x/share/0035G87EK4XFE")
+        );
+        assert_eq!(
+            dirs.pulled_untrusted_dir(&id),
+            Path::new("/x/share/0035G87EK4XFE/untrusted")
         );
     }
 }
