@@ -134,27 +134,31 @@
 //!   context's target source; the bounty shown, sanitised, on standard
 //!   error, and published as `bounties/<id>.json` under the writers' lock
 //!   with a fresh session only once the owner says yes.
-//! - `own_storage`, `OwnStorage`: the seam through which `post`, and later
-//!   `run` and `submit`, write the signed-in user's own records and read
+//! - `own_storage`, `OwnStorage`: the seam through which `post` and `run`,
+//!   and later `submit`, write the signed-in user's own records and read
 //!   them back, with a fake for the unit tests that can refuse a chosen
 //!   write.
 //! - `records`, `PublicRecords`: the seam through which `run` reads
 //!   anyone's public bounty, circle and sweep records, with no session,
 //!   each capped and parsed by core, with a fake for the unit tests.
-//! - `run`, so far its checking half and its fetching half: the `init`
-//!   project it must be run in, its marker read through `init`'s own
-//!   reader with the playbook a later `init` records; the bounty's
-//!   `pubky://` URL, anything else refused unquoted; whether this sweeper
-//!   may run the bounty (status `open`, then `open: true` or the owner's
-//!   own circle listing the sweeper, or with `--circle` both in that
-//!   circle); which targets it sweeps (every one this build can, or
-//!   `--target`'s, case-colliding ids and the target policy refused); what
-//!   it shows of the bounty, its title and focus sanitised and never its
-//!   brief; and the fetch: each target by its exact SHA, at depth 2, into
+//! - `run <bounty-url> [--target <tid>] [--circle <admin>]` (`run`): in
+//!   the `init` project it must be run in, whose marker may name a
+//!   playbook, it checks the bounty's `pubky://` URL (anything else refused
+//!   unquoted), whether this sweeper may run the bounty (status `open`,
+//!   then `open: true` or the owner's own circle listing the sweeper, or
+//!   with `--circle` both in that circle) and which targets it sweeps
+//!   (every one this build can, or `--target`'s, case-colliding ids and
+//!   the target policy refused), and shows the bounty, its title and focus
+//!   sanitised and never its brief. Then it publishes `sweeps/<id>.json` as
+//!   `running` under the writers' lock with a fresh session, and, outside
+//!   the lock, fetches each target by its exact SHA, at depth 2, into
 //!   `./sweeps/<id>/target/<tid>/`, links checked out as plain files, the
-//!   agent-instruction files stripped at every depth and in any case, and
-//!   `scope.json` and `brief.md` written beside them, the half-made sweep
-//!   directory removed if any step fails.
+//!   agent-instruction files stripped at every depth and in any case,
+//!   writes `scope.json` and `brief.md` beside them, and last the marker
+//!   `sweeps/<id>/.sweepky/sweep.json`. If any of that fails, the sweep
+//!   directory is removed and the record flipped to `aborted`. The report
+//!   says what to run next. Without a URL it says that picking a bounty
+//!   comes in a later build.
 //!
 //! The rules that hold for everything here (see "Rust conventions" in
 //! `docs/plan/03-cli-and-skill.md`):
@@ -247,9 +251,9 @@ mod records;
 // conversions, and the key stores the reads of the user's own records, of
 // anyone's public records and the listing.
 mod remote;
-// `run`: so far its checking half, the init project it needs, the bounty
-// URL, whether this sweeper may run the bounty and which targets it sweeps,
-// and its fetching half, the targets fetched, stripped and scoped.
+// `run`: the bounty checked, the sweep published as running, the targets
+// fetched, stripped and scoped, and the per-sweep marker written last; or
+// the sweep aborted.
 mod run;
 // The per-command session: the writers' lock, a fresh sign-in and a sign-out
 // that is always attempted. `login` holds its lock; `keys revoke` is the
@@ -432,7 +436,8 @@ pub fn run_without_context(cli: &Cli) -> Option<anyhow::Result<Report>> {
         | Command::Logout
         | Command::Keys { .. }
         | Command::Circle { .. }
-        | Command::Post { .. } => None,
+        | Command::Post { .. }
+        | Command::Run { .. } => None,
     }
 }
 
@@ -492,6 +497,14 @@ pub async fn run(cli: Cli, ctx: &Context) -> anyhow::Result<Report> {
             let prompting = prompt::Prompting::from_no_input_flag(cli.no_input);
             post::post(ctx, prompting, &draft).await
         }
+        // `run::run` is the function `run` in the module `run`: a module
+        // and a function live in different namespaces, so the two names
+        // do not clash with this function's own.
+        Command::Run {
+            bounty,
+            target,
+            circle,
+        } => run::run(ctx, bounty.as_deref(), target.as_deref(), circle.as_deref()).await,
     }
 }
 
@@ -548,6 +561,15 @@ mod tests {
             &["circle", "remove", "pk"],
             &["circle", "show"],
             &["post", "draft.json"],
+            &["run"],
+            &[
+                "run",
+                "pubky://owner/pub/sweepky/bounties/0035G87EK4XFE.json",
+                "--target",
+                "t1",
+                "--circle",
+                "admin",
+            ],
         ];
         for args in commands {
             // With and without `--no-input`, which changes nothing here: the

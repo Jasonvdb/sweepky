@@ -164,6 +164,37 @@ pub enum Command {
         #[arg(value_name = "DRAFT")]
         draft: PathBuf,
     },
+
+    /// Start a sweep of the bounty at BOUNTY_URL, in the init project this
+    /// is run in: check that you may run it, publish
+    /// /pub/sweepky/sweeps/ID.json as running, fetch each target by its
+    /// pinned SHA into sweeps/ID/target/TID/ with its agent-instruction
+    /// files stripped, and write scope.json, brief.md and the
+    /// sweeps/ID/.sweepky/sweep.json marker. If a fetch fails, the sweep is
+    /// marked aborted and its directory removed. Then run Claude Code here,
+    /// /sweepky, and `sweepky submit`.
+    Run {
+        /// The bounty's pubky:// URL, as `sweepky post` printed it.
+        /// (Picking a bounty from your circle without one comes in a later
+        /// build.)
+        //
+        // Plain text, checked by `run`, for the same reason as
+        // `--homeserver`: clap's own parse error would quote the value,
+        // and a key pasted in the wrong place must not be printed back.
+        #[arg(value_name = "BOUNTY_URL")]
+        bounty: Option<String>,
+
+        /// Sweep only the target with this id, instead of every target this
+        /// build can sweep.
+        #[arg(long, value_name = "TID")]
+        target: Option<String>,
+
+        /// Check the bounty against the circle ADMIN keeps, instead of its
+        /// owner's own: both the owner and you must be in it. ADMIN is a
+        /// pubky, with or without the `pubky` prefix.
+        #[arg(long, value_name = "ADMIN")]
+        circle: Option<String>,
+    },
 }
 
 /// The `circle` commands.
@@ -340,6 +371,40 @@ mod tests {
         // Exactly one: none, or a second, is a usage error.
         assert!(Cli::try_parse_from(["sweepky", "post"]).is_err());
         assert!(Cli::try_parse_from(["sweepky", "post", "a.json", "b.json"]).is_err());
+    }
+
+    #[test]
+    fn run_takes_an_optional_url_a_target_and_a_circle() {
+        let url = "pubky://owner/pub/sweepky/bounties/0035G87EK4XFE.json";
+        let cli =
+            Cli::try_parse_from(["sweepky", "run", url, "--target", "t1", "--circle", "admin"])
+                .expect("parses");
+        let Command::Run {
+            bounty,
+            target,
+            circle,
+        } = &cli.command
+        else {
+            panic!("run parses as Run: {cli:?}");
+        };
+        assert_eq!(bounty.as_deref(), Some(url));
+        assert_eq!(target.as_deref(), Some("t1"));
+        assert_eq!(circle.as_deref(), Some("admin"));
+
+        // Each is optional to clap: `run` says what a missing URL means. All
+        // three are plain text, which `run` checks, so a value clap would
+        // refuse, and quote, never reaches clap's own parse.
+        let cli = Cli::try_parse_from(["sweepky", "run"]).expect("parses");
+        assert!(matches!(
+            cli.command,
+            Command::Run {
+                bounty: None,
+                target: None,
+                circle: None
+            }
+        ));
+        // One URL at most.
+        assert!(Cli::try_parse_from(["sweepky", "run", url, url]).is_err());
     }
 
     #[test]

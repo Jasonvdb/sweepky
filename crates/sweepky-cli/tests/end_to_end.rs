@@ -28,8 +28,9 @@ use sweepky_cli::{
     StdinReader, TargetSource, run,
 };
 use sweepky_core::{
-    Bounty, BountyRef, Circle, DeviceIdentity, DeviceKey, GitSha, KnownBountyStatus, KnownTarget,
-    MAX_RECORD_BYTES, Pubky, RepoName, RepoPath, SecretString, Zeroizing, paths,
+    Bounty, BountyRef, Circle, DeviceIdentity, DeviceKey, GitSha, KnownBountyStatus,
+    KnownSweepStatus, KnownTarget, MAX_RECORD_BYTES, Pubky, RecordId, RepoName, RepoPath,
+    SecretString, Sweep, SweepRef, Zeroizing, paths,
 };
 
 /// What the context writes to standard error, kept where the test can read
@@ -740,7 +741,8 @@ async fn end_to_end() {
     let a_home = tempfile::tempdir().expect("temp dir");
     let (a, a_stderr) = context(&testnet, a_home.path(), Cursor::new(b"y\n".to_vec()));
     let b_home = tempfile::tempdir().expect("temp dir");
-    let (b, b_stderr) = context(&testnet, b_home.path(), io::empty());
+    // `mut`: B's working directory becomes its project before `run`.
+    let (mut b, b_stderr) = context(&testnet, b_home.path(), io::empty());
     sweepky(&a, &["login", "--identity", "a"])
         .await
         .expect("A logs in");
@@ -843,4 +845,111 @@ async fn end_to_end() {
     assert_eq!(commit.rev(), &m);
     assert_eq!(pr.number().get(), 1);
     assert_eq!((pr.base(), pr.head(), pr.merge_base()), (&m, &f2, &b_sha));
+
+    // ----- P2b: B runs A's bounty in an init project -----
+
+    // B's project, made by the minimal `init`; B then works in it, as
+    // `run` must be run in the project's own directory.
+    let b_projects = tempfile::tempdir().expect("temp dir");
+    let project = b_projects.path().join("project");
+    sweepky(&b, &["init", project.to_str().expect("a UTF-8 path")])
+        .await
+        .expect("B's init");
+    b.cwd = project.clone();
+
+    let report = sweepky(&b, &["run", &posted.to_string()])
+        .await
+        .expect("B runs A's bounty");
+
+    // B was shown why it may run the bounty, and the report says what to
+    // run next. One sweep directory, named by the sweep's id.
+    let shown = b_stderr.text();
+    assert!(shown.contains(&format!("Bounty {posted}\n")), "{shown}");
+    assert!(
+        shown.contains("Closed: you are in its owner's circle"),
+        "{shown}"
+    );
+    let sweeps = project.join("sweeps");
+    let ids: Vec<String> = fs::read_dir(&sweeps)
+        .expect("sweeps/")
+        .map(|entry| {
+            entry
+                .expect("an entry")
+                .file_name()
+                .into_string()
+                .expect("UTF-8")
+        })
+        .collect();
+    let [id] = ids.as_slice() else {
+        panic!("one sweep directory: {ids:?}");
+    };
+    let sweep = SweepRef {
+        sweeper: b_pubky,
+        id: id.parse::<RecordId>().expect("a record id"),
+    };
+    let text = report.text();
+    for next in [
+        "claude --setting-sources project,local".to_owned(),
+        "/sweepky".to_owned(),
+        format!("sweepky submit --run-dir sweeps/{id}"),
+    ] {
+        assert!(text.contains(&next), "{next} not in {text}");
+    }
+
+    // Anyone can read B's sweep record: running, for A's bounty, with all
+    // three targets, and the placeholder playbook, since B's `init`
+    // recorded none.
+    let b_user = PublicKey::try_from_z32(&b_pubky.to_string()).expect("a key");
+    let record = get_capped(
+        &testnet,
+        &b_user,
+        &paths::sweep_record(sweep.id),
+        MAX_RECORD_BYTES,
+    )
+    .await;
+    let record = Sweep::from_json(&record).expect("a sweep record");
+    assert_eq!(record.status.as_known(), Some(KnownSweepStatus::Running));
+    assert_eq!(record.bounty, posted);
+    let target_ids: Vec<&str> = record.targets.iter().map(|id| id.as_str()).collect();
+    assert_eq!(target_ids, ["t1", "t2", "t3"]);
+    assert_eq!(record.playbook.as_str(), "unspecified");
+    assert_eq!(record.finished_at, None);
+
+    // Each target holds its pinned commit, checked out detached, so
+    // `.git/HEAD` is the SHA itself: the repo and the commit target at M,
+    // the pull request at its head F2.
+    // The fixture's planted agent files are gone from each, and scope.json
+    // lists them for that target.
+    let planted = [
+        ".claude/",
+        ".mcp.json",
+        "AGENTS.md",
+        "CLAUDE.local.md",
+        "CLAUDE.md",
+        "src/auth/CLAUDE.md",
+    ];
+    let sweep_dir = sweeps.join(id);
+    let scope = json(&sweep_dir.join("scope.json"));
+    for (index, (tid, commit)) in [("t1", &m), ("t2", &m), ("t3", &f2)]
+        .into_iter()
+        .enumerate()
+    {
+        let target = sweep_dir.join("target").join(tid);
+        assert_eq!(
+            fs::read_to_string(target.join(".git/HEAD")).expect("HEAD"),
+            format!("{commit}\n"),
+            "{tid}"
+        );
+        assert_eq!(scope["targets"][index]["id"], tid);
+        assert_eq!(scope["targets"][index]["stripped"], json!(planted), "{tid}");
+        for relative in planted {
+            assert_gone(&target.join(relative));
+        }
+    }
+
+    // The per-sweep marker names the sweep and the bounty.
+    let marker = json(&sweep_dir.join(".sweepky/sweep.json"));
+    assert_eq!(marker["sweep"], sweep.to_string());
+    assert_eq!(marker["bounty"], posted.to_string());
+    assert_eq!(marker["targets"], json!(["t1", "t2", "t3"]));
 }

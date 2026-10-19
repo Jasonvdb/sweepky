@@ -112,8 +112,9 @@ impl RosterText {
 ///
 /// Both messages are fixed text, and so is core's error under the first: a
 /// value that fails either check is not a public key, and may be something
-/// pasted in by mistake, so it is never repeated.
-fn parse_pubky(text: &str, command: &str) -> anyhow::Result<Pubky> {
+/// pasted in by mistake, so it is never repeated. `run --circle` reads its
+/// value with it too.
+pub(crate) fn parse_pubky(text: &str, command: &str) -> anyhow::Result<Pubky> {
     let pubky: Pubky = text.parse().with_context(|| {
         format!(
             "{command} takes a pubky: 52 characters of z-base32, with or without the `pubky` \

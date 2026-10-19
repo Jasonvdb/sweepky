@@ -94,17 +94,6 @@ impl ProjectMarker {
     /// that names none, such as every one P2a's `init` writes.
     // `as_ref` lends the value inside the `Option` out, `Option<&Playbook>`,
     // so the caller reads it without taking it from the marker.
-    //
-    // The run command, later in P2b, is the first caller outside the tests:
-    // `expect` (not `allow`) silences the dead-code warning only while that
-    // is true, and that caller removes it.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the run command, later in P2b, is the first caller"
-        )
-    )]
     pub(crate) fn playbook(&self) -> Option<&Playbook> {
         self.playbook.as_ref()
     }

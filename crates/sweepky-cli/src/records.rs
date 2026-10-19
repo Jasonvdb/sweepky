@@ -128,14 +128,6 @@ pub(crate) struct PublicRecordReader<'a> {
     client: &'a pubky::Pubky,
 }
 
-// The run command, the next step of P2b, is the first to make a reader,
-// and the unit tests use the fake, so `new` is unused in both builds.
-// `expect` (not `allow`) silences that warning only while it is true, and
-// that step removes it.
-#[expect(
-    dead_code,
-    reason = "the run command, later in P2b, is the first to read through it"
-)]
 impl<'a> PublicRecordReader<'a> {
     /// A reader on `client`.
     pub(crate) fn new(client: &'a pubky::Pubky) -> Self {

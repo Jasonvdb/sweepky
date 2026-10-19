@@ -1,33 +1,65 @@
-//! `run`, the terminal command a sweeper runs before the agent: so far its
-//! checking half, which reads and decides and writes nothing, and its
-//! fetching half, which puts the chosen targets in the project.
+//! `run`, the terminal command a sweeper runs before the agent: it checks
+//! a bounty, publishes the sweep as `running`, fetches the bounty's targets
+//! into the project and writes what the agent and `submit` need beside
+//! them.
 //!
-//! - [`require_project`]: `run` must be run inside an `init` project, in
-//!   the directory that holds its `.sweepky` marker, which `init`'s own
-//!   reader reads (`init::read_project_marker`) and hands back with the
-//!   playbook P3's `init` will record in it.
-//! - [`parse_bounty_url`]: the bounty argument, a bounty record's
-//!   `pubky://` URL as `post` prints it. Anything else is refused in fixed
-//!   text that never quotes it: a sweep's URL, a web address, a malformed
-//!   URL, and a pasted key, which `login`'s classifier
-//!   (`identity::refuse_secret_material`) recognises.
-//! - [`check_bounty`]: reads the bounty from its owner's storage and, when
-//!   one decides, the circle it is checked against, through
-//!   [`PublicRecords`]; then `select` decides whether this sweeper may run
-//!   it and which targets it sweeps.
-//! - [`CheckedBounty::summary`]: what `run` shows of the bounty: its URL,
-//!   its title and focus through the terminal sanitiser, why it may be run,
-//!   and each target with the commit it reviews. Never the brief, which the
-//!   agent reads from a file.
-//! - `fetch`: the check that `./sweeps/<id>/` can be made, which `run`
-//!   makes before it publishes anything (`check_sweep_dir`), and the fetch
-//!   (`fetch_sweep`): each chosen target by its exact SHA, at depth 2, from
-//!   its one checked remote, into `./sweeps/<id>/target/<tid>/`, checked out
-//!   with every link written as a plain file; `strip` takes the
-//!   agent-instruction files out of each copy at every depth and in any
-//!   case; `scope_file` writes `scope.json`, rebuilt from the bounty's
-//!   checked targets, and `brief.md`. A failure removes the half-made sweep
-//!   directory.
+//! [`run`](fn@run), in the order 00's loop (step 2) and 03's `run` row give:
+//!
+//! 1. **Check, writing nothing.** The working directory must be an `init`
+//!    project ([`require_project`]), whose marker may name a playbook. The
+//!    argument must be a bounty's `pubky://` URL ([`parse_bounty_url`]);
+//!    without one, `run` says that picking a bounty from the circle comes
+//!    in a later build. `--circle` must be a pubky, and this install must
+//!    be logged in: the pubky `login.json` names is the sweeper.
+//!    [`check_bounty`] reads the bounty and the one circle that decides,
+//!    with no session, and chooses the targets; [`CheckedBounty::summary`]
+//!    goes to standard error. The git runner is made, and the sweep's id,
+//!    and `fetch::check_sweep_dir` checks that `./sweeps/<id>/` can be
+//!    made.
+//! 2. **Publish `running`.** `sweeps/<id>.json`, under the writers' lock
+//!    with a fresh session, signed out again at once
+//!    ([`LockedSessionPublisher`]). A refused write ends the run here: no
+//!    git has run and no directory was made.
+//! 3. **Fetch, outside the lock.** `fetch::fetch_sweep` fetches each
+//!    target, strips it and writes `scope.json` and `brief.md`; then the
+//!    per-sweep marker `sweeps/<id>/.sweepky/sweep.json` (`marker`) is
+//!    written, last.
+//! 4. **Or abort.** If any step of 3 fails, an unserved SHA among them,
+//!    the sweep directory is gone (the fetch's own guard, or a removal
+//!    here when only the marker failed) and the record is flipped to
+//!    `aborted`, with `finishedAt`, under the lock once more. `aborted` is
+//!    final: `pull` re-fetches only `running` sweeps and the board shows an
+//!    aborted one struck. A flip that fails too is said in the error, in
+//!    fixed text.
+//! 5. **Report** the sweep, what was stripped from each target, and what
+//!    to run next: Claude Code with the project's settings alone,
+//!    `/sweepky`, then `sweepky submit --run-dir sweeps/<id>`.
+//!
+//! So the lock is held twice at most, for the running write and for the
+//! flip, each time around a sign-in, one PUT and a sign-out, and never
+//! while git runs or the bounty is read.
+//!
+//! **The playbook.** The record's `playbook` is the one the project's
+//! `init` recorded or, when there is none, as with every P2a `init`, the
+//! placeholder [`UNSPECIFIED_PLAYBOOK`]: core's `Sweep` needs one, and
+//! `submit --playbook` replaces it.
+//!
+//! The parts:
+//!
+//! - [`require_project`], [`parse_bounty_url`], [`check_bounty`] and
+//!   [`CheckedBounty::summary`]: the checking half (above), with `select`,
+//!   which decides from the records alone.
+//! - `fetch`: the check that `./sweeps/<id>/` can be made, and the fetch:
+//!   each chosen target by its exact SHA, at depth 2, from its one checked
+//!   remote, into `./sweeps/<id>/target/<tid>/`, checked out with every
+//!   link written as a plain file; `strip` takes the agent-instruction
+//!   files out of each copy at every depth and in any case; `scope_file`
+//!   writes `scope.json`, rebuilt from the bounty's checked targets, and
+//!   `brief.md`. A failure removes the half-made sweep directory.
+//! - `marker`: the per-sweep marker, written last, all at once and never
+//!   through a link.
+//! - [`PublishRecord`], the seam the sweep record is written through, so
+//!   the order above is tested with a fake storage and the fixture source.
 //!
 //! **Which circle, and why** (00's trust row: whose bounties a sweeper
 //! works on is "the sweeper's own allowlist (circle by default) + the
@@ -42,35 +74,320 @@
 //! must be in that circle. Picking a bounty without a URL, a later step,
 //! picks from this install's own circle by default.
 
-// `run` is not wired to the command line until the step after this one, so
-// outside the tests everything here is dead code. `expect` (not `allow`)
-// silences that warning only while it is true, and that step removes it.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the run command, later in P2b, is the first caller"
-    )
-)]
-
 mod fetch;
+mod marker;
 mod scope_file;
 mod select;
 mod strip;
 
+use std::fs;
 use std::path::Path;
 
 use anyhow::{Context as _, bail};
-use sweepky_core::{Bounty, BountyRef, KnownTarget, Pubky, PubkyUrl, RepoName, SweepRef, TargetId};
+use sweepky_core::paths;
+use sweepky_core::{
+    Bounty, BountyRef, KnownSweepStatus, KnownTarget, Playbook, Pubky, PubkyUrl, RecordTime,
+    RepoName, SchemaVersion, Sweep, SweepRef, TargetId, UnknownFields,
+};
 
+use self::fetch::{FetchedSweep, check_sweep_dir, fetch_sweep};
+use self::marker::SweepMarker;
 use self::select::{Acceptance, ChosenTarget, ChosenTargets};
+use crate::circle::parse_pubky;
 use crate::display::sanitize;
+use crate::git::RunGit;
 use crate::identity::refuse_secret_material;
 use crate::init::{ProjectMarker, read_project_marker};
+use crate::own_storage::{OwnStorage, SessionStorage};
 use crate::post::draft::{MAX_FOCUS_CHARS, MAX_TITLE_CHARS};
-use crate::records::PublicRecords;
-use crate::remote::public_key_of;
+use crate::records::{PublicRecordReader, PublicRecords};
+use crate::remote::{public_key_of, write_error};
+use crate::session::{NOT_LOGGED_IN, with_writer_session};
+use crate::state::read_login_state;
 use crate::targets::TargetResolver;
+use crate::{Context, Dirs, Report, clock};
+
+/// What `run` says when it is given no bounty URL, until picking one is
+/// built.
+const PICKING_LATER: &str = "run needs a bounty's URL, \
+                             pubky://<owner>/pub/sweepky/bounties/<id>.json as `sweepky post` \
+                             printed it; picking a bounty from your circle without one comes in \
+                             a later build";
+
+/// The playbook a sweep record names when the project's `init` recorded
+/// none, as P2a's `init` never does: core's `Sweep` needs one, this passes
+/// 01's pattern, and `submit --playbook` replaces it.
+const UNSPECIFIED_PLAYBOOK: &str = "unspecified";
+
+/// What the error says, in front of the failure, once the record says
+/// `aborted`.
+const ABORTED: &str = "run stopped, and the sweep's public record now says aborted";
+
+/// What the error says, in front of the failure, when the record could not
+/// be flipped to `aborted` either.
+const NOT_ABORTED: &str = "run stopped, but the sweep's public record could not be changed \
+                           to aborted and still says running";
+
+/// What the write under the lock refuses when `login.json` names another
+/// pubky than the one `run` checked the bounty for.
+const LOGIN_CHANGED: &str = "this install was logged in as another identity while run checked the \
+                             bounty, so nothing was published; run it again";
+
+/// Runs `sweepky run [<bounty-url>] [--target <tid>] [--circle <admin>]`
+/// in `ctx.cwd`, which must be an `init` project: see the module docs for
+/// the order and why.
+pub(crate) async fn run(
+    ctx: &Context,
+    bounty_url: Option<&str>,
+    target: Option<&str>,
+    circle: Option<&str>,
+) -> anyhow::Result<Report> {
+    let project_marker = require_project(&ctx.cwd)?;
+    let Some(bounty_url) = bounty_url else {
+        bail!(PICKING_LATER);
+    };
+    let request = RunRequest {
+        bounty: parse_bounty_url(bounty_url)?,
+        // `map` parses only a `Some`, and `transpose` turns the
+        // `Option<Result<..>>` into the `Result<Option<..>>` that `?` takes.
+        circle: circle
+            .map(|admin| parse_pubky(admin, "run --circle"))
+            .transpose()?,
+        sweeper: logged_in_sweeper(&ctx.dirs)?,
+        target,
+    };
+    let records = PublicRecordReader::new(ctx.network.pubky());
+    let checked = check_bounty(&records, &ctx.targets, &request).await?;
+    ctx.stderr.write_flushed(&checked.summary())?;
+    // Made before anything is published, so a machine where git cannot run
+    // stops here with nothing to undo.
+    let git = ctx.targets.git_runner(&ctx.dirs, &ctx.git_env)?;
+    let new = NewSweep {
+        project: &ctx.cwd,
+        sweep: SweepRef {
+            sweeper: request.sweeper,
+            id: clock::new_record_id()?,
+        },
+        checked: &checked,
+        playbook: project_marker.playbook(),
+    };
+    let publisher = LockedSessionPublisher {
+        ctx,
+        sweeper: request.sweeper,
+    };
+    let fetched = start_sweep(&publisher, &git, &ctx.targets, &new).await?;
+    Ok(Report::new(started_report(&new, &fetched)))
+}
+
+/// The pubky this install is logged in as, from `login.json`: the sweeper,
+/// whom the bounty is checked for and whose storage the sweep goes in.
+fn logged_in_sweeper(dirs: &Dirs) -> anyhow::Result<Pubky> {
+    let Some(login) = read_login_state(dirs)? else {
+        bail!(NOT_LOGGED_IN);
+    };
+    Ok(login.pubky)
+}
+
+/// One sweep `run` starts: the project it goes in, its record's address
+/// (the sweeper and a new id), the bounty it sweeps, and the playbook the
+/// project's `init` recorded, if any. It borrows all but the address (the
+/// lifetime `'a`) from `run`, which keeps them.
+struct NewSweep<'a> {
+    project: &'a Path,
+    sweep: SweepRef,
+    checked: &'a CheckedBounty,
+    playbook: Option<&'a Playbook>,
+}
+
+/// Where `run` publishes its sweep record, `sweeps/<id>.json`: the running
+/// record, then, if the run fails, the aborted one.
+///
+/// A trait so that the order of the writes and the git runs can be tested
+/// without a homeserver: the tests implement it for
+/// `test_support::FakeOwnStorage`. Its method is an `async fn`, so callers
+/// take `&impl PublishRecord`, as with `RunGit`.
+trait PublishRecord {
+    /// Writes `record` at `path` of the sweeper's own storage. A refusal is
+    /// fixed text and the status, never the server's words.
+    async fn publish(&self, path: &str, record: Vec<u8>) -> anyhow::Result<()>;
+}
+
+/// The real [`PublishRecord`]: each write under the writers' lock, with a
+/// session signed in for it alone and signed out at once, so the lock is
+/// held around a sign-in, one PUT and a sign-out, and never while git runs.
+struct LockedSessionPublisher<'a> {
+    ctx: &'a Context,
+    /// The pubky `run` checked the bounty for, which the session must be.
+    sweeper: Pubky,
+}
+
+impl PublishRecord for LockedSessionPublisher<'_> {
+    async fn publish(&self, path: &str, record: Vec<u8>) -> anyhow::Result<()> {
+        // `async move` moves `record` into the body, and copies `self` and
+        // `path`, which are references. The body only borrows the session,
+        // so `with_writer_session` signs it out whatever the body returns.
+        with_writer_session(self.ctx, async move |signed| {
+            // `login.json` is read again under the lock. A `login` as
+            // another identity since `run` read it would publish this sweep
+            // under a pubky the bounty was not checked for.
+            if signed.login().pubky != self.sweeper {
+                bail!(LOGIN_CHANGED);
+            }
+            put_record(&SessionStorage::new(signed), path, record).await
+        })
+        .await
+    }
+}
+
+/// Writes `record` at `path` through `storage`, a refusal mapped by
+/// `write_error`: 403 and 507 to their messages, anything else to fixed
+/// text and the status, never the server's words.
+async fn put_record(storage: &impl OwnStorage, path: &str, record: Vec<u8>) -> anyhow::Result<()> {
+    storage
+        .put(path, record)
+        .await
+        .map_err(|error| write_error(&error).context(format!("could not write {path}")))
+}
+
+/// Starts `new`: checks that its directory can be made, publishes it as
+/// `running` through `publisher`, then, outside any lock, fetches its
+/// targets through `git` and `source` and writes its marker, last. If a
+/// step after the running write fails, the sweep directory is gone and the
+/// record is flipped to `aborted` ([`abort`]).
+async fn start_sweep(
+    publisher: &impl PublishRecord,
+    git: &impl RunGit,
+    source: &impl TargetResolver,
+    new: &NewSweep<'_>,
+) -> anyhow::Result<FetchedSweep> {
+    check_sweep_dir(new.project, new.sweep.id)?;
+    let running = running_record(new, clock::now()?)?;
+    let path = paths::sweep_record(new.sweep.id);
+    publisher
+        .publish(&path, record_bytes(&running)?)
+        .await
+        .context("could not publish the sweep as running, so run fetched nothing")?;
+    match fetch_and_mark(git, source, new, &running).await {
+        Ok(fetched) => Ok(fetched),
+        // `running` is moved into `abort`: the borrow `fetch_and_mark` took
+        // ended with it.
+        Err(failure) => Err(abort(publisher, &path, running, failure).await),
+    }
+}
+
+/// The record `run` publishes for `new` before it fetches anything:
+/// `running`, from `started_at`, with no `finishedAt`.
+fn running_record(new: &NewSweep<'_>, started_at: RecordTime) -> anyhow::Result<Sweep> {
+    let playbook = match new.playbook {
+        Some(playbook) => playbook.clone(),
+        None => UNSPECIFIED_PLAYBOOK
+            .parse()
+            .context("the placeholder playbook does not pass 01's pattern; this is a bug")?,
+    };
+    Ok(Sweep {
+        schema_version: SchemaVersion::CURRENT,
+        bounty: new.checked.bounty_ref,
+        targets: new
+            .checked
+            .targets
+            .iter()
+            .map(|chosen| chosen.id.clone())
+            .collect(),
+        playbook,
+        status: KnownSweepStatus::Running.into(),
+        started_at,
+        finished_at: None,
+        sha256: None,
+        extra: UnknownFields::new(),
+    })
+}
+
+/// `record` as it is published: compact JSON, as `post` writes a bounty.
+/// At most `MAX_TARGETS` ids of at most 32 characters, a URL and a short
+/// playbook keep it far under `MAX_RECORD_BYTES`.
+fn record_bytes(record: &Sweep) -> anyhow::Result<Vec<u8>> {
+    serde_json::to_vec(record).context("could not write the sweep record")
+}
+
+/// Fetches `new`'s targets into its sweep directory, then writes the
+/// marker of `running`, last. A marker that cannot be written takes the
+/// directory with it, as a failed fetch does, so no sweep is left without
+/// one.
+async fn fetch_and_mark(
+    git: &impl RunGit,
+    source: &impl TargetResolver,
+    new: &NewSweep<'_>,
+    running: &Sweep,
+) -> anyhow::Result<FetchedSweep> {
+    let fetched = fetch_sweep(git, source, new.project, new.sweep, new.checked).await?;
+    let marker = SweepMarker::new(new.sweep, running, new.playbook);
+    if let Err(error) = marker.write_into(&fetched.dir) {
+        // Best effort, as the fetch's own guard is: a directory left behind
+        // has no marker, so `submit` refuses it. `remove_dir_all` never
+        // follows a link inside it.
+        let _ = fs::remove_dir_all(&fetched.dir);
+        return Err(error);
+    }
+    Ok(fetched)
+}
+
+/// The error `run` stops with when a step after the running write failed
+/// with `failure`: `failure` itself, behind [`ABORTED`] once the record at
+/// `path` is flipped to `aborted`, or behind [`NOT_ABORTED`] and the
+/// flip's own error, which is fixed text too, when it could not be.
+async fn abort(
+    publisher: &impl PublishRecord,
+    path: &str,
+    running: Sweep,
+    failure: anyhow::Error,
+) -> anyhow::Error {
+    match publish_aborted(publisher, path, running).await {
+        Ok(()) => failure.context(ABORTED),
+        // `{:#}` writes the flip's whole chain of context on one line.
+        Err(flip) => failure.context(format!("{NOT_ABORTED} ({flip:#})")),
+    }
+}
+
+/// Publishes `record`, the running one, at `path` as `aborted`, finished
+/// now. Everything else stays as it was.
+// `mut record`: this function owns the record it was given, so it may
+// change it before writing it.
+async fn publish_aborted(
+    publisher: &impl PublishRecord,
+    path: &str,
+    mut record: Sweep,
+) -> anyhow::Result<()> {
+    record.status = KnownSweepStatus::Aborted.into();
+    record.finished_at = Some(clock::now()?);
+    publisher.publish(path, record_bytes(&record)?).await
+}
+
+/// What `run` reports once the sweep is whole: the sweep's URL, what was
+/// stripped from each target, and what to run next. The ids and counts
+/// are checked values and the project's path is the user's own, so
+/// nothing here needs the sanitiser; the stripped names, which are the
+/// repository's, are left to `scope.json`.
+fn started_report(new: &NewSweep<'_>, fetched: &FetchedSweep) -> String {
+    let id = new.sweep.id;
+    let mut text = format!(
+        "Started the sweep {}, published as running.\nIts targets are in sweeps/{id}/target/, \
+         with scope.json and brief.md beside them:\n",
+        new.sweep
+    );
+    for target in &fetched.targets {
+        text.push_str(&format!(
+            "  {}: agent-instruction files stripped: {} (scope.json lists them)\n",
+            target.id,
+            target.stripped.len()
+        ));
+    }
+    text.push_str(&format!(
+        "Next, in {}:\n  1. claude --setting-sources project,local\n  2. /sweepky, and let the \
+         agent work until it exits\n  3. sweepky submit --run-dir sweeps/{id}\n",
+        new.project.display()
+    ));
+    text
+}
 
 /// The marker of the `init` project `cwd` is, the directory `run` was run
 /// in, or why it is not one. Only `cwd` itself is looked at, never a parent
@@ -261,21 +578,36 @@ fn shown_repo(repo: &RepoName) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io;
     use std::os::unix::fs::symlink;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
 
-    use pubky::Keypair;
+    use anyhow::anyhow;
+    use pubky::{Keypair, StatusCode};
     use serde_json::{Value, json};
     use sweepky_core::paths;
-    use sweepky_core::{BountyRef, Pubky};
+    use sweepky_core::{
+        BountyRef, KnownSweepStatus, MAX_RECORD_BYTES, Playbook, Pubky, Sweep, SweepRef,
+    };
 
     use super::select::Acceptance;
-    use super::{RunRequest, check_bounty, parse_bounty_url, require_project};
+    use super::{
+        ABORTED, CheckedBounty, NOT_ABORTED, NewSweep, PICKING_LATER, PublishRecord, RunRequest,
+        abort, check_bounty, parse_bounty_url, put_record, record_bytes, require_project, run,
+        running_record, start_sweep,
+    };
+    use crate::git::{GitCommand, GitRunner, RunGit};
     use crate::identity::Refusal;
     use crate::init::{self, MARKER};
-    use crate::targets::TargetSource;
+    use crate::own_storage::OwnStorage;
+    use crate::remote::{QUOTA_FULL, WRITE_FORBIDDEN};
+    use crate::targets::{TargetResolver, TargetSource};
     use crate::test_support::{
-        FakePublicRecords, PLANTED, bounty_id, bounty_json, circle_json, json_bytes, random_pubky,
-        repo_target_json,
+        FakeOwnStorage, FakePublicRecords, PLANTED, RecordingGit, SYNTHETIC_SHA, bounty_id,
+        bounty_json, circle_json, dirs_in, fixture_repo, fixture_targets, json_bytes,
+        offline_network, private_temp, random_pubky, recorded_fixture_shas, repo_target_json,
+        test_context, test_git_env,
     };
 
     #[test]
@@ -532,5 +864,272 @@ mod tests {
         // The bounty, the target and its commit, which are checked values.
         assert!(summary.contains(&request.bounty.to_string()), "{summary}");
         assert!(summary.contains("t1: repo"), "{summary}");
+    }
+
+    // -----------------------------------------------------------------------
+    // The command: the running record, the fetch, the marker, the abort.
+
+    /// What the fake storage answers a refused write with: no message may
+    /// repeat it.
+    const SERVER_TEXT: &str = "MARKER-9q2w: tenant over quota, path policy says no";
+
+    const PLAYBOOK: &str = "cloudflare/security-audit@c1c8a8c";
+
+    const STARTED_AT: &str = "2026-10-19T12:00:00Z";
+
+    /// In the tests, the fake storage stands for the sweeper's storage
+    /// under the lock: each write goes straight to it, mapped as the real
+    /// publisher maps one.
+    impl PublishRecord for FakeOwnStorage {
+        async fn publish(&self, path: &str, record: Vec<u8>) -> anyhow::Result<()> {
+            put_record(self, path, record).await
+        }
+    }
+
+    /// The real runner, watched: before each git run it notes how many
+    /// writes `storage` had been asked for and whether the sweep's marker
+    /// was there, so a test can tell what came before git and what after.
+    struct WatchedGit<'a> {
+        git: GitRunner,
+        storage: &'a FakeOwnStorage,
+        marker: PathBuf,
+        seen: Mutex<Vec<(usize, bool)>>,
+    }
+
+    impl RunGit for WatchedGit<'_> {
+        async fn run(&self, command: &GitCommand) -> anyhow::Result<Vec<u8>> {
+            let marker_there = fs::symlink_metadata(&self.marker).is_ok();
+            self.seen
+                .lock()
+                .expect("lock")
+                .push((self.storage.puts().len(), marker_there));
+            self.git.run(command).await
+        }
+    }
+
+    /// An open bounty of `targets`, as `run` checks it with the fixture
+    /// source, read through a fake.
+    async fn fixture_bounty(targets: Value) -> CheckedBounty {
+        let request = request(random_pubky(), random_pubky());
+        let mut bounty = bounty_json(targets);
+        bounty["open"] = json!(true);
+        let records = records(&request, &bounty, None);
+        check_bounty(
+            &records,
+            &TargetSource::Fixture(fixture_targets()),
+            &request,
+        )
+        .await
+        .expect("accepted")
+    }
+
+    /// Target t1, commit `rev` of the fixture repository: M, which it
+    /// serves, or [`SYNTHETIC_SHA`], which it never had.
+    fn commit_target(rev: &str) -> Value {
+        json!({ "id": "t1", "kind": "commit", "repo": fixture_repo().to_string(), "rev": rev })
+    }
+
+    /// A new sweep of `checked` in `project`, by a random sweeper.
+    fn new_sweep<'a>(
+        project: &'a Path,
+        checked: &'a CheckedBounty,
+        playbook: Option<&'a Playbook>,
+    ) -> NewSweep<'a> {
+        NewSweep {
+            project,
+            sweep: SweepRef {
+                sweeper: random_pubky(),
+                id: bounty_id(),
+            },
+            checked,
+            playbook,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_running_record_names_the_bounty_the_targets_and_the_playbook() {
+        let (owner, sweeper) = (random_pubky(), random_pubky());
+        let request = request(owner, sweeper);
+        let records = records(
+            &request,
+            &bounty_json(json!([repo_target_json("t1"), repo_target_json("t2")])),
+            Some(&[owner, sweeper]),
+        );
+        let checked = check_bounty(&records, &TargetSource::Real, &request)
+            .await
+            .expect("accepted");
+        let project = Path::new("/abs/project");
+        let started_at = STARTED_AT.parse().expect("a time");
+
+        // No playbook recorded by `init`: the placeholder.
+        let record =
+            running_record(&new_sweep(project, &checked, None), started_at).expect("a record");
+        let bytes = record_bytes(&record).expect("written");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&bytes).expect("JSON"),
+            json!({
+                "schemaVersion": 1,
+                "bounty": request.bounty.to_string(),
+                "targets": ["t1", "t2"],
+                "playbook": "unspecified",
+                "status": "running",
+                "startedAt": STARTED_AT,
+            })
+        );
+        // Compact, within the cap, and read back equal by core.
+        assert!(!bytes.contains(&b'\n'));
+        assert!(bytes.len() <= MAX_RECORD_BYTES);
+        assert_eq!(Sweep::from_json(&bytes).expect("core reads it"), record);
+
+        // The playbook `init` recorded, when there is one.
+        let playbook: Playbook = PLAYBOOK.parse().expect("a playbook");
+        let started_at = STARTED_AT.parse().expect("a time");
+        let record = running_record(&new_sweep(project, &checked, Some(&playbook)), started_at)
+            .expect("a record");
+        assert_eq!(record.playbook, playbook);
+    }
+
+    #[tokio::test]
+    async fn running_is_published_before_git_runs_and_the_marker_written_after_the_fetch() {
+        let shas = recorded_fixture_shas();
+        let checked = fixture_bounty(json!([commit_target(shas["M"].as_str())])).await;
+        let playbook: Playbook = PLAYBOOK.parse().expect("a playbook");
+        let project = private_temp();
+        let new = new_sweep(project.path(), &checked, Some(&playbook));
+        let path = paths::sweep_record(new.sweep.id);
+        let sweep_dir = project.path().join("sweeps").join(new.sweep.id.to_string());
+        let source = TargetSource::Fixture(fixture_targets());
+        // Declared before the runner, so the runner, whose private HOME is
+        // under it, is dropped first.
+        let home = private_temp();
+        let storage = FakeOwnStorage::default();
+        let git = WatchedGit {
+            git: source
+                .git_runner(&dirs_in(&home), &test_git_env())
+                .expect("a runner"),
+            storage: &storage,
+            marker: sweep_dir.join(".sweepky/sweep.json"),
+            seen: Mutex::default(),
+        };
+
+        let fetched = start_sweep(&storage, &git, &source, &new)
+            .await
+            .unwrap_or_else(|error| panic!("{error:#}"));
+
+        // Every git run came after the one running write, and before the
+        // marker.
+        let seen = git.seen.into_inner().expect("lock");
+        assert!(!seen.is_empty());
+        assert!(seen.iter().all(|&run| run == (1, false)), "{seen:?}");
+        assert_eq!(storage.puts(), [path.as_str()]);
+        let stored = storage.get_own(&path).await.expect("reads").expect("there");
+        let record = Sweep::from_json(&stored).expect("a sweep record");
+        assert_eq!(record.status.as_known(), Some(KnownSweepStatus::Running));
+        assert_eq!(record.bounty, checked.bounty_ref);
+        assert_eq!(record.playbook, playbook);
+        // The marker, after the fetch, names the sweep and the record's
+        // bounty and targets.
+        let marker: Value =
+            serde_json::from_slice(&fs::read(sweep_dir.join(".sweepky/sweep.json")).expect("read"))
+                .expect("JSON");
+        assert_eq!(marker["sweep"], new.sweep.to_string());
+        assert_eq!(marker["bounty"], checked.bounty_ref.to_string());
+        assert_eq!(marker["targets"], json!(["t1"]));
+        assert_eq!(marker["playbook"], PLAYBOOK);
+        assert_eq!(fetched.dir, sweep_dir);
+    }
+
+    #[tokio::test]
+    async fn a_refused_running_write_runs_no_git_and_makes_no_sweep_directory() {
+        let checked = fixture_bounty(json!([commit_target(SYNTHETIC_SHA)])).await;
+        let project = private_temp();
+        let new = new_sweep(project.path(), &checked, None);
+        let path = paths::sweep_record(new.sweep.id);
+        let source = TargetSource::Fixture(fixture_targets());
+        let storage = FakeOwnStorage::refusing(&path, StatusCode::FORBIDDEN, SERVER_TEXT);
+        let git = RecordingGit::succeeding(source.protocols(), b"");
+
+        let error = start_sweep(&storage, &git, &source, &new)
+            .await
+            .expect_err("refused");
+
+        let message = format!("{error:#}");
+        assert!(message.contains(WRITE_FORBIDDEN), "{message}");
+        assert!(!message.contains("MARKER-9q2w"), "{message}");
+        // Nothing was written, so there is nothing to flip.
+        assert_eq!(storage.puts(), [path.as_str()]);
+        assert_eq!(git.argv(), Vec::<Vec<String>>::new());
+        assert!(fs::symlink_metadata(project.path().join("sweeps")).is_err());
+    }
+
+    #[tokio::test]
+    async fn an_unserved_sha_flips_the_record_to_aborted_and_removes_the_sweep() {
+        let checked = fixture_bounty(json!([commit_target(SYNTHETIC_SHA)])).await;
+        let project = private_temp();
+        let new = new_sweep(project.path(), &checked, None);
+        let path = paths::sweep_record(new.sweep.id);
+        let source = TargetSource::Fixture(fixture_targets());
+        let home = private_temp();
+        let git = source
+            .git_runner(&dirs_in(&home), &test_git_env())
+            .expect("a runner");
+        let storage = FakeOwnStorage::default();
+
+        let error = start_sweep(&storage, &git, &source, &new)
+            .await
+            .expect_err("not served");
+
+        let message = format!("{error:#}");
+        assert!(message.starts_with(ABORTED), "{message}");
+        assert!(
+            message.contains(&format!(
+                "the pinned commit {SYNTHETIC_SHA} is no longer served"
+            )),
+            "{message}"
+        );
+        // Running, then the same record as aborted, finished.
+        assert_eq!(storage.puts(), [path.as_str(), path.as_str()]);
+        let stored = storage.get_own(&path).await.expect("reads").expect("there");
+        let aborted = Sweep::from_json(&stored).expect("a sweep record");
+        let mut expected =
+            running_record(&new, aborted.started_at.clone()).expect("the running record");
+        expected.status = KnownSweepStatus::Aborted.into();
+        expected.finished_at = Some(aborted.finished_at.clone().expect("finishedAt is set"));
+        assert_eq!(aborted, expected);
+        // No sweep directory, so no marker either.
+        let sweep_dir = project.path().join("sweeps").join(new.sweep.id.to_string());
+        assert!(fs::symlink_metadata(&sweep_dir).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_refused_flip_to_aborted_is_reported_with_the_failure_in_fixed_text() {
+        let checked = fixture_bounty(json!([commit_target(SYNTHETIC_SHA)])).await;
+        let new = new_sweep(Path::new("/abs/project"), &checked, None);
+        let path = paths::sweep_record(new.sweep.id);
+        let running = running_record(&new, STARTED_AT.parse().expect("a time")).expect("a record");
+        let storage =
+            FakeOwnStorage::refusing(&path, StatusCode::INSUFFICIENT_STORAGE, SERVER_TEXT);
+
+        let error = abort(&storage, &path, running, anyhow!("the fetch failed")).await;
+
+        let message = format!("{error:#}");
+        assert!(message.starts_with(NOT_ABORTED), "{message}");
+        assert!(message.contains(QUOTA_FULL), "{message}");
+        assert!(message.ends_with("the fetch failed"), "{message}");
+        assert!(!message.contains("MARKER-9q2w"), "{message}");
+        assert_eq!(storage.puts(), [path.as_str()]);
+    }
+
+    #[tokio::test]
+    async fn run_without_a_url_says_picking_comes_later() {
+        let home = private_temp();
+        let (mut ctx, _stderr) = test_context(offline_network(), &home, io::empty());
+        let project = home.path().join("project");
+        init::init(&project).expect("init");
+        ctx.cwd = project;
+
+        let error = run(&ctx, None, None, None).await.expect_err("no URL");
+
+        assert_eq!(format!("{error:#}"), PICKING_LATER);
     }
 }
