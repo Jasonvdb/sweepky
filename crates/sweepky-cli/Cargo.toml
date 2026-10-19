@@ -33,13 +33,14 @@ pubky = { workspace = true }
 # configured behind the caller's back.
 clap = { workspace = true, features = ["derive"] }
 # The async runtime: `rt-multi-thread` for `#[tokio::main]`'s default runtime,
-# `macros` for `#[tokio::main]` itself, `time` for timeouts, and `process`
-# and `io-util` for the git runner's child processes and its bounded reads of
-# their output. pubky already turns all of them on in this build (it asks for
-# tokio's `full` on every target but wasm; `cargo tree -e features -i
-# tokio`), so naming them adds no code; it keeps this crate building if pubky
-# ever stops.
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "process", "io-util"] }
+# `macros` for `#[tokio::main]` itself, `time` for timeouts, `process` and
+# `io-util` for the git runner's child processes and its bounded reads of
+# their output, and `net` for `lookup_host`, through which the host policy
+# resolves a target's host. pubky already turns all of them on in this build
+# (it asks for tokio's `full` on every target but wasm; `cargo tree -e
+# features -i tokio`), so naming them adds no code; it keeps this crate
+# building if pubky ever stops.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "process", "io-util", "net"] }
 anyhow = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

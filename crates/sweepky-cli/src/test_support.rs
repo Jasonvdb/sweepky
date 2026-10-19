@@ -5,10 +5,11 @@
 //! [`offline_network`] or a testnet's) with a [`SharedBuffer`] that keeps
 //! what it writes to standard error, the [`GitEnv`] the tests run git with
 //! and the inert fixture repository they run it against, a
-//! [`FakeKeyStore`] in place of a homeserver's `keys/`, the passphrase the
-//! tests wrap secret files with and a byte search to check a wrapped file
-//! shows none of its secret, and a compile-time check that a secret type
-//! implements none of the traits that would print or copy it.
+//! [`FakeResolver`] in place of DNS and the [`checked_remote`] made
+//! through it, a [`FakeKeyStore`] in place of a homeserver's `keys/`, the
+//! passphrase the tests wrap secret files with and a byte search to check
+//! a wrapped file shows none of its secret, and a compile-time check that a
+//! secret type implements none of the traits that would print or copy it.
 //!
 //! Compiled only for `cargo test` (`#[cfg(test)]` on its `mod` line in
 //! `lib.rs`), so nothing here reaches the binary, and like any test code it
@@ -17,6 +18,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, Permissions};
 use std::io::{self, BufRead, ErrorKind, Write};
+use std::net::IpAddr;
 // `MetadataExt` adds `.mode()` and `.ino()` to `Metadata`; `PermissionsExt`
 // adds `Permissions::from_mode`.
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -29,6 +31,7 @@ use sweepky_core::{DeviceId, Pubky, Zeroizing};
 use tempfile::TempDir;
 
 use crate::device::{KeyIds, KeyStore, PublicKeys};
+use crate::targets::host::{HttpsRemote, ResolveHost};
 use crate::{Context, Dirs, GitEnv, Network, StderrWriter, StdinReader};
 
 /// A fresh private directory to work in, created 0700 (`tempfile` passes
@@ -360,6 +363,66 @@ impl KeyStore for FakeKeyStore {
         self.set_record(id, record);
         Ok(())
     }
+}
+
+/// What a [`FakeResolver`] that fails gives as its error: words that a
+/// test checks never reach a message.
+pub(crate) const FAKE_LOOKUP_TEXT: &str = "fake resolver: SERVFAIL for lookup-marker.example";
+
+/// A [`ResolveHost`] in place of DNS: it answers every host with the same
+/// addresses, or fails every lookup with [`FAKE_LOOKUP_TEXT`], and keeps
+/// every host it was asked for, in order. The `Mutex` is there for the
+/// same reason as in [`FakeKeyStore`].
+pub(crate) struct FakeResolver {
+    /// `None` fails every lookup.
+    answer: Option<Vec<IpAddr>>,
+    asked: Mutex<Vec<String>>,
+}
+
+impl FakeResolver {
+    /// Answers every host with `addresses`, each parsed from its text; an
+    /// empty list is a host with no address.
+    pub(crate) fn answering(addresses: &[&str]) -> Self {
+        let answer = addresses
+            .iter()
+            .map(|text| text.parse().expect("an IP address"))
+            .collect();
+        Self {
+            answer: Some(answer),
+            asked: Mutex::default(),
+        }
+    }
+
+    /// Fails every lookup.
+    pub(crate) fn failing() -> Self {
+        Self {
+            answer: None,
+            asked: Mutex::default(),
+        }
+    }
+
+    /// Every host asked for so far, in order.
+    pub(crate) fn asked(&self) -> Vec<String> {
+        self.asked.lock().expect("lock").clone()
+    }
+}
+
+impl ResolveHost for FakeResolver {
+    async fn resolve(&self, host: &str) -> anyhow::Result<Vec<IpAddr>> {
+        self.asked.lock().expect("lock").push(host.to_owned());
+        self.answer
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!(FAKE_LOOKUP_TEXT))
+    }
+}
+
+/// The https remote of `repo`, made the one way there is, through the host
+/// policy, with a [`FakeResolver`] that answers one public address.
+pub(crate) async fn checked_remote(repo: &str) -> HttpsRemote {
+    let repo = repo.parse().expect("a repo name");
+    HttpsRemote::for_repo(&repo, &FakeResolver::answering(&["140.82.112.3"]))
+        .await
+        .expect("a public host")
 }
 
 /// The permission bits of whatever is at `path`, not following a link.

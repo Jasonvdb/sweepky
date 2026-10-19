@@ -9,6 +9,13 @@
 //!   operand, and an operand that starts with `-`, which git would read as
 //!   an option, is refused ([`git_argv`]). `RepoName`, `GitSha` and the ref
 //!   patterns are checked before they get here, so none can.
+//! - **Only a checked repository is contacted.** The two subcommands that
+//!   talk to a repository, `ls-remote` and `fetch`, are built only with a
+//!   [`Remote`]: an [`HttpsRemote`], which exists only for a host whose
+//!   every address is public (`targets::host`), or the fixture source's
+//!   [`LocalRemote`]. Every other subcommand is a [`LocalSubcommand`],
+//!   which works on this disk alone. So no URL that a record or a server
+//!   wrote reaches git unchecked.
 //! - **A pure allowlist for an environment.** The child starts from an
 //!   empty environment (`env_clear`) and gets back exactly [`child_env`]'s
 //!   list: `PATH`, the proxy and CA variables `main.rs` captured
@@ -76,7 +83,7 @@ use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
 
 use anyhow::{Context as _, bail};
-use sweepky_core::{GitSha, RecordId, RepoName};
+use sweepky_core::{GitSha, RecordId};
 // `AsyncReadExt` adds `.take()` and `.read_to_end()` to tokio's pipes; a
 // trait's methods can only be called while it is in scope.
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -84,6 +91,8 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use crate::Dirs;
 use crate::clock;
 use crate::private_fs::{ensure_private_dir, lstat};
+use crate::targets::fixture::LocalRemote;
+use crate::targets::host::HttpsRemote;
 
 /// The variables of this process's environment that git may see, captured
 /// by `main.rs`: `PATH`, to find git, and the proxy and CA variables, so
@@ -232,44 +241,72 @@ pub(crate) const MAX_LS_REMOTE_LINE_BYTES: usize = 1024;
 
 /// `ls-remote`'s limits: 60 seconds, and standard output just large enough
 /// for [`MAX_LS_REMOTE_LINES`] lines of [`MAX_LS_REMOTE_LINE_BYTES`] and
-/// their newlines. `run`'s fetch, when it lands, gets 10 minutes.
+/// their newlines.
 pub(crate) const LS_REMOTE_LIMITS: Limits = Limits {
     timeout: Duration::from_secs(60),
     stdout_cap: MAX_LS_REMOTE_LINES * (MAX_LS_REMOTE_LINE_BYTES + 1),
     stderr_cap: STDERR_CAP,
 };
 
-/// A repository's address as git is given it.
+/// `run`'s fetch's limits: 10 minutes, for a large repository on a slow
+/// link. `git fetch` writes its few lines to standard error and nothing to
+/// standard output, so 64 KiB is room to spare.
+const FETCH_LIMITS: Limits = Limits {
+    timeout: Duration::from_secs(10 * 60),
+    stdout_cap: 64 * 1024,
+    stderr_cap: STDERR_CAP,
+};
+
+/// The repository a network subcommand (`ls-remote` or `fetch`) talks to,
+/// and the only way to name one: a real target's [`HttpsRemote`], whose
+/// host the policy has checked, or the fixture source's [`LocalRemote`].
 ///
-/// Only two ways to make one: [`RemoteUrl::https`] from a checked
-/// [`RepoName`], and [`RemoteUrl::file`] for the fixture source. Neither
-/// can start with `-`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RemoteUrl(String);
+/// No string converts into it, so an unchecked URL cannot reach git
+/// through [`GitCommand::ls_remote`] or [`GitCommand::fetch`]. It borrows
+/// the remote, which is why it has a lifetime `'a` and is `Copy`: copying
+/// it copies a reference, never the URL.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Remote<'a> {
+    /// A real target, at `https://<repo>`.
+    Https(&'a HttpsRemote),
+    /// The fixture source's repository on this disk, at `file://<path>`,
+    /// which needs [`AllowedProtocols::HttpsAndFile`].
+    Local(&'a LocalRemote),
+}
 
-impl RemoteUrl {
-    /// `https://<repo>`, the one form a real target is fetched from.
-    pub(crate) fn https(repo: &RepoName) -> Self {
-        Self(format!("https://{repo}"))
-    }
-
-    /// `file://<path>` for a repository on this disk: the fixture source
-    /// only, which needs [`AllowedProtocols::HttpsAndFile`]. `path` must be
-    /// absolute and UTF-8. git percent-decodes a URL, so a path with a `%`
-    /// in it would name another directory; the fixture's has none.
-    pub(crate) fn file(path: &Path) -> anyhow::Result<Self> {
-        match path.to_str() {
-            Some(text) if path.is_absolute() => Ok(Self(format!("file://{text}"))),
-            _ => bail!(
-                "{} is not an absolute UTF-8 path, so it cannot be a file:// URL",
-                path.display()
-            ),
+impl<'a> Remote<'a> {
+    /// The URL git is given. It borrows from the remote this borrows, so
+    /// it lives as long as `'a`, not just as long as this copy.
+    fn url(self) -> &'a str {
+        match self {
+            Self::Https(remote) => remote.as_str(),
+            Self::Local(remote) => remote.as_str(),
         }
     }
+}
 
-    /// The URL as git is given it.
-    pub(crate) fn as_str(&self) -> &str {
-        &self.0
+/// A git subcommand that works on this disk alone and never contacts a
+/// repository: every subcommand a [`GitCommand`] can run but `ls-remote`
+/// and `fetch`, which have constructors of their own that take a
+/// [`Remote`]. Add a variant when a command needs another local one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LocalSubcommand {
+    /// `git init`.
+    Init,
+    /// `git config`.
+    Config,
+    /// `git rev-parse`.
+    RevParse,
+}
+
+impl LocalSubcommand {
+    /// The subcommand as git spells it.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Init => "init",
+            Self::Config => "config",
+            Self::RevParse => "rev-parse",
+        }
     }
 }
 
@@ -288,9 +325,9 @@ enum GitArg {
 /// One git command to run: `git <hardening> <subcommand> <args>`, in a
 /// directory, under [`Limits`].
 ///
-/// Built by chaining (`GitCommand::new(...).flag(...).operand(...)`): each
-/// method takes `self` by value and hands it back, so no `mut` binding is
-/// needed. `Clone`, `Debug` and `PartialEq`, so a fake [`RunGit`] can keep
+/// Built by chaining (`GitCommand::local(...).flag(...).operand(...)`):
+/// each method takes `self` by value and hands it back, so no `mut` binding
+/// is needed. `Clone`, `Debug` and `PartialEq`, so a fake [`RunGit`] can keep
 /// the commands it was given and a test compare them: they hold URLs, SHAs
 /// and ref names, nothing secret.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -304,8 +341,10 @@ pub(crate) struct GitCommand {
 }
 
 impl GitCommand {
-    /// `git <subcommand>` under `limits`, with no arguments yet.
-    pub(crate) fn new(subcommand: &'static str, limits: Limits) -> Self {
+    /// `git <subcommand>` under `limits`, with no arguments yet. Private,
+    /// so that outside this module a command is either local
+    /// ([`GitCommand::local`]) or names its repository with a [`Remote`].
+    fn new(subcommand: &'static str, limits: Limits) -> Self {
         Self {
             subcommand,
             args: Vec::new(),
@@ -314,13 +353,27 @@ impl GitCommand {
         }
     }
 
-    /// `git ls-remote <url> <patterns>…`, under [`LS_REMOTE_LIMITS`].
-    pub(crate) fn ls_remote(url: &RemoteUrl, patterns: &[&str]) -> Self {
-        let mut command = Self::new("ls-remote", LS_REMOTE_LIMITS).operand(url.as_str());
+    /// `git <subcommand>` under `limits`, for a subcommand that never
+    /// contacts a repository.
+    pub(crate) fn local(subcommand: LocalSubcommand, limits: Limits) -> Self {
+        Self::new(subcommand.name(), limits)
+    }
+
+    /// `git ls-remote <remote> <patterns>…`, under [`LS_REMOTE_LIMITS`].
+    pub(crate) fn ls_remote(remote: Remote<'_>, patterns: &[&str]) -> Self {
+        let mut command = Self::new("ls-remote", LS_REMOTE_LIMITS).operand(remote.url());
         for pattern in patterns {
             command = command.operand(*pattern);
         }
         command
+    }
+
+    /// `git fetch <remote>`, under [`FETCH_LIMITS`]: the caller adds the
+    /// options and the SHAs to fetch, which git reads after the repository
+    /// as well as before it, and the repository to fetch into
+    /// ([`GitCommand::in_dir`]).
+    pub(crate) fn fetch(remote: Remote<'_>) -> Self {
+        Self::new("fetch", FETCH_LIMITS).operand(remote.url())
     }
 
     /// Adds an option, such as `--depth=2`.
@@ -717,18 +770,18 @@ pub(crate) struct RemoteRef {
     pub(crate) name: String,
 }
 
-/// Lists the refs of `url` that match `patterns` (`git ls-remote <url>
-/// <patterns>…`), through `git`.
+/// Lists the refs of `remote` that match `patterns` (`git ls-remote
+/// <remote> <patterns>…`), through `git`.
 ///
 /// git matches a pattern against the end of a ref's name, so `main` would
 /// match `refs/heads/main` and `refs/heads/x/main`: pass full names and
 /// compare [`RemoteRef::name`] exactly.
 pub(crate) async fn ls_remote(
     git: &impl RunGit,
-    url: &RemoteUrl,
+    remote: Remote<'_>,
     patterns: &[&str],
 ) -> anyhow::Result<Vec<RemoteRef>> {
-    let stdout = git.run(&GitCommand::ls_remote(url, patterns)).await?;
+    let stdout = git.run(&GitCommand::ls_remote(remote, patterns)).await?;
     parse_ls_remote(&stdout)
 }
 
@@ -819,13 +872,16 @@ mod tests {
     use tokio::process::Command;
 
     use super::{
-        AllowedProtocols, GitCommand, GitEnv, GitFailed, GitRunner, Limits,
-        MAX_LS_REMOTE_LINE_BYTES, MAX_LS_REMOTE_LINES, PrivateHome, RemoteRef, RemoteUrl, RunGit,
+        AllowedProtocols, GitCommand, GitEnv, GitFailed, GitRunner, Limits, LocalSubcommand,
+        MAX_LS_REMOTE_LINE_BYTES, MAX_LS_REMOTE_LINES, PrivateHome, Remote, RemoteRef, RunGit,
         child_env, git_argv, ls_remote, parse_ls_remote, run_bounded,
     };
     use crate::Dirs;
     use crate::private_fs::ensure_private_dir;
-    use crate::test_support::{dirs_in, inert_target_repo, mode, private_temp, test_git_env};
+    use crate::targets::fixture::LocalRemote;
+    use crate::test_support::{
+        checked_remote, dirs_in, inert_target_repo, mode, private_temp, test_git_env,
+    };
 
     /// Commits and the tag object of `fixtures/target-repo.git`, as
     /// `fixtures/README.md` records them: M is `main`'s tip and `HEAD`, and
@@ -1014,10 +1070,10 @@ mod tests {
             AllowedProtocols::HttpsAndFile,
         )
         .expect("a runner");
-        let url = RemoteUrl::file(&fixture).expect("an absolute UTF-8 path");
+        let remote = LocalRemote::for_tests(&fixture).expect("an absolute UTF-8 path");
         let refs = ls_remote(
             &git,
-            &url,
+            Remote::Local(&remote),
             &[
                 "HEAD",
                 "refs/heads/main",
@@ -1044,8 +1100,8 @@ mod tests {
         let temp = private_temp();
         let git = GitRunner::new(&dirs_in(&temp), &test_git_env(), AllowedProtocols::Https)
             .expect("a runner");
-        let url = RemoteUrl::file(&fixture).expect("an absolute UTF-8 path");
-        let error = ls_remote(&git, &url, &["HEAD"])
+        let remote = LocalRemote::for_tests(&fixture).expect("an absolute UTF-8 path");
+        let error = ls_remote(&git, Remote::Local(&remote), &["HEAD"])
             .await
             .expect_err("the file transport is not allowed");
         // Fixed text and git's exit status, and nothing git wrote.
@@ -1122,10 +1178,10 @@ mod tests {
         assert_eq!(names, expected);
     }
 
-    #[test]
-    fn argv_puts_every_hardening_option_before_the_subcommand() {
-        let repo = "github.com/org/name".parse().expect("a repo name");
-        let command = GitCommand::ls_remote(&RemoteUrl::https(&repo), &["HEAD", "refs/tags/v1^{}"]);
+    #[tokio::test]
+    async fn argv_puts_every_hardening_option_before_the_subcommand() {
+        let remote = checked_remote("github.com/org/name").await;
+        let command = GitCommand::ls_remote(Remote::Https(&remote), &["HEAD", "refs/tags/v1^{}"]);
         let settings = [
             "credential.helper=",
             "core.askPass=",
@@ -1167,15 +1223,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn argv_refuses_an_operand_that_git_could_read_as_an_option() {
-        let repo = "github.com/org/name".parse().expect("a repo name");
-        let url = RemoteUrl::https(&repo);
+    #[tokio::test]
+    async fn argv_refuses_an_operand_that_git_could_read_as_an_option() {
+        let remote = checked_remote("github.com/org/name").await;
         for operand in ["-", "--upload-pack=touch /tmp/pwned", "--", ""] {
-            // As a pattern after the URL, and as a bare operand.
+            // As a pattern after the URL, as a refspec after it, and to a
+            // local subcommand.
             for command in [
-                GitCommand::ls_remote(&url, &[operand]),
-                GitCommand::new("fetch", LOCAL).operand(operand),
+                GitCommand::ls_remote(Remote::Https(&remote), &[operand]),
+                GitCommand::fetch(Remote::Https(&remote)).operand(operand),
+                GitCommand::local(LocalSubcommand::RevParse, LOCAL).operand(operand),
             ] {
                 let error = git_argv(&command, AllowedProtocols::Https).expect_err(operand);
                 // The message names the rule, `'-'` included, so only an
@@ -1187,17 +1244,48 @@ mod tests {
             }
         }
         // An option the code itself chose is passed as it is.
-        let command = GitCommand::new("fetch", LOCAL)
-            .flag("--depth=2")
-            .operand(url.as_str());
+        let command = GitCommand::local(LocalSubcommand::RevParse, LOCAL).flag("--git-dir");
         let argv = git_argv(&command, AllowedProtocols::Https).expect("builds");
         assert_eq!(
-            argv.get(argv.len() - 3..),
+            argv.get(argv.len() - 2..),
+            Some(["rev-parse", "--git-dir"].map(String::from).as_slice())
+        );
+    }
+
+    #[tokio::test]
+    async fn network_commands_name_their_repository_only_through_a_remote() {
+        // `fetch <remote>` then what the caller adds: git reads options
+        // after the repository as well as before it.
+        let remote = checked_remote("github.com/org/name").await;
+        let command = GitCommand::fetch(Remote::Https(&remote))
+            .flag("--depth=2")
+            .operand(M);
+        let argv = git_argv(&command, AllowedProtocols::Https).expect("builds");
+        assert_eq!(
+            argv.get(argv.len() - 4..),
             Some(
-                ["fetch", "--depth=2", "https://github.com/org/name"]
+                ["fetch", "https://github.com/org/name", "--depth=2", M]
                     .map(String::from)
                     .as_slice()
             )
+        );
+        // The fixture's remote is its `file://` URL, for `fetch` and
+        // `ls-remote` alike.
+        let fixture = inert_target_repo();
+        let local = LocalRemote::for_tests(&fixture).expect("an absolute UTF-8 path");
+        for command in [
+            GitCommand::fetch(Remote::Local(&local)),
+            GitCommand::ls_remote(Remote::Local(&local), &[]),
+        ] {
+            let argv = git_argv(&command, AllowedProtocols::HttpsAndFile).expect("builds");
+            assert_eq!(argv.last().map(String::as_str), Some(local.as_str()));
+        }
+        // Checked when the test compiles: no string or default makes a
+        // `Remote`, so only the two checked types can.
+        crate::test_support::assert_not_impl_any!(
+            Remote<'static>: Default,
+            From<String>,
+            From<&'static str>,
         );
     }
 
@@ -1246,7 +1334,7 @@ mod tests {
         // exits 1 for a key that is not set.
         let error = git
             .run(
-                &GitCommand::new("config", LOCAL)
+                &GitCommand::local(LocalSubcommand::Config, LOCAL)
                     .flag("--get")
                     .operand("core.sweepkyprobe")
                     .in_dir(work.path()),
@@ -1258,7 +1346,7 @@ mod tests {
         // (or fail) and `rev-parse` name it. Without it, the repository is
         // the one `init` made here.
         git.run(
-            &GitCommand::new("init", LOCAL)
+            &GitCommand::local(LocalSubcommand::Init, LOCAL)
                 .flag("--quiet")
                 .in_dir(work.path()),
         )
@@ -1266,7 +1354,7 @@ mod tests {
         .expect("init");
         let git_dir = git
             .run(
-                &GitCommand::new("rev-parse", LOCAL)
+                &GitCommand::local(LocalSubcommand::RevParse, LOCAL)
                     .flag("--git-dir")
                     .in_dir(work.path()),
             )
@@ -1282,18 +1370,18 @@ mod tests {
         let temp = private_temp();
         let git = GitRunner::new(&dirs_in(&temp), &test_git_env(), AllowedProtocols::Https)
             .expect("a runner");
-        let get = GitCommand::new("config", LOCAL)
+        let get = GitCommand::local(LocalSubcommand::Config, LOCAL)
             .flag("--get")
             .operand("core.sweepkyprobe");
         git.run(
-            &GitCommand::new("init", LOCAL)
+            &GitCommand::local(LocalSubcommand::Init, LOCAL)
                 .flag("--quiet")
                 .in_dir(temp.path()),
         )
         .await
         .expect("init");
         git.run(
-            &GitCommand::new("config", LOCAL)
+            &GitCommand::local(LocalSubcommand::Config, LOCAL)
                 .operand("core.sweepkyprobe")
                 .operand("from-the-repo")
                 .in_dir(temp.path()),

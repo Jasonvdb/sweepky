@@ -110,8 +110,18 @@
 //!   only allowlisted transports, no redirects, hooks, submodules or LFS,
 //!   and a fresh private `HOME` under the data directory, removed when the
 //!   runner is dropped; each run is timed and its output capped, and an
-//!   error never quotes git. With it, the parser of `git ls-remote`'s
-//!   output.
+//!   error never quotes git. `ls-remote` and `fetch` name their repository
+//!   only through a checked `git::Remote`. With it, the parser of
+//!   `git ls-remote`'s output.
+//! - `targets`, where `post` and `run` get a target's repository from. So
+//!   far the host policy (`targets::host`): `is_public`, the pure
+//!   classifier that refuses loopback, private, link-local and otherwise
+//!   reserved addresses, IPv6 forms that carry such an IPv4 address
+//!   included; the `ResolveHost` seam, over the system resolver; and
+//!   `HttpsRemote`, the `https://<repo>` remote that git's network commands
+//!   take, made only for a host whose every address is public. And
+//!   `LocalRemote`, the fixture source's repository on this disk, which
+//!   only that source can make.
 //!
 //! The rules that hold for everything here (see "Rust conventions" in
 //! `docs/plan/03-cli-and-skill.md`):
@@ -201,6 +211,9 @@ mod remote;
 // sign-out itself, because it deletes files after the sign-out.
 mod session;
 mod state;
+// Where `post` and `run` get a target's repository from, and the network
+// policy for its host.
+mod targets;
 // Fixtures the unit tests of several modules share. `cfg(test)` compiles it
 // only for `cargo test`, so it never reaches the binary.
 #[cfg(test)]
