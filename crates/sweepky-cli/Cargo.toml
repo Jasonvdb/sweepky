@@ -47,6 +47,12 @@ serde_json = { workspace = true }
 # The writers' lock: an exclusive `flock` on `credential.lock`, made through
 # rustix, so this crate needs no `unsafe` and no `libc` of its own for it.
 fd-lock = { workspace = true }
+# `submit`'s walk of the sweep directory the agent wrote: `openat` with
+# O_NOFOLLOW, `statat` with AT_SYMLINK_NOFOLLOW and `fstat`, each relative
+# to an open directory handle, so no link is ever followed and nothing can
+# be swapped in between a check and an open. `fs` is the feature with those
+# calls; fd-lock already turns it on, so it adds no code.
+rustix = { workspace = true, features = ["fs"] }
 # The `Url` the SDK's transport URLs come in, named here so the directory
 # listing can add its query and parse `https://` listing lines. The release
 # pubky itself uses, so it adds no code.

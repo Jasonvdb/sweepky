@@ -258,6 +258,9 @@ mod remote;
 // fetched, stripped and scoped, and the per-sweep marker written last; or
 // the sweep aborted.
 mod run;
+// `submit`: the sweep directory found and checked, and walked without
+// following a link, `audit/`'s files read within caps.
+mod submit;
 // The per-command session: the writers' lock, a fresh sign-in and a sign-out
 // that is always attempted. `login` holds its lock; `keys revoke` is the
 // first command to run in a whole session; `logout` runs the sign-in and the

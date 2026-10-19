@@ -5199,6 +5199,7 @@ dependencies = [
  "fd-lock",
  "pubky",
  "pubky-testnet",
+ "rustix",
  "serde",
  "serde_json",
  "sweepky-core",

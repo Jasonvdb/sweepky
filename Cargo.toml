@@ -60,6 +60,12 @@ zeroize = "=1.9.1"
 qrcode = { version = "=0.14.1", default-features = false, features = ["svg"] }
 # The writers' lock file (P2a).
 fd-lock = "=4.0.4"
+# File-descriptor-relative file calls (`openat`, `statat`, `fstat`, reading a
+# directory from an open handle) for `submit`'s walk of a sweep directory
+# (P2b), through rustix's safe API, so sweepky-cli needs no `unsafe` and no
+# `libc` of its own. fd-lock already brings this exact release into the
+# graph with its `fs` feature on, so naming it here adds no new code.
+rustix = "=1.1.5"
 # URLs, for sweepky-cli's bounded directory listing (P2a): the SDK's
 # `PubkyResource::to_transport_url` returns a `url::Url` and
 # `from_transport_url` takes one. pubky already brings this exact release into
