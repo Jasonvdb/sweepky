@@ -9,7 +9,8 @@
 //! through it, a [`RecordingGit`] in place of git, a [`FakeGitHub`] in
 //! place of GitHub's API, the fixture source over
 //! that repository ([`fixture_targets`]) and the SHAs `fixtures/README.md`
-//! records for it, a [`FakeKeyStore`] in place of a homeserver's `keys/`, the
+//! records for it, a [`FakeKeyStore`] in place of a homeserver's `keys/`, a
+//! [`FakeOwnStorage`] in place of the signed-in user's own storage, the
 //! passphrase the tests wrap secret files with and a byte search to check
 //! a wrapped file shows none of its secret, and a compile-time check that a
 //! secret type implements none of the traits that would print or copy it.
@@ -35,6 +36,7 @@ use tempfile::TempDir;
 
 use crate::device::{KeyIds, KeyStore, PublicKeys};
 use crate::git::{AllowedProtocols, GitCommand, GitFailed, RunGit, git_argv};
+use crate::own_storage::OwnStorage;
 use crate::targets::TargetSource;
 use crate::targets::fixture::FixtureTargets;
 use crate::targets::github::GitHubApi;
@@ -422,6 +424,73 @@ impl KeyStore for FakeKeyStore {
         }
         self.set_record(id, record);
         Ok(())
+    }
+}
+
+/// A write a [`FakeOwnStorage`] refuses: the path, and the status and
+/// server text it answers with.
+struct RefusedPut {
+    path: String,
+    status: StatusCode,
+    server_text: String,
+}
+
+/// An [`OwnStorage`] in memory, in place of the signed-in user's own
+/// storage: the files by path, every path it was asked to write, in order,
+/// and, if set, the one path whose write it refuses. It hands a file back
+/// whole: the caps are the real storage's business. The `Mutex`es are
+/// there for the same reason as in [`FakeKeyStore`].
+#[derive(Default)]
+pub(crate) struct FakeOwnStorage {
+    files: Mutex<BTreeMap<String, Vec<u8>>>,
+    puts: Mutex<Vec<String>>,
+    refused: Option<RefusedPut>,
+}
+
+impl FakeOwnStorage {
+    /// A storage that refuses a write of `path` with `status` and
+    /// `server_text`, as the SDK reports a homeserver's non-2xx answer, and
+    /// takes every other write.
+    pub(crate) fn refusing(path: &str, status: StatusCode, server_text: &str) -> Self {
+        Self {
+            refused: Some(RefusedPut {
+                path: path.to_owned(),
+                status,
+                server_text: server_text.to_owned(),
+            }),
+            ..Self::default()
+        }
+    }
+
+    /// Every path asked to be written so far, refused or not, in order.
+    pub(crate) fn puts(&self) -> Vec<String> {
+        self.puts.lock().expect("lock").clone()
+    }
+}
+
+impl OwnStorage for FakeOwnStorage {
+    async fn put(&self, path: &str, bytes: Vec<u8>) -> pubky::Result<()> {
+        self.puts.lock().expect("lock").push(path.to_owned());
+        if let Some(refused) = self.refused.as_ref().filter(|refused| refused.path == path) {
+            return Err(pubky::Error::from(RequestError::Server {
+                status: refused.status,
+                message: refused.server_text.clone(),
+            }));
+        }
+        self.files
+            .lock()
+            .expect("lock")
+            .insert(path.to_owned(), bytes);
+        Ok(())
+    }
+
+    async fn get_own(&self, path: &str) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
+        Ok(self
+            .files
+            .lock()
+            .expect("lock")
+            .get(path)
+            .map(|bytes| Zeroizing::new(bytes.clone())))
     }
 }
 

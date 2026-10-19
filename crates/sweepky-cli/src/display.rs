@@ -90,13 +90,6 @@ pub(crate) fn sanitize(text: &str, max_chars: usize) -> String {
 
 /// [`sanitize`] for text of several lines, such as a bounty's brief: the
 /// same, except that a newline and a tab are kept as they are.
-// `post`, later in P2b, is the first caller: it shows a bounty's brief for
-// the owner to confirm. As in `prompt.rs`, `expect` (not `allow`) silences
-// the dead-code warning only while it is true, and that caller removes it.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "post, later in P2b, is the first caller")
-)]
 pub(crate) fn sanitize_multiline(text: &str, max_chars: usize) -> String {
     sanitize_as(text, max_chars, Layout::MultiLine)
 }

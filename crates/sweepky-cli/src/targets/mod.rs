@@ -24,18 +24,6 @@
 //!   one form a real target's repository reaches git in, which exists only
 //!   for a host whose every address is public.
 
-// Nothing outside the tests calls into this module yet: `post` and `run`,
-// later in P2b, are the first callers. As in `git.rs`, `expect` (not
-// `allow`) silences the dead-code warning only while it is true, and the
-// first caller removes it.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "post and run, later in P2b, are the first callers of the target sources"
-    )
-)]
-
 pub(crate) mod fixture;
 pub(crate) mod github;
 pub(crate) mod host;
@@ -112,6 +100,13 @@ pub(crate) trait TargetResolver {
     /// applies [`check_policy`](Self::check_policy) first, and the real
     /// source checks the host's addresses before it names an
     /// [`HttpsRemote`].
+    // `run`, later in P2b, is the first caller outside the tests, and
+    // removes this line. `allow`, not the crate's usual `expect`, because
+    // an `expect` here is never met: it marks the method as used, and then
+    // `TargetSource`'s own `fetch_remote`, which calls the two sources'
+    // ones, really is a use of it. `TargetRemote`, which only this method
+    // makes, needs nothing of its own for the same reason.
+    #[cfg_attr(not(test), allow(dead_code))]
     async fn fetch_remote(
         &self,
         kind: KnownTargetKind,

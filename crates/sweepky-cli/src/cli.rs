@@ -144,6 +144,26 @@ pub enum Command {
         #[command(subcommand)]
         command: CircleCommand,
     },
+
+    /// Post a bounty from the draft file DRAFT, closed: only sweeps from
+    /// this identity's circle are read. Pins every target to exact SHAs,
+    /// shows the bounty (title, focus, suggested playbook, each target with
+    /// its SHAs, and the brief) and asks before it publishes
+    /// /pub/sweepky/bounties/ID.json, which anyone can read. With
+    /// --no-input it shows the bounty and fails instead of asking, so
+    /// nothing is posted.
+    Post {
+        /// The bounty draft: a JSON file with the title, an optional focus,
+        /// the markdown brief, an optional suggested playbook and the
+        /// targets, unpinned, and no other field. Public once posted.
+        //
+        // A path, not the text: a multi-line brief and several targets fit
+        // a file, and stay out of the argument list, where clap would echo
+        // them back in a usage error. `PathBuf`, as for `init`'s `DIR`, so
+        // a path that is not UTF-8 is still taken as typed.
+        #[arg(value_name = "DRAFT")]
+        draft: PathBuf,
+    },
 }
 
 /// The `circle` commands.
@@ -308,6 +328,18 @@ mod tests {
         }
         let cli = Cli::try_parse_from(["sweepky", "keys", "list"]).expect("parses");
         assert!(!cli.no_input);
+    }
+
+    #[test]
+    fn post_takes_one_draft_path() {
+        let cli = Cli::try_parse_from(["sweepky", "post", "draft.json"]).expect("parses");
+        assert!(
+            matches!(&cli.command, Command::Post { draft } if draft == Path::new("draft.json")),
+            "{cli:?}"
+        );
+        // Exactly one: none, or a second, is a usage error.
+        assert!(Cli::try_parse_from(["sweepky", "post"]).is_err());
+        assert!(Cli::try_parse_from(["sweepky", "post", "a.json", "b.json"]).is_err());
     }
 
     #[test]

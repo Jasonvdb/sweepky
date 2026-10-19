@@ -127,11 +127,17 @@
 //!   address included, the `ResolveHost` seam, over the system resolver,
 //!   and `HttpsRemote`, the `https://<repo>` remote that git's network
 //!   commands take, made only for a host whose every address is public.
-//! - `post`, its first half: the bounty draft (`post <draft.json>`), read
-//!   with a cap and checked as strictly as a stranger's record, its public
-//!   text held to what the sanitiser prints unchanged; and the bounty built
-//!   from it, every target checked against the target policy and then
-//!   pinned through the context's target source.
+//! - `post <draft.json>` (`post`), for a bounty that is not `--open`: the
+//!   bounty draft, read with a cap and checked as strictly as a stranger's
+//!   record, its public text held to what the sanitiser prints unchanged;
+//!   every target checked against the target policy and pinned through the
+//!   context's target source; the bounty shown, sanitised, on standard
+//!   error, and published as `bounties/<id>.json` under the writers' lock
+//!   with a fresh session only once the owner says yes.
+//! - `own_storage`, `OwnStorage`: the seam through which `post`, and later
+//!   `run` and `submit`, write the signed-in user's own records and read
+//!   them back, with a fake for the unit tests that can refuse a chosen
+//!   write.
 //!
 //! The rules that hold for everything here (see "Rust conventions" in
 //! `docs/plan/03-cli-and-skill.md`):
@@ -202,10 +208,14 @@ mod login;
 // delete this install's files, in that order.
 mod logout;
 mod network;
+// `OwnStorage`: the signed-in user's own files, written and read back by
+// `post`, `run` and `submit`.
+mod own_storage;
 // `--passphrase-file` and the one way every secret file is written and read,
 // wrapped with that passphrase or plain.
 mod passphrase;
-// `post`: the bounty draft, checked and pinned into the bounty it publishes.
+// `post`: the bounty draft, checked and pinned into a bounty, shown, and
+// published once the owner says yes.
 mod post;
 // Owner-only files and directories, which every secret and state file goes
 // through.
@@ -394,9 +404,11 @@ pub fn run_without_context(cli: &Cli) -> Option<anyhow::Result<Report>> {
     // Matching on `&cli.command` borrows it, so `dir` is a `&PathBuf`.
     match &cli.command {
         Command::Init { dir } => Some(init::init(dir)),
-        Command::Login { .. } | Command::Logout | Command::Keys { .. } | Command::Circle { .. } => {
-            None
-        }
+        Command::Login { .. }
+        | Command::Logout
+        | Command::Keys { .. }
+        | Command::Circle { .. }
+        | Command::Post { .. } => None,
     }
 }
 
@@ -450,6 +462,12 @@ pub async fn run(cli: Cli, ctx: &Context) -> anyhow::Result<Report> {
             CircleCommand::Remove { pubky } => circle::remove(ctx, &pubky).await,
             CircleCommand::Show { admin } => circle::show(ctx, admin.as_deref()).await,
         },
+        // `match cli.command` moved only that field out of `cli`, so
+        // `cli.no_input`, another field, can still be read here.
+        Command::Post { draft } => {
+            let prompting = prompt::Prompting::from_no_input_flag(cli.no_input);
+            post::post(ctx, prompting, &draft).await
+        }
     }
 }
 
@@ -505,6 +523,7 @@ mod tests {
             &["circle", "add", "pk"],
             &["circle", "remove", "pk"],
             &["circle", "show"],
+            &["post", "draft.json"],
         ];
         for args in commands {
             // With and without `--no-input`, which changes nothing here: the

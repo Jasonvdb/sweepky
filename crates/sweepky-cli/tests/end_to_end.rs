@@ -6,14 +6,15 @@
 //! There is one test function and it is built up phase by phase: P2a's
 //! steps use the throwaway identity `throwaway` (not A, B or C, because
 //! `logout` deletes the identity it runs on), and P2b to P2d add their steps
-//! for A, B and C after these, without reordering them.
+//! for A, B and C after these, without reordering them. Each identity has a
+//! `SWEEPKY_HOME`, and so a `Context`, of its own, as on separate machines.
 //!
 //! It needs Postgres for the testnet's homeserver, through
 //! `TEST_PUBKY_CONNECTION_STRING`. `#[pubky_testnet::test]` drops the test
 //! databases when the test ends, even when it fails.
 
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, BufRead, Cursor, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -27,7 +28,8 @@ use sweepky_cli::{
     StdinReader, TargetSource, run,
 };
 use sweepky_core::{
-    Circle, DeviceIdentity, DeviceKey, MAX_RECORD_BYTES, Pubky, RepoName, SecretString, Zeroizing,
+    Bounty, BountyRef, Circle, DeviceIdentity, DeviceKey, GitSha, KnownBountyStatus, KnownTarget,
+    MAX_RECORD_BYTES, Pubky, RepoName, RepoPath, SecretString, Zeroizing, paths,
 };
 
 /// What the context writes to standard error, kept where the test can read
@@ -202,33 +204,52 @@ fn fixture_targets() -> TargetSource {
     TargetSource::Fixture(FixtureTargets::new([(repo, path)]))
 }
 
-/// A signup token in a form the homeserver rejects (400) before it looks at
-/// anything else, so a `login` that sent a signup with it would fail. Passed
-/// where `login` must not sign up, it proves that no signup was sent.
-const TRIPWIRE_TOKEN: &str = "not-a-signup-code";
+/// The SHA `fixtures/README.md` records for `name`, a commit of the
+/// fixture repository (R, A, B, M, F2, …), in a row of the form
+/// ``| name | `<sha>` | …`` of its `target-repo.git` section. A test binary
+/// cannot call `tests/fixture_target_repo.rs`'s own reader, so this is a
+/// small one of its own; the README stays the one place the SHAs are
+/// written.
+fn recorded_sha(name: &str) -> GitSha {
+    let readme =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/README.md"))
+            .expect("fixtures/README.md");
+    let section = readme
+        .split("\n## ")
+        .find(|section| section.starts_with("`target-repo.git`"))
+        .expect("fixtures/README.md has a `target-repo.git` section");
+    let row = format!("| {name} | `");
+    section
+        .lines()
+        .find_map(|line| line.strip_prefix(row.as_str()))
+        .and_then(|rest| rest.split('`').next())
+        .expect("the README records the commit")
+        .parse()
+        .expect("a SHA")
+}
 
-#[tokio::test]
-#[pubky_testnet::test]
-async fn end_to_end() {
-    let testnet = EphemeralTestnet::builder()
-        .with_http_relay()
-        .build()
-        .await
-        .expect("the testnet starts");
-    let homeserver = testnet.homeserver_app().public_key();
+/// A context for one identity: the testnet's client injected, `home` as
+/// its `SWEEPKY_HOME` and working directory, `stdin` as its standard input,
+/// and the buffer that keeps what it writes to standard error.
+fn context(
+    testnet: &EphemeralTestnet,
+    home: &Path,
+    stdin: impl BufRead + Send + 'static,
+) -> (Context, SharedBuffer) {
     // `local_url()` ends with `/`, so this is `http://localhost:<port>/inbox`.
     let relay = format!("{}inbox", testnet.http_relay().local_url());
-
-    // SWEEPKY_HOME for this test: a fresh directory that deletes itself.
-    let home = tempfile::tempdir().expect("temp dir");
     let stderr = SharedBuffer::default();
     let ctx = Context {
-        network: Network::injected(testnet.sdk().expect("client"), relay, homeserver.clone()),
-        dirs: Dirs::resolve(None, Some(home.path().as_os_str())).expect("absolute"),
-        cwd: home.path().to_path_buf(),
-        // An empty standard input: P2a's commands ask nothing, and a
-        // question would read the end of the input, which is no.
-        stdin: StdinReader::new(io::empty()),
+        network: Network::injected(
+            testnet.sdk().expect("client"),
+            relay,
+            testnet.homeserver_app().public_key(),
+        ),
+        dirs: Dirs::resolve(None, Some(home.as_os_str())).expect("absolute"),
+        cwd: home.to_path_buf(),
+        stdin: StdinReader::new(stdin),
+        // A clone of the handle: the context writes into the buffer the
+        // test reads.
         stderr: StderrWriter::new(stderr.clone()),
         // No --passphrase-file: the secret files are written plain, as the
         // test reads them.
@@ -247,6 +268,38 @@ async fn end_to_end() {
         // repository host.
         targets: fixture_targets(),
     };
+    (ctx, stderr)
+}
+
+/// The pubky `ctx`'s install is logged in as, from its `login.json`.
+fn logged_in(ctx: &Context) -> Pubky {
+    json(&ctx.dirs.login_file())["pubky"]
+        .as_str()
+        .expect("a pubky")
+        .parse()
+        .expect("a pubky")
+}
+
+/// A signup token in a form the homeserver rejects (400) before it looks at
+/// anything else, so a `login` that sent a signup with it would fail. Passed
+/// where `login` must not sign up, it proves that no signup was sent.
+const TRIPWIRE_TOKEN: &str = "not-a-signup-code";
+
+#[tokio::test]
+#[pubky_testnet::test]
+async fn end_to_end() {
+    let testnet = EphemeralTestnet::builder()
+        .with_http_relay()
+        .build()
+        .await
+        .expect("the testnet starts");
+    let homeserver = testnet.homeserver_app().public_key();
+
+    // SWEEPKY_HOME for the throwaway identity: a fresh directory that
+    // deletes itself. An empty standard input: P2a's commands ask nothing,
+    // and a question would read the end of the input, which is no.
+    let home = tempfile::tempdir().expect("temp dir");
+    let (ctx, stderr) = context(&testnet, home.path(), io::empty());
     // The test looks at the files through the context's own `Dirs`.
     let dirs = &ctx.dirs;
 
@@ -678,4 +731,116 @@ async fn end_to_end() {
         .expect_err("no login any more");
     assert!(format!("{err:#}").contains("not logged in"), "{err:#}");
     assert_eq!(stderr.text(), "", "nothing on standard error");
+
+    // ----- P2b: A posts a closed bounty for a circle that holds B -----
+
+    // A, the owner, and B, a member of A's circle, each with a SWEEPKY_HOME
+    // of their own. A answers yes to the one question `post` asks; B is
+    // asked nothing.
+    let a_home = tempfile::tempdir().expect("temp dir");
+    let (a, a_stderr) = context(&testnet, a_home.path(), Cursor::new(b"y\n".to_vec()));
+    let b_home = tempfile::tempdir().expect("temp dir");
+    let (b, b_stderr) = context(&testnet, b_home.path(), io::empty());
+    sweepky(&a, &["login", "--identity", "a"])
+        .await
+        .expect("A logs in");
+    sweepky(&b, &["login", "--identity", "b"])
+        .await
+        .expect("B logs in");
+    let a_pubky = logged_in(&a);
+    let b_pubky = logged_in(&b);
+    let a_user = PublicKey::try_from_z32(&a_pubky.to_string()).expect("a key");
+
+    // A's circle, with B in it, as anyone reads it.
+    sweepky(&a, &["circle", "create", "A's circle"])
+        .await
+        .expect("circle create");
+    sweepky(&a, &["circle", "add", &b_pubky.to_string(), "--label", "B"])
+        .await
+        .expect("circle add");
+    let roster = get_capped(
+        &testnet,
+        &a_user,
+        "/pub/sweepky/circle.json",
+        MAX_RECORD_BYTES,
+    )
+    .await;
+    let roster = Circle::from_json(&roster).expect("a circle record");
+    assert_eq!(roster.admin, a_pubky);
+    assert!(roster.is_in_roster(b_pubky));
+
+    // The draft A's agent would write, in a file of its own: one target of
+    // each kind in the fixture repository.
+    const TITLE: &str = "Session handling in the fixture repository";
+    const BRIEF: &str = "Look at how sessions expire and are revoked.\n\n- `session.rs`\n";
+    let drafts = tempfile::tempdir().expect("temp dir");
+    let draft = drafts.path().join("bounty.json");
+    let draft_json = json!({
+        "title": TITLE,
+        "brief": BRIEF,
+        "playbook": "cloudflare/security-audit@c1c8a8c",
+        "targets": [
+            { "kind": "repo", "repo": FIXTURE_REPO, "ref": "main", "paths": ["src/auth/"] },
+            { "kind": "commit", "repo": FIXTURE_REPO, "ref": "main" },
+            { "kind": "pr", "repo": FIXTURE_REPO, "number": 1 },
+        ],
+    });
+    fs::write(&draft, serde_json::to_vec(&draft_json).expect("JSON")).expect("written");
+
+    let report = sweepky(&a, &["post", draft.to_str().expect("a UTF-8 path")])
+        .await
+        .expect("A posts the bounty");
+
+    // A was shown the bounty and asked once; B, nothing.
+    let shown = a_stderr.text();
+    assert!(shown.contains(&format!("  Title: {TITLE}\n")), "{shown}");
+    assert_eq!(shown.matches("[y/N] ").count(), 1, "{shown}");
+    assert_eq!(b_stderr.text(), "", "B is asked nothing");
+    // The report's last line is the bounty's URL, under A's own pubky.
+    let url = report.text().lines().last().expect("a report");
+    let posted: BountyRef = url.parse().expect("a bounty URL");
+    assert_eq!(posted.owner, a_pubky);
+
+    // Anyone can read the bounty, closed and open for sweeps, every target
+    // pinned to the fixture's SHAs: the repo at M narrowed to `src/auth/`,
+    // the commit M, and pull request 1 based on M with head F2, the two
+    // meeting at B.
+    let record = get_capped(
+        &testnet,
+        &a_user,
+        &paths::bounty(posted.id),
+        MAX_RECORD_BYTES,
+    )
+    .await;
+    let bounty = Bounty::from_json(&record).expect("a bounty record");
+    assert!(!bounty.open, "a closed bounty");
+    assert_eq!(bounty.status().as_known(), Some(KnownBountyStatus::Open));
+    assert_eq!(
+        (bounty.title.as_str(), bounty.brief.as_str()),
+        (TITLE, BRIEF)
+    );
+    let targets: Vec<KnownTarget> = bounty
+        .targets
+        .iter()
+        .map(|target| target.known().expect("well formed").expect("a known kind"))
+        .collect();
+    let [
+        KnownTarget::Repo(narrowed),
+        KnownTarget::Commit(commit),
+        KnownTarget::Pr(pr),
+    ] = targets.as_slice()
+    else {
+        panic!("a repo, a commit and a pr target: {targets:?}");
+    };
+    let (m, f2, b_sha) = (recorded_sha("M"), recorded_sha("F2"), recorded_sha("B"));
+    assert_eq!(narrowed.rev(), &m);
+    assert_eq!(
+        narrowed
+            .paths()
+            .map(|paths| paths.iter().map(RepoPath::as_str).collect::<Vec<_>>()),
+        Some(vec!["src/auth/"])
+    );
+    assert_eq!(commit.rev(), &m);
+    assert_eq!(pr.number().get(), 1);
+    assert_eq!((pr.base(), pr.head(), pr.merge_base()), (&m, &f2, &b_sha));
 }

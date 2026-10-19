@@ -1,5 +1,7 @@
-//! `post`, for a bounty that is not `--open`: the half that reads the
-//! bounty draft and builds the bounty from it.
+//! `post <draft>`, for a bounty that is not `--open` (P2c adds that flag):
+//! the draft read and checked, every target pinned, the bounty shown to
+//! the owner, and, once they say yes, published as
+//! `/pub/sweepky/bounties/<id>.json`.
 //!
 //! - `draft`: the draft file an owner or their agent writes (title,
 //!   focus, brief, a suggested playbook and the targets, unpinned), read
@@ -8,31 +10,275 @@
 //!   pins each one through the context's target source, and builds the
 //!   core `Bounty` that `post` publishes, with the warnings it shows
 //!   first.
+//! - [`post`], the command, in this order:
+//!   1. read the draft, take `createdAt` from the clock, and pin every
+//!      target;
+//!   2. write the bounty as compact JSON, and refuse it when it is over
+//!      `MAX_RECORD_BYTES`, which no Sweepky would read back;
+//!   3. show the warnings and the bounty on standard error ([`preview`])
+//!      and ask whether to publish it. Anything but `y` or `yes` publishes
+//!      nothing, and so does `--no-input`, which fails instead of asking;
+//!   4. only then make the bounty's id from the clock and, under the
+//!      writers' lock with a fresh session that is always signed out
+//!      (`session::with_writer_session`), PUT the record through
+//!      [`OwnStorage`] ([`publish`]), and report its `pubky://` URL.
 //!
-//! The other half, later in P2b, shows the title and the brief for the
-//! owner to confirm, and only then writes the bounty.
-
-// Nothing calls into this module yet outside its tests: the `post` command,
-// later in P2b, is the first caller. As in `targets/mod.rs`, `expect` (not
-// `allow`) silences the dead-code warning only while it is true, and that
-// caller removes it.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the post command, later in P2b, is the first caller"
-    )
-)]
+//! **Why the question comes before the lock.** The lock serialises every
+//! writing command on this install, and a person may take minutes to
+//! answer, so no other command waits on them and no session is open
+//! meanwhile. The lock covers the sign-in, the PUT and the sign-out alone.
+//!
+//! **Agent-written text is sanitised on its way to the terminal.** The
+//! draft's checks already refuse public text the sanitiser would change,
+//! but the preview still prints every string a draft wrote (the title,
+//! focus, playbook, brief, target ids, repositories and paths) through
+//! `display::sanitize` or `sanitize_multiline`: a path is held to core's
+//! lexical rules only, and the preview takes a bounty, which nothing
+//! makes a draft check first.
 
 pub(crate) mod draft;
 
-use anyhow::Context as _;
-use sweepky_core::{Bounty, RecordTime, Target};
+use std::path::Path;
 
-use self::draft::{BountyDraft, UnpinnedKind, UnpinnedTarget};
+use anyhow::{Context as _, bail};
+use sweepky_core::paths;
+use sweepky_core::{
+    Bounty, BountyPlaybook, BountyRef, KnownTarget, MAX_RECORD_BYTES, RecordId, RecordTime,
+    RepoName, RepoPath, Target, TargetId,
+};
+
+use self::draft::{
+    BountyDraft, MAX_BRIEF_BYTES, MAX_FOCUS_CHARS, MAX_PLAYBOOK_CHARS, MAX_TITLE_CHARS,
+    UnpinnedKind, UnpinnedTarget, read_draft,
+};
+use crate::display::{sanitize, sanitize_multiline};
 use crate::git::RunGit;
+use crate::own_storage::{OwnStorage, SessionStorage};
+use crate::prompt::{Prompting, confirm};
+use crate::remote::write_error;
+use crate::session::with_writer_session;
 use crate::targets::github::GitHubApi;
 use crate::targets::{PullRequest, TargetResolver};
+use crate::{Context, Report, clock};
+
+/// What `post` asks before it publishes.
+const PUBLISH_QUESTION: &str = "Publish this bounty, where anyone can read it?";
+
+/// What `post` says when it publishes nothing: in its report when the
+/// owner does not say yes, and in front of the error under `--no-input`.
+const NOTHING_POSTED: &str = "nothing was posted";
+
+/// The line the preview and the report both give for a bounty that is
+/// not `--open`.
+const CLOSED: &str = "closed: sweeps from outside your circle are not read";
+
+/// Runs `post <draft>`: reads the bounty draft at `draft`, pins its
+/// targets, shows the bounty and asks whether to publish it, and only on a
+/// yes writes `bounties/<id>.json` under the writers' lock with a fresh
+/// session. `prompting` is the global `--no-input`, under which the
+/// question fails, so nothing is posted. See the module docs for the
+/// order and why.
+pub(crate) async fn post(
+    ctx: &Context,
+    prompting: Prompting,
+    draft: &Path,
+) -> anyhow::Result<Report> {
+    let prepared = pin_draft(ctx, draft).await?;
+    let record = bounty_bytes(&prepared.bounty)?;
+    ctx.stderr.write_flushed(&preview(&prepared)?)?;
+    // `context` puts the words in front of `--no-input`'s error, so both
+    // ways of not saying yes tell the owner that nothing was posted.
+    if !confirm(ctx, prompting, PUBLISH_QUESTION).context(NOTHING_POSTED)? {
+        return Ok(Report::new(format!(
+            "Not confirmed, so {NOTHING_POSTED}.\n"
+        )));
+    }
+    let posted = publish_signed_in(ctx, record).await?;
+    // A `BountyRef` prints as its `pubky://` URL, the raw z-base32 owner
+    // and the id, which need no sanitising. It ends its line, so it can be
+    // copied whole.
+    Ok(Report::new(format!(
+        "Posted the bounty, {CLOSED}:\n{posted}\n"
+    )))
+}
+
+/// The draft at `path`, read and checked, its targets pinned through the
+/// context's target source into the bounty `post` publishes, posted now.
+async fn pin_draft(ctx: &Context, path: &Path) -> anyhow::Result<PreparedBounty> {
+    let draft = read_draft(path)?;
+    let created_at = clock::now()?;
+    // The runner is dropped when this function returns, which removes its
+    // private HOME before `post` asks its question and waits on a person.
+    let git = ctx.targets.git_runner(&ctx.dirs, &ctx.git_env)?;
+    // The SDK's HTTP client is the GitHub API a pull request target is
+    // read through.
+    let github = ctx.network.pubky().client();
+    prepare_bounty(draft, &ctx.targets, &git, github, created_at).await
+}
+
+/// `bounty` as it is published: compact JSON, refused when it would be
+/// over [`MAX_RECORD_BYTES`], which no Sweepky reads a record past. A draft
+/// within its own caps can still build a longer bounty (the pinned SHAs
+/// and the fields `post` adds), so `post` checks this before it asks, and
+/// so before any session.
+fn bounty_bytes(bounty: &Bounty) -> anyhow::Result<Vec<u8>> {
+    let bytes = serde_json::to_vec(bounty).context("could not write the bounty record")?;
+    if bytes.len() > MAX_RECORD_BYTES {
+        bail!(
+            "the bounty would be {} bytes, over the {MAX_RECORD_BYTES} bytes Sweepky reads a \
+             record up to, so {NOTHING_POSTED}; shorten the brief or the paths",
+            bytes.len()
+        );
+    }
+    Ok(bytes)
+}
+
+/// Publishes `record` under a new bounty id, under the writers' lock with
+/// a fresh session that is always signed out, and gives the bounty's
+/// address.
+async fn publish_signed_in(ctx: &Context, record: Vec<u8>) -> anyhow::Result<BountyRef> {
+    // From the clock, which `new_record_id` checks first, so a clock before
+    // 1970 is an error here rather than a panic.
+    let id = clock::new_record_id()?;
+    // `async move` moves `record` into the closure, which `publish` then
+    // consumes; `id` is `Copy`, so the closure gets a copy. The closure
+    // only borrows the session, so `with_writer_session` still signs it
+    // out afterwards, whatever `publish` returned.
+    with_writer_session(ctx, async move |signed| {
+        publish(&SessionStorage::new(signed), id, record).await?;
+        Ok(BountyRef {
+            owner: signed.login().pubky,
+            id,
+        })
+    })
+    .await
+}
+
+/// Writes `record`, the bytes [`bounty_bytes`] gave, as the signed-in
+/// user's `bounties/<id>.json`. A refusal is mapped by `write_error`: 403
+/// and 507 to their messages, anything else to fixed text and the status,
+/// never the server's words.
+async fn publish(storage: &impl OwnStorage, id: RecordId, record: Vec<u8>) -> anyhow::Result<()> {
+    let path = paths::bounty(id);
+    storage
+        .put(&path, record)
+        .await
+        .map_err(|error| write_error(&error).context(format!("could not write {path}")))
+}
+
+/// What `post` shows before it asks: each warning, then the bounty as it
+/// is about to be published: the title, focus and suggested playbook,
+/// every target with its pinned SHAs, and the brief, each of its lines
+/// behind a `| ` gutter so that none can pass for a line of Sweepky's own.
+///
+/// Every string from the draft goes through the sanitiser, with room for
+/// the longest text the draft allows, so nothing a check let through is
+/// cut. The warnings are fixed text that names targets by place, and the
+/// SHAs and the pull request number are checked values, so those print as
+/// they are.
+fn preview(prepared: &PreparedBounty) -> anyhow::Result<String> {
+    // Taking the struct apart borrows each field and names them all, so a
+    // field added later does not compile until it is shown here or left
+    // out on purpose.
+    let PreparedBounty { bounty, warnings } = prepared;
+    // `collect` builds one `String` from the `String` each line gives.
+    let mut text: String = warnings
+        .iter()
+        .map(|warning| format!("warning: {warning}\n"))
+        .collect();
+    text.push_str(&format!(
+        "The bounty to post, {CLOSED}.\n  Title: {}\n  Focus: {}\n  Playbook: {}\n  \
+         Targets ({}):\n",
+        sanitize(&bounty.title, MAX_TITLE_CHARS),
+        sanitize(bounty.focus.as_str(), MAX_FOCUS_CHARS),
+        shown_playbook(&bounty.playbook),
+        bounty.targets.len()
+    ));
+    for (index, target) in bounty.targets.iter().enumerate() {
+        text.push_str(&target_lines(index, target)?);
+    }
+    text.push_str("  Brief:\n");
+    // A brief's characters are at most its bytes, so `MAX_BRIEF_BYTES`
+    // shows the whole of any brief the draft allows. `lines()` splits at
+    // the newlines the multi-line sanitiser keeps; every other control,
+    // `\r` among them, is an escape by then.
+    text.extend(
+        sanitize_multiline(&bounty.brief, MAX_BRIEF_BYTES)
+            .lines()
+            .map(|line| format!("  | {line}\n")),
+    );
+    Ok(text)
+}
+
+/// The suggested playbook as the preview shows it, sanitised, or that
+/// there is none.
+fn shown_playbook(playbook: &BountyPlaybook) -> String {
+    match &playbook.suggested {
+        Some(suggested) => format!(
+            "{} (suggested, not required)",
+            sanitize(suggested, MAX_PLAYBOOK_CHARS)
+        ),
+        None => "none suggested".to_owned(),
+    }
+}
+
+/// The preview's lines for `target`, the one at `index`: its id, its kind,
+/// its repository and every SHA it is pinned to, a pull request's three on
+/// lines of their own, and a repo target's paths ([`path_lines`]).
+fn target_lines(index: usize, target: &Target) -> anyhow::Result<String> {
+    let id = sanitize(target.id().as_str(), TargetId::MAX_LEN);
+    // `post` built every target itself from checked parts, so each is of a
+    // known kind with well-formed fields; `known` checks that again rather
+    // than assume it, and a target it refuses is not shown half-read.
+    let Ok(Some(known)) = target.known() else {
+        bail!("targets[{index}] is not a target this build can show, so {NOTHING_POSTED}");
+    };
+    let lines = match known {
+        KnownTarget::Repo(repo) => format!(
+            "    {id}: repo {} at {}\n{}",
+            shown_repo(repo.repo()),
+            repo.rev(),
+            path_lines(repo.paths())
+        ),
+        KnownTarget::Commit(commit) => format!(
+            "    {id}: commit {} in {}\n",
+            commit.rev(),
+            shown_repo(commit.repo())
+        ),
+        KnownTarget::Pr(pr) => format!(
+            "    {id}: pull request {} of {}\n      base {}\n      head {}\n      merge base {}\n",
+            pr.number(),
+            shown_repo(pr.repo()),
+            pr.base(),
+            pr.head(),
+            pr.merge_base()
+        ),
+    };
+    Ok(lines)
+}
+
+/// A repo target's paths as the preview shows them, sanitised, one a line,
+/// or that it is the whole repository (`None`, as core reads no `paths`).
+fn path_lines(paths: Option<&[RepoPath]>) -> String {
+    match paths {
+        Some(paths) => paths
+            .iter()
+            .map(|path| {
+                format!(
+                    "      path {}\n",
+                    sanitize(path.as_str(), RepoPath::MAX_LEN)
+                )
+            })
+            .collect(),
+        None => "      the whole repository\n".to_owned(),
+    }
+}
+
+/// `repo` as the preview shows it: through the sanitiser, like every other
+/// string a draft wrote.
+fn shown_repo(repo: &RepoName) -> String {
+    sanitize(repo.as_str(), RepoName::MAX_LEN)
+}
 
 /// A bounty ready for `post` to publish, and what `post` warns of before
 /// it asks the owner to confirm.
@@ -125,17 +371,35 @@ async fn pin_target(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::io::Cursor;
+    use std::path::PathBuf;
+
+    use pubky::StatusCode;
     use serde_json::{Value, json};
-    use sweepky_core::{Bounty, GitSha, KnownTarget, RecordTime};
+    use sweepky_core::{
+        Bounty, GitSha, KnownTarget, MAX_RECORD_BYTES, RecordTime, RepoPath, Target,
+    };
+    use tempfile::TempDir;
 
     use super::draft::BountyDraft;
-    use super::{PreparedBounty, prepare_bounty};
+    use super::{
+        NOTHING_POSTED, PUBLISH_QUESTION, PreparedBounty, bounty_bytes, post, prepare_bounty,
+        preview, publish,
+    };
+    use crate::Context;
+    use crate::clock;
+    use crate::own_storage::OwnStorage;
+    use crate::prompt::Prompting;
+    use crate::remote::{QUOTA_FULL, WRITE_FORBIDDEN};
+    use crate::session::NOT_LOGGED_IN;
     use crate::targets::fixture::FixtureTargets;
     use crate::targets::rev::NOT_ANONYMOUSLY_READABLE;
     use crate::targets::{TargetResolver, TargetSource};
     use crate::test_support::{
-        FakeGitHub, RecordingGit, dirs_in, fixture_repo, fixture_targets, private_temp,
-        recorded_fixture_shas, test_git_env,
+        FakeGitHub, FakeOwnStorage, RecordingGit, SharedBuffer, dirs_in, fixture_repo,
+        fixture_targets, offline_network, private_temp, recorded_fixture_shas, test_context,
+        test_git_env,
     };
 
     const TITLE: &str = "Auth and session handling";
@@ -303,5 +567,276 @@ mod tests {
             serde_json::to_value(&prepared.bounty.targets).expect("JSON"),
             json!([{ "id": "t1", "kind": "repo", "repo": fixture_repo(), "rev": head }])
         );
+    }
+
+    // ----- The command: the preview, the question and the write -----
+
+    /// A context for `post` on a network that reaches nothing, whose
+    /// standard input holds `answer`, with the fixture repository as its
+    /// target source and no login, so any sign-in would fail with
+    /// [`NOT_LOGGED_IN`]. The `TempDir` is its `SWEEPKY_HOME`, which lives
+    /// as long as the test keeps it.
+    fn post_context(answer: &'static [u8]) -> (TempDir, Context, SharedBuffer) {
+        let home = private_temp();
+        let (mut ctx, stderr) = test_context(offline_network(), &home, Cursor::new(answer));
+        ctx.targets = TargetSource::Fixture(fixture_targets());
+        (home, ctx, stderr)
+    }
+
+    /// `draft` written to `draft.json` in `home`, for `post` to read.
+    fn draft_file(home: &TempDir, draft: &[u8]) -> PathBuf {
+        let path = home.path().join("draft.json");
+        fs::write(&path, draft).expect("written");
+        path
+    }
+
+    /// A draft with one target of each kind in the fixture repository.
+    fn fixture_draft() -> Vec<u8> {
+        let repo = fixture_repo();
+        json!({
+            "title": TITLE,
+            "brief": BRIEF,
+            "playbook": PLAYBOOK,
+            "targets": [
+                { "kind": "repo", "repo": repo, "ref": "main", "paths": ["src/auth/"] },
+                { "kind": "commit", "repo": repo, "ref": "main" },
+                { "kind": "pr", "repo": repo, "number": 1 },
+            ],
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    /// A draft of one repo target whose paths, and then its brief, bring it
+    /// to 64 bytes under the record cap. It is within every cap the draft
+    /// itself has, while the bounty built from it, with its pinned SHA, its
+    /// id and the fields `post` adds, is over.
+    fn draft_near_the_cap() -> Vec<u8> {
+        let size = |draft: &Value| draft.to_string().len();
+        let wanted = MAX_RECORD_BYTES - 64;
+        let path = format!("src/{}", "a".repeat(RepoPath::MAX_LEN - "src/".len()));
+        let mut draft = json!({
+            "title": TITLE,
+            "brief": "b",
+            "targets": [{ "kind": "repo", "repo": fixture_repo(), "ref": "main", "paths": [path] }],
+        });
+        // Each path after the first adds itself, its two quotes and a comma.
+        let more = (wanted - size(&draft)) / (path.len() + 3);
+        draft["targets"][0]["paths"] = Value::from(vec![path; 1 + more]);
+        let short = wanted - size(&draft);
+        draft["brief"] = Value::from("b".repeat(1 + short));
+        assert_eq!(size(&draft), wanted);
+        draft.to_string().into_bytes()
+    }
+
+    /// A bounty of one repo target, pinned by hand rather than by git.
+    fn a_bounty() -> Bounty {
+        let draft = draft(json!([{ "kind": "repo", "repo": fixture_repo(), "ref": "main" }]));
+        let sha: GitSha = "b".repeat(40).parse().expect("a SHA");
+        let target = Target::repo(
+            "t1".parse().expect("an id"),
+            fixture_repo(),
+            sha,
+            Vec::new(),
+        );
+        draft.into_bounty(vec![target], created_at())
+    }
+
+    #[tokio::test]
+    async fn anything_but_yes_posts_nothing_and_opens_no_session() {
+        // `n`, an empty line and the end of the input are each a no.
+        for answer in [&b"n\n"[..], b"\n", b""] {
+            let (home, ctx, _stderr) = post_context(answer);
+            let draft = draft_file(&home, &fixture_draft());
+
+            let report = post(&ctx, Prompting::Allowed, &draft)
+                .await
+                .expect("a no is not an error");
+
+            // Had `post` signed in, it would have failed with
+            // NOT_LOGGED_IN: this context has no login.
+            assert!(report.text().contains(NOTHING_POSTED), "{}", report.text());
+            // The writers' lock file is made by the first command that
+            // takes the lock, so none was taken.
+            assert!(!ctx.dirs.credential_lock_file().exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn no_input_fails_instead_of_asking_and_posts_nothing() {
+        // A yes waits on standard input, and is never read.
+        let (home, ctx, stderr) = post_context(b"y\n");
+        let draft = draft_file(&home, &fixture_draft());
+
+        let error = post(&ctx, Prompting::Forbidden, &draft)
+            .await
+            .expect_err("no question under --no-input");
+
+        let message = format!("{error:#}");
+        assert!(message.contains(NOTHING_POSTED), "{message}");
+        assert!(message.contains("--no-input"), "{message}");
+        assert!(!message.contains(NOT_LOGGED_IN), "{message}");
+        assert!(!stderr.text().contains("[y/N]"), "{}", stderr.text());
+        assert!(!ctx.dirs.credential_lock_file().exists());
+    }
+
+    #[tokio::test]
+    async fn the_bounty_is_shown_with_every_pinned_sha_before_the_question() {
+        let shas = recorded_fixture_shas();
+        let sha = |name: &str| shas[name].to_string();
+        let repo = fixture_repo();
+        let (home, ctx, stderr) = post_context(b"n\n");
+        let draft = draft_file(&home, &fixture_draft());
+
+        post(&ctx, Prompting::Allowed, &draft)
+            .await
+            .expect("a no is not an error");
+
+        // The title, focus and playbook, every target with its pinned
+        // SHAs (main is M; pull request 1 is based on M, its head F2, the
+        // two meeting at B), the brief behind its gutter, and then the
+        // question.
+        let shown = stderr.text();
+        for line in [
+            format!("  Title: {TITLE}\n"),
+            "  Focus: security\n".to_owned(),
+            format!("  Playbook: {PLAYBOOK} (suggested, not required)\n"),
+            format!(
+                "    t1: repo {repo} at {}\n      path src/auth/\n",
+                sha("M")
+            ),
+            format!("    t2: commit {} in {repo}\n", sha("M")),
+            format!(
+                "    t3: pull request 1 of {repo}\n      base {}\n      head {}\n      \
+                 merge base {}\n",
+                sha("M"),
+                sha("F2"),
+                sha("B")
+            ),
+            "  Brief:\n  | Look at how sessions expire.\n  | \n  | - tokens\n".to_owned(),
+        ] {
+            assert!(shown.contains(&line), "{line:?} not in {shown}");
+        }
+        assert!(
+            shown.ends_with(&format!("{PUBLISH_QUESTION} [y/N] ")),
+            "{shown}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bounty_over_the_record_cap_is_refused_before_the_question() {
+        let (home, ctx, stderr) = post_context(b"y\n");
+        let draft = draft_near_the_cap();
+        BountyDraft::parse(&draft).expect("the draft itself is within its caps");
+        let path = draft_file(&home, &draft);
+
+        let error = post(&ctx, Prompting::Allowed, &path)
+            .await
+            .expect_err("refused");
+
+        // The cap's own message, not NOT_LOGGED_IN, which a sign-in after
+        // the yes on standard input would have given.
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&format!("over the {MAX_RECORD_BYTES} bytes")),
+            "{message}"
+        );
+        assert!(message.contains(NOTHING_POSTED), "{message}");
+        // Nothing shown, nothing asked and no lock taken.
+        assert_eq!(stderr.text(), "");
+        assert!(!ctx.dirs.credential_lock_file().exists());
+    }
+
+    #[test]
+    fn the_preview_sanitises_every_string_a_draft_wrote() {
+        // A bounty no draft check saw: an ESC sequence, a BEL or a carriage
+        // return in every string that can hold one, and a zero-width space
+        // in the path, which core's lexical check lets through. A target
+        // id and a repository name have no room for any of them.
+        let hostile = json!({
+            "schemaVersion": 1,
+            "title": "title \u{1b}[2J",
+            "focus": "focus \u{1b}]0;x\u{7}",
+            "brief": "one \u{1b}[31m\r\ntwo\n",
+            "playbook": { "suggested": "playbook \u{1b}[1m", "required": false },
+            "targets": [{
+                "id": "t1", "kind": "repo", "repo": "example.invalid/org/name",
+                "rev": "a".repeat(40), "paths": ["src/\u{200b}auth/"],
+            }],
+            "open": false,
+            "reward": null,
+            "status": "open",
+            "credits": [],
+            "createdAt": CREATED_AT,
+            "doneAt": null,
+        });
+        let bounty = Bounty::from_json(hostile.to_string().as_bytes()).expect("core reads it");
+        let prepared = PreparedBounty {
+            bounty,
+            warnings: Vec::new(),
+        };
+
+        let shown = preview(&prepared).expect("a preview");
+
+        for raw in ['\u{1b}', '\u{7}', '\r', '\u{200b}'] {
+            assert!(
+                !shown.contains(raw),
+                "{raw:?} reached the terminal: {shown:?}"
+            );
+        }
+        for escaped in [
+            "  Title: title \\u{1b}[2J\n",
+            "  Focus: focus \\u{1b}]0;x\\u{7}\n",
+            "  Playbook: playbook \\u{1b}[1m (suggested, not required)\n",
+            "      path src/\\u{200b}auth/\n",
+            "  | one \\u{1b}[31m\\u{d}\n  | two\n",
+        ] {
+            assert!(shown.contains(escaped), "{escaped:?} not in {shown:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_bounty_is_put_at_its_path_as_compact_json_that_reads_back_equal() {
+        let bounty = a_bounty();
+        let id = clock::new_record_id().expect("an id");
+        let storage = FakeOwnStorage::default();
+
+        let record = bounty_bytes(&bounty).expect("within the cap");
+        publish(&storage, id, record).await.expect("written");
+
+        let path = format!("/pub/sweepky/bounties/{id}.json");
+        assert_eq!(storage.puts(), [path.as_str()]);
+        let stored = storage
+            .get_own(&path)
+            .await
+            .expect("reads")
+            .expect("written");
+        // Compact: a JSON string holds no raw newline, so any newline would
+        // be layout.
+        assert!(stored.len() <= MAX_RECORD_BYTES);
+        assert!(!stored.contains(&b'\n'));
+        assert_eq!(Bounty::from_json(&stored).expect("core reads it"), bounty);
+    }
+
+    #[tokio::test]
+    async fn a_refused_write_gives_the_fixed_message_never_the_servers_text() {
+        const SERVER_TEXT: &str = "MARKER-5e7v: tenant over quota, path policy says no";
+        let id = clock::new_record_id().expect("an id");
+        let path = format!("/pub/sweepky/bounties/{id}.json");
+        for (status, fixed) in [
+            (StatusCode::INSUFFICIENT_STORAGE, QUOTA_FULL),
+            (StatusCode::FORBIDDEN, WRITE_FORBIDDEN),
+        ] {
+            let storage = FakeOwnStorage::refusing(&path, status, SERVER_TEXT);
+            let record = bounty_bytes(&a_bounty()).expect("within the cap");
+
+            let error = publish(&storage, id, record).await.expect_err("refused");
+
+            let message = format!("{error:#}");
+            assert!(message.contains(fixed), "{message}");
+            assert!(!message.contains("MARKER-5e7v"), "{message}");
+            assert_eq!(storage.puts(), [path.as_str()]);
+            assert!(storage.get_own(&path).await.expect("reads").is_none());
+        }
     }
 }

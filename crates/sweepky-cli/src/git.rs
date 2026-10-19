@@ -63,15 +63,16 @@
 //! `GitSha` also accepts 64. Killing git does not kill a helper it started
 //! (`git-remote-https`); the helper dies when its pipes close.
 
-// Nothing calls the runner yet: `post` and `run`, later in P2b, are its
-// first callers, so outside the tests the compiler would warn that most of
-// this module is dead code. As in `prompt.rs`, `expect` (not `allow`)
-// silences that only while it is true, and the first caller removes it.
+// `post` runs `ls-remote` and `merge-base` through the runner, but nothing
+// fetches yet: `run`, later in P2b, is the first caller of the fetch and of
+// what only it uses, so outside the tests the compiler would warn that
+// those are dead code. `expect` (not `allow`) silences that only while it
+// is true, and that caller removes it.
 #![cfg_attr(
     not(test),
     expect(
         dead_code,
-        reason = "post and run, later in P2b, are the first callers of the git runner"
+        reason = "run, later in P2b, is the first caller of the fetch"
     )
 )]
 

@@ -11,7 +11,7 @@
 //!   to each command that asks, and under it [`confirm`] fails at once and
 //!   reads nothing.
 //!
-//! `post` and `submit`, later in P2b, are the commands that ask: `post`
+//! `post` and, later in P2b, `submit` are the commands that ask: `post`
 //! before it publishes a bounty's title and brief, and `submit` before it
 //! encrypts to keys the owner added since the last submit.
 //!
@@ -19,21 +19,6 @@
 //! answer is never read with an unbounded `read_line`, which would buffer a
 //! line with no end until memory ran out. The read stops one byte past the
 //! cap, and a line that long is an error.
-
-// Nothing calls `confirm` yet: `post` and `submit`, later in P2b, are its
-// first callers, so outside the tests the compiler would warn that it and
-// what only it uses are dead code. `expect` (not `allow`) silences that
-// warning only while it is true: once a command calls `confirm`, the
-// expectation goes unmet, which is a warning of its own, and this line has
-// to go. `cfg_attr(not(test), …)` applies it to the normal build only,
-// because the unit tests below do call `confirm`.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "post and submit, later in P2b, are the first callers of confirm"
-    )
-)]
 
 use std::io::{BufRead, Read};
 use std::sync::{Mutex, PoisonError};
