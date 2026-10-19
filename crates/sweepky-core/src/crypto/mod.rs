@@ -10,6 +10,10 @@
 //! - `seal`: [`encrypt`] to a list of recipients as binary age v1, and
 //!   [`decrypt`] with one identity, which bounds what a stranger's file can
 //!   make it do and returns the whole [`Plaintext`] or nothing.
+//! - `passphrase` (P2a): [`wrap_with_passphrase`] and
+//!   [`unwrap_with_passphrase`], age's own scrypt recipient and identity
+//!   around one small local secret file, with the work factor
+//!   ([`WorkFactor`]) and the input bounded on both sides.
 //!
 //! Nothing here rolls its own cryptography: age does the encryption, and this
 //! module only decides which keys age is handed, what age may be made to
@@ -18,10 +22,15 @@
 
 mod keys;
 mod padding;
+mod passphrase;
 mod seal;
 
 pub use keys::{AgeRecipient, DeviceIdentity, DeviceKeyError, IdentityError, RecipientError};
 pub use padding::{PADDING_BUCKET_BYTES, PaddedPlaintext, PaddingError};
+pub use passphrase::{
+    MAX_SECRET_BYTES, MAX_WORK_FACTOR, MAX_WRAPPED_BYTES, PassphraseError, WRITE_WORK_FACTOR,
+    WorkFactor, looks_wrapped, unwrap_with_passphrase, wrap_with_passphrase,
+};
 // `pub(crate)`: the package module needs it, and nothing outside the crate
 // may make a `PaddedPlaintext` any way but by padding.
 pub(crate) use padding::PaddingWriter;

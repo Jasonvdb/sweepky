@@ -6,11 +6,55 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+# The crate is a library plus a thin binary. The library (`src/lib.rs`, which
+# Cargo finds on its own and names `sweepky_cli`) runs every command given a
+# network config, so the end-to-end test can call it with a local testnet's
+# client injected. The binary only parses the arguments, reads the environment,
+# builds that config and prints the result.
+#
 # The package is `sweepky-cli`, but the binary people run is `sweepky`.
 [[bin]]
 name = "sweepky"
 path = "src/main.rs"
 
-# No dependencies yet. P2a adds `pubky`, `clap`, `tokio`, `anyhow` and the path
-# dependency on sweepky-core, together with the library entry point.
+# Each entry opts in to a pin in the root Cargo.toml's [workspace.dependencies].
+#
+# Errors: `anyhow` is for this crate only, library and binary alike, because
+# here an error only has to become a good message for the user. sweepky-core
+# returns typed `thiserror` errors that code can `match` on.
 [dependencies]
+# Records, ids, paths and encryption, with no network or file I/O.
+sweepky-core = { path = "../sweepky-core" }
+# The Pubky SDK. The workspace entry turns on its `json` feature.
+pubky = { workspace = true }
+# Argument parsing. `derive` adds `#[derive(Parser)]`; clap's default features
+# stay on. Never `env`: only main.rs reads environment variables, with
+# `std::env::var_os`, and passes the values in, so nothing else can be
+# configured behind the caller's back.
+clap = { workspace = true, features = ["derive"] }
+# The async runtime: `rt-multi-thread` for `#[tokio::main]`'s default runtime,
+# `macros` for `#[tokio::main]` itself, `time` for timeouts.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+anyhow = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+# The writers' lock: an exclusive `flock` on `credential.lock`, made through
+# rustix, so this crate needs no `unsafe` and no `libc` of its own for it.
+fd-lock = { workspace = true }
+# The `Url` the SDK's transport URLs come in, named here so the directory
+# listing can add its query and parse `https://` listing lines. The release
+# pubky itself uses, so it adds no code.
+url = { workspace = true }
+
+# Crates for this crate's own tests only; none of them reaches the binary.
+[dev-dependencies]
+# A local Pubky network (DHT, pkarr relay, HTTP relay and a homeserver) for the
+# end-to-end test. Its homeserver needs Postgres through
+# TEST_PUBKY_CONNECTION_STRING.
+pubky-testnet = { workspace = true }
+# `#[tokio::test]` needs `macros` and `rt-multi-thread`, named here so the
+# tests keep them even if the library's own list changes. `sync` adds the
+# oneshot channel and the barrier the writers' lock tests coordinate with.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
+# Temporary directories that delete themselves when the test ends.
+tempfile = { workspace = true }

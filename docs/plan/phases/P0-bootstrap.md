@@ -7,7 +7,7 @@ A workspace skeleton that passes every quality gate while doing nothing, so late
 ## Build
 
 - Workspace `Cargo.toml` with `crates/sweepky-core` and `crates/sweepky-cli` (stub `lib.rs` / `main.rs`).
-- `rust-toolchain.toml` (stable), `deny.toml`, `rustfmt.toml`.
+- `rust-toolchain.toml` (stable), `deny.toml`, `rustfmt.toml`. [P2a](P2a-cli-identity.md) later pinned the toolchain to 1.96.0 and records why.
 - `web/` placeholder (`package.json` with a `test` script that passes; the real scaffold lands in P4).
 - `.github/workflows/ci.yml`: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo nextest run`, `cargo deny check`, `pnpm --dir web test`. A Postgres service container with `TEST_PUBKY_CONNECTION_STRING` set, because the CLI's testnet test, which starts in [P2a](P2a-cli-identity.md), runs an ephemeral testnet that needs it.
 - `skills/sweepky/` directory with a `README.md` stating what will live there. [`fixtures/`](../../../fixtures/README.md) already exists, with its `README.md` and `trust-labels.json`.

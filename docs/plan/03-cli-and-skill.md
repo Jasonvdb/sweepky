@@ -18,11 +18,11 @@ sweepky/
 
 ## The `sweepky` CLI (v1)
 
-A global `--testnet` flag (or `SWEEPKY_TESTNET=1`) selects the testnet client, the testnet HTTP relay (`http://localhost:15412/inbox`), the testnet homeserver as the default for `--identity` and as the default watch list. Without it the CLI talks to production. `SWEEPKY_HOME=<dir>` overrides the config and state directories so a script can run several identities side by side.
+A global `--testnet` flag (or `SWEEPKY_TESTNET=1`) selects the testnet client, the testnet HTTP relay (`http://localhost:15412/inbox`), the testnet homeserver as the default for `--identity` and as the default watch list. Without it the CLI talks to production. `SWEEPKY_HOME=<dir>` overrides the config and state directories so a script can run several identities side by side. A global `--passphrase-file <file>` names a file holding one line, the passphrase that wraps this install's secret files with age's scrypt recipient: `login` writes the identity file and device key it creates wrapped with it, and every command that reads a wrapped file needs it again. It takes a path, not the passphrase, and is meant for process substitution (`--passphrase-file <(pass show sweepky)`), which keeps the passphrase out of the argument list, the shell history and the disk, and leaves standard input free. An interactive prompt that does not echo is deferred: it needs a new crate or `unsafe` terminal calls.
 
 | Command | Does |
 |---|---|
-| `login [--identity <name>] [--homeserver <pk>] [--signup-token <code>]` | Default: Pubky Ring, via a sign-in page the CLI opens in the browser. `--identity` creates a dedicated identity instead. See [Two ways to log in](#two-ways-to-log-in). Either way it generates this install's age key and publishes `keys/<deviceId>.json`. That first write is the check that this identity may write under `/pub/sweepky/` on its homeserver: a 403 means its signup token forbids the path (production's free IP-verified tokens allow only Paykit and Bitkit paths), a 507 means its quota is full; both abort with that explanation and suggest a dedicated identity. Then it reminds the user to back up `~/.config/sweepky/` |
+| `login [--identity <name>] [--homeserver <pk>] [--signup-token <code>]` | Default: Pubky Ring, via a sign-in page the CLI opens in the browser. `--identity` creates a dedicated identity instead. See [Two ways to log in](#two-ways-to-log-in). Either way it generates this install's age key and publishes `keys/<deviceId>.json`. That first write is the check that this identity may write under `/pub/sweepky/` on its homeserver: a 403 means its signup token forbids the path (production's free IP-verified tokens allow only Paykit and Bitkit paths), a 507 means its quota is full; both abort with that explanation and suggest a dedicated identity. Then it reminds the user to back up `~/.config/sweepky/`. With `--passphrase-file`, the identity file and device key it creates are written wrapped with that passphrase |
 | `logout` | Marks this device key revoked, then revokes the grant (or forgets the identity), then deletes the local files |
 | `init <dir>` | Writes the sandbox settings and a `CLAUDE.md` for a sweeper project, a `.gitignore` with `sweeps/`, copies the `/sweepky` skill into `.claude/skills/`, and offers to install the Cloudflare playbook project-local at the pinned commit |
 | `circle create\|add\|remove\|show` | Roster admin |
@@ -46,7 +46,7 @@ Most people will use the pubky they already have in Ring, so that is the default
 | Flag | none | `--identity <name>` |
 | Whose identity | the one already in Ring | a new pubky the CLI creates, or one it created earlier under that name |
 | Human steps | scan one QR, once | none |
-| What is stored (0600, in `~/.config/sweepky/`) | the SDK's exported grant token: the grant scoped to `/pub/sweepky/:rw` plus the CLI's client key | the identity secret, optionally passphrase-wrapped, in a Sweepky file (not a Pubky recovery file) |
+| What is stored (0600, in `~/.config/sweepky/`) | the SDK's exported grant token: the grant scoped to `/pub/sweepky/:rw` plus the CLI's client key | the identity secret, optionally passphrase-wrapped (`--passphrase-file`), in a Sweepky file (not a Pubky recovery file) |
 | Lifetime | two years from approval, fixed by the SDK (neither Ring nor the user chooses), or until revoked from Ring or by `logout`. `login` shows the expiry and the CLI warns within 30 days of it | until the file is deleted |
 | If the file leaks | someone can write Sweepky records as you for up to two years unless you revoke, including a key record that lets them read later sweeps; `pull` alarms on that | that identity is theirs; your main identity is untouched |
 | Homeserver | wherever the Ring identity lives | `--homeserver <pubkey>`; defaults to the testnet homeserver under `--testnet`, else to `homeserver.pubky.app`, which needs `--signup-token` |
@@ -92,21 +92,23 @@ Exact pins, re-checked against crates.io and npm for P0 on 2026-10-15; each is t
 | `zeroize` | =1.9.1 | |
 | `sha2` | =0.10.9 | dev-dependency of `sweepky-core` (P1b), hashing the C2SP CCTV vectors' plaintexts; the release `age` itself uses at run time, so it adds no code. Not the newest: 0.11.1 is, and is in the graph too, through `rust-embed-utils` |
 | `miniz_oxide` | =0.9.1 | dev-dependency of `sweepky-core` (P1b), inflating the CCTV vectors stored with zlib; brings in only `adler2` |
+| `tempfile` | =3.27.0 | dev-dependency of `sweepky-cli` (P2a), temporary directories for its tests; the release `pubky-testnet` already brings into the graph, so it adds no code |
 | `qrcode` | =0.14.1 | `default-features = false, features = ["svg"]`, so the image stack stays out |
 | `fd-lock` | =4.0.4 | the writers' lock file |
+| `url` | =2.5.8 | `sweepky-cli` (P2a): the SDK's `PubkyResource` transport URLs are `url::Url`s, which the bounded directory listing adds its query to and parses `https://` listing lines with; the release `pubky` already brings into the graph, so it adds no code |
 | `clap` | =4.6.7 | |
 | `tokio` | =1.53.3 | |
 | `serde` / `serde_json` | =1.0.229 / =1.0.154 | |
 | `thiserror` (core) / `anyhow` (CLI) | =2.0.21 / =1.0.104 | |
 
-Web: `@synonymdev/pubky` 0.16.2, `react` and `react-dom` 19.3.1, `react-router` 8.4.0, `zustand` 5.0.15, `vite` 8.3.4, `typescript` 7.0.2. Cloudflare skill: commit `c1c8a8c1471069fb0e188eeaff69b8e8db6564a8` (still HEAD). Claude Code 2.1.285 or newer for the sandbox settings the template relies on. Tooling: stable toolchain, `cargo-nextest` 0.9.137 and `cargo-deny` 0.19.9, clippy with `-D warnings`. CI installs those two tools as prebuilt binaries and also pins Node 24.15.0, pnpm 10.33.0 (the `packageManager` in `web/package.json`), the `postgres:18.4` image and every action by commit SHA. These tool versions are the ones on this machine ([06](06-verification-and-limits.md#local-environment-this-machine)) rather than the newest releases, so CI and local runs agree; upgrade a tool on this machine and in CI at the same time.
+Web: `@synonymdev/pubky` 0.16.2, `react` and `react-dom` 19.3.1, `react-router` 8.4.0, `zustand` 5.0.15, `vite` 8.3.4, `typescript` 7.0.2. Cloudflare skill: commit `c1c8a8c1471069fb0e188eeaff69b8e8db6564a8` (still HEAD). Claude Code 2.1.285 or newer for the sandbox settings the template relies on. Tooling: rustc/cargo 1.96.0, pinned in `rust-toolchain.toml` ([P2a](phases/P2a-cli-identity.md) records why), `cargo-nextest` 0.9.137 and `cargo-deny` 0.19.9, clippy with `-D warnings`. CI installs those two tools as prebuilt binaries and also pins Node 24.15.0, pnpm 10.33.0 (the `packageManager` in `web/package.json`), the `postgres:18.4` image and every action by commit SHA. These tool versions are the ones on this machine ([06](06-verification-and-limits.md#local-environment-this-machine)) rather than the newest releases, so CI and local runs agree; upgrade a tool on this machine and in CI at the same time.
 
 No `paykit` or `locks` crates in v1: they pin `pubky` 0.15 and 0.11 (a git rev) respectively, and neither interoperates with 0.16.
 
 ## Rust conventions (teaching notes, keep in code comments)
 
 - `sweepky-core` does no network or file I/O, so it is unit-testable and could compile to WASM later. The package envelope is built from an in-memory list of files; the directory walk and its safety rules live in the CLI.
-- Typed errors with `thiserror` in the library; `anyhow` only in the binary, which only needs a good message.
+- Typed errors with `thiserror` in `sweepky-core`; `anyhow` only in `sweepky-cli`, library and binary alike, which only needs a good message.
 - Secrets: `age::x25519::Identity` wipes itself on drop and has no `Debug`, so hold it directly; it does not implement `Zeroize`, so wrapping it in `SecretBox` would not compile. `SecretString` for the bech32 identity string, passphrases and the grant token (which the SDK hands back as a plain `String`, so move it in at once); `Zeroizing<Vec<u8>>` for file buffers.
 - Open enums (`kind`, `status`, `alg`) are newtype `String`s with `as_known() -> Option<Known>` helpers, never closed serde enums, so unknown values from newer clients are skipped rather than failing the whole feed.
 - Sealed content (findings, attachments, the unknown fields of a package or its manifest) never derives `Debug`. Its hand-written `Debug` prints structure and counts only, and destructures the value naming every field, with no `..` in the pattern, so a field added later does not compile until someone decides whether it may print. Types built from it, such as the finding groups and the merged report, print it through that `Debug`.

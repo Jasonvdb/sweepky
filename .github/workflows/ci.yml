@@ -52,8 +52,8 @@ jobs:
         with:
           # Do not leave the job token in .git/config, where later steps could read it.
           persist-credentials: false
-      # With no argument, rustup installs (or updates) the toolchain and the
-      # components that rust-toolchain.toml names. It runs before rust-cache,
+      # With no argument, rustup installs the toolchain and the components
+      # that rust-toolchain.toml names. It runs before rust-cache,
       # which keys its cache on the rustc version.
       - run: rustup toolchain install --no-self-update
       # rust-cache adds the job id to its cache key, so `lint` and `test` keep

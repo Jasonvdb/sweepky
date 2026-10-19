@@ -102,6 +102,16 @@
 //!   `keys/` record to a checked recipient only when its `alg` is exactly
 //!   `age-x25519` and it is not revoked. Their errors, [`RecipientError`],
 //!   [`IdentityError`] and [`DeviceKeyError`], hold no data at all.
+//! - Passphrase wrap (P2a): [`wrap_with_passphrase`] writes one small local
+//!   secret (a dedicated identity's key file, a device key) as binary age v1
+//!   encrypted to a passphrase alone, through age's own scrypt recipient, at
+//!   the fixed [`WRITE_WORK_FACTOR`]; [`unwrap_with_passphrase`] opens one,
+//!   refusing input over [`MAX_WRAPPED_BYTES`] before age parses it and a
+//!   work factor over [`MAX_WORK_FACTOR`] before any scrypt work, into a
+//!   wiped buffer. [`looks_wrapped`] tells such a file from a plain one by
+//!   its first bytes. A [`WorkFactor`] is range-checked when it is made, so
+//!   age's asserting setter never sees a value it panics on, and
+//!   [`PassphraseError`] holds no data.
 //! - Sealing (P1b): [`PaddedPlaintext::pad`] copies a sweep package into a
 //!   buffer padded with trailing spaces to the next [`PADDING_BUCKET_BYTES`]
 //!   (64 KiB), refusing one over [`MAX_PACKAGE_BYTES`]; [`encrypt`] takes
@@ -247,8 +257,10 @@ mod validated_string;
 
 pub use crypto::{
     AgeRecipient, DecryptError, DeviceIdentity, DeviceKeyError, EncryptError, IdentityError,
-    MAX_CIPHERTEXT_BYTES, MAX_HEADER_BYTES, MAX_RECIPIENTS, PADDING_BUCKET_BYTES, PaddedPlaintext,
-    PaddingError, Plaintext, RecipientError, decrypt, encrypt,
+    MAX_CIPHERTEXT_BYTES, MAX_HEADER_BYTES, MAX_RECIPIENTS, MAX_SECRET_BYTES, MAX_WORK_FACTOR,
+    MAX_WRAPPED_BYTES, PADDING_BUCKET_BYTES, PaddedPlaintext, PaddingError, PassphraseError,
+    Plaintext, RecipientError, WRITE_WORK_FACTOR, WorkFactor, decrypt, encrypt, looks_wrapped,
+    unwrap_with_passphrase, wrap_with_passphrase,
 };
 pub use error::{JsonCategory, RecordError};
 pub use feed::{

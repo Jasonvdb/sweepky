@@ -60,13 +60,19 @@ zeroize = "=1.9.1"
 qrcode = { version = "=0.14.1", default-features = false, features = ["svg"] }
 # The writers' lock file (P2a).
 fd-lock = "=4.0.4"
+# URLs, for sweepky-cli's bounded directory listing (P2a): the SDK's
+# `PubkyResource::to_transport_url` returns a `url::Url` and
+# `from_transport_url` takes one. pubky already brings this exact release into
+# the graph, so naming it here adds no new code.
+url = "=2.5.8"
 clap = "=4.6.7"
 tokio = "=1.53.3"
 serde = "=1.0.229"
 serde_json = "=1.0.154"
 # Typed errors, for sweepky-core.
 thiserror = "=2.0.21"
-# Message-only errors, for the binary only.
+# Message-only errors, for sweepky-cli only: its library and its binary alike.
+# sweepky-core never takes it.
 anyhow = "=1.0.104"
 # Dev-dependencies of sweepky-core's C2SP CCTV test (P1b), never part of a
 # shipped build. SHA-256 for the vectors' `payload` hashes: the exact release
@@ -76,3 +82,7 @@ sha2 = "=0.10.9"
 # zlib inflate for the vectors marked `compressed: zlib`. It brings in only
 # adler2.
 miniz_oxide = "=0.9.1"
+# Temporary directories for sweepky-cli's tests (P2a), deleted when the test
+# ends. A dev-dependency only. pubky-testnet already brings this exact release
+# into the graph, so naming it here adds no new code.
+tempfile = "=3.27.0"

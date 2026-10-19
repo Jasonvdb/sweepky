@@ -2,14 +2,50 @@
 # Written for cargo-deny 0.19.9; any key left out takes the tool's default.
 # Reference: https://embarkstudios.github.io/cargo-deny/
 
+# Which part of the dependency graph every check below looks at.
+[graph]
+# Only the platforms Sweepky is built and tested on: CI's Linux runners and
+# macOS on both architectures. Without this list cargo-deny checks every
+# target-specific dependency of every crate, for every platform Rust knows,
+# including ones nothing here is ever compiled for. Add a target here before
+# shipping a build for it, so its dependencies are checked too.
+#
+# One effect: `atomic-polyfill` (RUSTSEC-2023-0089, unmaintained) drops out of
+# the graph. It comes in through pubky-common -> postcard -> heapless 0.7,
+# which depends on it only for avr, riscv32 (the `-none-elf` targets),
+# thumbv6m and xtensa, none of them a Sweepky platform. If a target that needs
+# it is ever added, the advisory comes back and has to be dealt with then.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+]
+
 # `cargo deny check advisories`: fail on crates with a RustSec advisory.
 # The database is fetched read-only from github.com/rustsec/advisory-db.
 [advisories]
 # With the defaults kept here, a vulnerability advisory always fails the check,
 # an unmaintained one fails for any crate in the graph, and an unsound one fails
 # for our direct dependencies. To accept one, list it here with a reason:
-# { id = "RUSTSEC-0000-0000", reason = "..." }. Never ignore without a reason.
-ignore = []
+# { id = "RUSTSEC-0000-0000", reason = "..." }. Never ignore without a reason,
+# and say when the entry can go.
+ignore = [
+    # quick-xml 0.39.4, two denial-of-service bugs when parsing untrusted XML
+    # (a quadratic duplicate-attribute check, and unbounded namespace
+    # declarations). Dev-only: it reaches the graph solely through the
+    # pubky-testnet dev-dependency -> pubky-homeserver 0.16.2 -> opendal 0.57
+    # -> opendal-core 0.57.0, which requires quick-xml ^0.39.3, and the
+    # `sweepky` binary never contains it (`cargo tree -p sweepky-cli
+    # -e normal --target all -i quick-xml` prints nothing). The fix is in
+    # quick-xml 0.41, which needs opendal-core 0.58, and pubky-homeserver's
+    # `opendal = "0.57"` excludes that. The tests' homeserver keeps its files
+    # in memory (pubky-homeserver's test config) and its index in a local
+    # Postgres, so it parses no XML from anyone. Remove both entries when
+    # pubky-testnet moves to opendal 0.58 or later.
+    { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.39.4, dev-only via pubky-testnet -> pubky-homeserver -> opendal-core 0.57; the fix (0.41) needs opendal-core 0.58, which pubky-homeserver 0.16.2 excludes" },
+    { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.39.4, dev-only via pubky-testnet -> pubky-homeserver -> opendal-core 0.57; the fix (0.41) needs opendal-core 0.58, which pubky-homeserver 0.16.2 excludes" },
+]
 # A yanked release was withdrawn by its author, often for a bug, so depending on
 # one fails the check instead of only warning (the default).
 yanked = "deny"
@@ -29,12 +65,12 @@ include-dev = true
 # pull in) use MIT, Apache-2.0 and Unicode-3.0 (unicode-ident's
 # `(MIT OR Apache-2.0) AND Unicode-3.0`). From P1b, `age` adds BSD-2-Clause
 # (zerocopy), BSD-3-Clause (x25519-dalek, curve25519-dalek and subtle) and
-# more Unicode-3.0 (tinystr). ISC, Zlib, CDLA-Permissive-2.0 and the
-# `option-ext` exception are not in use until P2a adds `pubky` and
-# `pubky-testnet`, so until then cargo-deny warns that they are not
-# encountered. Leave those warnings be: after P2a, `cargo deny check licenses`
-# shows which entries are really needed. (A probe on 2026-10-15 with every pin
-# in 03 in use needed all eight entries and the exception, and nothing else.)
+# more Unicode-3.0 (tinystr). From P2a, `pubky` and the `pubky-testnet`
+# dev-dependency add ISC (ring, rustls, rustls-webpki, untrusted and others),
+# Zlib (foldhash), CDLA-Permissive-2.0 (webpki-roots) and the `option-ext`
+# exception below. With them in, `cargo deny check licenses` passes and warns
+# about no entry it did not encounter, so all eight entries and the exception
+# are in use; drop any entry it later reports as not encountered.
 allow = [
     "MIT",
     "Apache-2.0",
