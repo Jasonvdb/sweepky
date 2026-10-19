@@ -4,7 +4,7 @@
 //! - `feed-cursors.json`, an owner's [`FeedCursors`]: for each watched
 //!   homeserver, the event id its `/events/` feed has been read up to (01,
 //!   "Open bounties": `pull` advances a cursor only after the whole batch
-//!   is processed and persists it per homeserver).
+//!   is processed and persists it per homeserver, [`FeedCursors::advance`]).
 //! - `poll-state.json`, an owner's [`PollState`]: what the roster polling
 //!   learnt (01, "Circle"). For each member, the newest record id seen in
 //!   their `bounties/` and `sweeps/` ([`Watermarks`]), where the next
@@ -143,10 +143,37 @@ impl FeedCursors {
         self.cursors.get(homeserver).copied()
     }
 
-    /// Sets `homeserver`'s cursor to `cursor`, as `pull` does once a batch
-    /// of its feed is processed.
+    /// Sets `homeserver`'s cursor to `cursor`, replacing the one it had.
     pub(crate) fn set(&mut self, homeserver: Pubky, cursor: EventCursor) {
         self.cursors.insert(homeserver, cursor);
+    }
+
+    /// Moves `owner`'s cursor for `homeserver` in the file from `from` on to
+    /// `to`, as `pull` does once a batch of that feed is processed, and says
+    /// whether it did: only while the file still holds `from` there, the
+    /// cursor this run started the batch from. A cursor another writer
+    /// stored meanwhile is left as the file has it: one `post --open`
+    /// lowered for a new bounty, so that its sweeps are not skipped, or one
+    /// a concurrent `pull` moved on. Checking that `to` is past `from` is
+    /// the caller's (`pull::feed`).
+    ///
+    /// Nothing here locks, so another writer can still come between this
+    /// read and its write; the check narrows that to the moment of the
+    /// write, where a whole run would be otherwise.
+    pub(crate) fn advance(
+        dirs: &Dirs,
+        owner: Pubky,
+        homeserver: Pubky,
+        from: EventCursor,
+        to: EventCursor,
+    ) -> anyhow::Result<bool> {
+        let mut stored = Self::read(dirs, owner)?;
+        if stored.get(&homeserver) != Some(from) {
+            return Ok(false);
+        }
+        stored.set(homeserver, to);
+        stored.write(dirs, owner)?;
+        Ok(true)
     }
 
     /// Lowers `homeserver`'s cursor to `cursor`: keeps the cursor there when
@@ -621,6 +648,39 @@ mod tests {
         cursors.lower_to(watched, cursor(5));
         assert_eq!(cursors.get(&home), Some(cursor(90)));
         assert_eq!(cursors.get(&watched), Some(cursor(5)));
+    }
+
+    #[test]
+    fn advance_moves_a_stored_cursor_only_from_the_one_the_caller_read() {
+        let temp = private_temp();
+        let dirs = dirs_in(&temp);
+        let path = dirs.feed_cursors_file();
+        let (owner, other, home) = (random_pubky(), random_pubky(), random_pubky());
+        // No cursor stored: nothing to move on from, and no file is made.
+        let moved = FeedCursors::advance(&dirs, owner, home, cursor(5), cursor(9));
+        assert!(!moved.expect("reads"));
+        assert_eq!(FileSnapshot::of(&path), None);
+
+        let mut mine = FeedCursors::default();
+        mine.set(home, cursor(5));
+        mine.write(&dirs, owner).expect("written");
+        let mut theirs = FeedCursors::default();
+        theirs.set(home, cursor(3));
+        theirs.write(&dirs, other).expect("written");
+
+        // From the cursor stored: moved, and another owner's is untouched.
+        let moved = FeedCursors::advance(&dirs, owner, home, cursor(5), cursor(9));
+        assert!(moved.expect("written"));
+        let read = FeedCursors::read(&dirs, owner).expect("reads");
+        assert_eq!(read.get(&home), Some(cursor(9)));
+        assert_eq!(FeedCursors::read(&dirs, other).expect("reads"), theirs);
+
+        // From one the file no longer holds, as when another writer moved
+        // it meanwhile: left as the file has it.
+        let before = FileSnapshot::of(&path);
+        let moved = FeedCursors::advance(&dirs, owner, home, cursor(5), cursor(12));
+        assert!(!moved.expect("reads"));
+        assert_eq!(FileSnapshot::of(&path), before);
     }
 
     #[test]

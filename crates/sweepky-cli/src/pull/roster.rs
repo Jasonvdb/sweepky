@@ -201,8 +201,10 @@ fn bounded(mut circle: Circle) -> (Circle, bool) {
     (circle, false)
 }
 
-/// Why the poll of one key ended before its last read.
-enum Stop {
+/// Why the poll of one key ended before its last read. `pub(super)`, like
+/// [`Fetched`], [`Polled`] and [`fetch`], so that the feed watcher
+/// (`pull::feed`) reads strangers' sweep records the same way.
+pub(super) enum Stop {
     /// Its homeserver did not resolve.
     Unreachable(Unreachable),
     /// A read failed: `remote`'s fixed text, which names the path and the
@@ -273,7 +275,7 @@ enum Reread {
 }
 
 /// What one read of a record gave.
-enum Fetched<T> {
+pub(super) enum Fetched<T> {
     /// The record as it is now, with the tag its answer gave.
     Record { record: T, etag: Option<ETag> },
     /// A 304: unchanged since the tag sent.
@@ -292,7 +294,7 @@ enum Fetched<T> {
 /// called, where it is, and how it is parsed. It is this crate's own trait,
 /// so it may be implemented for core's types. `Sized` is needed to return
 /// `Self` by value.
-trait Polled: Sized {
+pub(super) trait Polled: Sized {
     /// Its name in a message.
     const KIND: &'static str;
 
@@ -346,7 +348,7 @@ impl Polled for Sweep {
 
 /// Reads record `id` of `owner`'s storage, a `T`, sending `etag` as
 /// `If-None-Match` when there is one, and parses a new answer.
-async fn fetch<T: Polled>(
+pub(super) async fn fetch<T: Polled>(
     records: &impl PublicRecords,
     owner: Pubky,
     id: RecordId,

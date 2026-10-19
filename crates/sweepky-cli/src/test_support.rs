@@ -14,8 +14,9 @@
 //! [`FakeOwnStorage`] in place of the signed-in user's own storage, a
 //! [`FakePublicRecords`] in place of everyone's public storage and its
 //! listings, a [`FakeEventsFeed`] in place of a homeserver's events feed and
-//! stream, which keeps every request, with [`feed_page`], an honest feed's
-//! page as a homeserver writes it, and [`stream_event`], one event of a
+//! stream, which keeps every request, with [`feed_page`] and
+//! [`events_page`], an honest feed's page as a homeserver writes it, and
+//! [`stream_event`], one event of a
 //! stream answer, a [`LocalHttp`] server on the loopback address for the
 //! requests Sweepky sends itself, and the synthetic bounty, circle and
 //! sweep records the tests
@@ -831,6 +832,12 @@ impl FakeEventsFeed {
         Self::answering(move |cursor, limit| Ok(feed_page(&ids, cursor, limit)))
     }
 
+    /// An honest feed of `events`, each an id and its line, in increasing
+    /// order of id: each page as [`events_page`] writes it.
+    pub(crate) fn of_events(events: Vec<(u64, String)>) -> Self {
+        Self::answering(move |cursor, limit| Ok(events_page(&events, cursor, limit)))
+    }
+
     /// The same fake, answering every stream request with `body`.
     pub(crate) fn with_stream(self, body: &[u8]) -> Self {
         let body = body.to_vec();
@@ -918,26 +925,39 @@ pub(crate) fn stream_event(op: &str, url: &str, cursor: u64) -> String {
 }
 
 /// One page of an honest feed of public events with the ids `ids`, in
-/// increasing order, as `format_events_feed` in pubky-homeserver 0.16.2
-/// writes it: a `PUT` line for each of the first `limit` events after
-/// `cursor`, then `cursor: <the last one's id>`, joined with `\n`; the empty
-/// body when no event comes after `cursor`.
+/// increasing order, as [`events_page`] writes it: a `PUT` of a file of
+/// another app for each.
 pub(crate) fn feed_page(ids: &[u64], cursor: EventCursor, limit: u16) -> Vec<u8> {
     let user = Pubky::from_bytes([7; 32]);
-    let after: Vec<u64> = ids
+    // Only the events the page holds get a line written, so a long feed
+    // costs each page no more than its own lines.
+    let after: Vec<(u64, String)> = ids
         .iter()
-        .copied()
-        .filter(|&id| id > cursor.id())
+        .filter(|&&id| id > cursor.id())
+        .take(usize::from(limit))
+        .map(|&id| (id, format!("PUT pubky://{user}/pub/example.app/{id}.json")))
+        .collect();
+    events_page(&after, cursor, limit)
+}
+
+/// One page of an honest feed of `events`, each an id and its line (`PUT
+/// pubky://…` or `DEL pubky://…`), in increasing order of id, as
+/// `format_events_feed` in pubky-homeserver 0.16.2 writes it: the lines of
+/// the first `limit` events after `cursor`, then `cursor: <the last one's
+/// id>`, joined with `\n`; the empty body when no event comes after
+/// `cursor`.
+pub(crate) fn events_page(events: &[(u64, String)], cursor: EventCursor, limit: u16) -> Vec<u8> {
+    let after: Vec<&(u64, String)> = events
+        .iter()
+        .filter(|(id, _)| *id > cursor.id())
         .take(usize::from(limit))
         .collect();
-    let Some(last) = after.last() else {
+    let Some((last, _)) = after.last() else {
         return Vec::new();
     };
-    let mut lines: Vec<String> = after
-        .iter()
-        .map(|id| format!("PUT pubky://{user}/pub/example.app/{id}.json"))
-        .collect();
-    lines.push(format!("cursor: {last}"));
+    let mut lines: Vec<&str> = after.iter().map(|(_, line)| line.as_str()).collect();
+    let cursor_line = format!("cursor: {last}");
+    lines.push(&cursor_line);
     lines.join("\n").into_bytes()
 }
 
