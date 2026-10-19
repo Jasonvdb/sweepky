@@ -43,9 +43,12 @@
 //!    identity's `keys/` and raise 02's alarm for every id this owner's
 //!    installs did not create and whose record is not revoked, and for every
 //!    id they did create whose unrevoked record no longer holds the key
-//!    `installs.json` records for it, the same check `keys list` makes
-//!    (`keys::key_alarms`). A listing that fails is a warning in the report;
-//!    login has done its work by then.
+//!    `installs.json` records for it, the same check, with the same bounds,
+//!    that `keys list` makes (`keys::key_alarms`). A check that cannot
+//!    finish (`keys::KeyCheckError`: the listing fails or is past its
+//!    limits, the records pass the check's byte budget, or a known id's
+//!    record cannot be read) is a warning in the report; login has done its
+//!    work by then. `pull` prints the same failure as an alarm.
 //!
 //! **The passphrase.** With `--passphrase-file`, the two secret files login
 //! creates, the identity's key file (step 3) and `device.key` (step 6), are
@@ -443,9 +446,11 @@ async fn record_login_and_check_keys(
 /// id, which the tail has just published or checked.
 ///
 /// Never an error: by now the key is published and `login.json` written,
-/// so a check that cannot run (the listing fails, `installs.json` cannot be
-/// read) becomes a warning in the report that points at `keys list`,
-/// rather than a failed login.
+/// so a check that cannot run (`installs.json` cannot be read, or
+/// [`key_alarms`] fails with its `KeyCheckError`: the listing fails or is
+/// past its limits, the records pass the budget, a known id's record
+/// cannot be read) becomes a warning in the report that points at
+/// `keys list`, rather than a failed login.
 ///
 /// It only reads, so it takes the read-only [`PublicKeys`]; the tail's
 /// `&impl KeyStore` is one, because `PublicKeys` is its supertrait.
@@ -457,7 +462,9 @@ async fn check_key_ids(
 ) -> String {
     // An `async` block whose `?`s return from the block, so every failure
     // ends up in the one `Err` below. Its last line spells out the error
-    // type (`anyhow::Ok`), which the compiler cannot infer for a block.
+    // type (`anyhow::Ok`), which the compiler cannot infer for a block. The
+    // `?` after `key_alarms` turns its typed `KeyCheckError` into an
+    // `anyhow::Error`, which keeps the failure's cause in its chain.
     let checked = async {
         let installs = read_installs(dirs)?;
         let alarms = key_alarms(
@@ -1065,7 +1072,7 @@ mod tests {
     use crate::installs::{Install, read_installs, record_install, record_install_key};
     use crate::network::{NetworkKind, PRODUCTION_HOMESERVER, TESTNET_HOMESERVER};
     use crate::passphrase::{NeedsPassphrase, Passphrase};
-    use crate::remote::{QUOTA_FULL, WRITE_FORBIDDEN, public_key_of};
+    use crate::remote::{ListLimits, QUOTA_FULL, WRITE_FORBIDDEN, public_key_of};
     use crate::state::{
         LoginState, StoredIdentity, create_identity, read_identity, read_login_state,
         write_login_state,
@@ -1970,6 +1977,39 @@ mod tests {
             .await
             .expect("the second login");
         assert_eq!(tail.key_check, "");
+    }
+
+    #[tokio::test]
+    async fn a_key_check_that_cannot_finish_is_a_warning_not_a_failed_login() {
+        // The check fails with its typed failure, which login reports as a
+        // warning pointing at `keys list` (`pull` reports it as an alarm):
+        // by now the key is published and login.json written.
+        for case in ["a listing past the limit", "a failed read"] {
+            let keys = FakeKeyStore::default();
+            let (_temp, dirs, state, own) = after_a_first_login(&keys).await;
+            if case == "a failed read" {
+                keys.fail_reads_of(&own);
+            } else {
+                for n in 0..=ListLimits::DEFAULT.max_entries {
+                    keys.list_without_record(&format!("k{n}").parse().expect("valid"));
+                }
+            }
+            let tail = record_login_and_check_keys(&dirs, None, &keys, state)
+                .await
+                .expect(case);
+            assert!(
+                matches!(&tail.device, DeviceKeyOutcome::Reused(reused) if reused == &own),
+                "{case}: {:?}",
+                tail.device
+            );
+            let report = &tail.key_check;
+            assert!(
+                report.starts_with("warning: could not check keys/"),
+                "{case}: {report}"
+            );
+            assert!(report.contains("`sweepky keys list`"), "{case}: {report}");
+            assert!(!report.contains("alarm"), "{case}: {report}");
+        }
     }
 
     #[tokio::test]
