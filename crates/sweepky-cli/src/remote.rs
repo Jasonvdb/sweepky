@@ -3,10 +3,15 @@
 //!
 //! - [`get_public`] reads one public file of any owner, and [`get_own`] one of
 //!   the signed-in user's own; a 404 is `None`, "no such record".
+//!   [`get_public_if_changed`] reads a record again only if it changed since
+//!   the [`ETag`] its last answer gave (`If-None-Match`, so an unchanged one
+//!   costs a 304), and [`get_package`] reads a sweep's `.age`.
 //! - [`list_dir`] lists one directory of an owner, page by page, into the
 //!   Sweepky files it holds; a 404 is an empty directory.
+//!   [`list_dir_newest_first`] lists it newest first and stops at the newest
+//!   record id already seen there ([`ListOrder`]).
 //! - [`get_unredirected`], the one anonymous `GET` Sweepky sends itself:
-//!   `get_public`'s, each listing page's and each of GitHub's (in
+//!   that of every function above but `get_own`, and each of GitHub's (in
 //!   `targets::github`).
 //! - [`write_refusal`] turns the two answers a homeserver gives a write it
 //!   will not take, 403 and 507, into the message `login` aborts with, and
@@ -24,9 +29,10 @@
 //!   refuses a `Content-Length` over the cap before reading a byte, then
 //!   reads chunk by chunk and stops at the chunk that would cross it, so
 //!   nothing past the cap is ever copied in. The caller names the cap: a
-//!   record is read with [`MAX_RECORD_BYTES`](sweepky_core::MAX_RECORD_BYTES)
-//!   and then parsed with that record's `from_json`, core's capped,
-//!   version-first parse, which is the only record parser. The SDK's own
+//!   record is read with [`MAX_RECORD_BYTES`] and then parsed with that
+//!   record's `from_json`, core's capped, version-first parse, which is the
+//!   only record parser; a sweep package with [`MAX_CIPHERTEXT_BYTES`], the
+//!   most core's `decrypt` accepts. The SDK's own
 //!   `text()`, `bytes()` and `get_json` read a whole body with no cap, and
 //!   are never used on remote data.
 //! - **Listings are bounded by line, by page and in total.** The SDK's
@@ -40,7 +46,7 @@
 //!   [`read_capped`], and parses it with [`ListingParser`], which refuses a
 //!   line over [`MAX_LISTING_LINE_BYTES`], a line that is not UTF-8 or not a
 //!   resource URL, a page with more entries than were asked for, and a
-//!   listing past [`ListLimits`]' entry and page counts.
+//!   listing past [`ListLimits`]' entry and page counts, in either order.
 //! - **A redirected answer is refused, never used.** The SDK's HTTP client
 //!   follows redirects to any host and scheme (pubky 0.16.2 sets no
 //!   `redirect::Policy`, so reqwest's default of up to 10 applies), and a
@@ -64,7 +70,9 @@
 //!   the request URL. So every message built here is fixed text, the HTTP
 //!   status (whose wording comes from the `http` crate, not the server) and
 //!   the owner key and path the caller asked for. Text inside a record goes
-//!   through [`crate::display`]'s sanitiser before it is printed.
+//!   through [`crate::display`]'s sanitiser before it is printed. An
+//!   [`ETag`] is the server's text too: it is checked, kept and sent back,
+//!   and never printed.
 
 use std::fmt;
 
@@ -75,8 +83,8 @@ use anyhow::{Context as _, anyhow, bail};
 // takes a closure rather than a response (see `read_capped`).
 use pubky::errors::RequestError;
 use pubky::{Method, Pubky, PubkyHttpClient, PubkyResource, PubkySession, PublicKey, StatusCode};
-use sweepky_core::Zeroizing;
-use sweepky_core::paths::SweepkyPath;
+use sweepky_core::paths::{self, SweepkyPath};
+use sweepky_core::{MAX_CIPHERTEXT_BYTES, MAX_RECORD_BYTES, RecordId, Zeroizing};
 use url::Url;
 
 /// What `login` aborts with when its first key write gets a 403: the
@@ -390,7 +398,7 @@ pub(crate) fn public_key_of(pubky: &sweepky_core::Pubky) -> anyhow::Result<Publi
 /// redirected answer is refused. The owner and path go in as the SDK's
 /// `PubkyResource`, so no URL is put together from strings here. Parse a
 /// record with its type's `from_json` and pass
-/// [`MAX_RECORD_BYTES`](sweepky_core::MAX_RECORD_BYTES) as `cap`.
+/// [`MAX_RECORD_BYTES`] as `cap`.
 ///
 /// `path` appears in the error message, so pass one built by
 /// [`sweepky_core::paths`], never a stranger's text.
@@ -403,16 +411,171 @@ pub(crate) async fn get_public(
     // An `async` block is a future that runs the code inside when awaited;
     // `?` inside it returns from the block, not from `get_public`, so the
     // context below is added to every error the block can give.
-    async {
-        // `clone` because the resource keeps its own copy of the key; a
-        // `PublicKey` holds no heap data, so the copy is cheap.
-        let resource = PubkyResource::new(owner.clone(), path).map_err(|e| request_error(&e))?;
-        let url = resource.to_transport_url().map_err(|e| request_error(&e))?;
-        // A 404 is `None`, "no such record", as for a listing page.
-        get_unredirected(pubky.client(), url, &[], cap, page_status).await
+    async { fetch_public(pubky, public_url(owner, path)?, cap).await }
+        .await
+        .with_context(|| could_not_read(path, owner))
+}
+
+/// The transport URL of `path` of `owner`'s public storage, the URL the
+/// SDK's public storage sends its `GET` to, made by the SDK's
+/// `PubkyResource`, so no URL is put together from strings here.
+fn public_url(owner: &PublicKey, path: &str) -> anyhow::Result<Url> {
+    // `clone` because the resource keeps its own copy of the key; a
+    // `PublicKey` holds no heap data, so the copy is cheap.
+    let resource = PubkyResource::new(owner.clone(), path).map_err(|e| request_error(&e))?;
+    resource.to_transport_url().map_err(|e| request_error(&e))
+}
+
+/// What a failed read of `path` of `owner` says first: the path and the
+/// key the caller asked for, never a URL.
+fn could_not_read(path: &str, owner: &PublicKey) -> String {
+    format!("could not read {path} of {}", owner.z32())
+}
+
+/// The longest `ETag` kept, in bytes: 128. The 0.16.2 homeserver's is 46, a
+/// quoted base64 of the file's 32-byte content hash
+/// (`client_server/routes/tenants/read.rs`). A longer one counts as none,
+/// so a server cannot make Sweepky keep or send back more than this.
+pub(crate) const MAX_ETAG_BYTES: usize = 128;
+
+/// A record's entity tag, as a homeserver's `ETag` header gave it, kept to
+/// send back in `If-None-Match` so that an unchanged record costs a 304.
+///
+/// It is the server's text, so it is checked before it is kept (see
+/// [`ETag::parse`]) and never printed: no `Display`, and a `Debug` that
+/// gives its length alone. Two tags are compared exactly, as the homeserver
+/// compares them; nothing about a tag is secret, so no constant-time
+/// comparison is needed.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ETag(String);
+
+impl ETag {
+    /// `value`, the bytes of an `ETag` header, as a tag, or `None` when it
+    /// cannot be one Sweepky sends back: empty, over [`MAX_ETAG_BYTES`], or
+    /// holding anything but visible ASCII (`!` to `~`: no space, no control
+    /// character, nothing past 0x7E). `None` is as if the answer gave no
+    /// tag, so the next read of the record is a plain `GET`.
+    pub(crate) fn parse(value: &[u8]) -> Option<Self> {
+        let usable = !value.is_empty()
+            && value.len() <= MAX_ETAG_BYTES
+            && value.iter().all(u8::is_ascii_graphic);
+        if !usable {
+            return None;
+        }
+        // Visible ASCII is valid UTF-8, so this cannot fail; `.ok()?` keeps
+        // even that case from panicking.
+        let text = std::str::from_utf8(value).ok()?;
+        Some(Self(text.to_owned()))
     }
-    .await
-    .with_context(|| format!("could not read {path} of {}", owner.z32()))
+
+    /// The tag as it came, to send back in `If-None-Match`.
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ETag {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ETag({} bytes)", self.0.len())
+    }
+}
+
+/// What [`get_public_if_changed`] found.
+pub(crate) enum Conditional {
+    /// A 304: the record is unchanged since the tag that was sent. No body
+    /// was read.
+    NotModified,
+    /// A 404: there is no such record, or no longer.
+    Absent,
+    /// A 2xx: the record as it is now, at most
+    /// [`MAX_RECORD_BYTES`], and the tag to send next time, when the
+    /// answer gave one [`ETag::parse`] accepts.
+    // Outside the tests nothing reads the fields yet, so the compiler would
+    // warn. `expect` (not `allow`) silences that only while it is true:
+    // `pull`, the first reader, must remove it.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "pull, the first reader, comes in a later step")
+    )]
+    Changed {
+        /// The record's bytes.
+        body: Zeroizing<Vec<u8>>,
+        /// Its tag now.
+        etag: Option<ETag>,
+    },
+}
+
+/// Reads `path` of `owner`'s public storage again, a record of at most
+/// [`MAX_RECORD_BYTES`], unless it is unchanged since `etag`, the tag its
+/// last answer gave. The tag goes out as `If-None-Match`, so an unchanged
+/// record costs a 304 and no body: 01 ("Circle") re-fetches only records
+/// that can still change, open bounties and `running` sweeps, this way.
+///
+/// Without a tag nothing is compared: no `If-None-Match` goes out, and a
+/// 304 is refused like any status but 2xx and 404. As for [`get_public`],
+/// `path` appears in the error message; the tag never does.
+pub(crate) async fn get_public_if_changed(
+    pubky: &Pubky,
+    owner: &PublicKey,
+    path: &str,
+    etag: Option<&ETag>,
+) -> anyhow::Result<Conditional> {
+    async { fetch_if_changed(pubky, public_url(owner, path)?, etag).await }
+        .await
+        .with_context(|| could_not_read(path, owner))
+}
+
+/// The conditional `GET` of [`get_public_if_changed`], of `url`.
+async fn fetch_if_changed(
+    pubky: &Pubky,
+    url: Url,
+    etag: Option<&ETag>,
+) -> anyhow::Result<Conditional> {
+    // The one header, borrowing the tag's text, or none. `as_slice` makes a
+    // slice of length 1 or 0 of the `Option` without allocating.
+    let if_none_match = etag.map(|tag| ("if-none-match", tag.as_str()));
+    // Two functions with the same signature: the `if` makes both plain `fn`
+    // pointers, one type, so either can be passed on.
+    let read_status = if etag.is_some() {
+        conditional_status
+    } else {
+        page_status
+    };
+    let answer = get_unredirected(
+        pubky.client(),
+        url,
+        if_none_match.as_slice(),
+        MAX_RECORD_BYTES,
+        read_status,
+    )
+    .await?;
+    Ok(match answer {
+        Answer::Body { body, etag } => Conditional::Changed { body, etag },
+        Answer::Empty => Conditional::Absent,
+        Answer::NotModified => Conditional::NotModified,
+    })
+}
+
+/// Reads the encrypted package of sweep `id` of `sweeper`,
+/// `sweeps/<id>.age`, at most [`MAX_CIPHERTEXT_BYTES`], or `None` when
+/// there is none (a 404).
+pub(crate) async fn get_package(
+    pubky: &Pubky,
+    sweeper: &PublicKey,
+    id: RecordId,
+) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
+    let path = paths::sweep_package(id);
+    async { fetch_package(pubky, public_url(sweeper, &path)?).await }
+        .await
+        .with_context(|| could_not_read(&path, sweeper))
+}
+
+/// The `GET` of [`get_package`], of `url`: [`fetch_public`] under
+/// [`MAX_CIPHERTEXT_BYTES`], the most core's `decrypt` accepts at all (the
+/// longest header it reads, a 32 MiB package and age's framing of it), so
+/// nothing larger is ever buffered.
+async fn fetch_package(pubky: &Pubky, url: Url) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
+    fetch_public(pubky, url, MAX_CIPHERTEXT_BYTES).await
 }
 
 /// Reads `path` of the signed-in user's own storage through `session`, at
@@ -496,6 +659,63 @@ impl ListLimits {
 // a panic at run time): the default limits are ones `list_dir` accepts.
 const _: () = assert!(ListLimits::DEFAULT.page_size_is_honoured());
 
+/// Which way a directory is listed, and where a newest-first listing
+/// stops.
+///
+/// A homeserver lists in its paths' byte order, and record ids are
+/// timestamps that sort as they were made (01), so oldest first is the
+/// order they were written in, and `reverse=true` turns it round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ListOrder {
+    /// Oldest first, the homeserver's own order, and the whole directory:
+    /// [`list_dir`].
+    OldestFirst,
+    /// Newest first, stopping at the first file of a record whose id is at
+    /// or below `seen`, the newest id already seen in this directory, or
+    /// the whole directory when `seen` is `None`:
+    /// [`list_dir_newest_first`].
+    ///
+    /// P2c's reading of 01's "paging by cursor until an id already seen".
+    /// Every file named by a record id counts: `<id>.json`,
+    /// `<id>.discovered.json` and `<id>.age` all stop the listing, so a
+    /// file added later under an id already seen (a sweep's `.age`) is not
+    /// listed again; the record's re-read finds it. A writer can name a
+    /// record with an old id, which then stays unlisted: listings are
+    /// hints, as the feed is, and bounded either way.
+    NewestFirst {
+        /// The newest record id already seen in the directory.
+        seen: Option<RecordId>,
+    },
+}
+
+impl ListOrder {
+    /// Whether a listing in this order stops at `entry`, before keeping
+    /// it: in a newest-first one, at a file of a record whose id is at or
+    /// below the one already seen. A file with no record id (`circle.json`,
+    /// a `keys/` record) never stops one.
+    pub(crate) fn stops_at(self, entry: &SweepkyPath) -> bool {
+        match self {
+            Self::OldestFirst | Self::NewestFirst { seen: None } => false,
+            Self::NewestFirst { seen: Some(seen) } => {
+                record_id_of(entry).is_some_and(|id| id <= seen)
+            }
+        }
+    }
+}
+
+/// The record id in `entry`'s name, if it has one.
+fn record_id_of(entry: &SweepkyPath) -> Option<RecordId> {
+    // No `_ =>` arm, so a new kind of file does not build until someone
+    // decides whether its name carries an id.
+    match entry {
+        SweepkyPath::Bounty(id)
+        | SweepkyPath::Discovered(id)
+        | SweepkyPath::SweepRecord(id)
+        | SweepkyPath::SweepPackage(id) => Some(*id),
+        SweepkyPath::Circle | SweepkyPath::Key(_) => None,
+    }
+}
+
 /// What [`list_dir`] found in a directory.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Listing {
@@ -570,17 +790,31 @@ impl std::error::Error for ListingError {}
 pub(crate) struct ListingParser<'a> {
     directory: &'a PubkyResource,
     limits: ListLimits,
+    order: ListOrder,
     listing: Listing,
     entries_read: usize,
     pages_read: usize,
 }
 
 impl<'a> ListingParser<'a> {
-    /// A parser for `directory`, whose path ends with `/`.
+    /// A parser for an oldest-first listing of `directory`, whose path ends
+    /// with `/`: the tests' shorthand for [`in_order`](Self::in_order).
+    #[cfg(test)]
     pub(crate) fn new(directory: &'a PubkyResource, limits: ListLimits) -> Self {
+        Self::in_order(directory, limits, ListOrder::OldestFirst)
+    }
+
+    /// A parser for a listing of `directory`, whose path ends with `/`, in
+    /// `order`.
+    pub(crate) fn in_order(
+        directory: &'a PubkyResource,
+        limits: ListLimits,
+        order: ListOrder,
+    ) -> Self {
         Self {
             directory,
             limits,
+            order,
             listing: Listing::default(),
             entries_read: 0,
             pages_read: 0,
@@ -589,9 +823,10 @@ impl<'a> ListingParser<'a> {
 
     /// Reads one page, and gives the entry to ask for the next page after
     /// (its cursor), or `None` when this page was the last: one with fewer
-    /// entries than [`ListLimits::page_size`].
+    /// entries than [`ListLimits::page_size`], or one where a newest-first
+    /// listing reached a record already seen ([`ListOrder::stops_at`]).
     ///
-    /// The rules, P2a's choice:
+    /// The rules, P2a's choice, and the stop P2c's:
     ///
     /// - The page is refused whole if it is over the byte cap or past the
     ///   page count, and any line that breaks the protocol refuses it: one
@@ -606,6 +841,11 @@ impl<'a> ListingParser<'a> {
     /// - The cursor is the last entry of this owner inside the directory,
     ///   Sweepky file or not. A full page with none has no cursor, and is
     ///   refused.
+    /// - A newest-first listing stops at the first Sweepky file inside the
+    ///   directory that [`ListOrder::stops_at`]: neither it nor anything
+    ///   after it is kept, and the page is the last however full it is. The
+    ///   rest of the page is still read under every rule above, so a stop
+    ///   on the first line does not let the page break the protocol.
     pub(crate) fn page(&mut self, body: &[u8]) -> Result<Option<PubkyResource>, ListingError> {
         self.pages_read = self.pages_read.saturating_add(1);
         if self.pages_read > self.limits.max_pages {
@@ -617,6 +857,7 @@ impl<'a> ListingParser<'a> {
         let page_size = usize::from(self.limits.page_size);
         let mut on_page: usize = 0;
         let mut last = None;
+        let mut stopped = false;
         // Bytes, split at `\n`, as core's feed parser does: in UTF-8 the
         // byte 0x0A only ever means newline, so splitting first is safe, and
         // each line is decoded (strictly) on its own.
@@ -637,31 +878,33 @@ impl<'a> ListingParser<'a> {
                 return Err(ListingError::TooManyEntries);
             }
             let entry = parse_entry(line).ok_or(ListingError::NotAResource)?;
-            if self.is_inside(&entry) {
-                self.add(&entry);
-                last = Some(entry);
-            } else {
-                self.skip();
+            // Past the stop, each line is still checked above, and nothing
+            // more is kept.
+            if stopped {
+                continue;
             }
+            if !self.is_inside(&entry) {
+                self.skip();
+                continue;
+            }
+            // A match guard (`if` after the pattern): this arm applies only
+            // to a Sweepky file the order stops at.
+            match SweepkyPath::parse(entry.path.as_str()) {
+                Some(path) if self.order.stops_at(&path) => stopped = true,
+                Some(path) => self.listing.entries.push(path),
+                None => self.skip(),
+            }
+            last = Some(entry);
         }
         // `on_page == 0` matters only for a `page_size` of 0, which
         // `list_dir` never sends: an empty page still ends the listing.
-        if on_page < page_size || on_page == 0 {
+        if stopped || on_page < page_size || on_page == 0 {
             return Ok(None);
         }
         // A full page: the next one starts after its last entry, so a full
         // page without one cannot go on.
         let cursor = last.ok_or(ListingError::NoCursor)?;
         Ok(Some(cursor))
-    }
-
-    /// Adds `entry`, one inside the directory, to the listing, or counts it
-    /// as skipped when [`SweepkyPath::parse`] does not accept it.
-    fn add(&mut self, entry: &PubkyResource) {
-        match SweepkyPath::parse(entry.path.as_str()) {
-            Some(path) => self.listing.entries.push(path),
-            None => self.skip(),
-        }
     }
 
     /// Counts one entry as skipped.
@@ -731,6 +974,9 @@ pub(crate) enum PageStatus {
     /// answers 404 "Directory Not Found" for a directory with nothing in
     /// it); for a record, there is no such record.
     Empty,
+    /// 304: the record is unchanged since the tag sent in `If-None-Match`,
+    /// and the answer has no body. Only [`conditional_status`] gives it.
+    NotModified,
 }
 
 /// What `status` means for a homeserver's answer, a listing page or a
@@ -747,12 +993,24 @@ fn page_status(status: StatusCode) -> anyhow::Result<PageStatus> {
     }
 }
 
+/// What `status` means for a conditional `GET`, one that sent a tag in
+/// `If-None-Match`: a 304 is "unchanged", and anything else is as for
+/// [`page_status`].
+fn conditional_status(status: StatusCode) -> anyhow::Result<PageStatus> {
+    if status == StatusCode::NOT_MODIFIED {
+        Ok(PageStatus::NotModified)
+    } else {
+        page_status(status)
+    }
+}
+
 /// The URL of one listing page: the directory's transport URL, then
-/// `limit=<page_size>` and, after the first page, `cursor=` the last entry's
-/// `pubky://` URL.
+/// `limit=<page_size>`, `reverse=true` for a newest-first listing and,
+/// after the first page, `cursor=` the last entry's `pubky://` URL.
 fn page_url(
     directory: &PubkyResource,
     page_size: u16,
+    order: ListOrder,
     cursor: Option<&PubkyResource>,
 ) -> anyhow::Result<Url> {
     let mut url = directory
@@ -765,6 +1023,9 @@ fn page_url(
     {
         let mut query = url.query_pairs_mut();
         query.append_pair("limit", &page_size.to_string());
+        if matches!(order, ListOrder::NewestFirst { .. }) {
+            query.append_pair("reverse", "true");
+        }
         if let Some(last) = cursor {
             query.append_pair("cursor", &last.to_pubky_url());
         }
@@ -773,8 +1034,9 @@ fn page_url(
 }
 
 /// Lists `dir` (a path ending with `/`, such as
-/// [`paths::KEYS_DIR`](sweepky_core::paths::KEYS_DIR)) of `owner`'s public
-/// storage, page by page, within `limits`. A 404 is an empty directory.
+/// [`paths::KEYS_DIR`]) of `owner`'s public
+/// storage, oldest first, page by page, within `limits`. A 404 is an empty
+/// directory.
 ///
 /// Each page is an anonymous `GET` of the directory's transport URL, the
 /// same request the SDK's public storage sends, read through
@@ -790,6 +1052,34 @@ pub(crate) async fn list_dir(
     dir: &str,
     limits: ListLimits,
 ) -> anyhow::Result<Listing> {
+    list_in_order(pubky, owner, dir, limits, ListOrder::OldestFirst).await
+}
+
+/// Lists `dir` of `owner`'s public storage as [`list_dir`] does, but newest
+/// first (`reverse=true`), and stops at `seen`, the newest record id
+/// already seen there: the first file of a record at or below it ends the
+/// listing, and the page after it is never asked for
+/// ([`ListOrder::NewestFirst`]). `None` lists the whole directory, newest
+/// first. The same limits hold, and a 404 is an empty directory.
+pub(crate) async fn list_dir_newest_first(
+    pubky: &Pubky,
+    owner: &PublicKey,
+    dir: &str,
+    limits: ListLimits,
+    seen: Option<RecordId>,
+) -> anyhow::Result<Listing> {
+    list_in_order(pubky, owner, dir, limits, ListOrder::NewestFirst { seen }).await
+}
+
+/// [`list_dir`] and [`list_dir_newest_first`]: the checks on `limits` and
+/// `dir`, then [`read_listing`] with each page fetched by [`fetch_public`].
+async fn list_in_order(
+    pubky: &Pubky,
+    owner: &PublicKey,
+    dir: &str,
+    limits: ListLimits,
+    order: ListOrder,
+) -> anyhow::Result<Listing> {
     async {
         if !limits.page_size_is_honoured() {
             bail!(
@@ -803,40 +1093,98 @@ pub(crate) async fn list_dir(
         if !directory.path.as_str().ends_with('/') {
             bail!("not a directory: a listing's path ends with `/`");
         }
-        let mut parser = ListingParser::new(&directory, limits);
-        let mut cursor: Option<PubkyResource> = None;
-        loop {
-            let url = page_url(&directory, limits.page_size, cursor.as_ref())?;
-            let Some(body) = fetch_page(pubky, url, limits.max_page_bytes()).await? else {
-                break;
-            };
-            match parser.page(&body)? {
-                Some(last) => cursor = Some(last),
-                None => break,
-            }
-        }
-        anyhow::Ok(parser.finish())
+        let cap = limits.max_page_bytes();
+        read_listing(&directory, limits, order, async |url| {
+            fetch_public(pubky, url, cap).await
+        })
+        .await
     }
     .await
     .with_context(|| format!("could not list {dir} of {}", owner.z32()))
 }
 
-/// One listing page: an anonymous `GET` of `url` through
-/// [`get_unredirected`], its body read with `cap`, or `None` for a 404. Any
-/// other non-2xx answer is an error naming the status, and its body is
+/// Pages through the listing of `directory` in `order`: asks `fetch_page`
+/// for each page's URL, which gives the body or `None` for a 404, and
+/// parses it with a [`ListingParser`], until a 404, a short or empty page,
+/// or a newest-first listing's stop.
+///
+/// The fetch is a closure, as `read_capped`'s chunks are, so the tests page
+/// through fake pages with no network. `AsyncFnMut`: called once a page,
+/// and free to change what it captured.
+async fn read_listing(
+    directory: &PubkyResource,
+    limits: ListLimits,
+    order: ListOrder,
+    mut fetch_page: impl AsyncFnMut(Url) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>>,
+) -> anyhow::Result<Listing> {
+    let mut parser = ListingParser::in_order(directory, limits, order);
+    let mut cursor: Option<PubkyResource> = None;
+    loop {
+        let url = page_url(directory, limits.page_size, order, cursor.as_ref())?;
+        let Some(body) = fetch_page(url).await? else {
+            break;
+        };
+        match parser.page(&body)? {
+            Some(last) => cursor = Some(last),
+            None => break,
+        }
+    }
+    Ok(parser.finish())
+}
+
+/// An anonymous `GET` of `url` through [`get_unredirected`], its body read
+/// with `cap`, or `None` for a 404: a record, a listing page or a package.
+/// Any other non-2xx answer is an error naming the status, and its body is
 /// never read.
-async fn fetch_page(
+async fn fetch_public(
     pubky: &Pubky,
     url: Url,
     cap: usize,
 ) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
-    get_unredirected(pubky.client(), url, &[], cap, page_status).await
+    get_unredirected(pubky.client(), url, &[], cap, page_status)
+        .await?
+        .into_body()
 }
 
 /// What a request that ended at another URL than the one it was sent to is
 /// refused with. Fixed text: neither URL, which a server chose.
 const REDIRECTED: &str =
     "the server answered through a redirect, which Sweepky refuses: nothing in the answer was used";
+
+/// What [`Answer::into_body`] refuses a 304 with: only a `GET` that sent a
+/// tag expects one.
+const UNASKED_NOT_MODIFIED: &str =
+    "the server answered 304 Not Modified to a request that compared nothing";
+
+/// What [`get_unredirected`] hands back, as its `read_status` decided.
+pub(crate) enum Answer {
+    /// [`PageStatus::Read`]: the body, at most the cap, and the answer's
+    /// [`ETag`] when it gave one that [`ETag::parse`] accepts.
+    Body {
+        /// The bytes of the answer.
+        body: Zeroizing<Vec<u8>>,
+        /// Its tag, if usable.
+        etag: Option<ETag>,
+    },
+    /// [`PageStatus::Empty`]: a 404, and nothing read.
+    Empty,
+    /// [`PageStatus::NotModified`]: a 304, and nothing read.
+    NotModified,
+}
+
+impl Answer {
+    /// The body, or `None` for a 404: what a `GET` that sent no tag wants.
+    /// Such a `GET`'s `read_status` never gives [`PageStatus::NotModified`],
+    /// but should one, the 304 is refused rather than read as "no record".
+    pub(crate) fn into_body(self) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
+        match self {
+            // `..` leaves the tag out: a plain `GET` has no use for it.
+            Self::Body { body, .. } => Ok(Some(body)),
+            Self::Empty => Ok(None),
+            Self::NotModified => bail!(UNASKED_NOT_MODIFIED),
+        }
+    }
+}
 
 /// Sends an anonymous `GET` of `url` through `client`, the SDK's HTTP
 /// client, with `headers` added, and reads its body, at most `cap` bytes,
@@ -847,19 +1195,21 @@ const REDIRECTED: &str =
 /// 1. The answer is refused when it came through a redirect
 ///    ([`check_not_redirected`]), whatever its status.
 /// 2. `read_status` is given the status alone and decides: read the body
-///    ([`PageStatus::Read`]), hand back `None` ([`PageStatus::Empty`]), or
-///    fail. An error answer's body is never read.
-/// 3. The body is read under the cap.
+///    ([`PageStatus::Read`]), hand back [`Answer::Empty`] for a 404 or
+///    [`Answer::NotModified`] for a 304 (each with nothing read), or fail.
+///    An error answer's body is never read.
+/// 3. The `ETag` header is checked ([`ETag::parse`]) and the body read
+///    under the cap.
 ///
 /// Every error is fixed text, the status, or [`request_error`]'s: never the
-/// server's words or a URL.
+/// server's words, a URL or a header.
 pub(crate) async fn get_unredirected(
     client: &PubkyHttpClient,
     url: Url,
-    headers: &[(&'static str, &'static str)],
+    headers: &[(&str, &str)],
     cap: usize,
     read_status: impl FnOnce(StatusCode) -> anyhow::Result<PageStatus>,
-) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
+) -> anyhow::Result<Answer> {
     // `request_async` is the SDK's own way to address a URL: it resolves a
     // Pubky host through pkarr and may rewrite the URL (an ICANN domain in
     // place of the key, or a legacy homeserver's path). The URL to compare
@@ -868,8 +1218,11 @@ pub(crate) async fn get_unredirected(
         .request_async(Method::GET, url)
         .await
         .map_err(|e| request_error(&e))?;
-    // `&(name, value)` takes each pair apart, copying out its two
-    // `&'static str`s; `header` consumes the builder and hands it back.
+    // `&(name, value)` takes each pair apart, copying out its two `&str`s
+    // (a shared reference is `Copy`); `header` consumes the builder and
+    // hands it back. The values may borrow from the caller, such as an
+    // `If-None-Match` tag: reqwest copies each into a header of its own
+    // here, so nothing has to outlive this call.
     for &(name, value) in headers {
         builder = builder.header(name, value);
     }
@@ -886,16 +1239,24 @@ pub(crate) async fn get_unredirected(
         .await
         .map_err(|e| request_error(&e.into()))?;
     check_not_redirected(&sent, response.url())?;
-    if read_status(response.status())? == PageStatus::Empty {
-        return Ok(None);
+    match read_status(response.status())? {
+        PageStatus::Read => {}
+        PageStatus::Empty => return Ok(Answer::Empty),
+        PageStatus::NotModified => return Ok(Answer::NotModified),
     }
+    // `parse` copies the header's bytes out, so the borrow of the response
+    // ends here, before the reads below borrow it mutably.
+    let etag = response
+        .headers()
+        .get("etag")
+        .and_then(|value| ETag::parse(value.as_bytes()));
     // `content_length()` is read first, while nothing borrows the
     // response; the closure then borrows it mutably for the reads.
     let body = read_capped(response.content_length(), cap, async || {
         response.chunk().await
     })
     .await?;
-    Ok(Some(body))
+    Ok(Answer::Body { body, etag })
 }
 
 /// Refuses an answer whose URL, `received`, is not `sent`, the URL its
@@ -926,15 +1287,18 @@ mod tests {
 
     use pubky::errors::RequestError;
     use pubky::{Keypair, PubkyResource, PublicKey, StatusCode};
-    use sweepky_core::DeviceId;
     use sweepky_core::paths::{self, SweepkyPath};
+    use sweepky_core::{DeviceId, MAX_CIPHERTEXT_BYTES, MAX_RECORD_BYTES, Zeroizing};
 
     use super::{
-        BodyTooLarge, CappedBody, ListLimits, ListingError, ListingParser, MAX_LISTING_LINE_BYTES,
-        PACKAGE_TOO_LARGE, PageStatus, QUOTA_FULL, RATE_LIMITED, UPLOAD_QUOTA_FULL,
-        WRITE_FORBIDDEN, absent_on_not_found, check_not_redirected, page_status, page_url,
-        read_capped, request_error, status_of, upload_error, write_error, write_refusal,
+        BodyTooLarge, CappedBody, Conditional, ETag, ListLimits, ListOrder, Listing, ListingError,
+        ListingParser, MAX_ETAG_BYTES, MAX_LISTING_LINE_BYTES, PACKAGE_TOO_LARGE, PageStatus,
+        QUOTA_FULL, RATE_LIMITED, REDIRECTED, UPLOAD_QUOTA_FULL, WRITE_FORBIDDEN,
+        absent_on_not_found, check_not_redirected, conditional_status, fetch_if_changed,
+        fetch_package, page_status, page_url, read_capped, read_listing, request_error, status_of,
+        upload_error, write_error, write_refusal,
     };
+    use crate::test_support::{Canned, LocalHttp, canned, offline_network, record_id};
 
     /// What the server text in these tests tries to do: move the cursor, set
     /// a colour, start a new line that looks like Sweepky's own output.
@@ -1353,7 +1717,8 @@ mod tests {
     #[test]
     fn the_redirect_guard_accepts_only_the_url_that_was_sent() {
         let owner = Keypair::random().public_key();
-        let listing = page_url(&keys_dir(&owner), 100, None).expect("a URL");
+        let listing =
+            page_url(&keys_dir(&owner), 100, ListOrder::OldestFirst, None).expect("a URL");
         let github =
             url::Url::parse("https://api.github.com/repos/org/name/pulls/42").expect("a URL");
         for sent in [listing, github] {
@@ -1400,40 +1765,508 @@ mod tests {
         }
     }
 
+    /// The decoded query of `url`, pair by pair, in order.
+    fn query_pairs(url: &url::Url) -> Vec<(String, String)> {
+        url.query_pairs()
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect()
+    }
+
+    /// `(key, value)` as the owned pair [`query_pairs`] gives.
+    fn pair(key: &str, value: &str) -> (String, String) {
+        (key.to_owned(), value.to_owned())
+    }
+
     #[test]
     fn listing_url_carries_limit_and_cursor() {
         let owner = Keypair::random().public_key();
         let dir = keys_dir(&owner);
         let base = dir.to_transport_url().expect("a transport URL");
-        let pairs = |url: &url::Url| -> Vec<(String, String)> {
-            url.query_pairs()
-                .map(|(key, value)| (key.into_owned(), value.into_owned()))
-                .collect()
-        };
 
         // The first page: the directory's transport URL plus `limit` alone.
-        let first = page_url(&dir, 50, None).expect("a URL");
+        let first = page_url(&dir, 50, ListOrder::OldestFirst, None).expect("a URL");
         let mut without_query = first.clone();
         without_query.set_query(None);
         assert_eq!(without_query, base);
-        assert_eq!(pairs(&first), [("limit".to_owned(), "50".to_owned())]);
+        assert_eq!(query_pairs(&first), [pair("limit", "50")]);
 
         // Later pages add the last entry's `pubky://` URL as the cursor.
         let last = PubkyResource::new(owner.clone(), "/pub/sweepky/keys/laptop-1.json")
             .expect("a valid entry");
-        let next = page_url(&dir, 50, Some(&last)).expect("a URL");
+        let next = page_url(&dir, 50, ListOrder::OldestFirst, Some(&last)).expect("a URL");
         let mut without_query = next.clone();
         without_query.set_query(None);
         assert_eq!(without_query, base);
         assert_eq!(
-            pairs(&next),
+            query_pairs(&next),
             [
-                ("limit".to_owned(), "50".to_owned()),
-                (
-                    "cursor".to_owned(),
-                    pubky_line(&owner, "/pub/sweepky/keys/laptop-1.json")
+                pair("limit", "50"),
+                pair(
+                    "cursor",
+                    &pubky_line(&owner, "/pub/sweepky/keys/laptop-1.json")
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn a_newest_first_listing_url_adds_reverse_beside_limit_and_cursor() {
+        let owner = Keypair::random().public_key();
+        let dir = keys_dir(&owner);
+        let base = dir.to_transport_url().expect("a transport URL");
+        let newest_first = ListOrder::NewestFirst { seen: None };
+        let cursor_line = pubky_line(&owner, "/pub/sweepky/keys/laptop-1.json");
+        let last = PubkyResource::new(owner.clone(), "/pub/sweepky/keys/laptop-1.json")
+            .expect("a valid entry");
+
+        let first = page_url(&dir, 50, newest_first, None).expect("a URL");
+        assert_eq!(
+            query_pairs(&first),
+            [pair("limit", "50"), pair("reverse", "true")]
+        );
+        let next = page_url(&dir, 50, newest_first, Some(&last)).expect("a URL");
+        let mut without_query = next.clone();
+        without_query.set_query(None);
+        assert_eq!(without_query, base);
+        assert_eq!(
+            query_pairs(&next),
+            [
+                pair("limit", "50"),
+                pair("reverse", "true"),
+                pair("cursor", &cursor_line),
+            ]
+        );
+        // The cursor goes out percent-encoded, so it cannot add a parameter
+        // of its own.
+        let query = next.query().expect("a query");
+        assert!(
+            query.starts_with("limit=50&reverse=true&cursor=pubky%3A%2F%2F"),
+            "{query}"
+        );
+    }
+
+    /// The listing line for `bounties/<id>.json`, where `<id>` is
+    /// `record_id(n)`: a larger `n` is a newer bounty.
+    fn bounty_line(owner: &PublicKey, n: u64) -> String {
+        pubky_line(owner, &paths::bounty(record_id(n)))
+    }
+
+    /// The listing line for that bounty's `<id>.discovered.json`.
+    fn discovered_line(owner: &PublicKey, n: u64) -> String {
+        pubky_line(owner, &paths::discovered(record_id(n)))
+    }
+
+    fn bounties_dir(owner: &PublicKey) -> PubkyResource {
+        PubkyResource::new(owner.clone(), paths::BOUNTIES_DIR).expect("a valid directory")
+    }
+
+    /// The listing [`read_listing`] makes of `pages`, handed out one per
+    /// request, whatever URL it asks for, and then a 404; and the URLs it
+    /// asked for.
+    async fn list_fake_pages(
+        dir: &PubkyResource,
+        limits: ListLimits,
+        order: ListOrder,
+        pages: &[String],
+    ) -> (anyhow::Result<Listing>, Vec<url::Url>) {
+        let mut served = pages.iter();
+        let mut asked = Vec::new();
+        let listing = read_listing(dir, limits, order, async |url| {
+            asked.push(url);
+            Ok(served
+                .next()
+                .map(|page| Zeroizing::new(page.clone().into_bytes())))
+        })
+        .await;
+        (listing, asked)
+    }
+
+    #[tokio::test]
+    async fn a_newest_first_listing_stops_at_the_newest_id_already_seen() {
+        let owner = Keypair::random().public_key();
+        let dir = bounties_dir(&owner);
+        let two_a_page = ListLimits {
+            page_size: 2,
+            max_entries: 100,
+            max_pages: 10,
+        };
+        let bounty = |n| SweepkyPath::Bounty(record_id(n));
+        // Newest first, two entries a page, as the homeserver sends them
+        // with `reverse=true`: a bounty's record sorts after its
+        // `.discovered.json`, so it comes first.
+        let pages = [
+            [bounty_line(&owner, 5), discovered_line(&owner, 5)].join("\n"),
+            [bounty_line(&owner, 4), bounty_line(&owner, 3)].join("\n"),
+            [bounty_line(&owner, 2), bounty_line(&owner, 1)].join("\n"),
+        ];
+
+        // Bounty 3 is the newest already seen: the listing stops at it, and
+        // the third page is never asked for.
+        let seen_3 = ListOrder::NewestFirst {
+            seen: Some(record_id(3)),
+        };
+        let (listing, asked) = list_fake_pages(&dir, two_a_page, seen_3, &pages).await;
+        let listing = listing.expect("listed");
+        assert_eq!(
+            listing.entries,
+            [bounty(5), SweepkyPath::Discovered(record_id(5)), bounty(4)]
+        );
+        assert_eq!(listing.skipped, 0);
+        assert_eq!(asked.len(), 2, "asked past the stop: {asked:?}");
+        // Every page asks for newest first, and the second starts after the
+        // last entry of the first.
+        assert!(
+            asked
+                .iter()
+                .all(|url| query_pairs(url).contains(&pair("reverse", "true"))),
+            "{asked:?}"
+        );
+        assert!(
+            query_pairs(&asked[1]).contains(&pair("cursor", &discovered_line(&owner, 5))),
+            "{asked:?}"
+        );
+
+        // A stop on the first line keeps nothing and asks for nothing more.
+        let seen_5 = ListOrder::NewestFirst {
+            seen: Some(record_id(5)),
+        };
+        let (listing, asked) = list_fake_pages(&dir, two_a_page, seen_5, &pages).await;
+        assert!(listing.expect("listed").entries.is_empty());
+        assert_eq!(asked.len(), 1);
+
+        // With nothing seen yet, the whole directory is read, newest first,
+        // up to the 404 after the last page.
+        let nothing_seen = ListOrder::NewestFirst { seen: None };
+        let (listing, asked) = list_fake_pages(&dir, two_a_page, nothing_seen, &pages).await;
+        assert_eq!(
+            listing.expect("listed").entries,
+            [
+                bounty(5),
+                SweepkyPath::Discovered(record_id(5)),
+                bounty(4),
+                bounty(3),
+                bounty(2),
+                bounty(1)
+            ]
+        );
+        assert_eq!(asked.len(), 4);
+
+        // A 404 on the first page is an empty directory, not an error.
+        let (listing, asked) = list_fake_pages(&dir, two_a_page, seen_3, &[]).await;
+        assert_eq!(listing.expect("an empty listing"), Listing::default());
+        assert_eq!(asked.len(), 1);
+    }
+
+    #[test]
+    fn a_newest_first_listing_keeps_the_listing_limits() {
+        let owner = Keypair::random().public_key();
+        let dir = bounties_dir(&owner);
+        let seen = |n| ListOrder::NewestFirst {
+            seen: Some(record_id(n)),
+        };
+
+        // More entries than were asked for is refused, even when the stop is
+        // on the first line: the rest of the page is still read and checked.
+        let over: Vec<String> = (1..=5).rev().map(|n| bounty_line(&owner, n)).collect();
+        assert_eq!(
+            ListingParser::in_order(&dir, SMALL, seen(5))
+                .page(over.join("\n").as_bytes())
+                .err(),
+            Some(ListingError::PageOverLimit)
+        );
+
+        // So is a line over the line cap, after the stop or before it.
+        let long = pubky_line(
+            &owner,
+            &format!(
+                "{}{}.json",
+                paths::BOUNTIES_DIR,
+                "a".repeat(MAX_LISTING_LINE_BYTES)
+            ),
+        );
+        for body in [
+            [bounty_line(&owner, 3), long.clone()].join("\n"),
+            [long.clone(), bounty_line(&owner, 3)].join("\n"),
+        ] {
+            assert_eq!(
+                ListingParser::in_order(&dir, SMALL, seen(3))
+                    .page(body.as_bytes())
+                    .err(),
+                Some(ListingError::LineTooLong)
+            );
+        }
+
+        // And a listing past `max_pages`, while nothing it holds was seen.
+        let one_a_page = ListLimits {
+            page_size: 1,
+            max_entries: 100,
+            max_pages: 3,
+        };
+        let mut parser = ListingParser::in_order(&dir, one_a_page, seen(1));
+        for n in [9, 8, 7] {
+            assert!(
+                matches!(parser.page(bounty_line(&owner, n).as_bytes()), Ok(Some(_))),
+                "{n}"
+            );
+        }
+        assert_eq!(
+            parser.page(bounty_line(&owner, 6).as_bytes()).err(),
+            Some(ListingError::TooManyPages)
+        );
+    }
+
+    #[test]
+    fn an_etag_is_kept_only_when_it_is_short_visible_ascii() {
+        let longest = [b'a'; MAX_ETAG_BYTES];
+        for usable in [&b"\"tag-1\""[..], b"W/\"x\"", &longest] {
+            let tag = ETag::parse(usable).expect("a usable tag");
+            assert_eq!(tag.as_str().as_bytes(), usable);
+        }
+        // Empty, over the cap, a space, a control character, an escape
+        // sequence, DEL or anything past ASCII counts as no tag at all.
+        let too_long = [b'a'; MAX_ETAG_BYTES + 1];
+        for unusable in [
+            &b""[..],
+            &too_long,
+            b"\"a b\"",
+            b"\"a\tb\"",
+            b"\"\x1b[31m\"",
+            b"\"\x7f\"",
+            b"\"caf\xc3\xa9\"",
+        ] {
+            assert!(ETag::parse(unusable).is_none(), "{unusable:?}");
+        }
+        // Its `Debug` gives the length alone, never the server's text.
+        let tag = ETag::parse(b"\"pwned\"").expect("a usable tag");
+        assert_eq!(format!("{tag:?}"), "ETag(7 bytes)");
+    }
+
+    #[test]
+    fn a_conditional_get_reads_304_as_unchanged() {
+        assert_eq!(
+            conditional_status(StatusCode::NOT_MODIFIED).ok(),
+            Some(PageStatus::NotModified)
+        );
+        assert_eq!(
+            conditional_status(StatusCode::NOT_FOUND).ok(),
+            Some(PageStatus::Empty)
+        );
+        assert_eq!(
+            conditional_status(StatusCode::OK).ok(),
+            Some(PageStatus::Read)
+        );
+        let error = conditional_status(StatusCode::INTERNAL_SERVER_ERROR).expect_err("an error");
+        assert_eq!(
+            format!("{error:#}"),
+            "the homeserver answered 500 Internal Server Error"
+        );
+        // A GET that sent no tag still reads a 304 as an error.
+        assert!(page_status(StatusCode::NOT_MODIFIED).is_err());
+    }
+
+    /// The tag the local server's records carry.
+    const TAG: &str = "\"tag-1\"";
+
+    /// A 200 whose `Content-Length` is one byte over a package's cap, with
+    /// no body behind it.
+    fn claims_over_the_package_cap() -> Canned {
+        Canned::Bytes(
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                MAX_CIPHERTEXT_BYTES + 1
+            )
+            .into_bytes(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_conditional_get_maps_304_404_and_2xx() {
+        let long_tag = "a".repeat(MAX_ETAG_BYTES + 1);
+        let server = LocalHttp::start(vec![
+            ("/same", canned("304 Not Modified", &[("etag", TAG)], b"")),
+            ("/gone", canned("404 Not Found", &[], HOSTILE.as_bytes())),
+            (
+                "/new",
+                canned("200 OK", &[("etag", "\"tag-2\"")], b"{\"a\":1}"),
+            ),
+            ("/no-tag", canned("200 OK", &[], b"{}")),
+            (
+                "/spaced-tag",
+                canned("200 OK", &[("etag", "\"a b\"")], b"{}"),
+            ),
+            ("/long-tag", canned("200 OK", &[("etag", &long_tag)], b"{}")),
+            (
+                "/broken",
+                canned(
+                    "500 Internal Server Error",
+                    &[("etag", TAG)],
+                    HOSTILE.as_bytes(),
+                ),
+            ),
+        ])
+        .await;
+        let network = offline_network();
+        let pubky = network.pubky();
+        let tag = ETag::parse(TAG.as_bytes()).expect("a usable tag");
+
+        // A 304 to the tag sent in If-None-Match: unchanged, no body read.
+        let same = fetch_if_changed(pubky, server.url("/same"), Some(&tag))
+            .await
+            .expect("an answer");
+        assert!(matches!(same, Conditional::NotModified));
+        let heads = server.heads();
+        assert!(
+            heads[0].contains(&format!("\r\nif-none-match: {TAG}\r\n")),
+            "{heads:?}"
+        );
+
+        // A 404: there is no such record any more.
+        let gone = fetch_if_changed(pubky, server.url("/gone"), Some(&tag))
+            .await
+            .expect("an answer");
+        assert!(matches!(gone, Conditional::Absent));
+
+        // A 2xx: the record as it is now, and the tag to send next time.
+        let Conditional::Changed { body, etag } =
+            fetch_if_changed(pubky, server.url("/new"), Some(&tag))
+                .await
+                .expect("an answer")
+        else {
+            panic!("a 200 is a change");
+        };
+        assert_eq!(body.as_slice(), b"{\"a\":1}");
+        assert_eq!(etag.as_ref().map(ETag::as_str), Some("\"tag-2\""));
+
+        // An ETag that is missing, not visible ASCII or over the cap counts
+        // as none.
+        for path in ["/no-tag", "/spaced-tag", "/long-tag"] {
+            let Conditional::Changed { etag, .. } =
+                fetch_if_changed(pubky, server.url(path), Some(&tag))
+                    .await
+                    .expect("an answer")
+            else {
+                panic!("{path}: a 200 is a change");
+            };
+            assert!(etag.is_none(), "{path}: {etag:?}");
+        }
+
+        // Without a tag nothing is compared: no If-None-Match goes out, and a
+        // 304 is refused like any status but 2xx and 404.
+        let error = fetch_if_changed(pubky, server.url("/same"), None)
+            .await
+            .err()
+            .expect("a 304 to an unconditional GET is refused");
+        assert_eq!(
+            format!("{error:#}"),
+            "the homeserver answered 304 Not Modified"
+        );
+        let heads = server.heads();
+        let last = heads.last().expect("a request");
+        assert!(!last.contains("if-none-match"), "{last}");
+
+        // Any other answer is its status alone: never the tag sent or got,
+        // and never the server's text.
+        let error = fetch_if_changed(pubky, server.url("/broken"), Some(&tag))
+            .await
+            .err()
+            .expect("a 500 is refused");
+        let message = format!("{error:#}");
+        assert_eq!(message, "the homeserver answered 500 Internal Server Error");
+        assert!(!message.contains("tag-1"), "{message}");
+        assert!(!message.contains("pwned"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn a_redirected_conditional_or_package_answer_is_refused_before_its_status_or_body() {
+        let moved = |to: &str| canned("302 Found", &[("location", to)], b"");
+        let server = LocalHttp::start(vec![
+            ("/same", canned("304 Not Modified", &[("etag", TAG)], b"")),
+            ("/gone", canned("404 Not Found", &[], b"")),
+            (
+                "/broken",
+                canned("500 Internal Server Error", &[], HOSTILE.as_bytes()),
+            ),
+            ("/record", canned("200 OK", &[("etag", TAG)], b"{}")),
+            ("/huge", claims_over_the_package_cap()),
+            ("/to/same", moved("/same")),
+            ("/to/gone", moved("/gone")),
+            ("/to/broken", moved("/broken")),
+            ("/to/record", moved("/record")),
+            ("/to/huge", moved("/huge")),
+        ])
+        .await;
+        let network = offline_network();
+        let pubky = network.pubky();
+        let tag = ETag::parse(TAG.as_bytes()).expect("a usable tag");
+
+        // Whatever the answer at the end of the redirect says, it is refused
+        // unread: a 304 is not "unchanged", a 404 not "absent", a 500 not its
+        // status and a 200 not a body.
+        for to in ["/to/same", "/to/gone", "/to/broken", "/to/record"] {
+            let error = fetch_if_changed(pubky, server.url(to), Some(&tag))
+                .await
+                .err()
+                .expect("a redirected answer is refused");
+            assert_eq!(format!("{error:#}"), REDIRECTED, "{to}");
+        }
+        // A package's too: one over the cap is not even measured.
+        for to in ["/to/huge", "/to/gone", "/to/broken"] {
+            let error = fetch_package(pubky, server.url(to))
+                .await
+                .expect_err("a redirected answer is refused");
+            assert_eq!(format!("{error:#}"), REDIRECTED, "{to}");
+        }
+        // reqwest did follow each redirect: the guard refused the answer, it
+        // could not stop the request.
+        let heads = server.heads();
+        for target in ["/same", "/gone", "/broken", "/record", "/huge"] {
+            let request_line = format!("GET {target} HTTP/1.1\r\n");
+            assert!(
+                heads.iter().any(|head| head.starts_with(&request_line)),
+                "{target}: {heads:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_package_get_refuses_more_than_max_ciphertext_bytes_before_buffering() {
+        let two_mib = vec![b'x'; 2 * 1024 * 1024];
+        let server = LocalHttp::start(vec![
+            ("/claims-too-much", claims_over_the_package_cap()),
+            ("/endless", Canned::Endless),
+            ("/two-mib", canned("200 OK", &[], &two_mib)),
+        ])
+        .await;
+        let network = offline_network();
+        let pubky = network.pubky();
+
+        // A Content-Length over the cap is refused before a byte is read,
+        // and a body with no length at the chunk that would cross the cap.
+        for path in ["/claims-too-much", "/endless"] {
+            let error = fetch_package(pubky, server.url(path))
+                .await
+                .expect_err("over the cap");
+            assert_eq!(
+                error.downcast_ref::<BodyTooLarge>(),
+                Some(&BodyTooLarge {
+                    cap: MAX_CIPHERTEXT_BYTES
+                }),
+                "{path}: {error:#}"
+            );
+        }
+
+        // A package may be larger than a record, and is read whole.
+        assert!(two_mib.len() > MAX_RECORD_BYTES);
+        let package = fetch_package(pubky, server.url("/two-mib"))
+            .await
+            .expect("read")
+            .expect("there");
+        assert_eq!(package.as_slice(), two_mib.as_slice());
+
+        // A 404 is no package, not an error.
+        let missing = fetch_package(pubky, server.url("/missing"))
+            .await
+            .expect("a 404 is no error");
+        assert!(missing.is_none());
     }
 }

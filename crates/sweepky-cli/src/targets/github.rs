@@ -160,7 +160,9 @@ pub(crate) trait GitHubApi {
 // because the trait is ours (the "orphan rule" needs one of the two to be).
 impl GitHubApi for PubkyHttpClient {
     async fn get(&self, url: Url, cap: usize) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
-        get_unredirected(self, url, &HEADERS, cap, answer_status).await
+        get_unredirected(self, url, &HEADERS, cap, answer_status)
+            .await?
+            .into_body()
     }
 }
 

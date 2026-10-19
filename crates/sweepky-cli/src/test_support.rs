@@ -12,7 +12,9 @@
 //! records for it, a [`FakeKeyStore`] in place of a homeserver's `keys/`, a
 //! [`FakeOwnStorage`] in place of the signed-in user's own storage, a
 //! [`FakePublicRecords`] in place of everyone's public storage and its
-//! listings, and the synthetic bounty, circle and sweep records the tests
+//! listings, a [`LocalHttp`] server on the loopback address for the
+//! requests Sweepky sends itself, and the synthetic bounty, circle and
+//! sweep records the tests
 //! put there, with the snapshot `run` keeps of a sweep's fetch, the
 //! passphrase the tests wrap secret files with and a byte search to check
 //! a wrapped file shows none of its secret, and a compile-time check that a
@@ -24,6 +26,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, Permissions};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, BufRead, ErrorKind, Write};
 use std::net::IpAddr;
 // `MetadataExt` adds `.mode()` and `.ino()` to `Metadata`; `PermissionsExt`
@@ -35,18 +38,19 @@ use std::sync::{Arc, Mutex};
 use pubky::errors::RequestError;
 use pubky::{Keypair, PubkyHttpClient, PublicKey, StatusCode};
 use serde_json::{Value, json};
-use sweepky_core::paths::SweepkyPath;
+use sweepky_core::paths::{self, SweepkyPath};
 use sweepky_core::{
     Bounty, BountyRef, DeviceId, GitSha, KnownTarget, Pubky, RecordId, RepoName, SweepRef,
     TargetId, Timestamp, Zeroizing,
 };
 use tempfile::TempDir;
+use tokio::net::{TcpListener, TcpStream};
 
 use crate::device::{KeyIds, KeyStore, PublicKeys};
 use crate::git::{AllowedProtocols, GitCommand, GitFailed, RunGit, git_argv};
 use crate::own_storage::OwnStorage;
 use crate::records::PublicRecords;
-use crate::remote::{Listing, ListingError};
+use crate::remote::{Conditional, ETag, ListOrder, Listing, ListingError};
 use crate::sweep_state::SweepSnapshot;
 use crate::targets::TargetSource;
 use crate::targets::fixture::FixtureTargets;
@@ -602,12 +606,15 @@ impl OwnStorage for FakeOwnStorage {
 
 /// A [`PublicRecords`] in memory, in place of everyone's homeservers: files
 /// by owner and path, the directories whose listing it refuses, and every
-/// read and listing it was asked for, in order (a listing by its directory,
-/// which ends with `/`). It hands a file back whole, whatever its size, and
-/// lists a directory whole, in path order: the caps and the listing limits
-/// are the real reader's business, and the record parsers check the cap
-/// again themselves. The `Mutex` is there for the same reason as in
-/// [`FakeKeyStore`].
+/// request it was asked, in order: a read by its path, a listing by its
+/// directory, which ends with `/`. It hands a file back whole, whatever its
+/// size, and lists a directory whole, in path order or the reverse, newest
+/// first, where it stops as the real listing does
+/// ([`ListOrder::stops_at`]): the caps and the listing limits are the real
+/// reader's business, and the record parsers check the cap again
+/// themselves. A conditional read compares the tag sent with a hash of the
+/// file's bytes, as a homeserver compares its content hash. The `Mutex` is
+/// there for the same reason as in [`FakeKeyStore`].
 #[derive(Default)]
 pub(crate) struct FakePublicRecords {
     files: BTreeMap<(Pubky, String), Vec<u8>>,
@@ -638,28 +645,23 @@ impl FakePublicRecords {
         self
     }
 
-    /// The owner and path of every read and listing so far, in order.
+    /// The owner and path of every request so far, in order.
     pub(crate) fn asked(&self) -> Vec<(Pubky, String)> {
         self.asked.lock().expect("lock").clone()
     }
-}
 
-impl PublicRecords for FakePublicRecords {
-    async fn get_record(
-        &self,
-        owner: Pubky,
-        path: &str,
-    ) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
+    /// The file at `path` of `owner`'s storage, if any, with the request
+    /// kept in [`asked`](Self::asked).
+    fn file(&self, owner: Pubky, path: &str) -> Option<&Vec<u8>> {
         let key = (owner, path.to_owned());
-        let found = self
-            .files
-            .get(&key)
-            .map(|bytes| Zeroizing::new(bytes.clone()));
+        let found = self.files.get(&key);
         self.asked.lock().expect("lock").push(key);
-        Ok(found)
+        found
     }
 
-    async fn list(&self, owner: Pubky, dir: &str) -> anyhow::Result<Listing> {
+    /// The listing of `dir` of `owner`'s storage in `order`, with the
+    /// request kept in [`asked`](Self::asked).
+    fn listing(&self, owner: Pubky, dir: &str, order: ListOrder) -> anyhow::Result<Listing> {
         let key = (owner, dir.to_owned());
         let broken = self.broken_listings.contains(&key);
         self.asked.lock().expect("lock").push(key);
@@ -669,17 +671,236 @@ impl PublicRecords for FakePublicRecords {
         }
         // The Sweepky files in `dir`, as the real listing keeps them: the
         // map's order is the paths' byte order, a homeserver's order too.
-        let entries = self
+        let in_dir = self
             .files
             .keys()
             .filter(|(file_owner, path)| *file_owner == owner && path.starts_with(dir))
-            .filter_map(|(_, path)| SweepkyPath::parse(path))
-            .collect();
+            .filter_map(|(_, path)| SweepkyPath::parse(path));
+        let entries = match order {
+            ListOrder::OldestFirst => in_dir.collect(),
+            ListOrder::NewestFirst { .. } => in_dir
+                .rev()
+                .take_while(|entry| !order.stops_at(entry))
+                .collect(),
+        };
         Ok(Listing {
             entries,
             skipped: 0,
         })
     }
+}
+
+/// The tag [`FakePublicRecords`] gives a file: a hash of its bytes, quoted
+/// as a homeserver quotes its content hash, so it changes when they do.
+/// std's `DefaultHasher` is enough for a fake; it is no content hash to
+/// rely on.
+fn content_tag(bytes: &[u8]) -> ETag {
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    ETag::parse(format!("\"{:016x}\"", hasher.finish()).as_bytes()).expect("a usable tag")
+}
+
+impl PublicRecords for FakePublicRecords {
+    async fn get_record(
+        &self,
+        owner: Pubky,
+        path: &str,
+    ) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
+        Ok(self
+            .file(owner, path)
+            .map(|bytes| Zeroizing::new(bytes.clone())))
+    }
+
+    async fn list(&self, owner: Pubky, dir: &str) -> anyhow::Result<Listing> {
+        self.listing(owner, dir, ListOrder::OldestFirst)
+    }
+
+    async fn list_newest_first(
+        &self,
+        owner: Pubky,
+        dir: &str,
+        seen: Option<RecordId>,
+    ) -> anyhow::Result<Listing> {
+        self.listing(owner, dir, ListOrder::NewestFirst { seen })
+    }
+
+    async fn get_record_if_changed(
+        &self,
+        owner: Pubky,
+        path: &str,
+        etag: Option<&ETag>,
+    ) -> anyhow::Result<Conditional> {
+        let Some(bytes) = self.file(owner, path) else {
+            return Ok(Conditional::Absent);
+        };
+        let now = content_tag(bytes);
+        if etag == Some(&now) {
+            return Ok(Conditional::NotModified);
+        }
+        Ok(Conditional::Changed {
+            body: Zeroizing::new(bytes.clone()),
+            etag: Some(now),
+        })
+    }
+
+    async fn get_package(&self, sweep: SweepRef) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
+        Ok(self
+            .file(sweep.sweeper, &paths::sweep_package(sweep.id))
+            .map(|bytes| Zeroizing::new(bytes.clone())))
+    }
+}
+
+/// What a [`LocalHttp`] server answers a path with.
+pub(crate) enum Canned {
+    /// These bytes, as they go on the wire: the status line, the headers, a
+    /// blank line and the body ([`canned`] writes them). The connection
+    /// closes after them.
+    Bytes(Vec<u8>),
+    /// A 200 with no length, whose body is zero bytes sent until the client
+    /// hangs up or [`ENDLESS_LIMIT`] bytes have gone out: a server that
+    /// streams forever.
+    Endless,
+}
+
+/// The most a [`Canned::Endless`] body sends, so that a client that never
+/// stops reading still ends the test: 64 MiB, twice the largest cap
+/// Sweepky reads with.
+const ENDLESS_LIMIT: usize = 64 * 1024 * 1024;
+
+/// An HTTP/1.1 answer of `status` (such as `"302 Found"`), `headers` and
+/// `body`, with a `content-length` of the body's.
+pub(crate) fn canned(status: &str, headers: &[(&str, &str)], body: &[u8]) -> Canned {
+    let header_lines: String = headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect();
+    let head = format!(
+        "HTTP/1.1 {status}\r\n{header_lines}content-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    );
+    let mut bytes = head.into_bytes();
+    bytes.extend_from_slice(body);
+    Canned::Bytes(bytes)
+}
+
+/// An HTTP/1.1 server on the loopback address, for the tests of the
+/// requests Sweepky sends itself where a fake would skip the code under
+/// test: what reqwest does with a redirect, a 304 or a body over a cap. It
+/// answers each request with the [`Canned`] answer for its path (the query
+/// is ignored), any other path with a 404, and keeps the head of every
+/// request it read, in order. Dropping it stops it.
+pub(crate) struct LocalHttp {
+    base: url::Url,
+    heads: Arc<Mutex<Vec<String>>>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl LocalHttp {
+    /// A server on a free port of 127.0.0.1, answering `routes`: each a
+    /// path and its answer.
+    pub(crate) async fn start(routes: Vec<(&'static str, Canned)>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a free loopback port");
+        let address = listener.local_addr().expect("its address");
+        let base = url::Url::parse(&format!("http://{address}/")).expect("a URL");
+        // `Arc` because every connection's task reads the routes and writes
+        // the heads, and each task must own what it uses.
+        let routes: Arc<BTreeMap<&'static str, Canned>> = Arc::new(routes.into_iter().collect());
+        let heads = Arc::new(Mutex::new(Vec::new()));
+        let server = tokio::spawn({
+            let heads = Arc::clone(&heads);
+            async move {
+                // A task per connection, so a client that keeps one open
+                // does not hold up the next.
+                while let Ok((stream, _)) = listener.accept().await {
+                    tokio::spawn(answer(stream, Arc::clone(&routes), Arc::clone(&heads)));
+                }
+            }
+        });
+        Self {
+            base,
+            heads,
+            server,
+        }
+    }
+
+    /// The URL of `path` on this server.
+    pub(crate) fn url(&self, path: &str) -> url::Url {
+        self.base.join(path).expect("a URL")
+    }
+
+    /// The head of every request so far, its request line and headers, as
+    /// it arrived, in order.
+    pub(crate) fn heads(&self) -> Vec<String> {
+        self.heads.lock().expect("lock").clone()
+    }
+}
+
+impl Drop for LocalHttp {
+    // Stops accepting; each connection's task ends once its answer is out.
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
+/// Reads one request's head from `stream`, keeps it in `heads`, and writes
+/// the answer `routes` has for its path.
+async fn answer(
+    mut stream: TcpStream,
+    routes: Arc<BTreeMap<&'static str, Canned>>,
+    heads: Arc<Mutex<Vec<String>>>,
+) {
+    // `AsyncReadExt` and `AsyncWriteExt` add `.read`, `.write_all` and
+    // `.shutdown` to the socket. Imported here, not for the whole module,
+    // where tokio's `write` would clash with `std::io::Write`'s on
+    // `SharedBuffer`.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // A GET has no body, so its head is the whole request. 16 KiB is far
+    // more than reqwest sends.
+    let mut head = Vec::new();
+    let mut buf = [0_u8; 1024];
+    while !head.windows(4).any(|end| end == b"\r\n\r\n") && head.len() < 16 * 1024 {
+        match stream.read(&mut buf).await {
+            Ok(0) | Err(_) => return,
+            Ok(read) => head.extend_from_slice(&buf[..read]),
+        }
+    }
+    let head = String::from_utf8_lossy(&head).into_owned();
+    // `GET /path?query HTTP/1.1`: the path, without its query.
+    let path = head
+        .split(' ')
+        .nth(1)
+        .and_then(|target| target.split('?').next())
+        .unwrap_or_default()
+        .to_owned();
+    heads.lock().expect("lock").push(head);
+    // A write fails once the client has hung up, which is how an endless
+    // body ends, so the results are dropped.
+    match routes.get(path.as_str()) {
+        Some(Canned::Bytes(bytes)) => {
+            let _ = stream.write_all(bytes).await;
+        }
+        Some(Canned::Endless) => {
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n")
+                .await;
+            let zeros = [0_u8; 64 * 1024];
+            let mut sent = 0;
+            while sent < ENDLESS_LIMIT && stream.write_all(&zeros).await.is_ok() {
+                sent += zeros.len();
+            }
+        }
+        None => {
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await;
+        }
+    }
+    let _ = stream.shutdown().await;
 }
 
 /// A word the tests plant in a stranger's text, where serde_json's own
