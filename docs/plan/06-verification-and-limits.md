@@ -48,7 +48,7 @@ Read from the `production` branch of `pubky/pubky-stack`, whose deployment workf
 | Write paths and quota | per identity, from its signup token. SMS, Google and Lightning tokens: the 1024 MB default, any path. Free IP-verification tokens (what Bitkit creates): 2 MB, writable only under `/pub/paykit/` and `/pub/bitkit.to/` | Those identities cannot use Sweepky. `login`'s first key write returns 403 and the CLI says so; no endpoint lets a client read its own quota or paths |
 | Write rate | 1 MB/s sustained, 20 MB burst, per signed-in user; throttles instead of rejecting | None |
 | Grant sign-in and refresh (`POST /auth/grant/session`) | no request limit; a bearer lasts 1 h and the SDK re-mints it lazily | None. The 20/min rule is on the deprecated cookie `POST /session`, which Sweepky never uses |
-| `/events/` reads | 3/s per IP, burst 10 | None for one poll per 30–60 s; the one-off cursor search stays inside the burst |
+| `/events/` reads | 3/s per IP, burst 10 | None for one poll per 30–60 s. The one-off cursor search is about 2 × log2(head) requests, around 50 for event ids near 10^7, more than the burst, so it is paced: 5 at once, then one every 350 ms, about 15 s in all. A 429 stops it |
 | `/events-stream` | 1/s per IP, burst 5 | Used once per open bounty to read the starting cursor |
 | Deletes under `/pub/` | 5/s per path owner, burst 50 | None |
 | Storage backend | Google Cloud Storage; a throttled write returns 429 with `Retry-After` | Retry on 429; never rewrite one path in a tight loop |

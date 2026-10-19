@@ -12,7 +12,9 @@
 //! records for it, a [`FakeKeyStore`] in place of a homeserver's `keys/`, a
 //! [`FakeOwnStorage`] in place of the signed-in user's own storage, a
 //! [`FakePublicRecords`] in place of everyone's public storage and its
-//! listings, a [`LocalHttp`] server on the loopback address for the
+//! listings, a [`FakeEventsFeed`] in place of a homeserver's events feed and
+//! stream, with [`feed_page`], an honest feed's page as a homeserver writes
+//! it, a [`LocalHttp`] server on the loopback address for the
 //! requests Sweepky sends itself, and the synthetic bounty, circle and
 //! sweep records the tests
 //! put there, with the snapshot `run` keeps of a sweep's fetch, the
@@ -40,13 +42,14 @@ use pubky::{Keypair, PubkyHttpClient, PublicKey, StatusCode};
 use serde_json::{Value, json};
 use sweepky_core::paths::{self, SweepkyPath};
 use sweepky_core::{
-    Bounty, BountyRef, DeviceId, GitSha, KnownTarget, Pubky, RecordId, RepoName, SweepRef,
-    TargetId, Timestamp, Zeroizing,
+    Bounty, BountyRef, DeviceId, EventCursor, GitSha, KnownTarget, Pubky, RecordId, RepoName,
+    SweepRef, TargetId, Timestamp, Zeroizing,
 };
 use tempfile::TempDir;
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::device::{KeyIds, KeyStore, PublicKeys};
+use crate::events::EventsFeed;
 use crate::git::{AllowedProtocols, GitCommand, GitFailed, RunGit, git_argv};
 use crate::own_storage::OwnStorage;
 use crate::records::PublicRecords;
@@ -748,6 +751,104 @@ impl PublicRecords for FakePublicRecords {
             .file(sweep.sweeper, &paths::sweep_package(sweep.id))
             .map(|bytes| Zeroizing::new(bytes.clone())))
     }
+}
+
+/// What a [`FakeEventsFeed`] answers a page request with: the body for the
+/// cursor and the limit asked, or an error. `Box<dyn Fn ..>` is "any
+/// function of this shape", chosen by each test, closures that capture
+/// their own data included.
+type FeedAnswer = Box<dyn Fn(EventCursor, u16) -> anyhow::Result<Vec<u8>>>;
+
+/// An [`EventsFeed`] in memory, in place of a homeserver's `/events/` and
+/// `/events-stream`: each page is what its function answers for the cursor
+/// and the limit asked, whatever the homeserver, and every stream answer is
+/// the same body. It keeps the cursor and the limit of every page request,
+/// in order. The parse and the checks are `EventsFeed`'s provided methods',
+/// so they run on these bodies as on a homeserver's; the caps are the real
+/// reader's. The `Mutex` is there for the same reason as in
+/// [`FakeKeyStore`].
+pub(crate) struct FakeEventsFeed {
+    pages: FeedAnswer,
+    stream: Vec<u8>,
+    asked: Mutex<Vec<(EventCursor, u16)>>,
+}
+
+impl FakeEventsFeed {
+    /// A feed whose pages `answer` gives, and whose stream answer is empty.
+    // `'static`: the boxed function may outlive this call, so whatever it
+    // captures must be owned (`move`d in), not borrowed.
+    pub(crate) fn answering(
+        answer: impl Fn(EventCursor, u16) -> anyhow::Result<Vec<u8>> + 'static,
+    ) -> Self {
+        Self {
+            pages: Box::new(answer),
+            stream: Vec::new(),
+            asked: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// An honest feed of public events with the ids `ids`, in increasing
+    /// order: each page as [`feed_page`] writes it.
+    pub(crate) fn of_ids(ids: &[u64]) -> Self {
+        let ids = ids.to_vec();
+        Self::answering(move |cursor, limit| Ok(feed_page(&ids, cursor, limit)))
+    }
+
+    /// The same fake, answering every stream request with `body`.
+    pub(crate) fn with_stream(mut self, body: &[u8]) -> Self {
+        self.stream = body.to_vec();
+        self
+    }
+
+    /// The cursor and the limit of every page request so far, in order.
+    pub(crate) fn asked(&self) -> Vec<(EventCursor, u16)> {
+        self.asked.lock().expect("lock").clone()
+    }
+}
+
+impl EventsFeed for FakeEventsFeed {
+    async fn feed_body(
+        &self,
+        _homeserver: Pubky,
+        cursor: EventCursor,
+        limit: u16,
+    ) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+        self.asked.lock().expect("lock").push((cursor, limit));
+        (self.pages)(cursor, limit).map(Zeroizing::new)
+    }
+
+    async fn stream_body(
+        &self,
+        _homeserver: Pubky,
+        _owner: Pubky,
+        _path: &SweepkyPath,
+    ) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+        Ok(Zeroizing::new(self.stream.clone()))
+    }
+}
+
+/// One page of an honest feed of public events with the ids `ids`, in
+/// increasing order, as `format_events_feed` in pubky-homeserver 0.16.2
+/// writes it: a `PUT` line for each of the first `limit` events after
+/// `cursor`, then `cursor: <the last one's id>`, joined with `\n`; the empty
+/// body when no event comes after `cursor`.
+pub(crate) fn feed_page(ids: &[u64], cursor: EventCursor, limit: u16) -> Vec<u8> {
+    let user = Pubky::from_bytes([7; 32]);
+    let after: Vec<u64> = ids
+        .iter()
+        .copied()
+        .filter(|&id| id > cursor.id())
+        .take(usize::from(limit))
+        .collect();
+    let Some(last) = after.last() else {
+        return Vec::new();
+    };
+    let mut lines: Vec<String> = after
+        .iter()
+        .map(|id| format!("PUT pubky://{user}/pub/example.app/{id}.json"))
+        .collect();
+    lines.push(format!("cursor: {last}"));
+    lines.join("\n").into_bytes()
 }
 
 /// What a [`LocalHttp`] server answers a path with.

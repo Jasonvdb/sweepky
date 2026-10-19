@@ -214,7 +214,7 @@ pub(crate) fn request_error(error: &pubky::Error) -> anyhow::Error {
 /// A homeserver's non-2xx answer as "the homeserver answered 500 Internal
 /// Server Error": the status and the `http` crate's standard reason for it,
 /// never the server's own words.
-fn status_error(status: StatusCode) -> anyhow::Error {
+pub(crate) fn status_error(status: StatusCode) -> anyhow::Error {
     anyhow!("the homeserver answered {status}")
 }
 
@@ -630,8 +630,10 @@ pub(crate) const MAX_LISTING_LINE_BYTES: usize = 4096;
 
 /// The most entries a homeserver sends on one listing page, whatever
 /// `limit=` asks for: 1000 (`DEFAULT_MAX_LIST_LIMIT` in pubky-homeserver
-/// 0.16.2's `constants.rs`).
-const MAX_PAGE_SIZE: u16 = 1000;
+/// 0.16.2's `constants.rs`). Its `/events/` feed caps a page at the same
+/// number (`effective_list_limit`, which both share), so `events` asks for
+/// at most this many events a page too.
+pub(crate) const MAX_PAGE_SIZE: u16 = 1000;
 
 /// How much of a directory [`list_dir`] reads. P2a's choice; 01 sets none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1166,7 +1168,7 @@ async fn fetch_public(
 
 /// What a request that ended at another URL than the one it was sent to is
 /// refused with. Fixed text: neither URL, which a server chose.
-const REDIRECTED: &str =
+pub(crate) const REDIRECTED: &str =
     "the server answered through a redirect, which Sweepky refuses: nothing in the answer was used";
 
 /// What [`Answer::into_body`] refuses a 304 with: only a `GET` that sent a

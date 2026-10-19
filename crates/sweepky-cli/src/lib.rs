@@ -194,6 +194,17 @@
 //!   own `discovered.json`, the strangers' sweeps accepted and the
 //!   deletions confirmed. Both are capped, owner-only and keep the fields a
 //!   newer Sweepky adds.
+//! - `events` (P2c), the seam `post --open` and `pull` read a homeserver's
+//!   public events through, with no session: one page of its `/events/`
+//!   feed, capped and parsed by core, a page with more events than were
+//!   asked for refused; and the id of the owner's latest event of one file
+//!   from its non-live `/events-stream`, which must be a PUT of exactly that
+//!   file. The real one asks each homeserver by its key through the SDK's
+//!   HTTP client and `remote`'s unredirected `GET`, and the unit tests use a
+//!   fake. With it, `find_head`, the search for a watched homeserver's last
+//!   public event, an open bounty's starting cursor there: exponential, then
+//!   binary, with `limit=1`, bounded in its requests, never past cursor
+//!   2^62, paced for production's rate limit and stopped by a 429.
 //!
 //! The rules that hold for everything here (see "Rust conventions" in
 //! `docs/plan/03-cli-and-skill.md`):
@@ -246,6 +257,20 @@ mod clock;
 // records are read and written through.
 mod device;
 mod dirs;
+// A homeserver's public events: one `/events/` page, the owner's latest
+// event of a file from `/events-stream`, and the search for where a feed
+// ends. `post --open` and `pull`, its first users, come in later steps, so
+// outside the tests nothing uses the module yet and the compiler would warn
+// of dead code. `expect` (not `allow`) silences that only while it is true:
+// the step that wires the first of them in must remove it.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "post --open and pull, its first users, come in later steps"
+    )
+)]
+mod events;
 // The one way `post` and `run` run git: hardened, bounded and timed.
 mod git;
 // The identity name, secret file, details file and refusal rules of
