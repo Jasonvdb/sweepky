@@ -1,5 +1,6 @@
 //! `sweepky submit`, the terminal command the human runs after the agent:
-//! so far its first half, the one that reads the sweep directory.
+//! so far the half that reads the sweep directory, and the check of the
+//! bounty owner's keys.
 //!
 //! The agent wrote that directory after reading untrusted code, so
 //! [`collect_sweep`] treats it as hostile (02, "`submit` trusts nothing in
@@ -16,16 +17,26 @@
 //!   on entries, depth and sizes, and reads `audit/`'s files into
 //!   `SweepFile`s, the list `SweepPackage::build` takes.
 //!
+//! The owner's `keys/` were written by whoever can write there, so
+//! `owner_keys` takes from them only the unrevoked records core's
+//! `DeviceKey::encryption_recipient` accepts, within caps, and compares
+//! that set with the one `owner-keys.json` pins for the owner: first use
+//! pins it silently, and a new key is warned of by its device id and asked
+//! about (or, under `--no-input`, refused).
+//!
 //! What follows in P2b's next step, the command itself: the sweep record
-//! and the bounty, the package, the owner's keys, the encryption, the
-//! upload and the `done` flip, and the `.sweepky/submitted` stamp that
-//! picking reads.
+//! and the bounty, the package, the encryption, the upload and the `done`
+//! flip, the pin written under the writers' lock, and the
+//! `.sweepky/submitted` stamp that picking reads.
 
-// Until the command calls `collect_sweep`, nothing outside the tests does.
-// `expect` (not `allow`) silences the dead-code warning only while it is
-// true, so the command's step must remove it; `cfg_attr(not(test), …)`
-// applies it to the normal build only, because the tests below do call
-// everything.
+// Until the command calls `collect_sweep` and `accept_owner_keys`, nothing
+// outside the tests does. `expect` (not `allow`) silences the dead-code
+// warning only while it is true, so the command's step must remove it;
+// `cfg_attr(not(test), …)` applies it to the normal build only, because the
+// tests below do call everything. It covers `crate::pins` too: rustc counts
+// an item whose dead-code lint is expected as used, and so everything it
+// calls, so `pins` needs no expectation of its own (one there would go
+// unmet, a warning of its own).
 #![cfg_attr(
     not(test),
     expect(
@@ -34,6 +45,7 @@
     )
 )]
 
+mod owner_keys;
 mod sweep_dir;
 mod walk;
 

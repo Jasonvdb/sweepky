@@ -325,6 +325,10 @@ pub(crate) fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
 /// own words, which a test checks never reach a message.
 pub(crate) const FAKE_SERVER_TEXT: &str = "fake homeserver: tenant quota and path policy say no";
 
+/// What a [`FakeKeyStore`] fails a read with, in the fixed words a failed
+/// request gets from `remote`.
+pub(crate) const FAKE_READ_FAILURE: &str = "the homeserver answered 500 Internal Server Error";
+
 /// One call a [`FakeKeyStore`] was asked to make, with what it was asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum KeyStoreCall {
@@ -342,7 +346,8 @@ pub(crate) enum KeyStoreCall {
 /// A [`KeyStore`] (and so a [`PublicKeys`]) in memory, in place of a
 /// homeserver: one owner's `keys/` records by device id, every call it was
 /// asked to make, in order, and, if set, the status it refuses every write
-/// with. Its listing holds every record's id, in id order, and skips none.
+/// with. Its listing holds every record's id, and every id it was told to
+/// list without a record, in id order, and skips none.
 ///
 /// The methods take `&self`, as the trait's do, yet the fake has to change
 /// what it holds. A `Mutex` gives that "interior mutability": it hands out
@@ -350,6 +355,10 @@ pub(crate) enum KeyStoreCall {
 #[derive(Default)]
 pub(crate) struct FakeKeyStore {
     records: Mutex<BTreeMap<DeviceId, Vec<u8>>>,
+    /// Ids the listing names although no record is behind them.
+    listed_only: Mutex<BTreeSet<DeviceId>>,
+    /// Ids whose public read fails, as a request to a homeserver can.
+    failing_reads: Mutex<BTreeSet<DeviceId>>,
     calls: Mutex<Vec<KeyStoreCall>>,
     refuse_puts_with: Option<StatusCode>,
 }
@@ -390,6 +399,19 @@ impl FakeKeyStore {
         self.records.lock().expect("lock").remove(id);
     }
 
+    /// Lists `id` with no record behind it, as a record deleted between
+    /// the listing and its read is. Not logged either.
+    pub(crate) fn list_without_record(&self, id: &DeviceId) {
+        self.listed_only.lock().expect("lock").insert(id.clone());
+    }
+
+    /// Fails every public read of `keys/<id>.json` with
+    /// [`FAKE_READ_FAILURE`], as a request to a homeserver can fail. Not
+    /// logged either.
+    pub(crate) fn fail_reads_of(&self, id: &DeviceId) {
+        self.failing_reads.lock().expect("lock").insert(id.clone());
+    }
+
     fn log(&self, call: KeyStoreCall) {
         self.calls.lock().expect("lock").push(call);
     }
@@ -399,8 +421,11 @@ impl PublicKeys for FakeKeyStore {
     async fn list_key_ids(&self, owner: &PublicKey) -> anyhow::Result<KeyIds> {
         self.log(KeyStoreCall::ListKeyIds(owner.clone()));
         let records = self.records.lock().expect("lock");
+        let listed_only = self.listed_only.lock().expect("lock");
+        // Collected into a set first, so the ids come out in order, once.
+        let ids: BTreeSet<DeviceId> = records.keys().chain(listed_only.iter()).cloned().collect();
         Ok(KeyIds {
-            ids: records.keys().cloned().collect(),
+            ids: ids.into_iter().collect(),
             skipped: 0,
         })
     }
@@ -411,6 +436,9 @@ impl PublicKeys for FakeKeyStore {
         id: &DeviceId,
     ) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
         self.log(KeyStoreCall::GetKey(id.clone()));
+        if self.failing_reads.lock().expect("lock").contains(id) {
+            anyhow::bail!(FAKE_READ_FAILURE);
+        }
         Ok(self.record(id).map(Zeroizing::new))
     }
 }

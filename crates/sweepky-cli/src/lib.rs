@@ -68,6 +68,9 @@
 //! - `installs`, `installs.json`: per owner, the device ids this owner's
 //!   installs created here, which `login`, `keys list` and `pull` compare
 //!   `keys/` against, and the alarm for an id it does not hold.
+//! - `pins`, `owner-keys.json`: per bounty owner, the device keys `submit`
+//!   last encrypted a sweep to, each id with its key, which `submit`
+//!   compares that owner's `keys/` with the next time.
 //! - `keys list` and `keys revoke <deviceId>` (`keys`): the identity's
 //!   published device keys, read from public storage with no session, each
 //!   unknown id alarmed on, each key this build cannot encrypt to flagged by
@@ -238,6 +241,9 @@ mod own_storage;
 // `--passphrase-file` and the one way every secret file is written and read,
 // wrapped with that passphrase or plain.
 mod passphrase;
+// `owner-keys.json`: the keys of each bounty owner `submit` last encrypted
+// a sweep to, pinned so a key added later is noticed.
+mod pins;
 // `post`: the bounty draft, checked and pinned into a bounty, shown, and
 // published once the owner says yes.
 mod post;
@@ -259,7 +265,8 @@ mod remote;
 // the sweep aborted.
 mod run;
 // `submit`: the sweep directory found and checked, and walked without
-// following a link, `audit/`'s files read within caps.
+// following a link, `audit/`'s files read within caps; the bounty owner's
+// keys read and checked against their pin.
 mod submit;
 // The per-command session: the writers' lock, a fresh sign-in and a sign-out
 // that is always attempted. `login` holds its lock; `keys revoke` is the

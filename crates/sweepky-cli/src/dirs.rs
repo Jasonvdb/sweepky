@@ -14,6 +14,7 @@
 //! | `credential.lock` | the writers' lock |
 //! | `login.json` | which login this install uses |
 //! | `installs.json` | the device ids this owner's own installs created |
+//! | `owner-keys.json` | per bounty owner, the keys `submit` last encrypted a sweep to, pinned (`crate::pins`) |
 //! | `device.key` | this install's age identity |
 //! | `identities/<name>.key` | a dedicated identity's secret (`login --identity`) |
 //! | `identities/<name>.json` | that identity's public details |
@@ -24,9 +25,8 @@
 //! |---|---|
 //! | `git-home-<id>/` | git's `HOME` while one command (`post`, `run`) runs it: new, empty and 0700, removed when the command ends (`crate::git`) |
 //!
-//! Pinned owner keys (P2b) and the data directory's other subtrees (P2c)
-//! come later. Every file here is written with [`crate::private_fs`]:
-//! directories 0700, files 0600.
+//! The data directory's other subtrees (P2c) come later. Every file here
+//! is written with [`crate::private_fs`]: directories 0700, files 0600.
 //!
 //! **`XDG_CONFIG_HOME` and `XDG_DATA_HOME` are ignored, on purpose.** The
 //! sandbox template `init` writes into a sweeper project denies reads of
@@ -127,6 +127,13 @@ impl Dirs {
     /// created, which `keys list` and `pull` compare `keys/` against.
     pub fn installs_file(&self) -> PathBuf {
         self.config.join("installs.json")
+    }
+
+    /// `config/owner-keys.json`: per bounty owner, the device keys `submit`
+    /// last encrypted a sweep to, which it compares that owner's `keys/`
+    /// with the next time.
+    pub(crate) fn owner_keys_file(&self) -> PathBuf {
+        self.config.join("owner-keys.json")
     }
 
     /// `config/device.key`: this install's age identity.
@@ -239,6 +246,10 @@ mod tests {
         assert_eq!(dirs.login_file(), Path::new("/x/config/login.json"));
         assert_eq!(dirs.installs_file(), Path::new("/x/config/installs.json"));
         assert_eq!(dirs.device_key_file(), Path::new("/x/config/device.key"));
+        assert_eq!(
+            dirs.owner_keys_file(),
+            Path::new("/x/config/owner-keys.json")
+        );
         assert_eq!(dirs.identities_dir(), Path::new("/x/config/identities"));
         assert_eq!(
             dirs.identity_key_file(&name),
