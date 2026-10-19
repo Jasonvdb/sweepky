@@ -54,7 +54,7 @@ use crate::device::{KeyIds, KeyStore, PublicKeys};
 use crate::events::EventsFeed;
 use crate::git::{AllowedProtocols, GitCommand, GitFailed, RunGit, git_argv};
 use crate::own_storage::OwnStorage;
-use crate::pull::resolve::ResolveHomeserver;
+use crate::pull::resolve::{ResolveHomeserver, Unreachable};
 use crate::records::PublicRecords;
 use crate::remote::{Conditional, ETag, ListOrder, Listing, ListingError};
 use crate::sweep_state::SweepSnapshot;
@@ -1294,7 +1294,7 @@ pub(crate) enum FakeLookup {
     At(Pubky),
     /// The key has no pkarr record, or one that names no homeserver.
     NoRecord,
-    /// The lookup fails, with [`FAKE_LOOKUP_TEXT`].
+    /// The lookup fails.
     Fails,
 }
 
@@ -1329,7 +1329,7 @@ impl FakeHomeservers {
 }
 
 impl ResolveHomeserver for FakeHomeservers {
-    async fn homeserver_of(&self, user: Pubky) -> anyhow::Result<Option<Pubky>> {
+    async fn homeserver_of(&self, user: Pubky) -> Result<Pubky, Unreachable> {
         let earlier = self.times_asked(user);
         self.asked.lock().expect("lock").push(user);
         let answer = match self.answers.get(&user) {
@@ -1341,9 +1341,9 @@ impl ResolveHomeserver for FakeHomeservers {
                 .expect("at least one answer"),
         };
         match answer {
-            FakeLookup::At(homeserver) => Ok(Some(homeserver)),
-            FakeLookup::NoRecord => Ok(None),
-            FakeLookup::Fails => Err(anyhow::anyhow!(FAKE_LOOKUP_TEXT)),
+            FakeLookup::At(homeserver) => Ok(homeserver),
+            FakeLookup::NoRecord => Err(Unreachable::NoHomeserver),
+            FakeLookup::Fails => Err(Unreachable::LookupFailed),
         }
     }
 }

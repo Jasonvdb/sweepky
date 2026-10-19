@@ -6,7 +6,9 @@
 //! (`git::Remote`), and it refuses a host with any address on a loopback,
 //! private, link-local or otherwise reserved range. [`check_host`] is that
 //! check on its own, which GitHub's API host goes through too before the
-//! real source asks it about a pull request.
+//! real source asks it about a pull request, and so do the domains a
+//! homeserver's pkarr record names, before `pull` reads the storage of a key
+//! on it (`pull::resolve`), whose addresses go through [`is_public`] too.
 //!
 //! - [`is_public`], the pure address classifier.
 //! - [`ResolveHost`], the seam the lookup goes through: [`SystemResolver`]
