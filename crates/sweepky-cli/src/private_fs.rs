@@ -18,9 +18,10 @@
 //!   points at, or `None` when nothing is.
 //! - [`open_private_lock_file`] opens the writers' lock file, creating it
 //!   empty and 0600, and never replaces or truncates it.
-//! - [`temp_path_beside`], [`write_synced`] and [`open_seen_file`] are steps
-//!   the functions above are built from. `init` uses them too, for the files
-//!   it writes into a project, which are not private.
+//! - [`temp_path_beside`], [`write_synced`], [`open_seen_file`] and
+//!   [`sync_parent`] are steps the functions above are built from. `init`
+//!   uses them too, for the files it writes into a project, which are not
+//!   private.
 //!
 //! The rules, and why:
 //!
@@ -195,7 +196,7 @@ fn replace_with(temp: &Path, target: &Path, bytes: &[u8]) -> anyhow::Result<()> 
 /// rather than followed. [`open_seen_file`] then checks the open handle is
 /// that very directory (device and inode), as every read here does, since
 /// `open` itself would follow a link.
-fn sync_parent(path: &Path) -> anyhow::Result<()> {
+pub(crate) fn sync_parent(path: &Path) -> anyhow::Result<()> {
     let dir = parent_dir(path)?;
     let Some(seen) = lstat(dir)? else {
         bail!(

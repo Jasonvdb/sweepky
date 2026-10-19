@@ -15,20 +15,21 @@
 //!   open fails if anything at all is at that path, a symlink included (even
 //!   one that points nowhere), so it can neither follow a link nor truncate a
 //!   file. Once the bytes are on disk, a hard link gives the temp file its
-//!   real name, which fails in the same way if anything is there, and the
-//!   temp name is removed. A failure at any step removes the temp file, so
-//!   the real name never shows an empty or half-written file.
+//!   real name, which fails in the same way if anything is there, the
+//!   directory is synced so that name is on disk too, and the temp name is
+//!   removed. A failure at any step removes the temp file, so the real name
+//!   never shows an empty or half-written file.
 //! - An existing `.gitignore` is only ever appended to, and only when it is a
 //!   regular file; a symlink is refused, because appending through one would
 //!   write into whatever file it points at. It is not appended to when it has
 //!   other hard links either, which share its contents.
-//! - The marker is written last, so its presence means a finished `init`. A
-//!   second run reads it and changes nothing when it is a marker this build
-//!   reads; any other file at that name is refused, never taken for a
-//!   finished `init`.
+//! - The marker is written last, once everything before it is on disk, so
+//!   its presence means a finished `init`. A second run reads it and changes
+//!   nothing when it is a marker this build reads; any other file at that
+//!   name is refused, never taken for a finished `init`.
 
 use std::fs::{self, Metadata, OpenOptions};
-use std::io::{ErrorKind, Read, Write};
+use std::io::{ErrorKind, Write};
 // `MetadataExt` is a Unix-only extension trait that adds `nlink()` to
 // `fs::Metadata`. A trait's methods are callable only while the trait is in
 // scope, hence the `use`.
@@ -41,8 +42,11 @@ use sweepky_core::{RecordError, SchemaVersion, UnknownFields};
 
 use crate::Report;
 // File steps shared with the secret files' writer: the temp name, the synced
-// write, the open that checks it got the file it inspected, the capped read.
-use crate::private_fs::{open_seen_file, read_up_to_cap, temp_path_beside, write_synced};
+// write, the open that checks it got the file it inspected, the capped read
+// and the directory sync.
+use crate::private_fs::{
+    open_seen_file, read_up_to_cap, sync_parent, temp_path_beside, write_synced,
+};
 
 /// The project marker's file name, directly inside the project directory.
 pub(crate) const MARKER: &str = ".sweepky";
@@ -75,6 +79,13 @@ struct ProjectMarker {
 /// huge file someone left at that name into memory.
 const MAX_MARKER_BYTES: usize = 64 * 1024;
 
+/// The most bytes an existing `.gitignore` may have for init to edit it:
+/// 1 MiB. Init only needs to know whether a line reads `sweeps/` and whether
+/// the file ends in a newline; a `.gitignore` larger than this is not one
+/// init should edit, and the cap keeps an untrusted checkout's huge (or
+/// sparse) file from being read into memory whole.
+const MAX_GITIGNORE_BYTES: usize = 1024 * 1024;
+
 /// Runs `sweepky init <dir>`.
 pub(crate) fn init(dir: &Path) -> anyhow::Result<Report> {
     // Like `mkdir -p`: creates every missing parent, and succeeds if the
@@ -89,6 +100,7 @@ pub(crate) fn init(dir: &Path) -> anyhow::Result<Report> {
         )));
     }
 
+    refuse_symlinked_project_dir(&marker)?;
     let gitignore = ensure_gitignore(&dir.join(GITIGNORE))?;
     write_new(&marker, &marker_bytes()?)?;
 
@@ -97,6 +109,32 @@ pub(crate) fn init(dir: &Path) -> anyhow::Result<Report> {
         dir.display(),
         gitignore.describe()
     )))
+}
+
+/// Refuses a project directory that is a symbolic link, before anything is
+/// written. Each new file's name is synced to disk through its directory
+/// ([`create_with`]), and [`sync_parent`] refuses a directory that is a link
+/// rather than follow it, so without this check that refusal would come only
+/// once `.gitignore` was already written.
+///
+/// It looks at `marker`'s parent, which is the directory exactly as
+/// `sync_parent` will name it: `dir` as typed may end in `/`, and `lstat`
+/// follows a link written that way.
+fn refuse_symlinked_project_dir(marker: &Path) -> anyhow::Result<()> {
+    // `let ... else` binds the parent or leaves the function; a marker path
+    // always has one, so the `else` is only there because `parent` returns
+    // an `Option`.
+    let Some(dir) = marker.parent() else {
+        return Ok(());
+    };
+    if let Existing::Symlink = existing(dir)? {
+        bail!(
+            "{} is a symbolic link; init writes only into a real directory, whose entries it can \
+             sync to disk. Run init on the directory the link points to",
+            dir.display()
+        );
+    }
+    Ok(())
 }
 
 /// Whether a finished `init` already left its marker at `marker`. A regular
@@ -261,10 +299,19 @@ fn append_sweeps_line(path: &Path, seen: &Metadata) -> anyhow::Result<GitignoreC
         open_seen_file(path, seen, OpenOptions::new().read(true).append(true))?;
 
     // Bytes, not a `String`: a `.gitignore` need not be UTF-8, and its other
-    // lines are left exactly as they are.
-    let mut contents = Vec::new();
-    file.read_to_end(&mut contents)
+    // lines are left exactly as they are. As for the marker, one byte past
+    // the cap is enough to tell the file is too long without reading a huge
+    // one.
+    let contents = read_up_to_cap(&mut file, MAX_GITIGNORE_BYTES + 1)
         .with_context(|| format!("could not read {}", path.display()))?;
+    if contents.len() > MAX_GITIGNORE_BYTES {
+        bail!(
+            "{} is larger than the {MAX_GITIGNORE_BYTES} bytes init will edit, so init changed \
+             nothing. Add a line reading `sweeps/` to it yourself; init finishes only once the \
+             file is under that size",
+            path.display()
+        );
+    }
     if has_sweeps_line(&contents) {
         return Ok(GitignoreChange::AlreadyListed);
     }
@@ -281,6 +328,10 @@ fn append_sweeps_line(path: &Path, seen: &Metadata) -> anyhow::Result<GitignoreC
 
     file.write_all(&sweeps_line_after(&contents))
         .with_context(|| format!("could not append to {}", path.display()))?;
+    // Wait until the appended line is on disk, as `write_synced` does for a
+    // new file, before the marker that says init finished is written.
+    file.sync_all()
+        .with_context(|| format!("could not save {} to disk", path.display()))?;
     Ok(GitignoreChange::Appended)
 }
 
@@ -334,27 +385,36 @@ fn write_new(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
 ///   never writes through a link, and `path` appears only once the file is
 ///   whole. `rename` is one step too, but it would replace whatever is at
 ///   `path`.
+/// - [`sync_parent`] then syncs the directory, because the file's own sync
+///   makes its bytes durable but not the new name. So when this returns, the
+///   file survives a crash under its name: init creates `.gitignore` (or
+///   syncs its append) before the marker, and reports success only once the
+///   marker's name is on disk. A failed sync is an error, with `path` already
+///   in place, as after a rename in `private_fs`.
 ///
 /// The name `temp` is removed whether the link worked or not, so a failure
-/// leaves the directory as it was. A filesystem without hard links, such as
-/// FAT, fails at the link, and nothing is created.
+/// before the link leaves the directory as it was. A filesystem without hard
+/// links, such as FAT, fails at the link, and nothing is created.
 fn create_with(temp: &Path, path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let file = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(temp)
         .with_context(|| format!("could not create {}", temp.display()))?;
-    // `and_then` runs the link only when the write worked, so `linked` holds
-    // the first error, if any.
-    let linked = write_synced(temp, file, bytes).and_then(|()| {
-        fs::hard_link(temp, path).with_context(|| format!("could not create {}", path.display()))
-    });
+    // Each `and_then` runs only when the step before it worked, so `linked`
+    // holds the first error, if any.
+    let linked = write_synced(temp, file, bytes)
+        .and_then(|()| {
+            fs::hard_link(temp, path)
+                .with_context(|| format!("could not create {}", path.display()))
+        })
+        .and_then(|()| sync_parent(path));
     // From the link on, `path` keeps the file by itself.
     let removed =
         fs::remove_file(temp).with_context(|| format!("could not remove {}", temp.display()));
-    // `and` keeps the first error: the write's or the link's when one failed
-    // (a failed removal then goes unreported, as in `private_fs`), otherwise
-    // the removal's, which names the stray file.
+    // `and` keeps the first error: the write's, the link's or the sync's when
+    // one failed (a failed removal then goes unreported, as in `private_fs`),
+    // otherwise the removal's, which names the stray file.
     linked.and(removed)
 }
 
@@ -367,7 +427,7 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{GITIGNORE, MARKER, create_with, init, write_new};
+    use super::{GITIGNORE, MARKER, MAX_GITIGNORE_BYTES, create_with, init, write_new};
 
     /// A new, empty directory `name` inside `temp`.
     fn project_dir(temp: &TempDir, name: &str) -> PathBuf {
@@ -435,6 +495,24 @@ mod tests {
         assert_eq!(entries(&dir), names(&[MARKER]));
         let meta = fs::symlink_metadata(dir.join(MARKER)).expect("lstat");
         assert_eq!(meta.nlink(), 1);
+    }
+
+    #[test]
+    fn a_new_name_is_never_synced_through_a_linked_directory() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let real = project_dir(&temp, "real");
+        let link = temp.path().join("link");
+        symlink(&real, &link).expect("symlink");
+
+        // The link step works through the linked directory, but the sync of
+        // the directory that holds the new name refuses the link rather than
+        // follow it. That is an error with the file already in place and the
+        // temp name gone, as for a failed sync after a rename in `private_fs`.
+        let err = create_with(&link.join("marker.tmp"), &link.join(MARKER), b"linked\n")
+            .expect_err("the sync refuses a linked directory");
+        assert!(format!("{err:#}").contains("symbolic link"), "{err:#}");
+        assert_eq!(fs::read(real.join(MARKER)).expect("read"), b"linked\n");
+        assert_eq!(entries(&real), names(&[MARKER]));
     }
 
     #[test]
@@ -509,6 +587,36 @@ mod tests {
             fs::read_to_string(dir.join(GITIGNORE)).expect("read"),
             "sweeps/\n"
         );
+    }
+
+    #[test]
+    fn init_edits_an_existing_gitignore_only_up_to_the_cap() {
+        let temp = tempfile::tempdir().expect("temp dir");
+
+        // A file exactly at the cap is read whole and gets the line.
+        let dir = project_dir(&temp, "at-cap");
+        let at_cap = vec![b'#'; MAX_GITIGNORE_BYTES];
+        fs::write(dir.join(GITIGNORE), &at_cap).expect("write");
+        init(&dir).expect("init succeeds");
+        let after = fs::read(dir.join(GITIGNORE)).expect("read");
+        assert_eq!(after, [at_cap.as_slice(), b"\nsweeps/\n"].concat());
+        assert_eq!(entries(&dir), names(&[MARKER, GITIGNORE]));
+
+        // One byte more is refused with a message that names the file and the
+        // line to add by hand; the file is left byte for byte as it was, and
+        // no marker is written.
+        let dir = project_dir(&temp, "over-cap");
+        let over_cap = vec![b'#'; MAX_GITIGNORE_BYTES + 1];
+        fs::write(dir.join(GITIGNORE), &over_cap).expect("write");
+        let err = init(&dir).expect_err("a file over the cap is refused");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains(&dir.join(GITIGNORE).display().to_string()),
+            "{message}"
+        );
+        assert!(message.contains("`sweeps/`"), "{message}");
+        assert_eq!(fs::read(dir.join(GITIGNORE)).expect("read"), over_cap);
+        assert_eq!(entries(&dir), names(&[GITIGNORE]));
     }
 
     #[test]
@@ -590,6 +698,26 @@ mod tests {
         init(&dir).expect("init succeeds");
         assert_eq!(fs::read_to_string(&listed).expect("read"), "sweeps/\n");
         assert_eq!(entries(&dir), names(&[MARKER, GITIGNORE]));
+    }
+
+    #[test]
+    fn init_refuses_a_project_directory_that_is_a_symlink() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let real = project_dir(&temp, "real");
+        let link = temp.path().join("link");
+        symlink(&real, &link).expect("symlink");
+
+        // Each new name is synced through the directory that holds it, which
+        // must not be a link, so a linked project directory is refused before
+        // anything is written. Spelled with a trailing `/` too, a form whose
+        // `lstat` would follow the link.
+        let mut with_slash = link.clone().into_os_string();
+        with_slash.push("/");
+        for dir in [link, PathBuf::from(with_slash)] {
+            let err = init(&dir).expect_err("a linked directory is refused");
+            assert!(format!("{err:#}").contains("symbolic link"), "{err:#}");
+            assert!(entries(&real).is_empty(), "{}", dir.display());
+        }
     }
 
     #[test]
