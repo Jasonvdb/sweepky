@@ -286,12 +286,16 @@ async fn end_to_end() {
         device.recipient()
     );
 
-    // installs.json lists the id under this owner, and the report says to
-    // back the config directory up.
+    // installs.json lists the id under this owner, with the key it
+    // published, and the report says to back the config directory up.
+    let install_entry = json!([{
+        "deviceId": device_id,
+        "recipient": device.recipient().to_string(),
+    }]);
     assert_eq!(mode(&dirs.installs_file()), 0o600);
     assert_eq!(
         json(&dirs.installs_file())["owners"][pubky.as_str()],
-        json!([device_id])
+        install_entry
     );
     let reminder = format!("Back up {}", config.display());
     assert!(report.text().contains(&reminder), "{}", report.text());
@@ -376,7 +380,7 @@ async fn end_to_end() {
     assert_eq!(json(&dirs.login_file())["deviceId"], device_id.as_str());
     assert_eq!(
         json(&dirs.installs_file())["owners"][pubky.as_str()],
-        json!([device_id])
+        install_entry
     );
 
     // `keys list` lists this install's key, in use, and raises no alarm.
@@ -385,6 +389,34 @@ async fn end_to_end() {
     let text = report.text();
     assert!(text.contains(&own_line), "{text}");
     assert!(!text.contains("alarm"), "{text}");
+
+    // This install's own record rewritten with another valid, unrevoked
+    // key, by someone holding the identity's credentials: the id is known,
+    // so only the comparison with the key installs.json records for it
+    // tells. `keys list` raises the alarm and no longer shows the key in
+    // use, without printing either key. The original record then goes back,
+    // so the steps below find this install's key as login published it.
+    let original: Value = serde_json::from_slice(&record).expect("JSON");
+    let intruder = DeviceIdentity::generate();
+    let mut rewritten = original.clone();
+    rewritten["recipient"] = json!(intruder.recipient().to_string());
+    publish_as(&testnet, &key_file, &path, &rewritten).await;
+    let report = sweepky(&ctx, &["keys", "list"]).await.expect("keys list");
+    let text = report.text();
+    assert!(
+        text.contains(&format!(
+            "alarm: keys/{device_id}.json, this install's own device key record, does not hold \
+             this install's key"
+        )),
+        "{text}"
+    );
+    assert!(!text.contains(&own_line), "{text}");
+    for recipient in [intruder.recipient(), device.recipient()] {
+        assert!(!text.contains(&recipient.to_string()), "{text}");
+    }
+    publish_as(&testnet, &key_file, &path, &original).await;
+    let report = sweepky(&ctx, &["keys", "list"]).await.expect("keys list");
+    assert!(report.text().contains(&own_line), "{}", report.text());
 
     // A second key under the throwaway's keys/, written with the identity's
     // own root key, standing in for another install or an operator. It

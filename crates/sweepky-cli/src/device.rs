@@ -8,7 +8,9 @@
 //!   when the install was made, as every other Sweepky id does.
 //! - [`device_key_record`] is the record `login` publishes:
 //!   `{"schemaVersion":1,"alg":"age-x25519","recipient":"age1…",
-//!   "label":"sweepky-cli","createdAt":"<RFC 3339>","revokedAt":null}`.
+//!   "label":"sweepky-cli","createdAt":"<RFC 3339>","revokedAt":null}`,
+//!   and [`holds_key`] the check that a record read back still holds the
+//!   key an install published there.
 //! - [`create_device_key`] writes the secret to `device.key`, never over a
 //!   key that is already there; [`read_device_key`] reads it back and
 //!   [`remove_device_key`] deletes it.
@@ -37,9 +39,9 @@ use anyhow::{Context as _, bail};
 use pubky::{PubkySession, PublicKey};
 use sweepky_core::paths::{self, SweepkyPath};
 use sweepky_core::{
-    AgeRecipient, DeviceId, DeviceIdentity, DeviceKey, ExposeSecret, KnownKeyAlg, MAX_RECORD_BYTES,
-    MAX_WRAPPED_BYTES, RecordId, RecordTime, SchemaVersion, SecretString, Timestamp, UnknownFields,
-    Zeroizing,
+    AgeRecipient, DeviceId, DeviceIdentity, DeviceKey, DeviceKeyError, ExposeSecret, KnownKeyAlg,
+    MAX_RECORD_BYTES, MAX_WRAPPED_BYTES, RecordId, RecordTime, SchemaVersion, SecretString,
+    Timestamp, UnknownFields, Zeroizing,
 };
 
 use crate::Dirs;
@@ -102,6 +104,28 @@ pub(crate) fn device_key_record(recipient: &AgeRecipient, created_at: RecordTime
         revoked_at: None,
         extra: UnknownFields::new(),
     }
+}
+
+/// Whether `record`, a `keys/<deviceId>.json` read back, holds `expected`,
+/// the key the install with that id published there: the one comparison
+/// behind `login`'s check of this install's own record and `keys list`'s
+/// check of every record under an id this owner's installs created.
+///
+/// The record's key comes from [`DeviceKey::encryption_recipient`], the only
+/// way from a record to the key a sweeper's CLI would encrypt to. It also
+/// checks `alg`, that the key is not revoked and the recipient's strict
+/// form, and its error says which failed, in fixed text: such a record holds
+/// no key this build would use, so not the one an install of it published.
+/// `Ok(false)` is another valid key. The two are compared as
+/// [`AgeRecipient`] values, never as the record's text, so only a valid,
+/// canonical key can ever match; they are public keys, so comparing them in
+/// variable time leaks nothing.
+pub(crate) fn holds_key(
+    record: &DeviceKey,
+    expected: &AgeRecipient,
+) -> Result<bool, DeviceKeyError> {
+    // `?` returns core's error at once; `==` is `AgeRecipient`'s comparison.
+    Ok(record.encryption_recipient()? == *expected)
 }
 
 /// The record's bytes as they are published: compact JSON, `revokedAt`

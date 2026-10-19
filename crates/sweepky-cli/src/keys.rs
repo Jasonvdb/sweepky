@@ -6,7 +6,8 @@
 //! no lock ([`list`]):
 //!
 //! 1. `login.json` names the pubky this install is logged in as, and
-//!    `installs.json` the device ids this owner's installs here created.
+//!    `installs.json` the device ids this owner's installs here created,
+//!    each with the key that install published.
 //! 2. `keys/` is listed through public storage, paged and capped
 //!    (`remote::list_dir`); a name that is not a `keys/<deviceId>.json` is
 //!    skipped and counted, never fatal.
@@ -19,13 +20,21 @@
 //!    never its recipient, which is the homeserver's text.
 //! 5. An id that this owner's installs did not create raises the alarm of
 //!    02 ("Who can read a sweep"), unless its record says it is revoked
-//!    already, which is the fix the alarm asks for.
+//!    already, which is the fix the alarm asks for. So does an id they did
+//!    create whose unrevoked record no longer holds the key that install
+//!    published, as `installs.json` records it (`device::holds_key`, the
+//!    comparison `login` makes of this install's own record): someone who
+//!    can write `keys/` rewrote it. Only a record that holds this install's
+//!    recorded key is shown as `this install; in use`. An entry an earlier
+//!    build wrote records no key, so its record is shown as unverified,
+//!    with a note, and raises no alarm.
 //!
 //! [`list_keys`] does steps 2 to 5 and returns a typed [`KeyListing`]; its
 //! [`render`](KeyListing::render) is the text the binary prints, and every
 //! string a record holds (`label`, `alg`, the times) goes through
-//! `display::sanitize` on the way. [`unknown_key_alarms`] is step 5 alone,
-//! which `login` runs after it has published or reused this install's key.
+//! `display::sanitize` on the way. [`key_alarms`] is the same steps with
+//! only the alarms kept, which `login` runs after it has published or
+//! reused this install's key.
 //!
 //! **`keys revoke <deviceId>`** ([`revoke`]) checks the id, then, under the
 //! writers' lock with a session of its own that is always signed out
@@ -40,12 +49,16 @@ use std::collections::BTreeSet;
 
 use anyhow::{Context as _, bail};
 use pubky::PublicKey;
-use sweepky_core::{DeviceId, DeviceKey, DeviceKeyError, KeyAlg, Pubky, RecordTime};
+use sweepky_core::{AgeRecipient, DeviceId, DeviceKey, DeviceKeyError, KeyAlg, Pubky, RecordTime};
 
 use crate::clock;
-use crate::device::{KeyStore, PublicKeyReader, PublicKeys, SessionKeyStore, device_key_bytes};
+use crate::device::{
+    KeyStore, PublicKeyReader, PublicKeys, SessionKeyStore, device_key_bytes, holds_key,
+};
 use crate::display::{MAX_LABEL_CHARS, sanitize};
-use crate::installs::{read_installs, unknown_key_alarm, unknown_key_ids};
+use crate::installs::{
+    Install, read_installs, replaced_key_alarm, unknown_key_alarm, unknown_key_ids,
+};
 use crate::remote::{pubky_of, public_key_of, write_error};
 use crate::session::{NOT_LOGGED_IN, with_writer_session};
 use crate::state::read_login_state;
@@ -101,26 +114,53 @@ async fn read_record(keys: &impl PublicKeys, owner: &PublicKey, id: &DeviceId) -
     }
 }
 
-/// The unknown keys under `owner`'s `keys/` to alarm on: the ids
-/// [`unknown_key_ids`] finds against `created`, the ids this owner's
-/// installs created, less those whose record says it is revoked.
-///
-/// `login` runs this once it has published or reused this install's key,
-/// so that key is listed and known; P2c's `pull` is meant to run it too.
-/// Only the unknown ids' records are read.
-pub(crate) async fn unknown_key_alarms(
-    keys: &impl PublicKeys,
-    owner: &PublicKey,
-    created: &[DeviceId],
-) -> anyhow::Result<Vec<DeviceId>> {
-    let listed = keys.list_key_ids(owner).await?;
-    let mut alarms = Vec::new();
-    for id in unknown_key_ids(created, &listed.ids) {
-        if !read_record(keys, owner, &id).await.settles_the_alarm() {
-            alarms.push(id);
+/// An alarm of 02 ("Who can read a sweep") about one `keys/<id>.json`:
+/// someone who can write this owner's `keys/` may have given themselves a
+/// key that sweeps are encrypted to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum KeyAlarm {
+    /// None of this owner's installs here created this id, and its record
+    /// is not revoked, or could not be read to tell.
+    Unknown(DeviceId),
+    /// One of them did, but the record is unrevoked and no longer holds the
+    /// key that install published: someone rewrote it.
+    Replaced {
+        /// The device id.
+        id: DeviceId,
+        /// Whether that install is this one, whose fix is `logout`.
+        this_install: bool,
+    },
+}
+
+impl KeyAlarm {
+    /// The alarm as one line of a report, with what to do about it.
+    pub(crate) fn line(&self) -> String {
+        match self {
+            Self::Unknown(id) => unknown_key_alarm(id),
+            // `*this_install` copies the `bool` out of the borrowed alarm.
+            Self::Replaced { id, this_install } => replaced_key_alarm(id, *this_install),
         }
     }
-    Ok(alarms)
+}
+
+/// The alarms about `owner`'s `keys/`, from the same reads and checks as
+/// `keys list` ([`list_keys`], with the listing dropped), so the two never
+/// disagree: every listed record is read, an unknown id's to see whether it
+/// is revoked and a known id's to compare it with the key `installs`
+/// records for it. `installs` are this owner's installs here, from
+/// `installs.json`, and `this_install` the id `login.json` records as this
+/// install's.
+///
+/// `login` runs this once it has published or reused this install's key,
+/// so that key is listed, known and recorded with its key; P2c's `pull` is
+/// meant to run it too.
+pub(crate) async fn key_alarms(
+    keys: &impl PublicKeys,
+    owner: &PublicKey,
+    installs: &[Install],
+    this_install: Option<&DeviceId>,
+) -> anyhow::Result<Vec<KeyAlarm>> {
+    Ok(list_keys(keys, owner, installs, this_install).await?.alarms)
 }
 
 // ---------------------------------------------------------------------------
@@ -141,9 +181,9 @@ struct KeyListing {
     unreadable: Vec<UnreadableKey>,
     /// How many listing entries were not a `keys/<deviceId>.json`.
     skipped_names: usize,
-    /// The unknown ids to alarm on: not created by this owner's installs,
-    /// and not revoked.
-    alarms: Vec<DeviceId>,
+    /// The alarms, in the order the ids were listed: unknown ids that are
+    /// not revoked, and known ids whose record holds another key.
+    alarms: Vec<KeyAlarm>,
 }
 
 /// One parsed `keys/<id>.json`, as `keys list` shows it.
@@ -167,15 +207,61 @@ struct ListedKey {
     this_install: bool,
     /// Whether this owner's installs did not create it.
     unknown: bool,
+    /// For an unrevoked key this owner's installs created, whether it
+    /// still holds the key that install published.
+    check: KeyCheck,
+}
+
+/// What comparing a record with the key its install published, as
+/// `installs.json` records it, gave.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyCheck {
+    /// Nothing to compare: the record is revoked, so it takes no further
+    /// sweeps, or none of this owner's installs here created the id, which
+    /// has an alarm of its own.
+    Skipped,
+    /// `installs.json` records no key for the id: an entry an earlier build
+    /// wrote, or none at all for this install's own id.
+    NotRecorded,
+    /// The record holds the recorded key.
+    Matches,
+    /// The record holds another key, or none this build can encrypt to:
+    /// someone other than that install wrote it.
+    Replaced,
+}
+
+impl KeyCheck {
+    /// The check of `record`, which `unknown` says this owner's installs
+    /// did not create, against `recorded`, the key `installs.json` records
+    /// for its id.
+    fn of(record: &DeviceKey, unknown: bool, recorded: Option<&AgeRecipient>) -> Self {
+        if unknown || record.is_revoked() {
+            return Self::Skipped;
+        }
+        // `let … else`: bind the key when there is one, or return.
+        let Some(expected) = recorded else {
+            return Self::NotRecorded;
+        };
+        // `holds_key` is `login`'s comparison of this install's own record:
+        // `encryption_recipient`, then the two keys as `AgeRecipient`
+        // values. A record it cannot turn into a key does not hold the one
+        // the install published either, since that one was usable.
+        match holds_key(record, expected) {
+            Ok(true) => Self::Matches,
+            Ok(false) | Err(_) => Self::Replaced,
+        }
+    }
 }
 
 impl ListedKey {
-    /// The entry for `record`, listed as `id`.
+    /// The entry for `record`, listed as `id`. `recorded` is the key
+    /// `installs.json` records for `id`, if any.
     fn new(
         id: DeviceId,
         record: DeviceKey,
         this_install: Option<&DeviceId>,
         unknown: bool,
+        recorded: Option<&AgeRecipient>,
     ) -> Self {
         // Only an unrevoked key is one a sweeper would encrypt to, so only
         // it is checked. `encryption_recipient` is the one way from a record
@@ -187,6 +273,9 @@ impl ListedKey {
         } else {
             record.encryption_recipient().err()
         };
+        // Before the record is taken apart below, which leaves its
+        // recipient behind.
+        let check = KeyCheck::of(&record, unknown, recorded);
         // Taking the record apart moves its strings into the entry rather
         // than copying them. `recipient` and the unknown fields are left
         // behind in `..` and dropped: nothing shows a recipient.
@@ -208,6 +297,7 @@ impl ListedKey {
             revoked_at,
             unusable,
             unknown,
+            check,
         }
     }
 
@@ -237,14 +327,55 @@ impl ListedKey {
         }
     }
 
-    /// Whether the key is in use, revoked (and when), or one this build
-    /// cannot encrypt to.
+    /// Whether the key is revoked (and when), replaced, one this build
+    /// cannot encrypt to, unverified, or in use. "in use" for a key this
+    /// owner's installs created means it holds the key that install
+    /// published.
     fn status(&self) -> String {
-        match (&self.revoked_at, self.unusable) {
-            (Some(at), _) => format!("revoked {}", sanitize(at.as_str(), RecordTime::MAX_LEN)),
-            (None, Some(_)) => "unusable: this build cannot encrypt to it".to_owned(),
-            (None, None) => "in use".to_owned(),
+        // A tuple `match` takes the first arm that fits, top to bottom, so
+        // the order of the arms is the order of precedence.
+        match (&self.revoked_at, self.check, self.unusable) {
+            (Some(at), _, _) => format!("revoked {}", sanitize(at.as_str(), RecordTime::MAX_LEN)),
+            (None, KeyCheck::Replaced, _) => {
+                "REPLACED: it does not hold the key that install published".to_owned()
+            }
+            (None, _, Some(_)) => "unusable: this build cannot encrypt to it".to_owned(),
+            (None, KeyCheck::NotRecorded, None) => {
+                "unverified: installs.json does not record the key that install published"
+                    .to_owned()
+            }
+            (None, KeyCheck::Skipped | KeyCheck::Matches, None) => "in use".to_owned(),
         }
+    }
+
+    /// The note for a key `installs.json` records no key for, or `None`.
+    fn unverified_note(&self) -> Option<String> {
+        if self.check != KeyCheck::NotRecorded {
+            return None;
+        }
+        let fix = if self.this_install {
+            " The next `sweepky login` records this install's key, once it has checked the \
+             record against device.key."
+        } else {
+            ""
+        };
+        Some(format!(
+            "note: installs.json does not record the key keys/{}.json was published with (an \
+             earlier build wrote that entry, or it is missing), so keys list cannot tell whether \
+             someone has rewritten it.{fix}\n",
+            self.id
+        ))
+    }
+
+    /// The alarm for a record that holds another key than its install
+    /// published, or `None`.
+    fn replaced_alarm(&self) -> Option<KeyAlarm> {
+        // `bool::then` gives `Some` of the closure's value when the
+        // condition holds, and `None` without calling it otherwise.
+        (self.check == KeyCheck::Replaced).then(|| KeyAlarm::Replaced {
+            id: self.id.clone(),
+            this_install: self.this_install,
+        })
     }
 
     /// The warning for a key this build cannot encrypt to, or `None` for a
@@ -284,8 +415,9 @@ impl UnreadableKey {
 
 impl KeyListing {
     /// The text `keys list` prints: one line per key, then a warning per
-    /// unusable or unreadable record, the count of skipped names, and an
-    /// alarm per unknown id.
+    /// unusable or unreadable record, a note per record that cannot be
+    /// checked against its install's key, the count of skipped names, and
+    /// the alarms.
     ///
     /// Device ids and the owner's pubky are printed as they are: a
     /// [`DeviceId`] holds only `A-Z`, `a-z`, `0-9`, `-` and `_`, and a
@@ -303,11 +435,14 @@ impl KeyListing {
         for key in &self.unreadable {
             text.push_str(&key.warning());
         }
+        for note in self.keys.iter().filter_map(ListedKey::unverified_note) {
+            text.push_str(&note);
+        }
         if let Some(note) = self.skipped_note() {
             text.push_str(&note);
         }
-        for id in &self.alarms {
-            text.push_str(&unknown_key_alarm(id));
+        for alarm in &self.alarms {
+            text.push_str(&alarm.line());
         }
         text
     }
@@ -339,19 +474,48 @@ impl KeyListing {
     }
 }
 
+/// The key `installs` records for `id`, or `None` when it records none:
+/// no entry, or one an earlier build wrote with the id alone.
+fn recorded_key<'a>(installs: &'a [Install], id: &DeviceId) -> Option<&'a AgeRecipient> {
+    // The `'a` says the key is borrowed from `installs`, not from `id`.
+    // `find` gives the first entry for `id`, and `and_then` its key, if any.
+    installs
+        .iter()
+        .find(|install| install.device_id == *id)
+        .and_then(|install| install.recipient.as_ref())
+}
+
+/// The ids this owner's installs created, as [`unknown_key_ids`] compares
+/// the listing with: every id in `installs`, then `this_install`, the id
+/// `login.json` records as this install's.
+fn created_ids(installs: &[Install], this_install: Option<&DeviceId>) -> Vec<DeviceId> {
+    // This install's own id counts as created even if installs.json lost
+    // it (the next login puts it back), so it never reads as unknown.
+    // `chain` adds the `Option`'s value, if any, after the installs' ids:
+    // an `Option` is an iterator of zero or one items, and `cloned` turns
+    // the borrowed ids into owned ones.
+    installs
+        .iter()
+        .map(|install| &install.device_id)
+        .chain(this_install)
+        .cloned()
+        .collect()
+}
+
 /// Lists `owner`'s `keys/` through `keys`: steps 2 to 5 of the module docs.
 ///
-/// `created` are the ids this owner's installs created, and `this_install`
-/// the one `login.json` records as this install's. Only the listing itself
-/// can fail; one record that cannot be read is a warning in the listing.
+/// `installs` are this owner's installs here, from `installs.json`, each
+/// with the key it published when that is recorded, and `this_install` the
+/// id `login.json` records as this install's. Only the listing itself can
+/// fail; one record that cannot be read is a warning in the listing.
 async fn list_keys(
     keys: &impl PublicKeys,
     owner: &PublicKey,
-    created: &[DeviceId],
+    installs: &[Install],
     this_install: Option<&DeviceId>,
 ) -> anyhow::Result<KeyListing> {
     let listed = keys.list_key_ids(owner).await?;
-    let unknown = unknown_key_ids(created, &listed.ids);
+    let unknown = unknown_key_ids(&created_ids(installs, this_install), &listed.ids);
     let mut listing = KeyListing {
         owner: pubky_of(owner),
         keys: Vec::new(),
@@ -371,13 +535,15 @@ async fn list_keys(
         let is_unknown = unknown.contains(&id);
         let read = read_record(keys, owner, &id).await;
         if is_unknown && !read.settles_the_alarm() {
-            listing.alarms.push(id.clone());
+            listing.alarms.push(KeyAlarm::Unknown(id.clone()));
         }
         match read {
             RecordRead::Parsed(record) => {
-                listing
-                    .keys
-                    .push(ListedKey::new(id, record, this_install, is_unknown));
+                let recorded = recorded_key(installs, &id);
+                let key = ListedKey::new(id, record, this_install, is_unknown, recorded);
+                // `extend` with an `Option` adds its value, if any.
+                listing.alarms.extend(key.replaced_alarm());
+                listing.keys.push(key);
             }
             RecordRead::Unreadable(reason) => {
                 listing.unreadable.push(UnreadableKey { id, reason });
@@ -398,15 +564,14 @@ pub(crate) async fn list(ctx: &Context) -> anyhow::Result<Report> {
     };
     let owner = public_key_of(&login.pubky)?;
     let installs = read_installs(&ctx.dirs)?;
-    // This install's own id counts as created even if installs.json lost
-    // it (the next login puts it back), so it never reads as unknown.
-    // `to_vec` copies the borrowed slice into a `Vec` this function owns,
-    // and `extend` with an `Option` adds its value, if any: an `Option` is
-    // an iterator of zero or one items.
-    let mut created = installs.ids_of(&login.pubky).to_vec();
-    created.extend(login.device_id.clone());
     let reader = PublicKeyReader::new(ctx.network.pubky());
-    let listing = list_keys(&reader, &owner, &created, login.device_id.as_ref()).await?;
+    let listing = list_keys(
+        &reader,
+        &owner,
+        installs.installs_of(&login.pubky),
+        login.device_id.as_ref(),
+    )
+    .await?;
     Ok(Report::new(listing.render()))
 }
 
@@ -534,10 +699,16 @@ mod tests {
     use pubky::{Keypair, PubkyResource, PublicKey};
     use serde_json::{Value, json};
     use sweepky_core::paths;
-    use sweepky_core::{DeviceId, DeviceIdentity, DeviceKeyError, RecordTime, Zeroizing};
+    use sweepky_core::{
+        AgeRecipient, DeviceId, DeviceIdentity, DeviceKeyError, RecordTime, Zeroizing,
+    };
 
-    use super::{KeyListing, Revocation, list_keys, revoke_key, revoke_report};
+    use super::{
+        KeyAlarm, KeyCheck, KeyListing, Revocation, key_alarms, list_keys, revoke_key,
+        revoke_report,
+    };
     use crate::device::{KeyIds, PublicKeys, device_key_bytes, device_key_record};
+    use crate::installs::Install;
     use crate::remote::{ListLimits, ListingError, ListingParser};
     use crate::test_support::{FakeKeyStore, KeyStoreCall};
 
@@ -554,12 +725,27 @@ mod tests {
         Keypair::random().public_key()
     }
 
-    /// A record as this CLI publishes one, for a fresh key, as JSON.
-    fn record() -> Value {
-        let recipient = DeviceIdentity::generate().recipient();
-        let bytes = device_key_bytes(&device_key_record(&recipient, time("2026-10-16T09:41:07Z")))
+    /// A fresh public age key, from an identity made at run time.
+    fn new_key() -> AgeRecipient {
+        DeviceIdentity::generate().recipient()
+    }
+
+    /// A record as this CLI publishes one, for `recipient`, as JSON.
+    fn record_of(recipient: &AgeRecipient) -> Value {
+        let bytes = device_key_bytes(&device_key_record(recipient, time("2026-10-16T09:41:07Z")))
             .expect("JSON");
         serde_json::from_slice(&bytes).expect("JSON")
+    }
+
+    /// A record as this CLI publishes one, for a fresh key, as JSON.
+    fn record() -> Value {
+        record_of(&new_key())
+    }
+
+    /// The `installs.json` entry of an install of this owner's here, with
+    /// the key it published when that is recorded.
+    fn install(id: &DeviceId, recipient: Option<&AgeRecipient>) -> Install {
+        Install::new(id.clone(), recipient.cloned())
     }
 
     fn bytes(value: &Value) -> Vec<u8> {
@@ -580,24 +766,209 @@ mod tests {
         let keys = FakeKeyStore::default();
         let own = id("own-install");
         let other = id("other");
-        keys.set_record(&own, bytes(&record()));
+        let own_key = new_key();
+        keys.set_record(&own, bytes(&record_of(&own_key)));
         keys.set_record(&other, bytes(&record()));
 
-        // installs.json knows `own`, and login.json names it as this
-        // install's; nothing knows `other`.
-        let listing = list_keys(&keys, &owner(), std::slice::from_ref(&own), Some(&own))
+        // installs.json knows `own`, with the key it published, and
+        // login.json names it as this install's; nothing knows `other`.
+        let installs = [install(&own, Some(&own_key))];
+        let listing = list_keys(&keys, &owner(), &installs, Some(&own))
             .await
             .expect("lists");
         let mine = entry(&listing, &own);
         assert!(mine.this_install && !mine.unknown, "{mine:?}");
+        assert_eq!(mine.check, KeyCheck::Matches);
         let theirs = entry(&listing, &other);
         assert!(!theirs.this_install && theirs.unknown, "{theirs:?}");
         // One alarm, for the unknown id, with what to do about it.
-        assert_eq!(listing.alarms, std::slice::from_ref(&other));
+        assert_eq!(listing.alarms, [KeyAlarm::Unknown(other.clone())]);
         let text = listing.render();
+        assert!(
+            text.contains("keys/own-install.json: this install; in use"),
+            "{text}"
+        );
         assert!(text.contains("alarm: keys/other.json"), "{text}");
         assert!(text.contains("`sweepky keys revoke other`"), "{text}");
         assert!(!text.contains("alarm: keys/own-install.json"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_known_id_whose_record_names_another_key_alarms() {
+        // Someone who can write keys/ (the owner's grant, or an operator)
+        // rewrites the records of ids this owner's installs created, with
+        // a valid, unrevoked key of their own, or with one this build cannot
+        // encrypt to. Each is compared with the key installs.json records
+        // for its id and raises the alarm; none is shown as in use.
+        let keys = FakeKeyStore::default();
+        let own = id("own-install");
+        let sibling = id("sibling");
+        let renamed = id("renamed-alg");
+        let [own_key, sibling_key, renamed_key, intruder] =
+            [new_key(), new_key(), new_key(), new_key()];
+        keys.set_record(&own, bytes(&record_of(&intruder)));
+        keys.set_record(&sibling, bytes(&record_of(&intruder)));
+        // The key that install published, under an `alg` this build does
+        // not encrypt to: no longer the record that install wrote.
+        let mut other_alg = record_of(&renamed_key);
+        other_alg["alg"] = json!("AGE-X25519");
+        keys.set_record(&renamed, bytes(&other_alg));
+        let installs = [
+            install(&own, Some(&own_key)),
+            install(&sibling, Some(&sibling_key)),
+            install(&renamed, Some(&renamed_key)),
+        ];
+
+        let listing = list_keys(&keys, &owner(), &installs, Some(&own))
+            .await
+            .expect("lists");
+        for known in [&own, &sibling, &renamed] {
+            let shown = entry(&listing, known);
+            assert!(!shown.unknown, "{shown:?}");
+            assert_eq!(shown.check, KeyCheck::Replaced, "{shown:?}");
+        }
+        // One alarm each, in the order they were listed (the fake lists by
+        // id), this install's own with `logout` as its fix.
+        assert_eq!(
+            listing.alarms,
+            [
+                KeyAlarm::Replaced {
+                    id: own.clone(),
+                    this_install: true
+                },
+                KeyAlarm::Replaced {
+                    id: renamed.clone(),
+                    this_install: false
+                },
+                KeyAlarm::Replaced {
+                    id: sibling.clone(),
+                    this_install: false
+                },
+            ]
+        );
+        let text = listing.render();
+        assert!(!text.contains("in use"), "{text}");
+        for part in [
+            "keys/own-install.json: this install; REPLACED",
+            "keys/sibling.json: another install made here; REPLACED",
+            "alarm: keys/own-install.json, this install's own device key record, does not hold \
+             this install's key",
+            "`sweepky logout` to revoke keys/own-install.json",
+            "alarm: keys/sibling.json, the device key record of another of this owner's installs",
+            "`sweepky keys revoke sibling`",
+            "`sweepky keys revoke renamed-alg`",
+        ] {
+            assert!(text.contains(part), "{part:?} missing from: {text}");
+        }
+        // Never a recipient: not the intruder's, nor the recorded ones.
+        for key in [&own_key, &sibling_key, &renamed_key, &intruder] {
+            assert!(!text.contains(&key.to_string()), "{text}");
+        }
+
+        // The check `login` runs (and P2c's `pull` will) raises the same
+        // alarms from the same reads: every listed record, the known ones
+        // too.
+        let before = keys.calls().len();
+        let alarms = key_alarms(&keys, &owner(), &installs, Some(&own))
+            .await
+            .expect("checks");
+        assert_eq!(alarms, listing.alarms);
+        let calls = keys.calls();
+        for known in [&own, &sibling, &renamed] {
+            assert!(
+                calls[before..].contains(&KeyStoreCall::GetKey(known.clone())),
+                "{calls:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_known_id_whose_record_holds_its_key_or_is_revoked_stays_quiet() {
+        let keys = FakeKeyStore::default();
+        let own = id("own-install");
+        let sibling = id("sibling");
+        let [own_key, sibling_key, intruder] = [new_key(), new_key(), new_key()];
+        // This install's record holds the key it published.
+        keys.set_record(&own, bytes(&record_of(&own_key)));
+        // The sibling's was rewritten with another key, but is revoked: it
+        // takes no further sweeps, so it is shown as revoked, not alarmed.
+        let mut revoked = record_of(&intruder);
+        revoked["revokedAt"] = json!("2026-10-16T10:00:00Z");
+        keys.set_record(&sibling, bytes(&revoked));
+        let installs = [
+            install(&own, Some(&own_key)),
+            install(&sibling, Some(&sibling_key)),
+        ];
+
+        let listing = list_keys(&keys, &owner(), &installs, Some(&own))
+            .await
+            .expect("lists");
+        assert_eq!(entry(&listing, &own).check, KeyCheck::Matches);
+        assert_eq!(entry(&listing, &sibling).check, KeyCheck::Skipped);
+        assert!(listing.alarms.is_empty(), "{:?}", listing.alarms);
+        let text = listing.render();
+        assert!(
+            text.contains("keys/own-install.json: this install; in use"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "keys/sibling.json: another install made here; revoked 2026-10-16T10:00:00Z"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("alarm"), "{text}");
+        let alarms = key_alarms(&keys, &owner(), &installs, Some(&own))
+            .await
+            .expect("checks");
+        assert_eq!(alarms, []);
+    }
+
+    #[tokio::test]
+    async fn a_known_id_without_a_recorded_key_is_unverified_not_an_alarm() {
+        // An entry an earlier build wrote records the id alone, and an
+        // installs.json that lost this install's entry records nothing:
+        // there is no key to compare the record with, so keys list says so
+        // rather than failing or showing the key as in use, and raises no
+        // alarm.
+        let keys = FakeKeyStore::default();
+        let own = id("own-install");
+        let earlier = id("earlier");
+        keys.set_record(&own, bytes(&record()));
+        keys.set_record(&earlier, bytes(&record()));
+        for installs in [
+            vec![install(&own, None), install(&earlier, None)],
+            vec![install(&earlier, None)],
+        ] {
+            let listing = list_keys(&keys, &owner(), &installs, Some(&own))
+                .await
+                .expect("lists");
+            for known in [&own, &earlier] {
+                let shown = entry(&listing, known);
+                assert!(!shown.unknown, "{shown:?}");
+                assert_eq!(shown.check, KeyCheck::NotRecorded, "{shown:?}");
+            }
+            assert!(listing.alarms.is_empty(), "{:?}", listing.alarms);
+            let text = listing.render();
+            assert!(!text.contains("in use"), "{text}");
+            assert!(!text.contains("alarm"), "{text}");
+            for part in [
+                "keys/own-install.json: this install; unverified",
+                "keys/earlier.json: another install made here; unverified",
+                "note: installs.json does not record the key keys/own-install.json was \
+                 published with",
+                "The next `sweepky login` records this install's key",
+                "note: installs.json does not record the key keys/earlier.json",
+            ] {
+                assert!(text.contains(part), "{part:?} missing from: {text}");
+            }
+            // The login hint is for this install's key alone: one copy.
+            assert_eq!(
+                text.matches("The next `sweepky login`").count(),
+                1,
+                "{text}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -613,6 +984,7 @@ mod tests {
 
         let listing = list_keys(&keys, &owner(), &[], None).await.expect("lists");
         assert!(entry(&listing, &other).unknown);
+        assert_eq!(entry(&listing, &other).check, KeyCheck::Skipped);
         assert!(listing.alarms.is_empty(), "{:?}", listing.alarms);
         assert!(!listing.render().contains("alarm"), "{}", listing.render());
     }
@@ -679,8 +1051,10 @@ mod tests {
 
         // `keys list` shows the one key and counts the rest.
         let store = FakeKeyStore::default();
-        store.set_record(&id("laptop"), bytes(&record()));
-        let listing = list_keys(&ParsedListing { ids, store }, &owner, &[id("laptop")], None)
+        let laptop_key = new_key();
+        store.set_record(&id("laptop"), bytes(&record_of(&laptop_key)));
+        let installs = [install(&id("laptop"), Some(&laptop_key))];
+        let listing = list_keys(&ParsedListing { ids, store }, &owner, &installs, None)
             .await
             .expect("skipped names are not fatal");
         assert_eq!(listing.keys.len(), 1);
@@ -715,7 +1089,7 @@ mod tests {
         hostile["alg"] = json!("age-x25519\u{1b}[0m");
         keys.set_record(&id("hostile"), bytes(&hostile));
 
-        let text = list_keys(&keys, &owner(), &[id("hostile")], None)
+        let text = list_keys(&keys, &owner(), &[install(&id("hostile"), None)], None)
             .await
             .expect("lists")
             .render();
@@ -750,13 +1124,11 @@ mod tests {
         keys.set_record(&id("revoked"), bytes(&revoked));
         keys.set_record(&id("fine"), bytes(&base));
 
-        let created = [
-            id("new-alg"),
-            id("bad-recipient"),
-            id("revoked"),
-            id("fine"),
-        ];
-        let listing = list_keys(&keys, &owner(), &created, None)
+        // Known ids whose key installs.json does not record, so the
+        // unusable ones are flagged as unusable, not as replaced.
+        let installs =
+            ["new-alg", "bad-recipient", "revoked", "fine"].map(|name| install(&id(name), None));
+        let listing = list_keys(&keys, &owner(), &installs, None)
             .await
             .expect("lists");
         assert_eq!(
