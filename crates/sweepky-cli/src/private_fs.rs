@@ -4,7 +4,8 @@
 //! - [`ensure_private_dir`] creates a directory 0700 (owner only), or checks
 //!   that the one already there is.
 //! - [`write_private_file`] writes a file 0600 (owner read and write): a new
-//!   temp file next to it, then a rename over the old one.
+//!   temp file next to it, then a rename over the old one, then a sync of
+//!   the directory.
 //! - [`read_private_file`] reads one back, refusing anything another user
 //!   could read, anything over a size cap, and links, into a buffer that
 //!   zeroes itself.
@@ -32,7 +33,9 @@
 //! - **A file is written to a temp file and renamed into place.** `rename`
 //!   swaps the name over in one step, so a reader sees the old file or the
 //!   new one, never half of either, and a crash mid-write leaves the old file
-//!   whole.
+//!   whole. The temp file is synced before the rename and the directory
+//!   after it, so that once a write returns, both the bytes and the name
+//!   that points at them are on disk.
 //! - **No links and no special files.** A symlink in the config directory
 //!   would send a write somewhere else, or feed a read from somewhere else,
 //!   so a link where a file or directory should be is refused rather than
@@ -104,6 +107,21 @@ pub(crate) fn ensure_private_dir(path: &Path) -> anyhow::Result<()> {
 /// Refuses `path` unless `meta`, its `lstat`, is a directory with no group or
 /// other permission bit.
 fn check_private_dir(path: &Path, meta: &Metadata) -> anyhow::Result<()> {
+    refuse_unless_dir(path, meta)?;
+    if let Some(mode) = loose_permissions(meta) {
+        bail!(
+            "{} is open to other users (mode {mode:03o}); Sweepky keeps it private, as ssh does \
+             ~/.ssh. Run `chmod 700 {}` and try again",
+            path.display(),
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Refuses `path` unless `meta`, its `lstat`, is a directory: a symlink there,
+/// dangling or not, is refused, as is anything else that is not a directory.
+fn refuse_unless_dir(path: &Path, meta: &Metadata) -> anyhow::Result<()> {
     let kind = meta.file_type();
     if kind.is_symlink() {
         bail!(
@@ -115,14 +133,6 @@ fn check_private_dir(path: &Path, meta: &Metadata) -> anyhow::Result<()> {
     if !kind.is_dir() {
         bail!(
             "{} exists and is not a directory; move it away and try again",
-            path.display()
-        );
-    }
-    if let Some(mode) = loose_permissions(meta) {
-        bail!(
-            "{} is open to other users (mode {mode:03o}); Sweepky keeps it private, as ssh does \
-             ~/.ssh. Run `chmod 700 {}` and try again",
-            path.display(),
             path.display()
         );
     }
@@ -145,8 +155,9 @@ pub(crate) fn write_private_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()
     replace_with(&temp_path_beside(path)?, path, bytes)
 }
 
-/// Creates `temp` with `bytes`, then renames it over `target`. Removes
-/// `temp` again if any step fails.
+/// Creates `temp` with `bytes`, renames it over `target`, then syncs the
+/// directory that holds them ([`sync_parent`]). Removes `temp` again if the
+/// write or the rename fails.
 fn replace_with(temp: &Path, target: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let file = create_private_temp(temp)?;
     // `and_then` runs the rename only when the write succeeded; either
@@ -158,8 +169,67 @@ fn replace_with(temp: &Path, target: &Path, bytes: &[u8]) -> anyhow::Result<()> 
         // Best effort, and `let _ =` ignores its own failure: the error worth
         // reporting is the first one, which `result` carries.
         let _ = fs::remove_file(temp);
+        return result;
     }
-    result
+    // The rename is done, so `temp` is gone and there is nothing left to
+    // remove: from here on the new file is in place, and only whether it
+    // survives a crash is in doubt.
+    sync_parent(target)
+}
+
+/// Waits until the directory that holds `path` is on disk, so the name a
+/// rename just gave `path` survives a crash.
+///
+/// [`write_synced`]'s `sync_all` on the temp file makes its bytes durable,
+/// not the directory entry that names it. On filesystems that keep the two
+/// apart, a power loss after the rename could still bring back the old entry,
+/// or none, while the caller has gone on as if the write were done (after
+/// `login`'s signup, say, or once a device key is published). An `fsync` on
+/// a handle to the directory itself, which Linux and macOS both allow, closes
+/// that gap. Its failure is an error, never ignored, for the same reason: the
+/// caller is about to rely on the file.
+///
+/// The directory is opened read-only, which is all a sync needs, and only
+/// once an `lstat` has shown a real directory at its path
+/// ([`refuse_unless_dir`]): a symlink there, dangling or not, is refused
+/// rather than followed. [`open_seen_file`] then checks the open handle is
+/// that very directory (device and inode), as every read here does, since
+/// `open` itself would follow a link.
+fn sync_parent(path: &Path) -> anyhow::Result<()> {
+    let dir = parent_dir(path)?;
+    let Some(seen) = lstat(dir)? else {
+        bail!(
+            "{} is gone, so Sweepky could not make sure {} is saved; check it and try again",
+            dir.display(),
+            path.display()
+        );
+    };
+    refuse_unless_dir(dir, &seen)
+        .with_context(|| format!("could not make sure {} is saved", path.display()))?;
+    let (handle, _) = open_seen_file(dir, &seen, OpenOptions::new().read(true))?;
+    handle.sync_all().with_context(|| {
+        format!(
+            "{} is written, but its directory {} could not be synced to disk, so a crash could \
+             still lose it",
+            path.display(),
+            dir.display()
+        )
+    })
+}
+
+/// The directory that holds `path`.
+///
+/// The `&Path` it returns borrows from `path` (the one input reference, so
+/// lifetime elision ties the output to it); `Path::new(".")` borrows a
+/// `'static` string, which outlives any such borrow, so it fits too.
+fn parent_dir(path: &Path) -> anyhow::Result<&Path> {
+    match path.parent() {
+        // A bare file name, such as `login.json`, lives in the current
+        // directory, which `Path` spells as an empty parent.
+        Some(parent) if parent.as_os_str().is_empty() => Ok(Path::new(".")),
+        Some(parent) => Ok(parent),
+        None => bail!("{} has no parent directory", path.display()),
+    }
 }
 
 /// Creates the empty file `temp`, 0600 from the start.
@@ -509,8 +579,8 @@ mod tests {
     use sweepky_core::Zeroizing;
 
     use super::{
-        create_private_temp, ensure_private_dir, read_private_file, remove_private_file,
-        replace_with, temp_path_beside, write_private_file,
+        create_private_temp, ensure_private_dir, parent_dir, read_private_file,
+        remove_private_file, replace_with, sync_parent, temp_path_beside, write_private_file,
     };
     use crate::test_support::{chmod, mode, private_temp};
 
@@ -659,6 +729,44 @@ mod tests {
         old.read_to_end(&mut old_bytes).expect("read old");
         assert_eq!(old_bytes, b"first");
         assert_eq!(entries(temp.path()), ["device.key"]);
+    }
+
+    #[test]
+    fn directory_sync_never_follows_a_link() {
+        let temp = private_temp();
+        let real = temp.path().join("real");
+        ensure_private_dir(&real).expect("created");
+        fs::write(real.join("login.json"), "{}").expect("write");
+
+        // The directory itself syncs.
+        sync_parent(&real.join("login.json")).expect("a real directory syncs");
+
+        // A link in the directory's place, to a real directory or to
+        // nothing, is refused rather than followed.
+        let link = temp.path().join("link");
+        symlink(&real, &link).expect("symlink");
+        let dangling = temp.path().join("dangling");
+        symlink(temp.path().join("nowhere"), &dangling).expect("symlink");
+        for dir in [&link, &dangling] {
+            let err = sync_parent(&dir.join("login.json")).expect_err("a link is refused");
+            assert!(format!("{err:#}").contains("symbolic link"), "{err:#}");
+        }
+
+        // A directory that is not there is an error, not a panic.
+        let gone = temp.path().join("gone").join("login.json");
+        let err = sync_parent(&gone).expect_err("a missing directory is refused");
+        assert!(format!("{err:#}").contains("is gone"), "{err:#}");
+    }
+
+    #[test]
+    fn bare_file_name_is_in_the_current_directory() {
+        // `Path::parent` gives a bare name an empty parent, which is the
+        // current directory; only a path with no parent at all is an error.
+        for (path, parent) in [("login.json", "."), ("/dir/login.json", "/dir")] {
+            let found = parent_dir(Path::new(path)).expect("a parent");
+            assert_eq!(found, Path::new(parent), "{path}");
+        }
+        assert!(parent_dir(Path::new("/")).is_err());
     }
 
     #[test]
