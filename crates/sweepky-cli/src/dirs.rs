@@ -25,6 +25,7 @@
 //! |---|---|
 //! | `git-home-<id>/` | git's `HOME` while one command (`post`, `run`) runs it: new, empty and 0700, removed when the command ends (`crate::git`) |
 //! | `staging/<id>/` | the sweep directory `run` builds before it moves it into the project's `sweeps/<id>/`: new and 0700, removed when `run` ends (`run::fetch`) |
+//! | `sweeps/<id>.json` | what `run` fetched for sweep `id`, which `submit` builds the manifest's commits from: written by `run`, removed once the sweep's record says `done` or `aborted` (`crate::sweep_state`) |
 //!
 //! The data directory's other subtrees (P2c) come later. Every file here
 //! is written with [`crate::private_fs`]: directories 0700, files 0600;
@@ -177,6 +178,19 @@ impl Dirs {
     pub(crate) fn staging_dir(&self) -> PathBuf {
         self.data.join("staging")
     }
+
+    /// `data/sweeps/`: what `run` fetched for each sweep not yet finished,
+    /// one file per sweep, out of reach of the agent.
+    pub(crate) fn sweep_snapshots_dir(&self) -> PathBuf {
+        self.data.join("sweeps")
+    }
+
+    /// `data/sweeps/<id>.json`: what `run` fetched for sweep `id`. A
+    /// [`RecordId`] is one plain path segment, as for
+    /// [`git_home_dir`](Self::git_home_dir).
+    pub(crate) fn sweep_snapshot_file(&self, id: &RecordId) -> PathBuf {
+        self.sweep_snapshots_dir().join(format!("{id}.json"))
+    }
 }
 
 /// `value` as a path, if it is non-empty and absolute; `variable` names it in
@@ -275,5 +289,9 @@ mod tests {
             Path::new("/x/share/git-home-0035G87EK4XFE")
         );
         assert_eq!(dirs.staging_dir(), Path::new("/x/share/staging"));
+        assert_eq!(
+            dirs.sweep_snapshot_file(&id),
+            Path::new("/x/share/sweeps/0035G87EK4XFE.json")
+        );
     }
 }

@@ -7,20 +7,25 @@
 //! sweep directory, the marker and `scope.json` included, so nothing here
 //! is read from there. The sweep record, `sweeps/<id>.json` in this login's
 //! own storage, is what `run` published and only this login can write: it
-//! names the bounty, the targets and when the sweep started. The bounty,
-//! read from its owner's storage, pins the commit each target reviews. The
-//! sweeper is this login, and the sweep finishes now. So a manifest says
-//! exactly what the public record says, plus the commits the owner pinned.
+//! names the bounty, the targets and when the sweep started. The commit
+//! each target was swept at is the one `run` checked out, from the snapshot
+//! it kept in the data directory (`crate::sweep_state`), never the bounty
+//! as it reads now: an owner, or their homeserver, may have rewritten a
+//! target's pinned revision since, and a manifest that took the new one
+//! would claim an audit of a commit nobody looked at. So the bounty, read
+//! from its owner's storage, must still pin every target as `run` fetched
+//! it, or the sweep is refused. The sweeper is this login, and the sweep
+//! finishes now. So a manifest says exactly what the public record says,
+//! plus the commits `run` fetched.
 
-use std::collections::BTreeMap;
-
-use anyhow::{Context as _, anyhow, bail};
+use anyhow::bail;
 use sweepky_core::{
-    Bounty, BountyRef, GitSha, KnownSweepStatus, Manifest, Playbook, Pubky, RecordTime, Sweep,
-    TargetId, UnknownFields,
+    Bounty, BountyRef, KnownSweepStatus, Manifest, Playbook, Pubky, RecordTime, Sweep,
+    UnknownFields,
 };
 
 use crate::run::UNSPECIFIED_PLAYBOOK;
+use crate::sweep_state::SweepSnapshot;
 
 /// What `submit` says of a sweep whose record says `done`.
 const ALREADY_DONE: &str = "this sweep's record says done: it was submitted already, so submit \
@@ -39,6 +44,13 @@ const PLAYBOOK_NEEDED: &str = "this sweep's record names no playbook yet (`unspe
                                `run` writes until `init` records one), so give the one the \
                                agent followed with --playbook, such as \
                                --playbook cloudflare/security-audit@c1c8a8c";
+
+/// What `submit` says when the bounty no longer pins what `run` fetched
+/// for the sweep. Fixed text: it quotes neither the bounty nor a target.
+pub(super) const TARGETS_CHANGED: &str = "the bounty's targets changed since this sweep was run: \
+                                          it no longer pins the commits `sweepky run` fetched, \
+                                          so submit sent nothing; run the sweep again with \
+                                          `sweepky run`";
 
 /// Refuses `record` unless it says `running`, the one status `submit`
 /// completes: `done` was submitted already, `aborted` is final, and a
@@ -71,19 +83,22 @@ pub(super) fn final_playbook(flag: Option<&Playbook>, record: &Sweep) -> anyhow:
 }
 
 /// The manifest of `sweeper`'s sweep `record` of the bounty `bounty`, read
-/// from `bounty_ref`: the sweeper, the record's bounty and targets, each
-/// target's reviewed commit as the bounty pins it (a pull request's head),
-/// the record's `startedAt`, `playbook`, and `finished_at`.
+/// from `bounty_ref`, of which `fetched` is what `run` fetched: the
+/// sweeper, the record's bounty and targets, the commit `run` checked out
+/// for each target (a pull request's head), the record's `startedAt`,
+/// `playbook`, and `finished_at`.
 ///
-/// Refuses a record that is not `running`, one that names another bounty
-/// than `bounty_ref`, and a bounty with no well-formed target of a kind
-/// this build knows under one of the record's target ids. Every refusal
-/// names a target by its id alone, a checked value.
+/// Refuses a record that is not `running`, and one that names another
+/// bounty than `bounty_ref`. Refuses with [`TARGETS_CHANGED`] when
+/// `fetched` is of another bounty, or `bounty` no longer pins one of the
+/// record's targets as `run` fetched it: the same kind, repository and
+/// revisions (`SweepSnapshot::target_shas`).
 pub(super) fn build_manifest(
     sweeper: Pubky,
     record: &Sweep,
     bounty_ref: BountyRef,
     bounty: &Bounty,
+    fetched: &SweepSnapshot,
     playbook: Playbook,
     finished_at: RecordTime,
 ) -> anyhow::Result<Manifest> {
@@ -92,13 +107,10 @@ pub(super) fn build_manifest(
     if record.bounty != bounty_ref {
         bail!("this sweep's record names another bounty than the one read for it");
     }
-    let target_shas = record
-        .targets
-        .iter()
-        .map(|id| Ok((id.clone(), reviewed_commit(bounty, id)?)))
-        // `collect` into a `Result` stops at the first error and returns
-        // it; otherwise it builds the map from the pairs.
-        .collect::<anyhow::Result<BTreeMap<TargetId, GitSha>>>()?;
+    // The commits come from `fetched` alone; `bounty` only has to agree.
+    let Some(target_shas) = fetched.target_shas(record, bounty) else {
+        bail!(TARGETS_CHANGED);
+    };
     Ok(Manifest {
         sweeper,
         bounty: record.bounty,
@@ -111,45 +123,23 @@ pub(super) fn build_manifest(
     })
 }
 
-/// The commit target `id` of `bounty` reviews, `KnownTarget::reviewed_commit`:
-/// a pull request's head, or a repo or commit target's `rev`.
-fn reviewed_commit(bounty: &Bounty, id: &TargetId) -> anyhow::Result<GitSha> {
-    let target = bounty
-        .targets
-        .iter()
-        .find(|target| target.id() == id)
-        .ok_or_else(|| {
-            anyhow!(
-                "the bounty has no target {id}, which this sweep's record names, so submit cannot \
-                 say which commit was swept"
-            )
-        })?;
-    // core's `TargetError` is fixed text that quotes no field.
-    let known = target
-        .known()
-        .with_context(|| format!("target {id} of the bounty is not well formed"))?
-        .ok_or_else(|| {
-            anyhow!("target {id} of the bounty is of a kind this build does not know")
-        })?;
-    Ok(known.reviewed_commit().clone())
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
     use sweepky_core::{Bounty, BountyRef, Playbook, Sweep, TargetId};
 
-    use super::{ABORTED_IS_FINAL, ALREADY_DONE, PLAYBOOK_NEEDED, build_manifest, final_playbook};
+    use super::{
+        ABORTED_IS_FINAL, ALREADY_DONE, PLAYBOOK_NEEDED, TARGETS_CHANGED, build_manifest,
+        final_playbook,
+    };
+    use crate::sweep_state::SweepSnapshot;
     use crate::test_support::{
-        SYNTHETIC_HEAD, SYNTHETIC_SHA, bounty_id, bounty_json, json_bytes, pr_target_json,
-        random_pubky, record_id, repo_target_json, sweep_json,
+        SYNTHETIC_HEAD, SYNTHETIC_SHA, UNPINNED_SHA, bounty_id, bounty_of, json_bytes,
+        pr_target_json, random_pubky, random_sweep_and_bounty, record_id, repo_target_json,
+        snapshot_of, sweep_json,
     };
 
     const PLAYBOOK: &str = "cloudflare/security-audit@c1c8a8c";
-
-    fn bounty(targets: Value) -> Bounty {
-        Bounty::from_json(&json_bytes(&bounty_json(targets))).expect("a bounty")
-    }
 
     fn record(value: &Value) -> Sweep {
         Sweep::from_json(&json_bytes(value)).expect("a sweep record")
@@ -164,36 +154,43 @@ mod tests {
     }
 
     #[test]
-    fn the_manifest_takes_the_record_s_bounty_and_targets_and_the_bounty_s_commits() {
-        let (sweeper, owner) = (random_pubky(), random_pubky());
-        let at = BountyRef {
-            owner,
-            id: bounty_id(),
-        };
+    fn the_manifest_takes_the_record_s_bounty_and_targets_and_the_fetched_commits() {
+        let (sweep, at) = random_sweep_and_bounty();
         // The record names t2 and t1, of the bounty's three targets.
         let swept = record(&sweep_json(at, &["t2", "t1"], "running"));
-        let bounty = bounty(json!([
+        let fetched = bounty_of(json!([
             repo_target_json("t1"),
             pr_target_json("t2"),
             repo_target_json("t3"),
         ]));
+        let snapshot = snapshot_of(sweep, at, &fetched, &["t2", "t1"]);
+        // The bounty as it reads now: the same pins, though t1 is narrowed
+        // to paths it was not and t3 is gone.
+        let mut narrowed = repo_target_json("t1");
+        narrowed["paths"] = json!(["src/auth/"]);
+        let now = bounty_of(json!([narrowed, pr_target_json("t2")]));
         let finished_at = "2026-10-19T12:30:00Z".parse().expect("a time");
 
         let manifest = build_manifest(
-            sweeper,
+            sweep.sweeper,
             &swept,
             at,
-            &bounty,
+            &now,
+            &snapshot,
             playbook(PLAYBOOK),
             finished_at,
         )
         .expect("a manifest");
 
-        assert_eq!(manifest.sweeper, sweeper);
+        assert_eq!(manifest.sweeper, sweep.sweeper);
         assert_eq!(manifest.bounty, at);
         assert_eq!(ids(&manifest.targets), ["t2", "t1"]);
-        // Each target's reviewed commit: a repo target's rev, and a pull
-        // request's head, never its base or merge base.
+        // The snapshot's commit for each target: a repo target's rev, and a
+        // pull request's head, never its base or merge base.
+        assert_eq!(
+            Some(manifest.target_shas.clone()),
+            snapshot.target_shas(&swept, &now)
+        );
         let shas: Vec<(&str, &str)> = manifest
             .target_shas
             .iter()
@@ -207,50 +204,72 @@ mod tests {
     }
 
     #[test]
-    fn a_record_not_running_or_of_another_bounty_or_a_missing_target_is_refused() {
-        let owner = random_pubky();
-        let at = BountyRef {
-            owner,
-            id: bounty_id(),
-        };
-        let bounty = bounty(json!([repo_target_json("t1")]));
-        let attempt = |swept: &Sweep, at: BountyRef| {
+    fn a_record_not_running_or_of_another_bounty_or_a_bounty_changed_since_run_is_refused() {
+        let (sweep, at) = random_sweep_and_bounty();
+        let fetched = bounty_of(json!([repo_target_json("t1"), pr_target_json("t2")]));
+        let snapshot = snapshot_of(sweep, at, &fetched, &["t1", "t2"]);
+        // The manifest of `swept` against `now`, the bounty at `at` as it
+        // reads, and `snapshot`, which must be refused: the refusal.
+        let attempt = |swept: &Sweep, now: &Bounty, snapshot: &SweepSnapshot| {
             let finished_at = "2026-10-19T12:30:00Z".parse().expect("a time");
             let refused = build_manifest(
-                random_pubky(),
+                sweep.sweeper,
                 swept,
                 at,
-                &bounty,
+                now,
+                snapshot,
                 playbook(PLAYBOOK),
                 finished_at,
             );
             format!("{:#}", refused.expect_err("refused"))
         };
+        // A record of the bounty at `at` with `status`, against the bounty
+        // as fetched.
+        let with_status = |status: &str| {
+            attempt(
+                &record(&sweep_json(at, &["t1"], status)),
+                &fetched,
+                &snapshot,
+            )
+        };
 
-        assert_eq!(
-            attempt(&record(&sweep_json(at, &["t1"], "done")), at),
-            ALREADY_DONE
-        );
-        assert_eq!(
-            attempt(&record(&sweep_json(at, &["t1"], "aborted")), at),
-            ABORTED_IS_FINAL
-        );
+        assert_eq!(with_status("done"), ALREADY_DONE);
+        assert_eq!(with_status("aborted"), ABORTED_IS_FINAL);
         assert!(ABORTED_IS_FINAL.contains("start a new sweep"));
-        let unknown = attempt(&record(&sweep_json(at, &["t1"], "paused")), at);
+        let unknown = with_status("paused");
         assert!(unknown.contains("does not know"), "{unknown}");
         assert!(!unknown.contains("paused"), "{unknown}");
 
         // The record names another bounty than the one read.
         let other = BountyRef {
-            owner,
+            owner: at.owner,
             id: record_id(1),
         };
-        let message = attempt(&record(&sweep_json(other, &["t1"], "running")), at);
+        let elsewhere = record(&sweep_json(other, &["t1"], "running"));
+        let message = attempt(&elsewhere, &fetched, &snapshot);
         assert!(message.contains("another bounty"), "{message}");
 
-        // The bounty has no target t2, which the record names.
-        let message = attempt(&record(&sweep_json(at, &["t1", "t2"], "running")), at);
-        assert!(message.contains("no target t2"), "{message}");
+        // The owner rewrote t1's pinned revision after `run` fetched it:
+        // refused, in fixed text that quotes neither revision.
+        let running = record(&sweep_json(at, &["t1", "t2"], "running"));
+        let mut moved = repo_target_json("t1");
+        moved["rev"] = json!(UNPINNED_SHA);
+        let rewritten = bounty_of(json!([moved, pr_target_json("t2")]));
+        assert_eq!(attempt(&running, &rewritten, &snapshot), TARGETS_CHANGED);
+        assert!(
+            !TARGETS_CHANGED.contains(UNPINNED_SHA) && !TARGETS_CHANGED.contains(SYNTHETIC_SHA)
+        );
+
+        // The bounty lost t2, which the record names.
+        let shrunk = bounty_of(json!([repo_target_json("t1")]));
+        assert_eq!(attempt(&running, &shrunk, &snapshot), TARGETS_CHANGED);
+
+        // A snapshot of a fetch from another bounty.
+        let fetched_elsewhere = snapshot_of(sweep, other, &fetched, &["t1", "t2"]);
+        assert_eq!(
+            attempt(&running, &fetched, &fetched_elsewhere),
+            TARGETS_CHANGED
+        );
     }
 
     #[test]

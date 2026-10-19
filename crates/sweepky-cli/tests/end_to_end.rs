@@ -1029,6 +1029,11 @@ async fn end_to_end() {
     assert_eq!(marker["bounty"], posted.to_string());
     assert_eq!(marker["targets"], json!(["t1", "t2", "t3"]));
 
+    // What B fetched, kept under B's data directory, out of the agent's
+    // reach, 0600: what B's submit takes the manifest's commits from.
+    let snapshot_file = b.dirs.data().join(format!("sweeps/{id}.json"));
+    assert_eq!(mode(&snapshot_file), 0o600);
+
     // ----- P2b: B submits a Cloudflare-format sweep -----
 
     // What the agent leaves, Cloudflare's skill having written its output
@@ -1038,18 +1043,55 @@ async fn end_to_end() {
     for name in CLOUDFLARE_FILES {
         fs::copy(cloudflare_fixture(name), audit.join(name)).expect("copy");
     }
-    let report = sweepky(
-        &b,
-        &[
-            "submit",
-            "--run-dir",
-            &format!("sweeps/{id}"),
-            "--playbook",
-            PLAYBOOK,
-        ],
+    let submit_args = [
+        "submit",
+        "--run-dir",
+        &format!("sweeps/{id}"),
+        "--playbook",
+        PLAYBOOK,
+    ];
+
+    // A rewrites t1's pinned revision, M, to F2 after B fetched it, with
+    // A's own root key, as A's homeserver could too. B's submit refuses:
+    // its manifest would say F2 was swept. Nothing is published, and the
+    // snapshot stays for the next try.
+    let as_posted: Value = serde_json::from_slice(
+        &get_capped(
+            &testnet,
+            &a_user,
+            &paths::bounty(posted.id),
+            MAX_RECORD_BYTES,
+        )
+        .await,
     )
-    .await
-    .expect("B submits the sweep");
+    .expect("JSON");
+    let mut rewritten = as_posted.clone();
+    rewritten["targets"][0]["rev"] = json!(f2.as_str());
+    let a_key_file = a.dirs.config().join("identities/a.key");
+    publish_as(&testnet, &a_key_file, &paths::bounty(posted.id), &rewritten).await;
+    let error = sweepky(&b, &submit_args)
+        .await
+        .expect_err("the bounty changed since the run");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("the bounty's targets changed since this sweep was run"),
+        "{message}"
+    );
+    assert!(!package_exists(&testnet, &b_user, sweep.id).await);
+    assert_eq!(
+        read_sweep(&testnet, &b_user, sweep.id)
+            .await
+            .status
+            .as_known(),
+        Some(KnownSweepStatus::Running)
+    );
+    assert_eq!(mode(&snapshot_file), 0o600);
+
+    // A puts the bounty back as posted, and B's submit goes through.
+    publish_as(&testnet, &a_key_file, &paths::bounty(posted.id), &as_posted).await;
+    let report = sweepky(&b, &submit_args)
+        .await
+        .expect("B submits the sweep");
     assert!(
         report.text().contains(&sweep.to_string()),
         "{}",
@@ -1115,8 +1157,10 @@ async fn end_to_end() {
             },
         })
     );
-    // The sweep directory is stamped as submitted.
+    // The sweep directory is stamped as submitted, and the snapshot of the
+    // fetch is gone, the record being final.
     assert!(sweep_dir.join(".sweepky/submitted").is_file());
+    assert_gone(&snapshot_file);
 
     // ----- P2b: a second run, with links planted in its audit/ -----
 

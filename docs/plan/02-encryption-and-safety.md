@@ -55,7 +55,7 @@ Why age: it encrypts to several recipients natively (an owner with two laptops, 
 age has no sender authentication, and Pubky Ring signs nothing for apps. Authorship therefore rests on two facts:
 
 1. The record sits at the writer's own path on their own homeserver, which only their session can write, as reported by that homeserver. The homeserver operator is trusted for integrity and availability; confidentiality survives a passive operator, not an active one (above).
-2. The manifest inside the ciphertext echoes sweeper, bounty and targets, so a copied report does not check out under another sweeper, another bounty or other targets. The manifest has no sweep id, so a sweeper's own package uploaded again under another of their sweep records, for the same bounty and targets, does check out there.
+2. The manifest inside the ciphertext echoes sweeper, bounty and targets, so a copied report does not check out under another sweeper, another bounty or other targets. `submit` binds the manifest to the revisions `run` fetched, kept in the data directory, and refuses a sweep whose bounty changed since. The manifest has no sweep id, so a sweeper's own package uploaded again under another of their sweep records, for the same bounty and targets, does check out there.
 
 Clients reject records whose path owner does not match the sweeper named inside, and, for closed bounties, records from pubkys outside the roster.
 

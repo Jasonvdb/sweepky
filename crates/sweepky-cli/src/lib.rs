@@ -171,8 +171,9 @@
 //!   and checks the sweep directory, walks it through open handles without
 //!   following a link, refusing links, hard links and special files within
 //!   caps, and reads `audit/`; reads the sweep's own record, which must say
-//!   `running`, and its bounty; builds the manifest from those two alone
-//!   and the package from `audit/`, Cloudflare's findings converted; checks
+//!   `running`, and its bounty; builds the manifest from those two and the
+//!   commits `run` fetched, which the bounty must still pin, and the
+//!   package from `audit/`, Cloudflare's findings converted; checks
 //!   the owner's keys against their pin, asking about new ones (or failing
 //!   under `--no-input`); prints the file list; and seals the package to
 //!   the owner's keys and this install's own. Then, under the writers' lock
@@ -181,6 +182,10 @@
 //!   upload flips it to `aborted`, which is final, and a 429 or a network
 //!   error leaves it `running`. Last, it stamps the sweep directory as
 //!   submitted.
+//! - `sweep_state`, `<data dir>/sweeps/<id>.json`: what `run` fetched for
+//!   a sweep, each target's pins and the commit checked out, kept where
+//!   the agent cannot write, which `submit` builds the manifest's
+//!   `targetShas` from and removes once the record is final.
 //!
 //! The rules that hold for everything here (see "Rust conventions" in
 //! `docs/plan/03-cli-and-skill.md`):
@@ -283,10 +288,14 @@ mod remote;
 // the sweep aborted.
 mod run;
 // `submit`: the sweep directory found, checked and walked without following
-// a link; the manifest from the sweep's own record and its bounty; the
+// a link; the manifest from the sweep's own record, its bounty and what `run`
+// fetched; the
 // package sealed to the bounty owner's pinned keys and this install's;
 // uploaded, and the record flipped, under the writers' lock.
 mod submit;
+// What `run` fetched for each sweep, kept under the data directory, which
+// `submit` builds the manifest's commits from.
+mod sweep_state;
 // The per-command session: the writers' lock, a fresh sign-in and a sign-out
 // that is always attempted. `login` holds its lock; `keys revoke` is the
 // first command to run in a whole session; `logout` runs the sign-in and the

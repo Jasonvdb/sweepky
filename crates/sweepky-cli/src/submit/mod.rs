@@ -23,8 +23,11 @@
 //!    sweep was run while it was, and its owner can still read it.
 //! 3. **The playbook and the manifest** (`manifest`): `--playbook`, or the
 //!    record's own unless it is still `run`'s placeholder; and the
-//!    manifest, from the record and the bounty alone, never from the
-//!    marker or `scope.json`.
+//!    manifest, from the record and the commits `run` checked out, which
+//!    it kept in the data directory (`crate::sweep_state`), never from the
+//!    marker or `scope.json`. A sweep with no such snapshot is refused, and
+//!    so is one whose bounty no longer pins its targets as `run` fetched
+//!    them: the sweep must be run again.
 //! 4. **The package**: core's `SweepPackage::build`, which converts a
 //!    Cloudflare `findings.json` and leaves out, with a warning naming the
 //!    file, anything that is not text or sits at a path a package may not
@@ -42,7 +45,9 @@
 //!    the record is read back and must still say `running`, for the same
 //!    bounty and targets; the pin is written; `sweeps/<id>.age` is
 //!    uploaded; and the record is rewritten as `done`, with `finishedAt`
-//!    and the playbook.
+//!    and the playbook. Once the record says `done`, or a refused upload
+//!    has flipped it to `aborted`, the snapshot is removed; while it says
+//!    `running`, the snapshot stays for the next try.
 //! 8. **The stamp** `.sweepky/submitted`, after the lock, so that picking
 //!    without `--run-dir` passes this sweep over.
 //!
@@ -72,8 +77,8 @@ use pubky::StatusCode;
 use sweepky_core::paths;
 use sweepky_core::{
     AgeRecipient, AttachmentPath, Bounty, BuiltPackage, FindingsSource, KnownBountyStatus,
-    KnownSweepStatus, Manifest, Playbook, Pubky, RecordTime, SkipReason, SkippedFile, Sweep,
-    SweepPackage, SweepRef, seal_package,
+    KnownSweepStatus, Manifest, Playbook, Pubky, RecordId, RecordTime, SkipReason, SkippedFile,
+    Sweep, SweepPackage, SweepRef, seal_package,
 };
 
 use self::manifest::{build_manifest, final_playbook, require_running};
@@ -89,6 +94,7 @@ use crate::records::{PublicRecordReader, PublicRecords};
 use crate::remote::{status_of, upload_error};
 use crate::run::{logged_in_sweeper, put_record, record_bytes};
 use crate::session::with_writer_session;
+use crate::sweep_state::{forget_snapshot, read_snapshot};
 use crate::{Context, Dirs, Report, clock};
 
 /// What the report says when the person answered no to the question about
@@ -200,11 +206,13 @@ async fn submit_through(
     let sweep = dir.sweep();
     let (record, bounty) = read_records(ctx, records, sweep).await?;
     let playbook = final_playbook(request.playbook.as_ref(), &record)?;
+    let fetched = read_snapshot(&ctx.dirs, sweep)?;
     let manifest = build_manifest(
         request.sweeper,
         &record,
         record.bounty,
         &bounty,
+        &fetched,
         playbook.clone(),
         clock::now()?,
     )?;
@@ -475,7 +483,9 @@ impl FinishSweep for LockedSession<'_> {
 /// record read back and checked, the pin written, `sweeps/<id>.age`
 /// uploaded and the record flipped to `done`. A refused upload flips it to
 /// `aborted` instead ([`abort_upload`]); a 429 or a failure that is no
-/// answer at all leaves it `running`.
+/// answer at all leaves it `running`. The snapshot of what `run` fetched
+/// is forgotten once the record says `done` or `aborted`, and kept while
+/// it says `running`, so that `submit` can be run again.
 async fn finish_sweep(storage: &impl OwnStorage, upload: Upload<'_>) -> anyhow::Result<()> {
     // Taking `upload` apart moves each field out on its own, so the
     // ciphertext can move into its PUT while the rest is still used.
@@ -499,7 +509,7 @@ async fn finish_sweep(storage: &impl OwnStorage, upload: Upload<'_>) -> anyhow::
             return Err(failure.context(STILL_RUNNING));
         }
         let aborted = finished_record(current, KnownSweepStatus::Aborted, playbook, finished_at);
-        return Err(abort_upload(storage, &record_path, &aborted, failure).await);
+        return Err(abort_upload(storage, &record_path, &aborted, failure, dirs, &sweep.id).await);
     }
     let done = finished_record(current, KnownSweepStatus::Done, playbook, finished_at);
     put_record(storage, &record_path, record_bytes(&done)?)
@@ -509,7 +519,9 @@ async fn finish_sweep(storage: &impl OwnStorage, upload: Upload<'_>) -> anyhow::
                 "uploaded {package_path}, but could not change the sweep's record to done, so it \
                  still says running; run submit again"
             )
-        })
+        })?;
+    forget_snapshot(dirs, &sweep.id);
+    Ok(())
 }
 
 /// Whether `error`, from the `.age` PUT, is the homeserver refusing the
@@ -547,19 +559,25 @@ fn require_unchanged(current: &Sweep, read: &Sweep, path: &str) -> anyhow::Resul
 
 /// The error `submit` stops with when the homeserver refused the package
 /// with `failure`: `failure` behind [`ABORTED`] once `aborted` is written
-/// at `path`, or behind [`NOT_ABORTED`] and the flip's own error, fixed
-/// text too, when it could not be.
+/// at `path`, which is final, so the snapshot of sweep `id` under `dirs` is
+/// forgotten; or behind [`NOT_ABORTED`] and the flip's own error, fixed
+/// text too, when it could not be, the snapshot kept for the next try.
 async fn abort_upload(
     storage: &impl OwnStorage,
     path: &str,
     aborted: &Sweep,
     failure: anyhow::Error,
+    dirs: &Dirs,
+    id: &RecordId,
 ) -> anyhow::Error {
     // An `async` block, so that `?` inside it stops the block, not this
     // function, and both ways the flip can fail end up in `flipped`.
     let flipped = async { put_record(storage, path, record_bytes(aborted)?).await }.await;
     match flipped {
-        Ok(()) => failure.context(ABORTED),
+        Ok(()) => {
+            forget_snapshot(dirs, id);
+            failure.context(ABORTED)
+        }
         // `{:#}` writes the flip's whole chain of context on one line.
         Err(flip) => failure.context(format!("{NOT_ABORTED} ({flip:#})")),
     }
@@ -845,7 +863,7 @@ mod command_tests {
     use std::path::{Path, PathBuf};
 
     use pubky::StatusCode;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use sweepky_core::paths;
     use sweepky_core::{
         AttachmentPath, BountyRef, DeviceId, DeviceIdentity, KnownSweepStatus, Playbook, Pubky,
@@ -854,7 +872,7 @@ mod command_tests {
     use tempfile::TempDir;
 
     use super::fixture::SweepFixture;
-    use super::manifest::ABORTED_IS_FINAL;
+    use super::manifest::{ABORTED_IS_FINAL, TARGETS_CHANGED};
     use super::owner_keys::accept_owner_keys;
     use super::{
         ABORTED, FinishSweep, NOT_ABORTED, NOT_CONFIRMED, STILL_RUNNING, SubmitRequest, Upload,
@@ -868,10 +886,11 @@ mod command_tests {
     use crate::prompt::Prompting;
     use crate::records::PublicRecords;
     use crate::remote::{Listing, PACKAGE_TOO_LARGE, QUOTA_FULL, RATE_LIMITED, UPLOAD_QUOTA_FULL};
+    use crate::sweep_state::NO_SNAPSHOT;
     use crate::test_support::{
         FakeKeyStore, FakeOwnStorage, FakePublicRecords, SYNTHETIC_HEAD, SYNTHETIC_SHA, bounty_id,
-        bounty_json, dirs_in, json_bytes, offline_network, pr_target_json, private_temp,
-        random_pubky, repo_target_json, sweep_json, test_context,
+        bounty_json, bounty_of, dirs_in, json_bytes, offline_network, pr_target_json, private_temp,
+        random_pubky, repo_target_json, snapshot_of, sweep_json, test_context,
     };
 
     /// What the fake storage answers a refused write with: no message may
@@ -929,10 +948,10 @@ mod command_tests {
 
     /// A sweep `run` started and the agent finished: the sweep directory
     /// with `fixtures/cloudflare/` copied into its `audit/`; this install,
-    /// the sweeper, with its device key; the bounty owner, with one key
-    /// under `keys/laptop.json`; the bounty, of a repo target t1 and a pull
-    /// request t2; and the running record of both, naming `playbook`.
-    /// Every key is made at run time.
+    /// the sweeper, with its device key and the snapshot `run` kept of its
+    /// fetch; the bounty owner, with one key under `keys/laptop.json`; the
+    /// bounty, of a repo target t1 and a pull request t2; and the running
+    /// record of both, naming `playbook`. Every key is made at run time.
     struct Scenario {
         fixture: SweepFixture,
         home: TempDir,
@@ -956,11 +975,17 @@ mod command_tests {
                 owner: random_pubky(),
                 id: bounty_id(),
             };
-            let others = FakePublicRecords::default().with_record(
-                bounty.owner,
-                &paths::bounty(bounty.id),
-                &bounty_json(json!([repo_target_json("t1"), pr_target_json("t2")])),
-            );
+            let others = bounty_served(bounty, as_posted());
+            // What `run` kept of its fetch of both targets, from the bounty
+            // as it is served.
+            let sweep = SweepRef {
+                sweeper: fixture.sweeper(),
+                id: fixture.id(),
+            };
+            let fetched = bounty_of(as_posted());
+            snapshot_of(sweep, bounty, &fetched, &["t1", "t2"])
+                .write(&dirs_in(&home))
+                .expect("the snapshot");
             let own = FakeOwnStorage::default();
             let mut record = sweep_json(bounty, &["t1", "t2"], "running");
             record["playbook"] = json!(playbook);
@@ -1053,6 +1078,16 @@ mod command_tests {
             fs::symlink_metadata(self.fixture.dir().join(".sweepky/submitted")).is_ok()
         }
 
+        /// Where the snapshot of `run`'s fetch of this sweep is kept.
+        fn snapshot_file(&self) -> PathBuf {
+            dirs_in(&self.home).sweep_snapshot_file(&self.fixture.id())
+        }
+
+        /// Whether that snapshot is still there.
+        fn has_snapshot(&self) -> bool {
+            fs::symlink_metadata(self.snapshot_file()).is_ok()
+        }
+
         /// The keys pinned for the bounty's owner, as `(device id, key)`.
         fn pinned(&self) -> Option<Vec<(String, String)>> {
             let pins = read_pins(&dirs_in(&self.home)).expect("reads");
@@ -1068,6 +1103,21 @@ mod command_tests {
 
     fn device_id(text: &str) -> DeviceId {
         text.parse().expect("a device id")
+    }
+
+    /// The scenario's bounty's targets, as posted: a repo target t1 and a
+    /// pull request t2.
+    fn as_posted() -> Value {
+        json!([repo_target_json("t1"), pr_target_json("t2")])
+    }
+
+    /// Everyone else's storage, holding the bounty at `at`, of `targets`.
+    fn bounty_served(at: BountyRef, targets: Value) -> FakePublicRecords {
+        FakePublicRecords::default().with_record(
+            at.owner,
+            &paths::bounty(at.id),
+            &bounty_json(targets),
+        )
     }
 
     // DW1: B's submit of a Cloudflare-format sweep, in unit form.
@@ -1154,8 +1204,10 @@ mod command_tests {
             assert_eq!(package.attachments.get(&report_md), Some(original.as_str()));
         }
 
-        // Stamped, and the owner's one key pinned.
+        // Stamped, the owner's one key pinned, and the snapshot of the
+        // fetch forgotten, the record being final.
         assert!(scenario.stamped());
+        assert!(!scenario.has_snapshot());
         assert_eq!(
             scenario.pinned(),
             Some(vec![(
@@ -1236,6 +1288,7 @@ mod command_tests {
             assert_eq!(record.status.as_known(), Some(KnownSweepStatus::Aborted));
             assert!(record.finished_at.is_some());
             assert!(!scenario.stamped());
+            assert!(!scenario.has_snapshot());
 
             // Aborted is final: a later submit is refused, and says to start
             // a new run, even once the homeserver would take the package.
@@ -1276,6 +1329,8 @@ mod command_tests {
             let record = scenario.record().await;
             assert_eq!(record.status.as_known(), Some(KnownSweepStatus::Running));
             assert!(!scenario.stamped());
+            // Kept for the next try.
+            assert!(scenario.has_snapshot());
 
             // Run again once the homeserver takes it: done.
             scenario.servers.own.stop_failing();
@@ -1284,6 +1339,7 @@ mod command_tests {
             let record = scenario.record().await;
             assert_eq!(record.status.as_known(), Some(KnownSweepStatus::Done));
             assert!(scenario.stamped());
+            assert!(!scenario.has_snapshot());
         }
     }
 
@@ -1310,6 +1366,59 @@ mod command_tests {
         assert!(!message.contains("MARKER-5k8d"), "{message}");
         let record = scenario.record().await;
         assert_eq!(record.status.as_known(), Some(KnownSweepStatus::Running));
+        // Still running, so the snapshot stays for the next try.
+        assert!(scenario.has_snapshot());
+    }
+
+    // The review finding: the owner, or their homeserver, rewrote a
+    // target's pinned revision after `run` fetched it. Taking the commits
+    // from the bounty now would seal a manifest that claims the new commit
+    // was audited.
+    #[tokio::test]
+    async fn a_bounty_whose_pinned_revision_moved_since_run_is_refused_unpublished() {
+        let mut scenario = Scenario::new(PLAYBOOK);
+        let mut moved = repo_target_json("t1");
+        moved["rev"] = json!(SYNTHETIC_HEAD);
+        scenario.servers.others =
+            bounty_served(scenario.bounty, json!([moved, pr_target_json("t2")]));
+
+        let message = scenario.refusal(None).await;
+
+        // Fixed text, and nothing written anywhere: no package, no flip,
+        // no pin, no stamp; the record still says running and the
+        // snapshot is kept.
+        assert_eq!(message, TARGETS_CHANGED);
+        assert_eq!(scenario.servers.own.puts(), Vec::<String>::new());
+        assert_eq!(scenario.pinned(), None);
+        assert!(!scenario.stamped());
+        assert_eq!(
+            scenario.record().await.status.as_known(),
+            Some(KnownSweepStatus::Running)
+        );
+        assert!(scenario.has_snapshot());
+
+        // The bounty put back as `run` fetched it: the same sweep submits,
+        // its manifest naming the commits fetched.
+        scenario.servers.others = bounty_served(scenario.bounty, as_posted());
+        let (submitted, _) = scenario.submit(None, "").await;
+        submitted.unwrap_or_else(|error| panic!("refused: {error:#}"));
+        assert_eq!(
+            scenario.record().await.status.as_known(),
+            Some(KnownSweepStatus::Done)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sweep_with_no_snapshot_of_its_fetch_is_refused_unpublished() {
+        let scenario = Scenario::new(PLAYBOOK);
+        fs::remove_file(scenario.snapshot_file()).expect("removed");
+
+        let message = scenario.refusal(None).await;
+
+        assert_eq!(message, NO_SNAPSHOT);
+        assert_eq!(scenario.servers.own.puts(), Vec::<String>::new());
+        assert_eq!(scenario.pinned(), None);
+        assert!(!scenario.stamped());
     }
 
     #[tokio::test]

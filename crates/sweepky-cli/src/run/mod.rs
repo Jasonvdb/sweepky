@@ -17,7 +17,8 @@
 //!    with no session, and chooses the targets, a picked target as if
 //!    `--target` named it; [`CheckedBounty::summary`] goes to standard
 //!    error. The git runner is made, and the sweep's id, and
-//!    `fetch::check_sweep_dir` checks that `./sweeps/<id>/` can be made.
+//!    `fetch::check_sweep_dir` checks that `./sweeps/<id>/` can be made,
+//!    and `sweep_state` that no snapshot of a fetch is there for that id.
 //! 2. **Publish `running`.** `sweeps/<id>.json`, under the writers' lock
 //!    with a fresh session, signed out again at once
 //!    ([`LockedSessionPublisher`]). A refused write ends the run here: no
@@ -26,17 +27,19 @@
 //!    directory under the data directory, out of the agent's reach: it
 //!    fetches each target, strips it and writes `scope.json` and
 //!    `brief.md`; then the per-sweep marker `.sweepky/sweep.json`
-//!    (`marker`) is written there, last; then `place` moves the whole
-//!    directory into the project as `sweeps/<id>/`, through handles that
-//!    follow no link.
+//!    (`marker`) is written there, last; then the snapshot of what was
+//!    fetched, each target's pins and the commit checked out, goes in the
+//!    data directory (`crate::sweep_state`), where `submit` takes the
+//!    manifest's commits from; then `place` moves the whole directory into
+//!    the project as `sweeps/<id>/`, through handles that follow no link.
 //! 4. **Or abort.** If any step of 3 fails, an unserved SHA among them,
 //!    nothing of the sweep is left: the staging directory goes with the
-//!    fetch's own guard, and the project never got a part of it (a copy
-//!    across filesystems that fails removes itself). The record is flipped
-//!    to `aborted`, with `finishedAt`, under the lock once more. `aborted` is
-//!    final: `pull` re-fetches only `running` sweeps and the board shows an
-//!    aborted one struck. A flip that fails too is said in the error, in
-//!    fixed text.
+//!    fetch's own guard, the snapshot is forgotten, and the project never
+//!    got a part of it (a copy across filesystems that fails removes
+//!    itself). The record is flipped to `aborted`, with `finishedAt`,
+//!    under the lock once more. `aborted` is final: `pull` re-fetches only
+//!    `running` sweeps and the board shows an aborted one struck. A flip
+//!    that fails too is said in the error, in fixed text.
 //! 5. **Report** the sweep, what was stripped from each target, and what
 //!    to run next: Claude Code with the project's settings alone,
 //!    `/sweepky`, then `sweepky submit --run-dir sweeps/<id>`.
@@ -117,6 +120,7 @@ use crate::records::{PublicRecordReader, PublicRecords};
 use crate::remote::{public_key_of, write_error};
 use crate::session::{NOT_LOGGED_IN, with_writer_session};
 use crate::state::read_login_state;
+use crate::sweep_state::{SweepSnapshot, forget_snapshot, refuse_existing_snapshot};
 use crate::targets::TargetResolver;
 use crate::{Context, Dirs, Report, clock};
 
@@ -293,11 +297,12 @@ pub(crate) async fn put_record(
         .map_err(|error| write_error(&error).context(format!("could not write {path}")))
 }
 
-/// Starts `new`: checks that its directory can be made, publishes it as
-/// `running` through `publisher`, then, outside any lock, fetches its
-/// targets through `git` and `source` and writes its marker, last. If a
-/// step after the running write fails, the sweep directory is gone and the
-/// record is flipped to `aborted` ([`abort`]).
+/// Starts `new`: checks that its directory can be made and that no
+/// snapshot is there for its id, publishes it as `running` through
+/// `publisher`, then, outside any lock, fetches its targets through `git`
+/// and `source` and writes its marker and its snapshot, last. If a step
+/// after the running write fails, the sweep directory and the snapshot are
+/// gone and the record is flipped to `aborted` ([`abort`]).
 async fn start_sweep(
     publisher: &impl PublishRecord,
     git: &impl RunGit,
@@ -305,6 +310,7 @@ async fn start_sweep(
     new: &NewSweep<'_>,
 ) -> anyhow::Result<FetchedSweep> {
     check_sweep_dir(new.project, new.sweep.id)?;
+    refuse_existing_snapshot(new.dirs, &new.sweep.id)?;
     let running = running_record(new, clock::now()?)?;
     let path = paths::sweep_record(new.sweep.id);
     publisher
@@ -314,8 +320,13 @@ async fn start_sweep(
     match fetch_mark_and_place(git, source, new, &running).await {
         Ok(fetched) => Ok(fetched),
         // `running` is moved into `abort`: the borrow
-        // `fetch_mark_and_place` took ended with it.
-        Err(failure) => Err(abort(publisher, &path, running, failure).await),
+        // `fetch_mark_and_place` took ended with it. The snapshot, if the
+        // failure came after it was written, describes a sweep the project
+        // never got, so it goes first.
+        Err(failure) => {
+            forget_snapshot(new.dirs, &new.sweep.id);
+            Err(abort(publisher, &path, running, failure).await)
+        }
     }
 }
 
@@ -354,10 +365,11 @@ pub(crate) fn record_bytes(record: &Sweep) -> anyhow::Result<Vec<u8>> {
 }
 
 /// Fetches `new`'s targets into a staging directory, writes the marker of
-/// `running` there, last, then puts the whole sweep in the project. If any
-/// step fails, `?` returns early and the staged sweep is dropped, taking
-/// its staging directory with it, so the project gets no sweep without a
-/// marker.
+/// `running` there, last, and the snapshot of the fetch in the data
+/// directory, then puts the whole sweep in the project. If any step fails,
+/// `?` returns early and the staged sweep is dropped, taking its staging
+/// directory with it, so the project gets no sweep without a marker, and
+/// none without a snapshot for `submit`.
 async fn fetch_mark_and_place(
     git: &impl RunGit,
     source: &impl TargetResolver,
@@ -366,6 +378,14 @@ async fn fetch_mark_and_place(
 ) -> anyhow::Result<FetchedSweep> {
     let staged = fetch_sweep(git, source, new.dirs, new.project, new.sweep, new.checked).await?;
     SweepMarker::new(new.sweep, running, new.playbook).write_into(staged.dir())?;
+    // Each target fetched, as the pair the snapshot takes: its id and the
+    // checked view it was fetched and checked out from.
+    let fetched = new
+        .checked
+        .targets
+        .iter()
+        .map(|chosen| (&chosen.id, &chosen.target));
+    SweepSnapshot::new(new.sweep, new.checked.bounty_ref, fetched).write(new.dirs)?;
     staged.place()
 }
 
@@ -643,11 +663,13 @@ mod tests {
     use crate::identity::Refusal;
     use crate::init::{self, MARKER};
     use crate::own_storage::OwnStorage;
+    use crate::private_fs::{ensure_private_dir, write_private_file};
     use crate::remote::{QUOTA_FULL, WRITE_FORBIDDEN};
+    use crate::sweep_state::read_snapshot;
     use crate::targets::{TargetResolver, TargetSource};
     use crate::test_support::{
         FakeOwnStorage, FakePublicRecords, PLANTED, RecordingGit, SYNTHETIC_SHA, bounty_id,
-        bounty_json, circle_json, dirs_in, fixture_repo, fixture_targets, json_bytes,
+        bounty_json, circle_json, dirs_in, fixture_repo, fixture_targets, json_bytes, mode,
         offline_network, private_temp, random_pubky, recorded_fixture_shas, repo_target_json,
         sweep_json, test_context, test_git_env,
     };
@@ -1090,6 +1112,99 @@ mod tests {
         assert_eq!(marker["targets"], json!(["t1"]));
         assert_eq!(marker["playbook"], PLAYBOOK);
         assert_eq!(fetched.targets.len(), 1);
+        // The snapshot, 0600 under the data directory, out of the agent's
+        // reach: t1 at the commit checked out, M, while the bounty agrees.
+        let snapshot_file = dirs.sweep_snapshot_file(&new.sweep.id);
+        assert_eq!(mode(&snapshot_file), 0o600);
+        assert_eq!(mode(&dirs.sweep_snapshots_dir()), 0o700);
+        let snapshot = read_snapshot(&dirs, new.sweep).expect("a snapshot");
+        let commits = snapshot
+            .target_shas(&record, &checked.bounty)
+            .expect("the bounty agrees");
+        let commits: Vec<(&str, &str)> = commits
+            .iter()
+            .map(|(id, sha)| (id.as_str(), sha.as_str()))
+            .collect();
+        assert_eq!(commits, [("t1", shas["M"].as_str())]);
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_already_there_refuses_the_run_before_anything_is_published() {
+        let checked = fixture_bounty(json!([commit_target(SYNTHETIC_SHA)])).await;
+        let project = private_temp();
+        let home = private_temp();
+        let dirs = dirs_in(&home);
+        let new = new_sweep(project.path(), &dirs, &checked, None);
+        // A file at the new sweep's snapshot path, as a clash of ids or
+        // tampering would leave one.
+        let planted = dirs.sweep_snapshot_file(&new.sweep.id);
+        ensure_private_dir(&dirs.sweep_snapshots_dir()).expect("the directory");
+        write_private_file(&planted, PLANTED.as_bytes()).expect("planted");
+        let source = TargetSource::Fixture(fixture_targets());
+        let storage = FakeOwnStorage::default();
+        let git = RecordingGit::succeeding(source.protocols(), b"");
+
+        let error = start_sweep(&storage, &git, &source, &new)
+            .await
+            .expect_err("refused");
+
+        // Refused by the path alone, before anything was published or run,
+        // and the file is left as it was.
+        let message = format!("{error:#}");
+        assert!(
+            message.contains(&planted.display().to_string()),
+            "{message}"
+        );
+        assert!(!message.contains(PLANTED), "{message}");
+        assert_eq!(storage.puts(), Vec::<String>::new());
+        assert_eq!(git.argv(), Vec::<Vec<String>>::new());
+        assert_eq!(fs::read(&planted).expect("still there"), PLANTED.as_bytes());
+    }
+
+    /// The real runner, which first makes `planted`, the sweep's directory
+    /// in the project, so that the placement fails after the fetch, the
+    /// marker and the snapshot are all done.
+    struct PlantingGit {
+        git: GitRunner,
+        planted: PathBuf,
+    }
+
+    impl RunGit for PlantingGit {
+        async fn run(&self, command: &GitCommand) -> anyhow::Result<Vec<u8>> {
+            fs::create_dir_all(&self.planted).expect("planted");
+            self.git.run(command).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_placement_refused_after_the_snapshot_forgets_it_and_aborts() {
+        let shas = recorded_fixture_shas();
+        let checked = fixture_bounty(json!([commit_target(shas["M"].as_str())])).await;
+        let project = private_temp();
+        let home = private_temp();
+        let dirs = dirs_in(&home);
+        let new = new_sweep(project.path(), &dirs, &checked, None);
+        let path = paths::sweep_record(new.sweep.id);
+        let source = TargetSource::Fixture(fixture_targets());
+        let git = PlantingGit {
+            git: source.git_runner(&dirs, &test_git_env()).expect("a runner"),
+            planted: project.path().join("sweeps").join(new.sweep.id.to_string()),
+        };
+        let storage = FakeOwnStorage::default();
+
+        let error = start_sweep(&storage, &git, &source, &new)
+            .await
+            .expect_err("not placed");
+
+        let message = format!("{error:#}");
+        assert!(message.starts_with(ABORTED), "{message}");
+        // Running, then aborted; and no snapshot of a sweep the project
+        // never got.
+        assert_eq!(storage.puts(), [path.as_str(), path.as_str()]);
+        let stored = storage.get_own(&path).await.expect("reads").expect("there");
+        let aborted = Sweep::from_json(&stored).expect("a sweep record");
+        assert_eq!(aborted.status.as_known(), Some(KnownSweepStatus::Aborted));
+        assert!(fs::symlink_metadata(dirs.sweep_snapshot_file(&new.sweep.id)).is_err());
     }
 
     #[tokio::test]

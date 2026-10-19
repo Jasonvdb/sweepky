@@ -13,7 +13,7 @@
 //! [`FakeOwnStorage`] in place of the signed-in user's own storage, a
 //! [`FakePublicRecords`] in place of everyone's public storage and its
 //! listings, and the synthetic bounty, circle and sweep records the tests
-//! put there, the
+//! put there, with the snapshot `run` keeps of a sweep's fetch, the
 //! passphrase the tests wrap secret files with and a byte search to check
 //! a wrapped file shows none of its secret, and a compile-time check that a
 //! secret type implements none of the traits that would print or copy it.
@@ -36,7 +36,10 @@ use pubky::errors::RequestError;
 use pubky::{Keypair, PubkyHttpClient, PublicKey, StatusCode};
 use serde_json::{Value, json};
 use sweepky_core::paths::SweepkyPath;
-use sweepky_core::{BountyRef, DeviceId, GitSha, Pubky, RecordId, RepoName, Timestamp, Zeroizing};
+use sweepky_core::{
+    Bounty, BountyRef, DeviceId, GitSha, KnownTarget, Pubky, RecordId, RepoName, SweepRef,
+    TargetId, Timestamp, Zeroizing,
+};
 use tempfile::TempDir;
 
 use crate::device::{KeyIds, KeyStore, PublicKeys};
@@ -44,6 +47,7 @@ use crate::git::{AllowedProtocols, GitCommand, GitFailed, RunGit, git_argv};
 use crate::own_storage::OwnStorage;
 use crate::records::PublicRecords;
 use crate::remote::{Listing, ListingError};
+use crate::sweep_state::SweepSnapshot;
 use crate::targets::TargetSource;
 use crate::targets::fixture::FixtureTargets;
 use crate::targets::github::GitHubApi;
@@ -756,6 +760,50 @@ pub(crate) fn sweep_json(bounty: BountyRef, targets: &[&str], status: &str) -> V
         "status": status,
         "startedAt": "2026-10-19T09:00:00Z",
     })
+}
+
+/// A SHA no synthetic target pins, for a revision rewritten after a fetch.
+pub(crate) const UNPINNED_SHA: &str = "4444444444444444444444444444444444444444";
+
+/// [`bounty_json`] of `targets`, read by core.
+pub(crate) fn bounty_of(targets: Value) -> Bounty {
+    Bounty::from_json(&json_bytes(&bounty_json(targets))).expect("a bounty")
+}
+
+/// A random sweeper's sweep and a random owner's bounty, unrelated so far.
+pub(crate) fn random_sweep_and_bounty() -> (SweepRef, BountyRef) {
+    let sweep = SweepRef {
+        sweeper: random_pubky(),
+        id: record_id(7),
+    };
+    let bounty = BountyRef {
+        owner: random_pubky(),
+        id: bounty_id(),
+    };
+    (sweep, bounty)
+}
+
+/// The snapshot `run` keeps of `sweep`, a fetch of the targets `ids` of
+/// `bounty`, read from `at`: each checked out at its reviewed commit.
+pub(crate) fn snapshot_of(
+    sweep: SweepRef,
+    at: BountyRef,
+    bounty: &Bounty,
+    ids: &[&str],
+) -> SweepSnapshot {
+    let fetched: Vec<(TargetId, KnownTarget)> = ids
+        .iter()
+        .map(|id| {
+            let target = bounty
+                .targets
+                .iter()
+                .find(|target| target.id().as_str() == *id)
+                .expect("a target of the bounty");
+            let known = target.known().expect("well formed").expect("a known kind");
+            (target.id().clone(), known)
+        })
+        .collect();
+    SweepSnapshot::new(sweep, at, fetched.iter().map(|(id, target)| (id, target)))
 }
 
 /// A `circle.json` that `admin` keeps, listing `members` and no labels.
