@@ -7,34 +7,39 @@
 //! alone. A revision is pinned with one anonymous `git ls-remote`
 //! (`rev::pin`).
 //!
-//! Generic over [`ResolveHost`], so the tests answer the host lookup with
-//! any addresses and no network, and its methods take any [`RunGit`], so
-//! they record git's arguments instead of running it.
+//! A pull request is read from GitHub's unauthenticated API (`github`):
+//! its base and head from the pull request, checked against the base
+//! repository's own `refs/pull/<n>/head` through ls-remote, then their
+//! merge base from the compare API. GitHub's API host goes through the host
+//! policy too, before the first request.
 //!
-//! Pull requests come from GitHub's unauthenticated API, which comes later
-//! in P2b; until then [`RealTargets::pull_request`] applies the policy and
-//! refuses.
+//! Generic over [`ResolveHost`], so the tests answer the host lookup with
+//! any addresses and no network, and its methods take any [`RunGit`] and
+//! any [`GitHubApi`], so they record git's arguments and GitHub's URLs
+//! instead of contacting either.
 //!
 //! [`TargetSource::Real`]: super::TargetSource::Real
 
 use std::num::NonZeroU64;
 
-use anyhow::bail;
+use anyhow::{Context as _, bail};
 use sweepky_core::{GitSha, KnownTargetKind, RepoName};
 
-use super::host::{HttpsRemote, ResolveHost};
-use super::rev::{RevSpec, pin};
-use super::{PullRequest, TargetRemote, TargetResolver};
+use super::github::{API_HOST, GitHubApi, GitHubRepo, PullShas, read_merge_base, read_pull};
+use super::host::{HttpsRemote, ResolveHost, check_host};
+use super::rev::{RevSpec, find_ref, list_refs, pin};
+use super::{PullRequest, TargetRemote, TargetResolver, pull_head_ref};
 use crate::git::{AllowedProtocols, Remote, RunGit};
 
-/// The start of every repository on GitHub: the host, then the `/` a
-/// `RepoName` always has after it. So a name starts with this exactly when
-/// its host is `github.com`.
-const GITHUB: &str = "github.com/";
+/// What a head that GitHub's API and the repository's ref disagree on is
+/// refused with: a push landed between the two reads.
+pub(crate) const PULL_REQUEST_MOVED: &str =
+    "the pull request moved while it was being pinned; try again";
 
-const PR_NOT_ON_GITHUB: &str = "a pull request target must be on github.com: Sweepky reads pull \
-                                requests from GitHub only";
-const PR_NOT_BUILT: &str = "Sweepky cannot read pull requests from GitHub yet";
+/// What a pull request whose head ref the repository does not list is
+/// refused with.
+pub(crate) const NO_PULL_HEAD: &str = "the repository lists no refs/pull/<n>/head for the pull \
+     request, so its head cannot be checked";
 
 /// The real source, looking hosts up through `R`: [`SystemResolver`] in the
 /// binary, a fake in the tests.
@@ -60,8 +65,8 @@ impl<R: ResolveHost> TargetResolver for RealTargets<R> {
     }
 
     fn check_policy(&self, kind: KnownTargetKind, repo: &RepoName) -> anyhow::Result<()> {
-        if kind == KnownTargetKind::Pr && !repo.as_str().starts_with(GITHUB) {
-            bail!(PR_NOT_ON_GITHUB);
+        if kind == KnownTargetKind::Pr {
+            GitHubRepo::of(repo)?;
         }
         Ok(())
     }
@@ -80,12 +85,24 @@ impl<R: ResolveHost> TargetResolver for RealTargets<R> {
 
     async fn pull_request(
         &self,
-        _git: &impl RunGit,
+        git: &impl RunGit,
+        github: &impl GitHubApi,
         repo: &RepoName,
-        _number: NonZeroU64,
+        number: NonZeroU64,
     ) -> anyhow::Result<PullRequest> {
-        self.check_policy(KnownTargetKind::Pr, repo)?;
-        bail!(PR_NOT_BUILT)
+        // The policy first, with no network: `github.com/<owner>/<name>`.
+        let api_repo = GitHubRepo::of(repo)?;
+        check_host(API_HOST, &self.resolver)
+            .await
+            .with_context(|| format!("could not reach GitHub's API at {API_HOST}"))?;
+        let PullShas { base, head } = read_pull(github, &api_repo, number).await?;
+        self.check_pull_head(git, repo, number, &head).await?;
+        let merge_base = read_merge_base(github, &api_repo, &base, &head).await?;
+        Ok(PullRequest {
+            base,
+            head,
+            merge_base,
+        })
     }
 
     async fn fetch_remote(
@@ -99,20 +116,83 @@ impl<R: ResolveHost> TargetResolver for RealTargets<R> {
     }
 }
 
+impl<R: ResolveHost> RealTargets<R> {
+    /// Checks that `head`, the head GitHub's API named for pull request
+    /// `number`, is what `repo` itself lists as `refs/pull/<number>/head`:
+    /// one anonymous ls-remote of the base repository, after its host
+    /// check, so the commit `run` will fetch from that ref is the one
+    /// pinned. A head that differs is [`PULL_REQUEST_MOVED`]; none listed
+    /// is [`NO_PULL_HEAD`].
+    async fn check_pull_head(
+        &self,
+        git: &impl RunGit,
+        repo: &RepoName,
+        number: NonZeroU64,
+        head: &GitSha,
+    ) -> anyhow::Result<()> {
+        let remote = HttpsRemote::for_repo(repo, &self.resolver).await?;
+        let head_ref = pull_head_ref(number);
+        let refs = list_refs(git, Remote::Https(&remote), &[&head_ref]).await?;
+        match find_ref(&refs, &head_ref)? {
+            // A match guard: this arm applies only when the condition holds.
+            // Two SHAs from public places, so a plain `==` leaks nothing.
+            Some(listed) if listed == *head => Ok(()),
+            Some(_) => bail!(PULL_REQUEST_MOVED),
+            None => bail!(NO_PULL_HEAD),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU64;
 
     use sweepky_core::{KnownTargetKind, RepoName};
 
-    use super::RealTargets;
+    use super::{NO_PULL_HEAD, PULL_REQUEST_MOVED, RealTargets};
     use crate::git::AllowedProtocols;
+    use crate::targets::github::NOT_A_GITHUB_REPO;
     use crate::targets::rev::NOT_ANONYMOUSLY_READABLE;
-    use crate::targets::{TargetRemote, TargetResolver};
-    use crate::test_support::{FakeResolver, RecordingGit, checked_remote};
+    use crate::targets::{PullRequest, TargetRemote, TargetResolver};
+    use crate::test_support::{FakeGitHub, FakeResolver, RecordingGit, checked_remote};
 
     const REPO: &str = "github.com/org/name";
     const SHA: &str = "6a0e0f6f873af85d97788783fde43f3e3fa83133";
+
+    /// Synthetic object names for pull request 42: the base tip, the head
+    /// GitHub names, a head that moved after it, and the merge base.
+    const BASE: &str = "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1";
+    const HEAD: &str = "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2";
+    const MOVED: &str = "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4";
+    const MERGE_BASE: &str = "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3";
+
+    /// The API URLs the real source asks for pull request 42 of [`REPO`].
+    const PULLS_URL: &str = "https://api.github.com/repos/org/name/pulls/42";
+    fn compare_url() -> String {
+        format!("https://api.github.com/repos/org/name/compare/{BASE}...{HEAD}?per_page=1&page=2")
+    }
+
+    fn forty_two() -> NonZeroU64 {
+        NonZeroU64::new(42).expect("not zero")
+    }
+
+    /// GitHub as the tests script it: pull request 42 with [`BASE`] and
+    /// [`HEAD`], and their merge base [`MERGE_BASE`]. Every other URL is a
+    /// 404.
+    fn github() -> FakeGitHub {
+        let pull = format!(r#"{{"base":{{"sha":"{BASE}"}},"head":{{"sha":"{HEAD}"}}}}"#);
+        let compare = format!(r#"{{"merge_base_commit":{{"sha":"{MERGE_BASE}"}}}}"#);
+        FakeGitHub::answering(&[
+            (PULLS_URL, pull.as_bytes()),
+            (&compare_url(), compare.as_bytes()),
+        ])
+    }
+
+    /// What `git ls-remote <repo> refs/pull/42/head` lists when the head
+    /// is `head`.
+    fn pull_head_listing(head: &str) -> String {
+        format!("{head}\trefs/pull/42/head\n")
+    }
 
     fn repo(text: &str) -> RepoName {
         text.parse().expect("a repo name")
@@ -217,32 +297,144 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_pull_request_target_must_be_on_github_com() {
+    async fn a_pull_request_target_must_be_github_com_owner_name() {
         let real = public();
-        let gitlab = repo("gitlab.com/org/name");
         assert!(real.check_policy(KnownTargetKind::Pr, &repo(REPO)).is_ok());
-        for kind in [KnownTargetKind::Repo, KnownTargetKind::Commit] {
-            assert!(real.check_policy(kind, &gitlab).is_ok(), "{kind:?}");
-        }
-        let error = real
-            .check_policy(KnownTargetKind::Pr, &gitlab)
-            .expect_err("not GitHub");
-        assert!(format!("{error:#}").contains("github.com"), "{error:#}");
-        assert!(!format!("{error:#}").contains("gitlab"), "{error:#}");
-        // The pull request and fetch paths apply it themselves, before any
-        // lookup or git run.
         let git = RecordingGit::succeeding(real.protocols(), b"");
-        assert!(
-            real.pull_request(&git, &gitlab, NonZeroU64::MIN)
+        let github = github();
+        for text in [
+            "gitlab.com/org/name",
+            "github.com/org/name/x",
+            "github.com/org/name.git",
+        ] {
+            let refused = repo(text);
+            // Other kinds may be anywhere.
+            for kind in [KnownTargetKind::Repo, KnownTargetKind::Commit] {
+                assert!(real.check_policy(kind, &refused).is_ok(), "{kind:?} {text}");
+            }
+            let error = real
+                .check_policy(KnownTargetKind::Pr, &refused)
+                .expect_err(text);
+            assert_eq!(format!("{error:#}"), NOT_A_GITHUB_REPO, "{text}");
+            assert!(format!("{error:#}").contains("github.com"), "{error:#}");
+            assert!(!format!("{error:#}").contains("gitlab"), "{error:#}");
+            // The pull request and fetch paths apply it themselves, before
+            // any lookup, git run or request to GitHub.
+            let error = real
+                .pull_request(&git, &github, &refused, forty_two())
                 .await
-                .is_err()
-        );
-        assert!(
-            real.fetch_remote(KnownTargetKind::Pr, &gitlab)
-                .await
-                .is_err()
-        );
+                .expect_err(text);
+            assert_eq!(format!("{error:#}"), NOT_A_GITHUB_REPO, "{text}");
+            assert!(
+                real.fetch_remote(KnownTargetKind::Pr, &refused)
+                    .await
+                    .is_err()
+            );
+        }
         assert_eq!(git.argv(), Vec::<Vec<String>>::new());
+        assert_eq!(github.asked(), Vec::<String>::new());
         assert_eq!(real.resolver.asked(), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn a_pull_request_is_read_from_github_and_its_head_checked_with_ls_remote() {
+        let real = public();
+        let github = github();
+        let listing = pull_head_listing(HEAD);
+        let git = RecordingGit::succeeding(real.protocols(), listing.as_bytes());
+        let pinned = real
+            .pull_request(&git, &github, &repo(REPO), forty_two())
+            .await
+            .expect("pins");
+        let sha = |text: &str| text.parse().expect("a SHA");
+        assert_eq!(
+            pinned,
+            PullRequest {
+                base: sha(BASE),
+                head: sha(HEAD),
+                merge_base: sha(MERGE_BASE),
+            }
+        );
+        // The pull request, then the compare of its base and head.
+        assert_eq!(github.asked(), [PULLS_URL.to_owned(), compare_url()]);
+        // Both hosts went through the host policy first: GitHub's API, then
+        // the repository's own.
+        assert_eq!(real.resolver.asked(), ["api.github.com", "github.com"]);
+        // One ls-remote of the base repository's own `refs/pull/42/head`,
+        // never of the fork the pull request came from.
+        let argv = git.argv();
+        let [argv] = argv.as_slice() else {
+            panic!("one git run: {argv:?}");
+        };
+        let subcommand = argv
+            .iter()
+            .position(|arg| arg == "ls-remote")
+            .expect("ls-remote");
+        assert_eq!(
+            argv.get(subcommand + 1..),
+            Some(
+                ["https://github.com/org/name", "refs/pull/42/head"]
+                    .map(String::from)
+                    .as_slice()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_head_that_moved_or_is_not_listed_is_refused() {
+        let real = public();
+        for (listing, expected) in [
+            (pull_head_listing(MOVED), PULL_REQUEST_MOVED),
+            (String::new(), NO_PULL_HEAD),
+        ] {
+            let github = github();
+            let git = RecordingGit::succeeding(real.protocols(), listing.as_bytes());
+            let error = real
+                .pull_request(&git, &github, &repo(REPO), forty_two())
+                .await
+                .expect_err(expected);
+            assert_eq!(format!("{error:#}"), expected);
+            // Refused before the merge base is asked for.
+            assert_eq!(github.asked(), [PULLS_URL]);
+        }
+        assert_eq!(
+            PULL_REQUEST_MOVED,
+            "the pull request moved while it was being pinned; try again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pull_request_github_does_not_answer_is_not_found_or_not_public() {
+        let real = public();
+        // A GitHub that answers 404 to everything, as it does for a
+        // private repository.
+        let github = FakeGitHub::answering(&[]);
+        let git = RecordingGit::succeeding(real.protocols(), b"");
+        let error = real
+            .pull_request(&git, &github, &repo(REPO), forty_two())
+            .await
+            .expect_err("a 404");
+        assert!(
+            format!("{error:#}").contains("not found, or not public"),
+            "{error:#}"
+        );
+        assert_eq!(github.asked(), [PULLS_URL]);
+        assert_eq!(git.argv(), Vec::<Vec<String>>::new());
+    }
+
+    #[tokio::test]
+    async fn github_on_a_non_public_address_is_refused_before_any_request() {
+        let real = RealTargets::new(FakeResolver::answering(&["127.0.0.1"]));
+        let github = github();
+        let git = RecordingGit::succeeding(real.protocols(), b"");
+        let error = real
+            .pull_request(&git, &github, &repo(REPO), forty_two())
+            .await
+            .expect_err("not public");
+        assert!(format!("{error:#}").contains("not public"), "{error:#}");
+        assert!(format!("{error:#}").contains("GitHub's API"), "{error:#}");
+        assert_eq!(real.resolver.asked(), ["api.github.com"]);
+        assert_eq!(github.asked(), Vec::<String>::new());
+        assert_eq!(git.argv(), Vec::<Vec<String>>::new());
     }
 }

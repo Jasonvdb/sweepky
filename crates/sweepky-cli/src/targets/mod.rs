@@ -9,7 +9,11 @@
 //! - [`TargetSource`], what the [`Context`](crate::Context) holds: the real
 //!   source in the binary, the fixture source in the tests.
 //! - `real`, the real source: repositories on the internet, over https
-//!   only, each host checked by the host policy before git contacts it.
+//!   only, each host checked by the host policy before git contacts it,
+//!   with pull requests read from GitHub's API.
+//! - `github`, GitHub's unauthenticated REST API: the pull request target
+//!   policy (`github.com/<owner>/<name>`), the `GitHubApi` seam the
+//!   requests go through, and the parsers of its two answers.
 //! - `fixture`, the fixture source: the bare repository under `fixtures/`,
 //!   over the `file` transport, for the tests alone.
 //! - `rev`, a checked revision and the ls-remote pinning both sources
@@ -33,6 +37,7 @@
 )]
 
 pub(crate) mod fixture;
+pub(crate) mod github;
 pub(crate) mod host;
 pub(crate) mod real;
 pub(crate) mod rev;
@@ -42,6 +47,7 @@ use std::num::NonZeroU64;
 use sweepky_core::{GitSha, KnownTargetKind, RepoName};
 
 use self::fixture::{FixtureTargets, LocalRemote};
+use self::github::GitHubApi;
 use self::host::{HttpsRemote, SystemResolver};
 use self::real::RealTargets;
 use self::rev::RevSpec;
@@ -90,10 +96,14 @@ pub(crate) trait TargetResolver {
     ) -> anyhow::Result<GitSha>;
 
     /// Pull request `number` of `repo`: its base, head and merge base. It
-    /// applies [`check_policy`](Self::check_policy) first.
+    /// applies [`check_policy`](Self::check_policy) first. The real source
+    /// reads them through `github` (the caller passes the SDK's HTTP client,
+    /// `ctx.network.pubky().client()`) and checks the head with `git`; the
+    /// fixture source never asks `github` anything.
     async fn pull_request(
         &self,
         git: &impl RunGit,
+        github: &impl GitHubApi,
         repo: &RepoName,
         number: NonZeroU64,
     ) -> anyhow::Result<PullRequest>;
@@ -161,12 +171,17 @@ impl TargetResolver for TargetSource {
     async fn pull_request(
         &self,
         git: &impl RunGit,
+        github: &impl GitHubApi,
         repo: &RepoName,
         number: NonZeroU64,
     ) -> anyhow::Result<PullRequest> {
         match self {
-            Self::Real => system_targets().pull_request(git, repo, number).await,
-            Self::Fixture(fixture) => fixture.pull_request(git, repo, number).await,
+            Self::Real => {
+                system_targets()
+                    .pull_request(git, github, repo, number)
+                    .await
+            }
+            Self::Fixture(fixture) => fixture.pull_request(git, github, repo, number).await,
         }
     }
 
@@ -192,6 +207,13 @@ pub(crate) enum TargetRemote {
     Https(HttpsRemote),
     /// A fixture repository on this disk, at `file://<path>`.
     Local(LocalRemote),
+}
+
+/// `refs/pull/<number>/head`, the ref a repository host keeps for a pull
+/// request's head in the base repository itself: what both sources list
+/// the head under, and what `run` fetches it from.
+pub(crate) fn pull_head_ref(number: NonZeroU64) -> String {
+    format!("refs/pull/{number}/head")
 }
 
 /// A pull request as `post` pins it: the commits of a `pr` target.

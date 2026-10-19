@@ -6,7 +6,8 @@
 //! what it writes to standard error, the [`GitEnv`] the tests run git with
 //! and the inert fixture repository they run it against, a
 //! [`FakeResolver`] in place of DNS and the [`checked_remote`] made
-//! through it, a [`RecordingGit`] in place of git, the fixture source over
+//! through it, a [`RecordingGit`] in place of git, a [`FakeGitHub`] in
+//! place of GitHub's API, the fixture source over
 //! that repository ([`fixture_targets`]) and the SHAs `fixtures/README.md`
 //! records for it, a [`FakeKeyStore`] in place of a homeserver's `keys/`, the
 //! passphrase the tests wrap secret files with and a byte search to check
@@ -36,6 +37,7 @@ use crate::device::{KeyIds, KeyStore, PublicKeys};
 use crate::git::{AllowedProtocols, GitCommand, GitFailed, RunGit, git_argv};
 use crate::targets::TargetSource;
 use crate::targets::fixture::FixtureTargets;
+use crate::targets::github::GitHubApi;
 use crate::targets::host::{HttpsRemote, ResolveHost};
 use crate::{Context, Dirs, GitEnv, Network, StderrWriter, StdinReader};
 
@@ -526,6 +528,46 @@ impl RunGit for RecordingGit {
         } else {
             Err(GitFailed::for_tests(command, self.code, self.stderr.clone()).into())
         }
+    }
+}
+
+/// A [`GitHubApi`] in place of GitHub: it answers each URL it was given a
+/// body for with that body, as a 2xx answer, and every other URL as a 404
+/// (`None`), and keeps every URL it was asked for, in order. It hands the
+/// body back whole, whatever the cap: the parsers check the cap again
+/// themselves. The `Mutex` is there for the same reason as in
+/// [`FakeKeyStore`].
+pub(crate) struct FakeGitHub {
+    answers: BTreeMap<String, Vec<u8>>,
+    asked: Mutex<Vec<String>>,
+}
+
+impl FakeGitHub {
+    /// Answers each `(url, body)` of `answers`; an empty list answers
+    /// every URL with a 404.
+    pub(crate) fn answering(answers: &[(&str, &[u8])]) -> Self {
+        Self {
+            answers: answers
+                .iter()
+                .map(|&(url, body)| (url.to_owned(), body.to_vec()))
+                .collect(),
+            asked: Mutex::default(),
+        }
+    }
+
+    /// Every URL asked for so far, in order.
+    pub(crate) fn asked(&self) -> Vec<String> {
+        self.asked.lock().expect("lock").clone()
+    }
+}
+
+impl GitHubApi for FakeGitHub {
+    async fn get(&self, url: url::Url, _cap: usize) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
+        self.asked.lock().expect("lock").push(url.to_string());
+        Ok(self
+            .answers
+            .get(url.as_str())
+            .map(|body| Zeroizing::new(body.clone())))
     }
 }
 

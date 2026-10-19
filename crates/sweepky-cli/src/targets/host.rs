@@ -4,7 +4,9 @@
 //! resolves to must be public. [`HttpsRemote::for_repo`] is the one way to
 //! make the `https://<repo>` remote that git's network commands take
 //! (`git::Remote`), and it refuses a host with any address on a loopback,
-//! private, link-local or otherwise reserved range.
+//! private, link-local or otherwise reserved range. [`check_host`] is that
+//! check on its own, which GitHub's API host goes through too before the
+//! real source asks it about a pull request.
 //!
 //! - [`is_public`], the pure address classifier.
 //! - [`ResolveHost`], the seam the lookup goes through: [`SystemResolver`]
@@ -25,13 +27,13 @@ use anyhow::{Context as _, bail};
 use sweepky_core::RepoName;
 
 // The refusals, fixed text that names neither the host nor an address: the
-// caller says which target it was, by its id.
-const LOOKUP_FAILED: &str = "could not look up the repository's host, so Sweepky did not contact \
-                             it; check the network connection and try again";
-const NO_ADDRESS: &str = "the repository's host has no address, so Sweepky did not contact it";
-const NOT_PUBLIC: &str = "the repository's host resolves to an address that is not public \
-                          (loopback, private, link-local or otherwise reserved), so Sweepky \
-                          refused to contact it; Sweepky sweeps public repositories only";
+// caller says which target, or which service, it was.
+const LOOKUP_FAILED: &str = "could not look up the host, so Sweepky did not contact it; check the \
+                             network connection and try again";
+const NO_ADDRESS: &str = "the host has no address, so Sweepky did not contact it";
+const NOT_PUBLIC: &str = "the host resolves to an address that is not public (loopback, private, \
+                          link-local or otherwise reserved), so Sweepky refused to contact it; \
+                          Sweepky sweeps public repositories only";
 
 /// A real target's repository as git is given it, `https://<repo>`: the
 /// only form a network git command takes for a real target, made only
@@ -46,14 +48,7 @@ pub(crate) struct HttpsRemote {
 }
 
 impl HttpsRemote {
-    /// `https://<repo>`, once `resolver` has given at least one address for
-    /// `repo`'s host and every one of them is public.
-    ///
-    /// Refused, in fixed text that names neither the host nor an address,
-    /// when the lookup fails, when it gives no address, and when any one
-    /// address is not public, whatever the others are: git connects to
-    /// whichever address it likes, so one private address is enough to
-    /// reach the sweeper's own network.
+    /// `https://<repo>`, once `repo`'s host passed [`check_host`].
     pub(crate) async fn for_repo(
         repo: &RepoName,
         resolver: &impl ResolveHost,
@@ -64,19 +59,7 @@ impl HttpsRemote {
             .as_str()
             .split_once('/')
             .context("the repository name has no host")?;
-        // The lookup's own error is dropped rather than added as context:
-        // its text is the resolver's, and could name the host.
-        let Ok(addresses) = resolver.resolve(host).await else {
-            bail!(LOOKUP_FAILED);
-        };
-        // `all` is true for an empty list, so an empty answer is refused
-        // before it.
-        if addresses.is_empty() {
-            bail!(NO_ADDRESS);
-        }
-        if !addresses.into_iter().all(is_public) {
-            bail!(NOT_PUBLIC);
-        }
+        check_host(host, resolver).await?;
         Ok(Self {
             url: format!("https://{repo}"),
         })
@@ -88,6 +71,31 @@ impl HttpsRemote {
     }
 }
 
+/// Passes `host` once `resolver` has given at least one address for it and
+/// every one of them is public.
+///
+/// Refused, in fixed text that names neither the host nor an address, when
+/// the lookup fails, when it gives no address, and when any one address is
+/// not public, whatever the others are: git and reqwest connect to
+/// whichever address they like, so one private address is enough to reach
+/// the sweeper's own network.
+pub(crate) async fn check_host(host: &str, resolver: &impl ResolveHost) -> anyhow::Result<()> {
+    // The lookup's own error is dropped rather than added as context: its
+    // text is the resolver's, and could name the host.
+    let Ok(addresses) = resolver.resolve(host).await else {
+        bail!(LOOKUP_FAILED);
+    };
+    // `all` is true for an empty list, so an empty answer is refused before
+    // it.
+    if addresses.is_empty() {
+        bail!(NO_ADDRESS);
+    }
+    if !addresses.into_iter().all(is_public) {
+        bail!(NOT_PUBLIC);
+    }
+    Ok(())
+}
+
 /// Where a host's addresses are looked up: the seam between the host
 /// policy and DNS.
 ///
@@ -97,7 +105,7 @@ impl HttpsRemote {
 /// the compiler makes one copy of each caller per implementation.
 pub(crate) trait ResolveHost {
     /// Every address `host` resolves to. An error's text is never shown
-    /// ([`HttpsRemote::for_repo`] replaces it with fixed text).
+    /// ([`check_host`] replaces it with fixed text).
     async fn resolve(&self, host: &str) -> anyhow::Result<Vec<IpAddr>>;
 }
 

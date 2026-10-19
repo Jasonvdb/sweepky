@@ -19,8 +19,9 @@ use std::time::Duration;
 use anyhow::{Context as _, bail};
 use sweepky_core::{GitSha, KnownTargetKind, RepoName};
 
+use super::github::GitHubApi;
 use super::rev::{RevSpec, find_ref, list_refs, pin};
-use super::{PullRequest, TargetRemote, TargetResolver};
+use super::{PullRequest, TargetRemote, TargetResolver, pull_head_ref};
 use crate::git::{
     AllowedProtocols, GitCommand, Limits, LocalSubcommand, Remote, RunGit, STDERR_CAP,
 };
@@ -98,15 +99,18 @@ impl TargetResolver for FixtureTargets {
         pin(git, Remote::Local(&remote), rev).await
     }
 
+    /// The fixture's own refs stand in for GitHub, so `_github` is never
+    /// asked anything.
     async fn pull_request(
         &self,
         git: &impl RunGit,
+        _github: &impl GitHubApi,
         repo: &RepoName,
         number: NonZeroU64,
     ) -> anyhow::Result<PullRequest> {
         let path = self.path(repo)?;
         let remote = LocalRemote::new(path)?;
-        let head_ref = format!("refs/pull/{number}/head");
+        let head_ref = pull_head_ref(number);
         let refs = list_refs(git, Remote::Local(&remote), &["HEAD", &head_ref]).await?;
         let base = find_ref(&refs, "HEAD")?.context(NO_BASE)?;
         let head = find_ref(&refs, &head_ref)?.context(NO_PULL_REQUEST)?;
@@ -218,8 +222,8 @@ mod tests {
     use crate::targets::rev::NOT_ANONYMOUSLY_READABLE;
     use crate::targets::{PullRequest, TargetRemote, TargetResolver, TargetSource};
     use crate::test_support::{
-        RecordingGit, dirs_in, fixture_repo, fixture_targets, inert_target_repo, private_temp,
-        recorded_fixture_shas, test_git_env,
+        FakeGitHub, RecordingGit, dirs_in, fixture_repo, fixture_targets, inert_target_repo,
+        private_temp, recorded_fixture_shas, test_git_env,
     };
 
     /// A repository name the fixture source does not map.
@@ -264,9 +268,10 @@ mod tests {
         assert_ne!(sha("A"), sha("v0.1.0"), "the tag object is not its commit");
 
         let one = NonZeroU64::MIN;
+        let github = FakeGitHub::answering(&[]);
         assert_eq!(
             source
-                .pull_request(&git, &repo, one)
+                .pull_request(&git, &github, &repo, one)
                 .await
                 .expect("pull request 1"),
             PullRequest {
@@ -275,6 +280,8 @@ mod tests {
                 merge_base: sha("B"),
             }
         );
+        // From the fixture repository alone: GitHub is never asked.
+        assert_eq!(github.asked(), Vec::<String>::new());
         // The fixture's `example.invalid` name passes the pull request
         // policy: the source allows its own mapped names.
         assert!(source.check_policy(KnownTargetKind::Pr, &repo).is_ok());
@@ -289,6 +296,7 @@ mod tests {
             .expect("a runner");
         let repo = fixture_repo();
         let one = NonZeroU64::MIN;
+        let github = FakeGitHub::answering(&[]);
         // A name the repository does not have, a pull request it does not
         // have, and a repository the source does not map.
         assert!(
@@ -298,7 +306,12 @@ mod tests {
                 .is_err()
         );
         let two = NonZeroU64::new(2).expect("not zero");
-        assert!(source.pull_request(&git, &repo, two).await.is_err());
+        assert!(
+            source
+                .pull_request(&git, &github, &repo, two)
+                .await
+                .is_err()
+        );
         let elsewhere = unmapped();
         assert!(
             source
@@ -306,7 +319,12 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(source.pull_request(&git, &elsewhere, one).await.is_err());
+        assert!(
+            source
+                .pull_request(&git, &github, &elsewhere, one)
+                .await
+                .is_err()
+        );
         assert!(
             source
                 .fetch_remote(KnownTargetKind::Repo, &elsewhere)
@@ -336,7 +354,7 @@ mod tests {
             assert_eq!(format!("{error:#}"), NOT_ANONYMOUSLY_READABLE, "{rev}");
         }
         let error = source
-            .pull_request(&git, &repo, NonZeroU64::MIN)
+            .pull_request(&git, &FakeGitHub::answering(&[]), &repo, NonZeroU64::MIN)
             .await
             .expect_err("no repository");
         assert_eq!(format!("{error:#}"), NOT_ANONYMOUSLY_READABLE);

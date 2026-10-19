@@ -167,8 +167,9 @@ fn looks_like_sha(value: &str) -> bool {
 }
 
 /// Whether `value` is a full SHA-1 as git prints one: core's `GitSha`
-/// check (lower-case hex), at SHA-1's 40 characters.
-fn is_full_sha1(value: &str) -> bool {
+/// check (lower-case hex), at SHA-1's 40 characters. GitHub's answers are
+/// held to it too (`github.rs`).
+pub(crate) fn is_full_sha1(value: &str) -> bool {
     value.len() == GitSha::SHA1_LEN && value.parse::<GitSha>().is_ok()
 }
 
