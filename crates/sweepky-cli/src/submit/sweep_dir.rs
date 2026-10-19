@@ -39,7 +39,8 @@
 //! lists the ids. The stamp is agent-writable too, so it only narrows the
 //! pick: a stamp the agent deleted lets an old sweep be picked again, and
 //! the command's check of the sweep record, which then reads `done`,
-//! refuses it.
+//! refuses it. [`SweepDir::stamp_submitted`] writes it, through the
+//! directory's open handle, never through a link.
 
 use std::ffi::{CStr, CString, OsStr};
 use std::fs;
@@ -47,7 +48,8 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context as _, anyhow, bail};
-use rustix::fs::{FileType, Mode};
+use rustix::fs::{FileType, Mode, OFlags};
+use rustix::io::Errno;
 use serde::Deserialize;
 use sweepky_core::{
     BountyRef, Playbook, Pubky, RecordError, RecordId, SchemaVersion, SweepRef, TargetId,
@@ -70,7 +72,18 @@ const MARKER_FILE: &CStr = c"sweep.json";
 
 /// The stamp `submit` leaves in [`MARKER_DIR`] once a sweep is submitted,
 /// so that picking without `--run-dir` passes it over.
-pub(super) const SUBMITTED_STAMP: &CStr = c"submitted";
+const SUBMITTED_STAMP: &CStr = c"submitted";
+
+/// How the stamp is made: a new file (`O_CREAT | O_EXCL`, which fails on
+/// anything already at the name and never follows a link there), opened
+/// write-only and left empty, never this process's terminal, and not handed
+/// to any program this one starts.
+const STAMP_FLAGS: OFlags = OFlags::WRONLY
+    .union(OFlags::CREATE)
+    .union(OFlags::EXCL)
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::NOCTTY)
+    .union(OFlags::CLOEXEC);
 
 /// The most bytes a per-sweep marker may have: 64 KiB, as for the project's
 /// marker. The one `run` writes is a few hundred.
@@ -112,6 +125,32 @@ impl SweepDir {
     /// happened to its path since.
     pub(super) fn fd(&self) -> BorrowedFd<'_> {
         self.dir.as_fd()
+    }
+
+    /// Stamps this sweep directory as submitted: an empty
+    /// `.sweepky/submitted`, made 0600 through the directory's open handle,
+    /// so picking without `--run-dir` passes it over.
+    ///
+    /// Anything already at that name, a link included, counts as the stamp
+    /// and is left alone: `O_EXCL` fails on it rather than follow or
+    /// overwrite it, and the stamp only narrows a pick (module docs).
+    pub(super) fn stamp_submitted(&self) -> anyhow::Result<()> {
+        let shown = format!("{}/.sweepky", self.path.display());
+        let Some(marker_dir) = real_dir(self.dir.as_fd(), MARKER_DIR, &shown)? else {
+            bail!("{shown} is gone");
+        };
+        match rustix::fs::openat(
+            marker_dir.as_fd(),
+            SUBMITTED_STAMP,
+            STAMP_FLAGS,
+            Mode::RUSR | Mode::WUSR,
+        ) {
+            // `_` binds nothing, so the new file's handle is dropped, and
+            // closed, with the match: the stamp is its name, and it holds
+            // nothing.
+            Ok(_) | Err(Errno::EXIST) => Ok(()),
+            Err(err) => Err(err).with_context(|| format!("could not write {shown}/submitted")),
+        }
     }
 }
 
@@ -462,7 +501,7 @@ mod tests {
 
     use super::{SweepDir, find_sweep_dir, parse_marker};
     use crate::submit::fixture::SweepFixture;
-    use crate::test_support::{PLANTED, bounty_id, json_bytes, random_pubky, record_id};
+    use crate::test_support::{PLANTED, bounty_id, json_bytes, mode, random_pubky, record_id};
 
     /// The sweep directory `run_dir` names from `cwd` for `fixture`'s
     /// sweeper, which must be accepted.
@@ -794,5 +833,33 @@ mod tests {
         fs::remove_file(fixture.dir().join(".sweepky/sweep.json")).expect("rm");
         let message = refusal(&fixture, fixture.project(), None);
         assert!(message.contains("none there has the marker"), "{message}");
+    }
+
+    #[test]
+    fn the_stamp_is_an_empty_private_file_and_never_written_through_a_link() {
+        let fixture = SweepFixture::new();
+        let sweep = fixture.open();
+
+        sweep.stamp_submitted().expect("stamped");
+
+        let stamp = fixture.dir().join(".sweepky/submitted");
+        let meta = fs::symlink_metadata(&stamp).expect("there");
+        assert!(meta.is_file() && meta.len() == 0, "{meta:?}");
+        assert_eq!(mode(&stamp), 0o600);
+        // Picking now passes the sweep over, and stamping again is fine.
+        let message = refusal(&fixture, fixture.project(), None);
+        assert!(
+            message.contains("stamped as submitted already"),
+            "{message}"
+        );
+        sweep.stamp_submitted().expect("stamped again");
+
+        // A link the agent planted at the name counts as the stamp and is
+        // never followed: what it points at is not made.
+        let other = SweepFixture::in_temp_with(&fixture, "other");
+        let elsewhere = fixture.temp().join("elsewhere");
+        symlink(&elsewhere, other.dir().join(".sweepky/submitted")).expect("symlink");
+        other.open().stamp_submitted().expect("counts as stamped");
+        assert!(fs::symlink_metadata(&elsewhere).is_err(), "followed");
     }
 }

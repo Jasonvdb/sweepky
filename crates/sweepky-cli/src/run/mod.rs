@@ -118,8 +118,9 @@ const TARGET_NEEDS_URL: &str = "--target names a target of one bounty, so it nee
 
 /// The playbook a sweep record names when the project's `init` recorded
 /// none, as P2a's `init` never does: core's `Sweep` needs one, this passes
-/// 01's pattern, and `submit --playbook` replaces it.
-const UNSPECIFIED_PLAYBOOK: &str = "unspecified";
+/// 01's pattern, and `submit --playbook` replaces it (`submit` refuses a
+/// record that still names it without the flag).
+pub(crate) const UNSPECIFIED_PLAYBOOK: &str = "unspecified";
 
 /// What the error says, in front of the failure, once the record says
 /// `aborted`.
@@ -207,7 +208,8 @@ pub(crate) async fn run(
 
 /// The pubky this install is logged in as, from `login.json`: the sweeper,
 /// whom the bounty is checked for and whose storage the sweep goes in.
-fn logged_in_sweeper(dirs: &Dirs) -> anyhow::Result<Pubky> {
+/// `submit` asks it the same.
+pub(crate) fn logged_in_sweeper(dirs: &Dirs) -> anyhow::Result<Pubky> {
     let Some(login) = read_login_state(dirs)? else {
         bail!(NOT_LOGGED_IN);
     };
@@ -267,8 +269,13 @@ impl PublishRecord for LockedSessionPublisher<'_> {
 
 /// Writes `record` at `path` through `storage`, a refusal mapped by
 /// `write_error`: 403 and 507 to their messages, anything else to fixed
-/// text and the status, never the server's words.
-async fn put_record(storage: &impl OwnStorage, path: &str, record: Vec<u8>) -> anyhow::Result<()> {
+/// text and the status, never the server's words. `submit` writes its
+/// flip of the record through it too.
+pub(crate) async fn put_record(
+    storage: &impl OwnStorage,
+    path: &str,
+    record: Vec<u8>,
+) -> anyhow::Result<()> {
     storage
         .put(path, record)
         .await
@@ -331,7 +338,7 @@ fn running_record(new: &NewSweep<'_>, started_at: RecordTime) -> anyhow::Result<
 /// `record` as it is published: compact JSON, as `post` writes a bounty.
 /// At most `MAX_TARGETS` ids of at most 32 characters, a URL and a short
 /// playbook keep it far under `MAX_RECORD_BYTES`.
-fn record_bytes(record: &Sweep) -> anyhow::Result<Vec<u8>> {
+pub(crate) fn record_bytes(record: &Sweep) -> anyhow::Result<Vec<u8>> {
     serde_json::to_vec(record).context("could not write the sweep record")
 }
 

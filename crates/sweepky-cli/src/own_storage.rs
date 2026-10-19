@@ -44,17 +44,9 @@ pub(crate) trait OwnStorage {
 
     /// The file at `path`, read as a record: at most [`MAX_RECORD_BYTES`],
     /// or `None` when there is none. The bytes are the homeserver's: parse
-    /// them with the record type's `from_json`.
-    // `run` and `submit`, later in P2b, are the first callers outside the
-    // tests: `expect` (not `allow`) silences the dead-code warning only
-    // while it is true, and the first caller removes it.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "run and submit, later in P2b, are the first callers"
-        )
-    )]
+    /// them with the record type's `from_json`. `submit` reads its sweep
+    /// record back this way under the writers' lock, through the session,
+    /// before it uploads anything.
     async fn get_own(&self, path: &str) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>>;
 }
 

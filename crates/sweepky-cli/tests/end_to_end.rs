@@ -15,8 +15,8 @@
 
 use std::fs;
 use std::io::{self, BufRead, Cursor, Write};
-use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::os::unix::fs::{MetadataExt, symlink};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use clap::Parser;
@@ -29,8 +29,9 @@ use sweepky_cli::{
 };
 use sweepky_core::{
     Bounty, BountyRef, Circle, DeviceIdentity, DeviceKey, GitSha, KnownBountyStatus,
-    KnownSweepStatus, KnownTarget, MAX_RECORD_BYTES, Pubky, RecordId, RepoName, RepoPath,
-    SecretString, Sweep, SweepRef, Zeroizing, paths,
+    KnownSweepStatus, KnownTarget, MAX_CIPHERTEXT_BYTES, MAX_RECORD_BYTES, Playbook, Pubky,
+    RecordId, RepoName, RepoPath, SecretString, Sweep, SweepRef, Zeroizing, open_package,
+    parse_audit_findings, paths,
 };
 
 /// What the context writes to standard error, kept where the test can read
@@ -270,6 +271,29 @@ fn context(
         targets: fixture_targets(),
     };
     (ctx, stderr)
+}
+
+/// The playbook B's sweeps name: the pinned Cloudflare skill.
+const PLAYBOOK: &str = "cloudflare/security-audit@c1c8a8c";
+
+/// The three files of `fixtures/cloudflare/`, the synthetic run directory
+/// of a Cloudflare-format sweep.
+const CLOUDFLARE_FILES: [&str; 3] = ["REPORT.md", "coverage-ledger.json", "findings.json"];
+
+/// `fixtures/cloudflare/<name>`.
+fn cloudflare_fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/cloudflare")
+        .join(name)
+}
+
+/// The device key of the install whose directories are `dirs`, read from
+/// its plain `device.key` (the test passes no `--passphrase-file`): the
+/// age identity string alone, which goes straight into a `SecretString`.
+fn device_identity(dirs: &Dirs) -> DeviceIdentity {
+    let bytes = Zeroizing::new(fs::read(dirs.device_key_file()).expect("device.key"));
+    let text = std::str::from_utf8(&bytes).expect("UTF-8");
+    DeviceIdentity::from_secret(&SecretString::from(text)).expect("an age identity")
 }
 
 /// The pubky `ctx`'s install is logged in as, from its `login.json`.
@@ -952,4 +976,170 @@ async fn end_to_end() {
     assert_eq!(marker["sweep"], sweep.to_string());
     assert_eq!(marker["bounty"], posted.to_string());
     assert_eq!(marker["targets"], json!(["t1", "t2", "t3"]));
+
+    // ----- P2b: B submits a Cloudflare-format sweep -----
+
+    // What the agent leaves, Cloudflare's skill having written its output
+    // into audit/: the synthetic Cloudflare run directory.
+    let audit = sweep_dir.join("audit");
+    fs::create_dir(&audit).expect("audit/");
+    for name in CLOUDFLARE_FILES {
+        fs::copy(cloudflare_fixture(name), audit.join(name)).expect("copy");
+    }
+    let report = sweepky(
+        &b,
+        &[
+            "submit",
+            "--run-dir",
+            &format!("sweeps/{id}"),
+            "--playbook",
+            PLAYBOOK,
+        ],
+    )
+    .await
+    .expect("B submits the sweep");
+    assert!(
+        report.text().contains(&sweep.to_string()),
+        "{}",
+        report.text()
+    );
+    // B was shown the conversion and the packaged files, and asked
+    // nothing: this is B's first submit to A, so A's keys are pinned
+    // without a word.
+    let shown = b_stderr.text();
+    assert!(shown.contains("Cloudflare's format"), "{shown}");
+    for name in CLOUDFLARE_FILES {
+        assert!(shown.contains(&format!("  audit/{name} (")), "{shown}");
+    }
+    assert!(!shown.contains("[y/N]"), "{shown}");
+
+    // Anyone can read B's sweep record: done, finished, with the playbook
+    // given.
+    let record = get_capped(
+        &testnet,
+        &b_user,
+        &paths::sweep_record(sweep.id),
+        MAX_RECORD_BYTES,
+    )
+    .await;
+    let record = Sweep::from_json(&record).expect("a sweep record");
+    assert_eq!(record.status.as_known(), Some(KnownSweepStatus::Done));
+    assert!(record.finished_at.is_some());
+    assert_eq!(record.playbook.as_str(), PLAYBOOK);
+
+    // Anyone can download the package, within the cap a reader applies;
+    // A's device key opens it, and its findings are the fixture's,
+    // converted.
+    let sealed = get_capped(
+        &testnet,
+        &b_user,
+        &paths::sweep_package(sweep.id),
+        MAX_CIPHERTEXT_BYTES,
+    )
+    .await;
+    let a_device = device_identity(&a.dirs);
+    let package = open_package(&sealed, &a_device, &sweep, &record).expect("A opens B's sweep");
+    let playbook: Playbook = PLAYBOOK.parse().expect("a playbook");
+    let fixture = fs::read(cloudflare_fixture("findings.json")).expect("the fixture");
+    let (expected, _) = parse_audit_findings(&fixture, &playbook).expect("findings");
+    // `assert!` rather than `assert_eq!`, so a failure prints no finding.
+    assert!(package.findings == expected, "the findings differ");
+    assert_eq!(package.manifest.sweeper, b_pubky);
+    assert_eq!(package.manifest.bounty, posted);
+
+    // B's pin of A's keys: A's one install, its device id and its key, in
+    // a 0600 file.
+    let pins_file = b.dirs.config().join("owner-keys.json");
+    assert_eq!(mode(&pins_file), 0o600);
+    assert_eq!(
+        json(&pins_file),
+        json!({
+            "schemaVersion": 1,
+            "owners": {
+                a_pubky.to_string(): [{
+                    "deviceId": json(&a.dirs.login_file())["deviceId"],
+                    "recipient": a_device.recipient().to_string(),
+                }],
+            },
+        })
+    );
+    // The sweep directory is stamped as submitted.
+    assert!(sweep_dir.join(".sweepky/submitted").is_file());
+
+    // ----- P2b: a second run, with links planted in its audit/ -----
+
+    sweepky(&b, &["run", &posted.to_string()])
+        .await
+        .expect("B runs A's bounty again");
+    let run2_id = fs::read_dir(&sweeps)
+        .expect("sweeps/")
+        .map(|entry| {
+            entry
+                .expect("an entry")
+                .file_name()
+                .into_string()
+                .expect("UTF-8")
+        })
+        .find(|name| name != id)
+        .expect("a second sweep directory");
+    let run2: RecordId = run2_id.parse().expect("a record id");
+    let run2_audit = sweeps.join(&run2_id).join("audit");
+    fs::create_dir(&run2_audit).expect("audit/");
+    fs::copy(
+        cloudflare_fixture("findings.json"),
+        run2_audit.join("findings.json"),
+    )
+    .expect("copy");
+    // A hard link to B's login.json and a symbolic link to B's device key.
+    // The project and B's SWEEPKY_HOME are both under the system's temp
+    // directory, so on one filesystem, where a hard link can be made.
+    let b_config = b.dirs.config();
+    fs::hard_link(
+        b_config.join("login.json"),
+        run2_audit.join("planted-hard-link"),
+    )
+    .expect("a hard link");
+    symlink(b.dirs.device_key_file(), run2_audit.join("planted-symlink")).expect("a symlink");
+    let pins_before = fs::read(&pins_file).expect("the pins");
+    let run2_args = [
+        "submit",
+        "--run-dir",
+        &format!("sweeps/{run2_id}"),
+        "--playbook",
+        PLAYBOOK,
+    ];
+
+    // The walk stops at the first entry it refuses, in name order: the
+    // hard link, then, once that is gone, the symbolic link.
+    for (planted, what) in [
+        ("planted-hard-link", "hard links"),
+        ("planted-symlink", "a symbolic link"),
+    ] {
+        let error = sweepky(&b, &run2_args).await.expect_err("refused");
+        let message = format!("{error:#}");
+        assert!(message.contains(&format!("audit/{planted}")), "{message}");
+        assert!(message.contains(what), "{message}");
+        fs::remove_file(run2_audit.join(planted)).expect("remove the planted link");
+    }
+
+    // Nothing of run 2 reached B's storage, its record still says running,
+    // and B's pins are as they were.
+    let exists = testnet
+        .sdk()
+        .expect("client")
+        .public_storage()
+        .exists((&b_user, paths::sweep_package(run2).as_str()))
+        .await
+        .expect("the path is public");
+    assert!(!exists, "run 2's package was uploaded");
+    let record = get_capped(
+        &testnet,
+        &b_user,
+        &paths::sweep_record(run2),
+        MAX_RECORD_BYTES,
+    )
+    .await;
+    let record = Sweep::from_json(&record).expect("a sweep record");
+    assert_eq!(record.status.as_known(), Some(KnownSweepStatus::Running));
+    assert_eq!(fs::read(&pins_file).expect("the pins"), pins_before);
 }

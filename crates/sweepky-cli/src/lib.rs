@@ -137,14 +137,13 @@
 //!   context's target source; the bounty shown, sanitised, on standard
 //!   error, and published as `bounties/<id>.json` under the writers' lock
 //!   with a fresh session only once the owner says yes.
-//! - `own_storage`, `OwnStorage`: the seam through which `post` and `run`,
-//!   and later `submit`, write the signed-in user's own records and read
-//!   them back, with a fake for the unit tests that can refuse a chosen
-//!   write.
-//! - `records`, `PublicRecords`: the seam through which `run` reads
-//!   anyone's public bounty, circle and sweep records, and lists their
-//!   bounties and sweeps, with no session, each capped and parsed by core,
-//!   each listing bounded, with a fake for the unit tests.
+//! - `own_storage`, `OwnStorage`: the seam through which `post`, `run` and
+//!   `submit` write the signed-in user's own records and read them back,
+//!   with a fake for the unit tests that can refuse a chosen write.
+//! - `records`, `PublicRecords`: the seam through which `run` and `submit`
+//!   read anyone's public bounty, circle and sweep records, and `run` lists
+//!   their bounties and sweeps, with no session, each capped and parsed by
+//!   core, each listing bounded, with a fake for the unit tests.
 //! - `run [<bounty-url>] [--target <tid>] [--circle <admin>]` (`run`): in
 //!   the `init` project it must be run in, whose marker may name a
 //!   playbook, it checks the bounty's `pubky://` URL (anything else refused
@@ -165,6 +164,19 @@
 //!   bounties of the circle's members (`--circle`'s, else this install's
 //!   own circle), the target their sweep records name least, reading
 //!   within fixed bounds, and then runs it as for its URL and `--target`.
+//! - `submit [--run-dir <dir>] [--playbook <name>]` (`submit`): it finds
+//!   and checks the sweep directory, walks it through open handles without
+//!   following a link, refusing links, hard links and special files within
+//!   caps, and reads `audit/`; reads the sweep's own record, which must say
+//!   `running`, and its bounty; builds the manifest from those two alone
+//!   and the package from `audit/`, Cloudflare's findings converted; checks
+//!   the owner's keys against their pin, asking about new ones; prints the
+//!   file list; and seals the package to the owner's keys and this
+//!   install's own. Then, under the writers' lock with a fresh session, it
+//!   reads the record back, writes the pin, uploads `sweeps/<id>.age` and
+//!   flips the record to `done`; a refused upload flips it to `aborted`,
+//!   which is final, and a 429 or a network error leaves it `running`.
+//!   Last, it stamps the sweep directory as submitted.
 //!
 //! The rules that hold for everything here (see "Rust conventions" in
 //! `docs/plan/03-cli-and-skill.md`):
@@ -264,9 +276,10 @@ mod remote;
 // fetched, stripped and scoped, and the per-sweep marker written last; or
 // the sweep aborted.
 mod run;
-// `submit`: the sweep directory found and checked, and walked without
-// following a link, `audit/`'s files read within caps; the bounty owner's
-// keys read and checked against their pin.
+// `submit`: the sweep directory found, checked and walked without following
+// a link; the manifest from the sweep's own record and its bounty; the
+// package sealed to the bounty owner's pinned keys and this install's;
+// uploaded, and the record flipped, under the writers' lock.
 mod submit;
 // The per-command session: the writers' lock, a fresh sign-in and a sign-out
 // that is always attempted. `login` holds its lock; `keys revoke` is the
@@ -450,7 +463,8 @@ pub fn run_without_context(cli: &Cli) -> Option<anyhow::Result<Report>> {
         | Command::Keys { .. }
         | Command::Circle { .. }
         | Command::Post { .. }
-        | Command::Run { .. } => None,
+        | Command::Run { .. }
+        | Command::Submit { .. } => None,
     }
 }
 
@@ -518,6 +532,10 @@ pub async fn run(cli: Cli, ctx: &Context) -> anyhow::Result<Report> {
             target,
             circle,
         } => run::run(ctx, bounty.as_deref(), target.as_deref(), circle.as_deref()).await,
+        Command::Submit { run_dir, playbook } => {
+            let prompting = prompt::Prompting::from_no_input_flag(cli.no_input);
+            submit::submit(ctx, prompting, run_dir.as_deref(), playbook.as_deref()).await
+        }
     }
 }
 
@@ -582,6 +600,14 @@ mod tests {
                 "t1",
                 "--circle",
                 "admin",
+            ],
+            &["submit"],
+            &[
+                "submit",
+                "--run-dir",
+                "sweeps/0035G87EK4XFE",
+                "--playbook",
+                "cloudflare/security-audit@c1c8a8c",
             ],
         ];
         for args in commands {

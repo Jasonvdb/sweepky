@@ -11,6 +11,8 @@
 //! - [`write_refusal`] turns the two answers a homeserver gives a write it
 //!   will not take, 403 and 507, into the message `login` aborts with, and
 //!   [`request_error`] turns every other SDK error into a message.
+//!   [`upload_error`] says what a failed upload of a sweep package means:
+//!   413, 429 and 507 in `submit`'s own words, anything else as for a write.
 //! - [`pubky_of`] and [`public_key_of`] convert between core's `Pubky` and
 //!   the SDK's `PublicKey`, the owner these helpers take, so the commands
 //!   share one conversion.
@@ -90,6 +92,23 @@ pub(crate) const WRITE_FORBIDDEN: &str = "the homeserver refused the write (HTTP
 pub(crate) const QUOTA_FULL: &str =
     "the homeserver refused the write (HTTP 507): storage quota full; use a dedicated identity";
 
+/// What `submit` says when the homeserver answers its upload of a sweep
+/// package with a 413: the package, which the padding has made at most 32
+/// MiB, is more than this homeserver takes in one write.
+pub(crate) const PACKAGE_TOO_LARGE: &str = "the homeserver refused the upload (HTTP 413): the \
+     package is too large for this homeserver";
+
+/// What `submit` says when the homeserver answers its upload with a 429:
+/// it throttles this user's writes for now (06, "Production homeserver": a
+/// throttled write gets a 429 with `Retry-After`).
+pub(crate) const RATE_LIMITED: &str =
+    "the homeserver refused the upload (HTTP 429): rate limited; try again later";
+
+/// What `submit` says when the homeserver answers its upload with a 507:
+/// this identity's storage has no room for the package.
+pub(crate) const UPLOAD_QUOTA_FULL: &str = "the homeserver refused the upload (HTTP 507): storage quota full, so there is no room for \
+     the package";
+
 /// The HTTP status of an SDK error that is a homeserver's answer, or `None`
 /// for any other error (a transport failure, a pkarr lookup, a bad URL).
 ///
@@ -126,6 +145,22 @@ pub(crate) fn write_error(error: &pubky::Error) -> anyhow::Error {
         Some(message) => anyhow::Error::msg(message),
         None => request_error(error),
     }
+}
+
+/// A failed upload of a sweep package as the message to stop with:
+/// [`PACKAGE_TOO_LARGE`], [`RATE_LIMITED`] and [`UPLOAD_QUOTA_FULL`] for
+/// 413, 429 and 507, and [`write_error`]'s for anything else. Fixed text
+/// and the status, never the server's words. Which of these leave the
+/// sweep to be submitted again is `submit`'s decision, made from
+/// [`status_of`].
+pub(crate) fn upload_error(error: &pubky::Error) -> anyhow::Error {
+    let message = match status_of(error) {
+        Some(StatusCode::PAYLOAD_TOO_LARGE) => PACKAGE_TOO_LARGE,
+        Some(StatusCode::TOO_MANY_REQUESTS) => RATE_LIMITED,
+        Some(StatusCode::INSUFFICIENT_STORAGE) => UPLOAD_QUOTA_FULL,
+        _ => return write_error(error),
+    };
+    anyhow::Error::msg(message)
 }
 
 /// An SDK error as a message that quotes nothing it holds: the status for a
@@ -896,8 +931,9 @@ mod tests {
 
     use super::{
         BodyTooLarge, CappedBody, ListLimits, ListingError, ListingParser, MAX_LISTING_LINE_BYTES,
-        PageStatus, QUOTA_FULL, WRITE_FORBIDDEN, absent_on_not_found, check_not_redirected,
-        page_status, page_url, read_capped, request_error, status_of, write_error, write_refusal,
+        PACKAGE_TOO_LARGE, PageStatus, QUOTA_FULL, RATE_LIMITED, UPLOAD_QUOTA_FULL,
+        WRITE_FORBIDDEN, absent_on_not_found, check_not_redirected, page_status, page_url,
+        read_capped, request_error, status_of, upload_error, write_error, write_refusal,
     };
 
     /// What the server text in these tests tries to do: move the cursor, set
@@ -1003,6 +1039,31 @@ mod tests {
         );
         for error in [server(StatusCode::NOT_FOUND), not_an_answer()] {
             let message = shown(request_error(&error));
+            assert!(!message.contains("pwned"), "{message}");
+            assert!(!message.chars().any(char::is_control), "{message:?}");
+        }
+    }
+
+    #[test]
+    fn an_upload_s_413_429_and_507_say_what_they_mean_for_the_package() {
+        let shown = |status| format!("{:#}", upload_error(&server(status)));
+        assert_eq!(shown(StatusCode::PAYLOAD_TOO_LARGE), PACKAGE_TOO_LARGE);
+        assert!(PACKAGE_TOO_LARGE.contains("the package is too large for this homeserver"));
+        assert_eq!(shown(StatusCode::TOO_MANY_REQUESTS), RATE_LIMITED);
+        assert!(RATE_LIMITED.contains("rate limited; try again later"));
+        assert_eq!(shown(StatusCode::INSUFFICIENT_STORAGE), UPLOAD_QUOTA_FULL);
+        assert!(UPLOAD_QUOTA_FULL.contains("storage quota full"));
+        // Anything else as for any write: a 403's message, the status alone,
+        // or a fixed sentence for an error that is not an answer.
+        assert_eq!(shown(StatusCode::FORBIDDEN), WRITE_FORBIDDEN);
+        assert_eq!(
+            shown(StatusCode::BAD_GATEWAY),
+            "the homeserver answered 502 Bad Gateway"
+        );
+        for message in [
+            shown(StatusCode::PAYLOAD_TOO_LARGE),
+            format!("{:#}", upload_error(&not_an_answer())),
+        ] {
             assert!(!message.contains("pwned"), "{message}");
             assert!(!message.chars().any(char::is_control), "{message:?}");
         }

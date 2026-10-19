@@ -1,7 +1,9 @@
-//! [`PublicRecords`], the seam through which `run` reads anyone's public
-//! Sweepky records: a bounty, a circle and a sweep record, each from the
-//! storage of the key that owns it, and the bounty and sweep records a key's
-//! storage lists, with no session.
+//! [`PublicRecords`], the seam through which `run` and `submit` read
+//! anyone's public Sweepky records: a bounty, a circle and a sweep record,
+//! each from the storage of the key that owns it, and the bounty and sweep
+//! records a key's storage lists, with no session. `submit` reads its own
+//! sweep record this way too before it builds a package, as anyone would
+//! see it, and reads it back through its session only under the lock.
 //!
 //! - [`PublicRecords::get_record`] and [`PublicRecords::list`] are the two
 //!   methods an implementation writes: the bytes of one public file, at most
@@ -46,7 +48,7 @@ use sweepky_core::{
 use crate::remote::{ListLimits, Listing, get_public, list_dir, public_key_of};
 
 /// Anyone's public Sweepky records, read with no session: the seam between
-/// `run` and everyone's homeservers.
+/// `run` and `submit` and everyone's homeservers.
 ///
 /// A trait so that `run` can be tested without a network, as with
 /// `device::PublicKeys`. Its methods are `async fn`s, so it cannot be a

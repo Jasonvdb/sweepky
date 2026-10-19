@@ -85,7 +85,17 @@ const NOWHERE: &str = "http://127.0.0.1:1/";
 /// request it made would fail. Its auth relay and default homeserver are
 /// just as unreachable.
 pub(crate) fn offline_network() -> Network {
-    let client = PubkyHttpClient::builder()
+    Network::injected(
+        pubky::Pubky::with_client(offline_client()),
+        format!("{NOWHERE}inbox"),
+        Keypair::random().public_key(),
+    )
+}
+
+/// The client of an [`offline_network`]: no DHT, and its one pkarr relay
+/// at [`NOWHERE`].
+fn offline_client() -> PubkyHttpClient {
+    PubkyHttpClient::builder()
         .pkarr(|pkarr| {
             pkarr
                 .no_dht()
@@ -93,12 +103,7 @@ pub(crate) fn offline_network() -> Network {
                 .expect("a valid relay URL")
         })
         .build()
-        .expect("an offline client");
-    Network::injected(
-        pubky::Pubky::with_client(client),
-        format!("{NOWHERE}inbox"),
-        Keypair::random().public_key(),
-    )
+        .expect("an offline client")
 }
 
 /// A writer the test keeps a handle on: the context writes into it, the
@@ -462,24 +467,30 @@ impl KeyStore for FakeKeyStore {
     }
 }
 
-/// A write a [`FakeOwnStorage`] refuses: the path, and the status and
-/// server text it answers with.
-struct RefusedPut {
-    path: String,
-    status: StatusCode,
-    server_text: String,
+/// How a [`FakeOwnStorage`] fails the write of one path.
+#[derive(Clone)]
+enum PutFailure {
+    /// The homeserver answers with this status and its own text.
+    Status {
+        status: StatusCode,
+        server_text: String,
+    },
+    /// The request never gets an answer: a transport error, such as a
+    /// connection refused.
+    Transport,
 }
 
 /// An [`OwnStorage`] in memory, in place of the signed-in user's own
 /// storage: the files by path, every path it was asked to write, in order,
-/// and, if set, the one path whose write it refuses. It hands a file back
+/// and the paths whose write it fails, each with how. It hands a file back
 /// whole: the caps are the real storage's business. The `Mutex`es are
-/// there for the same reason as in [`FakeKeyStore`].
+/// there for the same reason as in [`FakeKeyStore`]; the failures sit
+/// behind one too, so a test can lift them between two runs of a command.
 #[derive(Default)]
 pub(crate) struct FakeOwnStorage {
     files: Mutex<BTreeMap<String, Vec<u8>>>,
     puts: Mutex<Vec<String>>,
-    refused: Option<RefusedPut>,
+    failures: Mutex<BTreeMap<String, PutFailure>>,
 }
 
 impl FakeOwnStorage {
@@ -487,14 +498,46 @@ impl FakeOwnStorage {
     /// `server_text`, as the SDK reports a homeserver's non-2xx answer, and
     /// takes every other write.
     pub(crate) fn refusing(path: &str, status: StatusCode, server_text: &str) -> Self {
-        Self {
-            refused: Some(RefusedPut {
-                path: path.to_owned(),
-                status,
-                server_text: server_text.to_owned(),
-            }),
-            ..Self::default()
-        }
+        let storage = Self::default();
+        storage.refuse(path, status, server_text);
+        storage
+    }
+
+    /// Refuses every write of `path` from now on with `status` and
+    /// `server_text`.
+    pub(crate) fn refuse(&self, path: &str, status: StatusCode, server_text: &str) {
+        let failure = PutFailure::Status {
+            status,
+            server_text: server_text.to_owned(),
+        };
+        self.fail(path, failure);
+    }
+
+    /// Fails every write of `path` from now on with a transport error, as
+    /// when the homeserver cannot be reached.
+    pub(crate) fn fail_transport(&self, path: &str) {
+        self.fail(path, PutFailure::Transport);
+    }
+
+    fn fail(&self, path: &str, failure: PutFailure) {
+        self.failures
+            .lock()
+            .expect("lock")
+            .insert(path.to_owned(), failure);
+    }
+
+    /// Takes every write from now on, as a homeserver that has recovered.
+    pub(crate) fn stop_failing(&self) {
+        self.failures.lock().expect("lock").clear();
+    }
+
+    /// Puts `bytes` in place at `path`, as an earlier command wrote them.
+    /// Not logged as a write.
+    pub(crate) fn insert(&self, path: &str, bytes: Vec<u8>) {
+        self.files
+            .lock()
+            .expect("lock")
+            .insert(path.to_owned(), bytes);
     }
 
     /// Every path asked to be written so far, refused or not, in order.
@@ -503,14 +546,38 @@ impl FakeOwnStorage {
     }
 }
 
+/// A transport error as the SDK reports one: a request to [`NOWHERE`],
+/// where nothing listens, so the connection is refused at once without
+/// leaving the machine. reqwest's error type has no public constructor, so
+/// a real failed request is the way to get one.
+async fn transport_error() -> pubky::Error {
+    let refused = offline_client()
+        .request(pubky::Method::PUT, &NOWHERE)
+        .send()
+        .await
+        .expect_err("nothing listens there");
+    pubky::Error::from(RequestError::Transport(refused))
+}
+
 impl OwnStorage for FakeOwnStorage {
     async fn put(&self, path: &str, bytes: Vec<u8>) -> pubky::Result<()> {
         self.puts.lock().expect("lock").push(path.to_owned());
-        if let Some(refused) = self.refused.as_ref().filter(|refused| refused.path == path) {
-            return Err(pubky::Error::from(RequestError::Server {
-                status: refused.status,
-                message: refused.server_text.clone(),
-            }));
+        // `cloned` copies the failure out, so the lock's guard, a temporary,
+        // is released at the end of this statement: a guard must not be
+        // held across the `.await` below.
+        let failure = self.failures.lock().expect("lock").get(path).cloned();
+        match failure {
+            None => {}
+            Some(PutFailure::Status {
+                status,
+                server_text,
+            }) => {
+                return Err(pubky::Error::from(RequestError::Server {
+                    status,
+                    message: server_text,
+                }));
+            }
+            Some(PutFailure::Transport) => return Err(transport_error().await),
         }
         self.files
             .lock()
@@ -638,6 +705,25 @@ pub(crate) fn json_bytes(value: &Value) -> Vec<u8> {
 /// [`SYNTHETIC_SHA`], as a bounty's `targets` holds it.
 pub(crate) fn repo_target_json(id: &str) -> Value {
     json!({ "id": id, "kind": "repo", "repo": "github.com/org/name", "rev": SYNTHETIC_SHA })
+}
+
+/// The head of the pull request [`pr_target_json`] gives: the commit a
+/// sweep of it reviews, unlike its base, [`SYNTHETIC_SHA`].
+pub(crate) const SYNTHETIC_HEAD: &str = "2222222222222222222222222222222222222222";
+
+/// A pull request target `id`, number 7 of `github.com/org/name`, with
+/// base [`SYNTHETIC_SHA`] and head [`SYNTHETIC_HEAD`], as a bounty's
+/// `targets` holds it.
+pub(crate) fn pr_target_json(id: &str) -> Value {
+    json!({
+        "id": id,
+        "kind": "pr",
+        "repo": "github.com/org/name",
+        "number": 7,
+        "base": SYNTHETIC_SHA,
+        "head": SYNTHETIC_HEAD,
+        "mergeBase": "3333333333333333333333333333333333333333",
+    })
 }
 
 /// A bounty record as `post` writes it, with `targets`: status `open`,

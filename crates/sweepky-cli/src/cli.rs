@@ -198,6 +198,39 @@ pub enum Command {
         #[arg(long, value_name = "ADMIN")]
         circle: Option<String>,
     },
+
+    /// Finish a sweep once the agent has exited: check the sweep directory
+    /// and walk it without following a link, build the package from its
+    /// audit/ (Cloudflare's findings.json converted), check the bounty
+    /// owner's keys against the ones pinned when you last submitted to them
+    /// and ask about new ones, print the file list, encrypt the package to
+    /// the owner's keys and this install's own, upload
+    /// /pub/sweepky/sweeps/ID.age and mark the sweep done. A homeserver that
+    /// refuses the package marks it aborted, which is final; a network
+    /// error or a rate limit leaves it running, to submit again.
+    Submit {
+        /// The sweep directory, as `sweepky run` printed it: sweeps/ID from
+        /// the init project, or that path in full. Without it, submit must
+        /// be run in the init project's own directory, and takes the one
+        /// sweep there not yet submitted.
+        //
+        // `PathBuf`, as for `init`'s `DIR`, so a path that is not UTF-8 is
+        // still taken as typed; `submit` checks it and never quotes it.
+        #[arg(long, value_name = "DIR")]
+        run_dir: Option<PathBuf>,
+
+        /// The playbook the agent followed, as the sweep's public record
+        /// and the package name it, such as
+        /// cloudflare/security-audit@c1c8a8c: up to 64 of A-Z a-z 0-9 . _ /
+        /// -, then optionally @ and 7 to 40 hex digits of a commit. Needed
+        /// while the record names none (until init records one).
+        //
+        // Plain text, checked by `submit`, as `run`'s arguments are: clap's
+        // own parse error would quote it, and a key pasted here must be
+        // refused before it reaches a public record.
+        #[arg(long, value_name = "NAME")]
+        playbook: Option<String>,
+    },
 }
 
 /// The `circle` commands.
@@ -408,6 +441,39 @@ mod tests {
         ));
         // One URL at most.
         assert!(Cli::try_parse_from(["sweepky", "run", url, url]).is_err());
+    }
+
+    #[test]
+    fn submit_takes_an_optional_run_dir_and_playbook() {
+        let cli = Cli::try_parse_from([
+            "sweepky",
+            "submit",
+            "--run-dir",
+            "sweeps/0035G87EK4XFE",
+            "--playbook",
+            "cloudflare/security-audit@c1c8a8c",
+        ])
+        .expect("parses");
+        let Command::Submit { run_dir, playbook } = &cli.command else {
+            panic!("submit parses as Submit: {cli:?}");
+        };
+        assert_eq!(run_dir.as_deref(), Some(Path::new("sweeps/0035G87EK4XFE")));
+        assert_eq!(
+            playbook.as_deref(),
+            Some("cloudflare/security-audit@c1c8a8c")
+        );
+
+        // Both optional to clap, and both plain text that `submit` checks.
+        let cli = Cli::try_parse_from(["sweepky", "submit"]).expect("parses");
+        assert!(matches!(
+            cli.command,
+            Command::Submit {
+                run_dir: None,
+                playbook: None
+            }
+        ));
+        // No positional argument.
+        assert!(Cli::try_parse_from(["sweepky", "submit", "sweeps/0035G87EK4XFE"]).is_err());
     }
 
     #[test]
