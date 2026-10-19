@@ -10,7 +10,9 @@
 //! place of GitHub's API, the fixture source over
 //! that repository ([`fixture_targets`]) and the SHAs `fixtures/README.md`
 //! records for it, a [`FakeKeyStore`] in place of a homeserver's `keys/`, a
-//! [`FakeOwnStorage`] in place of the signed-in user's own storage, the
+//! [`FakeOwnStorage`] in place of the signed-in user's own storage, a
+//! [`FakePublicRecords`] in place of everyone's public storage and the
+//! synthetic bounty and circle records the tests put there, the
 //! passphrase the tests wrap secret files with and a byte search to check
 //! a wrapped file shows none of its secret, and a compile-time check that a
 //! secret type implements none of the traits that would print or copy it.
@@ -31,12 +33,14 @@ use std::sync::{Arc, Mutex};
 
 use pubky::errors::RequestError;
 use pubky::{Keypair, PubkyHttpClient, PublicKey, StatusCode};
-use sweepky_core::{DeviceId, GitSha, Pubky, RepoName, Zeroizing};
+use serde_json::{Value, json};
+use sweepky_core::{DeviceId, GitSha, Pubky, RecordId, RepoName, Zeroizing};
 use tempfile::TempDir;
 
 use crate::device::{KeyIds, KeyStore, PublicKeys};
 use crate::git::{AllowedProtocols, GitCommand, GitFailed, RunGit, git_argv};
 use crate::own_storage::OwnStorage;
+use crate::records::PublicRecords;
 use crate::targets::TargetSource;
 use crate::targets::fixture::FixtureTargets;
 use crate::targets::github::GitHubApi;
@@ -492,6 +496,104 @@ impl OwnStorage for FakeOwnStorage {
             .get(path)
             .map(|bytes| Zeroizing::new(bytes.clone())))
     }
+}
+
+/// A [`PublicRecords`] in memory, in place of everyone's homeservers: files
+/// by owner and path, and every read it was asked for, in order. It hands
+/// a file back whole, whatever its size: the cap is the real reader's
+/// business, and the record parsers check it again themselves. The
+/// `Mutex` is there for the same reason as in [`FakeKeyStore`].
+#[derive(Default)]
+pub(crate) struct FakePublicRecords {
+    files: BTreeMap<(Pubky, String), Vec<u8>>,
+    asked: Mutex<Vec<(Pubky, String)>>,
+}
+
+impl FakePublicRecords {
+    /// The same fake, holding `bytes` at `path` of `owner`'s storage too.
+    // It takes `self` by value and hands it back, so a test builds one in a
+    // chain: `FakePublicRecords::default().with_file(..).with_file(..)`.
+    pub(crate) fn with_file(mut self, owner: Pubky, path: &str, bytes: Vec<u8>) -> Self {
+        self.files.insert((owner, path.to_owned()), bytes);
+        self
+    }
+
+    /// The owner and path of every read so far, in order.
+    pub(crate) fn asked(&self) -> Vec<(Pubky, String)> {
+        self.asked.lock().expect("lock").clone()
+    }
+}
+
+impl PublicRecords for FakePublicRecords {
+    async fn get_record(
+        &self,
+        owner: Pubky,
+        path: &str,
+    ) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
+        let key = (owner, path.to_owned());
+        let found = self
+            .files
+            .get(&key)
+            .map(|bytes| Zeroizing::new(bytes.clone()));
+        self.asked.lock().expect("lock").push(key);
+        Ok(found)
+    }
+}
+
+/// A word the tests plant in a stranger's text, where serde_json's own
+/// message or a careless format string would repeat it: no message may.
+pub(crate) const PLANTED: &str = "PLANTED-7f3a";
+
+/// A full lower-case SHA-1 for the targets of a synthetic bounty.
+pub(crate) const SYNTHETIC_SHA: &str = "1111111111111111111111111111111111111111";
+
+/// The record id of a synthetic bounty or sweep.
+pub(crate) fn bounty_id() -> RecordId {
+    "0035G87EK4XFE".parse().expect("a record id")
+}
+
+/// The bytes of `value`, as a homeserver would hand them back.
+pub(crate) fn json_bytes(value: &Value) -> Vec<u8> {
+    serde_json::to_vec(value).expect("JSON")
+}
+
+/// A repo target `id` of the whole of `github.com/org/name` at
+/// [`SYNTHETIC_SHA`], as a bounty's `targets` holds it.
+pub(crate) fn repo_target_json(id: &str) -> Value {
+    json!({ "id": id, "kind": "repo", "repo": "github.com/org/name", "rev": SYNTHETIC_SHA })
+}
+
+/// A bounty record as `post` writes it, with `targets`: status `open`,
+/// closed to strangers, no playbook suggested.
+pub(crate) fn bounty_json(targets: Value) -> Value {
+    json!({
+        "schemaVersion": 1,
+        "title": "Auth before the release",
+        "focus": "security",
+        "brief": "Look at the session handling.",
+        "playbook": { "required": false },
+        "targets": targets,
+        "open": false,
+        "reward": null,
+        "status": "open",
+        "credits": [],
+        "createdAt": "2026-10-19T08:00:00Z",
+        "doneAt": null,
+    })
+}
+
+/// A `circle.json` that `admin` keeps, listing `members` and no labels.
+pub(crate) fn circle_json(admin: Pubky, members: &[Pubky]) -> Value {
+    let members: Vec<Value> = members
+        .iter()
+        .map(|member| json!({ "pubky": member.to_string() }))
+        .collect();
+    json!({
+        "schemaVersion": 1,
+        "name": "Friends",
+        "admin": admin.to_string(),
+        "members": members,
+    })
 }
 
 /// What a [`FakeResolver`] that fails gives as its error: words that a

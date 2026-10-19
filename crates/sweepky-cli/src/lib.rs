@@ -1,7 +1,7 @@
 //! The `sweepky` command-line tool, as a library. `src/main.rs` is a thin
 //! binary on top of it.
 //!
-//! Why a library: [`run`] executes a command given a [`Context`], and the
+//! Why a library: [`run`](fn@run) executes a command given a [`Context`], and the
 //! context carries the [`Network`] to talk to: the Pubky client, the auth relay
 //! URL and the default homeserver. The binary builds that from `--testnet` /
 //! `SWEEPKY_TESTNET` or the production defaults; the end-to-end test builds it
@@ -138,6 +138,18 @@
 //!   `run` and `submit`, write the signed-in user's own records and read
 //!   them back, with a fake for the unit tests that can refuse a chosen
 //!   write.
+//! - `records`, `PublicRecords`: the seam through which `run` reads
+//!   anyone's public bounty, circle and sweep records, with no session,
+//!   each capped and parsed by core, with a fake for the unit tests.
+//! - `run`, so far its checking half: the `init` project it must be run
+//!   in, its marker read through `init`'s own reader with the playbook a
+//!   later `init` records; the bounty's `pubky://` URL, anything else
+//!   refused unquoted; whether this sweeper may run the bounty (status
+//!   `open`, then `open: true` or the owner's own circle listing the
+//!   sweeper, or with `--circle` both in that circle); which targets it
+//!   sweeps (every one this build can, or `--target`'s, case-colliding ids
+//!   and the target policy refused); and what it shows of the bounty, its
+//!   title and focus sanitised and never its brief.
 //!
 //! The rules that hold for everything here (see "Rust conventions" in
 //! `docs/plan/03-cli-and-skill.md`):
@@ -222,11 +234,17 @@ mod post;
 mod private_fs;
 // Standard input, and the one yes-or-no question a command asks on it.
 mod prompt;
+// `PublicRecords`: anyone's public bounty, circle and sweep records, read
+// with a cap and parsed by core, with a fake for the unit tests.
+mod records;
 // Bounded reads of remote records and listings, the write-error mapping and
 // the key conversions. `login` and `keys` use the write errors and the
 // conversions, and the key stores the reads of the user's own records, of
 // anyone's public records and the listing.
 mod remote;
+// `run`: so far its checking half, the init project it needs, the bounty
+// URL, whether this sweeper may run the bounty and which targets it sweeps.
+mod run;
 // The per-command session: the writers' lock, a fresh sign-in and a sign-out
 // that is always attempted. `login` holds its lock; `keys revoke` is the
 // first command to run in a whole session; `logout` runs the sign-in and the
@@ -295,9 +313,9 @@ pub struct Context {
     /// warning before it acts, or that it is waiting for another command.
     pub stderr: StderrWriter,
     /// The passphrase from `--passphrase-file`, which the caller reads with
-    /// [`Passphrase::from_file`] before [`run`]: `login` wraps the secret
+    /// [`Passphrase::from_file`] before [`run`](fn@run): `login` wraps the secret
     /// files it creates with it, and every command that reads a wrapped one
-    /// unwraps it with it. `None` without the flag; [`run`] refuses a
+    /// unwraps it with it. `None` without the flag; [`run`](fn@run) refuses a
     /// command line that has the flag when this is `None`, so the flag can
     /// never be dropped on the way and leave files written unwrapped.
     pub passphrase: Option<Passphrase>,
@@ -383,7 +401,7 @@ impl Report {
 
 /// Runs `cli` when its command needs nothing from a [`Context`], and hands
 /// back `None` for every other command, which the caller then runs with
-/// [`run`].
+/// [`run`](fn@run).
 ///
 /// `init <dir>` is the one such command so far: it works only in the
 /// directory it is given. The binary calls this before it builds the
@@ -391,12 +409,12 @@ impl Report {
 /// the `--passphrase-file` (it writes no secret file, so there is nothing to
 /// wrap), and never builds a Pubky client: a production client starts a DHT
 /// node that contacts public servers, which a local command has no reason
-/// to do. [`run`] still runs `init` when given a context, so a caller that
+/// to do. [`run`](fn@run) still runs `init` when given a context, so a caller that
 /// always builds one, such as the end-to-end test, can run every command
-/// through [`run`] alone.
+/// through [`run`](fn@run) alone.
 ///
 /// `Option<Result<…>>` keeps the two answers apart: `None` is "not one of
-/// mine, build the context and call [`run`]", and `Some` carries the
+/// mine, build the context and call [`run`](fn@run)", and `Some` carries the
 /// command's own success or failure.
 pub fn run_without_context(cli: &Cli) -> Option<anyhow::Result<Report>> {
     // Every variant is named, with no `_` arm, so a command added later does

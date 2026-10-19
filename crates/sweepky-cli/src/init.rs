@@ -4,7 +4,10 @@
 //! skill and the playbook arrive in P3.
 //!
 //! The marker is a small JSON file, `{"schemaVersion":1}` and a newline, so
-//! later phases can add fields to it the way records grow.
+//! later phases can add fields to it the way records grow. One is read
+//! already: `playbook`, the playbook P3's `init` will record it installed,
+//! which [`read_project_marker`] hands `run` (and later `submit`) when it is
+//! there. This build never writes it.
 //!
 //! File safety: init writes into a directory the user named, which may
 //! already hold files, so it never writes through a link and never replaces
@@ -38,7 +41,7 @@ use std::path::Path;
 
 use anyhow::{Context as _, anyhow, bail};
 use serde::{Deserialize, Serialize};
-use sweepky_core::{RecordError, SchemaVersion, UnknownFields};
+use sweepky_core::{Playbook, RecordError, SchemaVersion, UnknownFields};
 
 use crate::Report;
 // File steps shared with the secret files' writer: the temp name, the synced
@@ -58,20 +61,53 @@ const GITIGNORE: &str = ".gitignore";
 /// and the agent's output, which must never be committed.
 const SWEEPS_LINE: &[u8] = b"sweeps/";
 
-/// The marker's contents. Serialized with `serde` so that adding a field later
-/// is one line here, and read back with it to tell a marker from any other
-/// file at that name.
-#[derive(Serialize, Deserialize)]
+/// The marker's contents, as [`read_project_marker`] hands them out.
+/// Serialized with `serde` so that adding a field later is one line here,
+/// and read back with it to tell a marker from any other file at that name.
+// `Debug` so a test can print one; nothing in it is secret. The fields are
+// private: a marker comes only from `marker_bytes` or from a file that
+// passed `parse_marker`, so `playbook()` always gives a checked value.
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct ProjectMarker {
+pub(crate) struct ProjectMarker {
     /// The format's version, 1. Reading one refuses a newer version, as a
     /// record's does.
     schema_version: SchemaVersion,
+    /// The playbook the project has installed, which P3's `init` records
+    /// and `run` writes into the sweep record. Read through core's
+    /// [`Playbook`], so a value outside 01's pattern makes the file no
+    /// marker this build reads.
+    // `default` reads a missing key as `None`, and `skip_serializing_if`
+    // leaves `None` out, so the marker this build writes is still exactly
+    // `{"schemaVersion":1}`: P2a's marker, unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    playbook: Option<Playbook>,
     /// Fields a newer Sweepky wrote. `flatten` collects every key not named
     /// above into this map instead of failing, so a marker a later phase
     /// added fields to still reads as a marker.
     #[serde(flatten)]
     extra: UnknownFields,
+}
+
+impl ProjectMarker {
+    /// The playbook the project's `init` recorded, or `None` for a marker
+    /// that names none, such as every one P2a's `init` writes.
+    // `as_ref` lends the value inside the `Option` out, `Option<&Playbook>`,
+    // so the caller reads it without taking it from the marker.
+    //
+    // The run command, later in P2b, is the first caller outside the tests:
+    // `expect` (not `allow`) silences the dead-code warning only while that
+    // is true, and that caller removes it.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the run command, later in P2b, is the first caller"
+        )
+    )]
+    pub(crate) fn playbook(&self) -> Option<&Playbook> {
+        self.playbook.as_ref()
+    }
 }
 
 /// The most bytes a marker may have: 64 KiB. The one init writes is 20; the
@@ -139,13 +175,13 @@ fn refuse_symlinked_project_dir(marker: &Path) -> anyhow::Result<()> {
 
 /// Whether a finished `init` already left its marker at `marker`. A regular
 /// file there counts only when it holds a marker this build reads (see
-/// [`check_marker`]). Anything else there is an error, because init would
+/// [`read_marker`]). Anything else there is an error, because init would
 /// have to write through it or replace it.
 fn is_initialised(marker: &Path) -> anyhow::Result<bool> {
     match existing(marker)? {
         Existing::Missing => Ok(false),
         Existing::File(seen) => {
-            check_marker(marker, &seen)?;
+            read_marker(marker, &seen)?;
             Ok(true)
         }
         Existing::Symlink => bail!(
@@ -160,11 +196,42 @@ fn is_initialised(marker: &Path) -> anyhow::Result<bool> {
     }
 }
 
-/// Refuses the regular file at `marker`, which `seen` describes, unless it
-/// holds a marker this build reads (see [`check_marker_bytes`]). An empty or
-/// half-written file, or someone else's file of that name, is not a finished
-/// `init`, so it is refused rather than reported as one, and left as it is.
-fn check_marker(marker: &Path, seen: &Metadata) -> anyhow::Result<()> {
+/// The project marker directly inside `dir`, read with the rules `init`
+/// reads its own with: a regular file, never a link followed, at most
+/// [`MAX_MARKER_BYTES`], parsed as a [`ProjectMarker`] with its optional
+/// `playbook` checked. Anything else at that name, or nothing, is an error
+/// that names the path and quotes none of the file.
+///
+/// `run` and `submit` call it on their working directory, and only there:
+/// a directory inside a project is not one, as `git` would take it to be.
+/// A sweep's files are written relative to the project, so the command must
+/// be run where they go.
+pub(crate) fn read_project_marker(dir: &Path) -> anyhow::Result<ProjectMarker> {
+    let marker = dir.join(MARKER);
+    match existing(&marker)? {
+        Existing::File(seen) => read_marker(&marker, &seen),
+        Existing::Missing => bail!(
+            "{} is not a Sweepky project: it has no {MARKER} marker. `sweepky init <dir>` makes \
+             one",
+            dir.display()
+        ),
+        Existing::Symlink => bail!(
+            "{} is a symbolic link, which is never followed to a marker",
+            marker.display()
+        ),
+        Existing::Other => bail!(
+            "{} is not a regular file, so not a Sweepky project marker",
+            marker.display()
+        ),
+    }
+}
+
+/// Reads the regular file at `marker`, which `seen` describes, and refuses
+/// it unless it holds a marker this build reads (see [`parse_marker`]). An
+/// empty or half-written file, or someone else's file of that name, is not
+/// a finished `init`, so it is refused rather than reported as one, and
+/// left as it is.
+fn read_marker(marker: &Path, seen: &Metadata) -> anyhow::Result<ProjectMarker> {
     // Were the file swapped for a FIFO between the `lstat` and this `open`,
     // the open would wait for a writer. That needs someone who can write the
     // directory and costs a hung command, nothing more, so it is left at
@@ -177,8 +244,8 @@ fn check_marker(marker: &Path, seen: &Metadata) -> anyhow::Result<()> {
     let bytes = read_up_to_cap(&mut file, MAX_MARKER_BYTES + 1)
         .with_context(|| format!("could not read {}", marker.display()))?;
     // `map_err` turns only the `Err` side into an `anyhow::Error`, adding the
-    // path; an `Ok(())` passes through untouched.
-    check_marker_bytes(&bytes).map_err(|fault| {
+    // path; an `Ok` marker passes through untouched.
+    parse_marker(&bytes).map_err(|fault| {
         anyhow!(
             "{} is not a Sweepky project marker ({fault}); move it away and run init again",
             marker.display()
@@ -186,25 +253,21 @@ fn check_marker(marker: &Path, seen: &Metadata) -> anyhow::Result<()> {
     })
 }
 
-/// Checks that `bytes` are a marker this build reads: at most
-/// [`MAX_MARKER_BYTES`] long, JSON whose `schemaVersion` is at most 1, any
-/// other fields allowed. The `Err` says what is wrong, for the caller's
-/// message.
+/// Parses `bytes` as a marker this build reads: at most
+/// [`MAX_MARKER_BYTES`] long, JSON whose `schemaVersion` is at most 1 and
+/// whose `playbook`, if any, is a valid [`Playbook`], any other fields
+/// allowed. The `Err` says what is wrong, for the caller's message.
 ///
 /// It never quotes `bytes`. serde_json's own messages can, so a parse error
 /// goes through core's `RecordError`, which keeps only the kind of fault and
 /// where it is, as every record parse does.
-fn check_marker_bytes(bytes: &[u8]) -> Result<(), String> {
+fn parse_marker(bytes: &[u8]) -> Result<ProjectMarker, String> {
     if bytes.len() > MAX_MARKER_BYTES {
         return Err(format!(
             "it is longer than the {MAX_MARKER_BYTES} bytes a marker may have"
         ));
     }
-    // `::<ProjectMarker>` (the "turbofish") names the type to parse into,
-    // since the result is only checked, never bound to a typed variable.
-    serde_json::from_slice::<ProjectMarker>(bytes)
-        .map(|_| ())
-        .map_err(|err| RecordError::from(err).to_string())
+    serde_json::from_slice(bytes).map_err(|err| RecordError::from(err).to_string())
 }
 
 /// What was at a path, as `symlink_metadata` saw it.
@@ -246,6 +309,7 @@ fn existing(path: &Path) -> anyhow::Result<Existing> {
 fn marker_bytes() -> anyhow::Result<Vec<u8>> {
     let marker = ProjectMarker {
         schema_version: SchemaVersion::CURRENT,
+        playbook: None,
         extra: UnknownFields::new(),
     };
     let mut bytes = serde_json::to_vec(&marker).context("could not write the marker")?;
@@ -425,9 +489,12 @@ mod tests {
     use std::os::unix::fs::{MetadataExt, symlink};
     use std::path::{Path, PathBuf};
 
+    use sweepky_core::Playbook;
     use tempfile::TempDir;
 
-    use super::{GITIGNORE, MARKER, MAX_GITIGNORE_BYTES, create_with, init, write_new};
+    use super::{
+        GITIGNORE, MARKER, MAX_GITIGNORE_BYTES, create_with, init, read_project_marker, write_new,
+    };
 
     /// A new, empty directory `name` inside `temp`.
     fn project_dir(temp: &TempDir, name: &str) -> PathBuf {
@@ -798,6 +865,74 @@ mod tests {
         );
         assert_eq!(fs::read(dir.join(MARKER)).expect("read"), marker);
         assert_eq!(entries(&dir), names(&[MARKER]));
+    }
+
+    #[test]
+    fn the_marker_init_writes_reads_back_with_no_playbook() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let dir = temp.path().join("project");
+        init(&dir).expect("init succeeds");
+
+        let marker = read_project_marker(&dir).expect("init's own marker reads");
+        assert_eq!(marker.playbook(), None);
+    }
+
+    #[test]
+    fn a_marker_s_playbook_is_read_and_a_bad_one_refused_unquoted() {
+        let temp = tempfile::tempdir().expect("temp dir");
+
+        // P3's init records the playbook it installed, beside fields a
+        // later build may add.
+        let dir = project_dir(&temp, "with-playbook");
+        fs::write(
+            dir.join(MARKER),
+            "{\"schemaVersion\":1,\"playbook\":\"cloudflare/security-audit@c1c8a8c\",\
+             \"addedLater\":[1]}\n",
+        )
+        .expect("write");
+        let marker = read_project_marker(&dir).expect("reads");
+        assert_eq!(
+            marker.playbook().map(Playbook::as_str),
+            Some("cloudflare/security-audit@c1c8a8c")
+        );
+
+        // A playbook outside 01's pattern, or not a string at all, makes the
+        // file no marker this build reads: refused by name, never quoted,
+        // and left as it is by init too.
+        let cases: [(&str, &[u8]); 3] = [
+            (
+                "pattern",
+                b"{\"schemaVersion\":1,\"playbook\":\"PLANTED-7f3a ../x\"}\n",
+            ),
+            (
+                "escape",
+                b"{\"schemaVersion\":1,\"playbook\":\"PLANTED-7f3a\\u001b[2J\"}\n",
+            ),
+            (
+                "not-a-string",
+                b"{\"schemaVersion\":1,\"playbook\":[\"PLANTED-7f3a\"]}\n",
+            ),
+        ];
+        for (name, contents) in cases {
+            let dir = project_dir(&temp, name);
+            fs::write(dir.join(MARKER), contents).expect("write");
+            for err in [
+                read_project_marker(&dir).expect_err(name),
+                init(&dir).expect_err(name),
+            ] {
+                let message = format!("{err:#}");
+                assert!(
+                    message.contains(&dir.join(MARKER).display().to_string()),
+                    "{name}: {message}"
+                );
+                assert!(
+                    message.contains("is not a Sweepky project marker"),
+                    "{name}: {message}"
+                );
+                assert!(!message.contains("PLANTED"), "{name}: {message}");
+            }
+            assert_eq!(fs::read(dir.join(MARKER)).expect("read"), contents);
+        }
     }
 
     #[test]
