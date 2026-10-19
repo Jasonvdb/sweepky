@@ -486,7 +486,7 @@ mod tests {
     use crate::remote::{BodyTooLarge, MAX_PAGE_SIZE, REDIRECTED, pubky_of};
     use crate::test_support::{
         Canned, FakeEventsFeed, LocalHttp, PLANTED, canned, feed_page, offline_network,
-        random_pubky, record_id,
+        random_pubky, record_id, stream_event,
     };
 
     /// No pause between the search's requests: the tests' pace.
@@ -707,18 +707,6 @@ mod tests {
             )),
             "{query}"
         );
-    }
-
-    /// One event of an `/events-stream` answer, as pubky-homeserver 0.16.2
-    /// writes it: its type, the file's URL, its cursor and, for a PUT, a
-    /// content hash, then a blank line.
-    fn stream_event(op: &str, url: &str, cursor: u64) -> String {
-        let hash = if op == "PUT" {
-            "data: content_hash: r0NJufX5oaagQE3qNtzJSZvLJcmtwRK3zJqTyuQfMmI=\n"
-        } else {
-            ""
-        };
-        format!("event: {op}\ndata: {url}\ndata: cursor: {cursor}\n{hash}\n")
     }
 
     #[tokio::test]

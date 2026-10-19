@@ -13,8 +13,9 @@
 //! [`FakeOwnStorage`] in place of the signed-in user's own storage, a
 //! [`FakePublicRecords`] in place of everyone's public storage and its
 //! listings, a [`FakeEventsFeed`] in place of a homeserver's events feed and
-//! stream, with [`feed_page`], an honest feed's page as a homeserver writes
-//! it, a [`LocalHttp`] server on the loopback address for the
+//! stream, which keeps every request, with [`feed_page`], an honest feed's
+//! page as a homeserver writes it, and [`stream_event`], one event of a
+//! stream answer, a [`LocalHttp`] server on the loopback address for the
 //! requests Sweepky sends itself, and the synthetic bounty, circle and
 //! sweep records the tests
 //! put there, with the snapshot `run` keeps of a sweep's fetch, the
@@ -759,18 +760,32 @@ impl PublicRecords for FakePublicRecords {
 /// their own data included.
 type FeedAnswer = Box<dyn Fn(EventCursor, u16) -> anyhow::Result<Vec<u8>>>;
 
+/// What a [`FakeEventsFeed`] answers a stream request with: the body for
+/// the homeserver, the owner and the path asked, or an error.
+type StreamAnswer = Box<dyn Fn(Pubky, Pubky, &SweepkyPath) -> anyhow::Result<Vec<u8>>>;
+
+/// One stream request a [`FakeEventsFeed`] was sent: the homeserver asked,
+/// and the owner and the path of the file whose latest event it asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StreamRequest {
+    pub(crate) homeserver: Pubky,
+    pub(crate) owner: Pubky,
+    pub(crate) path: SweepkyPath,
+}
+
 /// An [`EventsFeed`] in memory, in place of a homeserver's `/events/` and
 /// `/events-stream`: each page is what its function answers for the cursor
-/// and the limit asked, whatever the homeserver, and every stream answer is
-/// the same body. It keeps the cursor and the limit of every page request,
-/// in order. The parse and the checks are `EventsFeed`'s provided methods',
-/// so they run on these bodies as on a homeserver's; the caps are the real
-/// reader's. The `Mutex` is there for the same reason as in
-/// [`FakeKeyStore`].
+/// and the limit asked, whatever the homeserver, and each stream answer
+/// what its other function answers for the request. It keeps every page
+/// request, with its homeserver, and every stream request, in order. The
+/// parse and the checks are `EventsFeed`'s provided methods', so they run
+/// on these bodies as on a homeserver's; the caps are the real reader's.
+/// The `Mutex`es are there for the same reason as in [`FakeKeyStore`].
 pub(crate) struct FakeEventsFeed {
     pages: FeedAnswer,
-    stream: Vec<u8>,
-    asked: Mutex<Vec<(EventCursor, u16)>>,
+    stream: StreamAnswer,
+    asked: Mutex<Vec<(Pubky, EventCursor, u16)>>,
+    streams_asked: Mutex<Vec<StreamRequest>>,
 }
 
 impl FakeEventsFeed {
@@ -782,8 +797,9 @@ impl FakeEventsFeed {
     ) -> Self {
         Self {
             pages: Box::new(answer),
-            stream: Vec::new(),
+            stream: Box::new(|_, _, _| Ok(Vec::new())),
             asked: Mutex::new(Vec::new()),
+            streams_asked: Mutex::new(Vec::new()),
         }
     }
 
@@ -795,36 +811,89 @@ impl FakeEventsFeed {
     }
 
     /// The same fake, answering every stream request with `body`.
-    pub(crate) fn with_stream(mut self, body: &[u8]) -> Self {
-        self.stream = body.to_vec();
+    pub(crate) fn with_stream(self, body: &[u8]) -> Self {
+        let body = body.to_vec();
+        self.with_stream_answer(move |_, _, _| Ok(body.clone()))
+    }
+
+    /// The same fake, answering each stream request with what `answer`
+    /// gives for its homeserver, owner and path.
+    pub(crate) fn with_stream_answer(
+        mut self,
+        answer: impl Fn(Pubky, Pubky, &SweepkyPath) -> anyhow::Result<Vec<u8>> + 'static,
+    ) -> Self {
+        self.stream = Box::new(answer);
         self
     }
 
     /// The cursor and the limit of every page request so far, in order.
     pub(crate) fn asked(&self) -> Vec<(EventCursor, u16)> {
-        self.asked.lock().expect("lock").clone()
+        self.asked
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|&(_, cursor, limit)| (cursor, limit))
+            .collect()
+    }
+
+    /// Every homeserver a page was asked of so far, once each.
+    pub(crate) fn homeservers_asked(&self) -> BTreeSet<Pubky> {
+        self.asked
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|&(homeserver, _, _)| homeserver)
+            .collect()
+    }
+
+    /// Every stream request so far, in order.
+    pub(crate) fn streams_asked(&self) -> Vec<StreamRequest> {
+        self.streams_asked.lock().expect("lock").clone()
     }
 }
 
 impl EventsFeed for FakeEventsFeed {
     async fn feed_body(
         &self,
-        _homeserver: Pubky,
+        homeserver: Pubky,
         cursor: EventCursor,
         limit: u16,
     ) -> anyhow::Result<Zeroizing<Vec<u8>>> {
-        self.asked.lock().expect("lock").push((cursor, limit));
+        self.asked
+            .lock()
+            .expect("lock")
+            .push((homeserver, cursor, limit));
         (self.pages)(cursor, limit).map(Zeroizing::new)
     }
 
     async fn stream_body(
         &self,
-        _homeserver: Pubky,
-        _owner: Pubky,
-        _path: &SweepkyPath,
+        homeserver: Pubky,
+        owner: Pubky,
+        path: &SweepkyPath,
     ) -> anyhow::Result<Zeroizing<Vec<u8>>> {
-        Ok(Zeroizing::new(self.stream.clone()))
+        self.streams_asked
+            .lock()
+            .expect("lock")
+            .push(StreamRequest {
+                homeserver,
+                owner,
+                path: path.clone(),
+            });
+        (self.stream)(homeserver, owner, path).map(Zeroizing::new)
     }
+}
+
+/// One event of an `/events-stream` answer, as pubky-homeserver 0.16.2
+/// writes it: its type, the file's URL, its cursor and, for a PUT, a
+/// content hash, then a blank line.
+pub(crate) fn stream_event(op: &str, url: &str, cursor: u64) -> String {
+    let hash = if op == "PUT" {
+        "data: content_hash: r0NJufX5oaagQE3qNtzJSZvLJcmtwRK3zJqTyuQfMmI=\n"
+    } else {
+        ""
+    };
+    format!("event: {op}\ndata: {url}\ndata: cursor: {cursor}\n{hash}\n")
 }
 
 /// One page of an honest feed of public events with the ids `ids`, in

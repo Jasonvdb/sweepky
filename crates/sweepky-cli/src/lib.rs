@@ -133,13 +133,19 @@
 //!   address included, the `ResolveHost` seam, over the system resolver,
 //!   and `HttpsRemote`, the `https://<repo>` remote that git's network
 //!   commands take, made only for a host whose every address is public.
-//! - `post <draft.json>` (`post`), for a bounty that is not `--open`: the
-//!   bounty draft, read with a cap and checked as strictly as a stranger's
-//!   record, its public text held to what the sanitiser prints unchanged;
-//!   every target checked against the target policy and pinned through the
-//!   context's target source; the bounty shown, sanitised, on standard
-//!   error, and published as `bounties/<id>.json` under the writers' lock
-//!   with a fresh session only once the owner says yes.
+//! - `post <draft.json> [--open]` (`post`): the bounty draft, read with a
+//!   cap and checked as strictly as a stranger's record, its public text
+//!   held to what the sanitiser prints unchanged; every target checked
+//!   against the target policy and pinned through the context's target
+//!   source; the bounty shown, sanitised, on standard error, and published
+//!   as `bounties/<id>.json` under the writers' lock with a fresh session
+//!   only once the owner says yes. With `--open` the record says `open:
+//!   true`, and `post` also writes `bounties/<id>.discovered.json` with the
+//!   bounty's starting cursors and no sweeps: each watched homeserver's
+//!   feed head, searched after the yes and before the PUT, and the owner's
+//!   own homeserver's event of the PUT, read from its stream right after
+//!   it. The same cursors go into `feed-cursors.json`, never raising a
+//!   lower one there.
 //! - `own_storage`, `OwnStorage`: the seam through which `post`, `run` and
 //!   `submit` write the signed-in user's own records and read them back,
 //!   with a fake for the unit tests that can refuse a chosen write.
@@ -189,11 +195,11 @@
 //! - `pull` (P2c), so far only the local state it keeps between runs in the
 //!   data directory, one entry per owner: `feed-cursors.json`, each watched
 //!   homeserver's feed cursor, set after a batch or lowered to a bounty's
-//!   starting cursor; and `poll-state.json`, the roster poll's newest ids
-//!   seen, bounty and sweep summaries with their `ETag`s, the `ETag` of each
-//!   own `discovered.json`, the strangers' sweeps accepted and the
-//!   deletions confirmed. Both are capped, owner-only and keep the fields a
-//!   newer Sweepky adds.
+//!   starting cursor, as `post --open` does; and `poll-state.json`, the
+//!   roster poll's newest ids seen, bounty and sweep summaries with their
+//!   `ETag`s, the `ETag` of each own `discovered.json`, the strangers'
+//!   sweeps accepted and the deletions confirmed. Both are capped,
+//!   owner-only and keep the fields a newer Sweepky adds.
 //! - `events` (P2c), the seam `post --open` and `pull` read a homeserver's
 //!   public events through, with no session: one page of its `/events/`
 //!   feed, capped and parsed by core, a page with more events than were
@@ -259,17 +265,7 @@ mod device;
 mod dirs;
 // A homeserver's public events: one `/events/` page, the owner's latest
 // event of a file from `/events-stream`, and the search for where a feed
-// ends. `post --open` and `pull`, its first users, come in later steps, so
-// outside the tests nothing uses the module yet and the compiler would warn
-// of dead code. `expect` (not `allow`) silences that only while it is true:
-// the step that wires the first of them in must remove it.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "post --open and pull, its first users, come in later steps"
-    )
-)]
+// ends, which `post --open` starts an open bounty's discovery from.
 mod events;
 // The one way `post` and `run` run git: hardened, bounded and timed.
 mod git;
@@ -301,16 +297,16 @@ mod pins;
 // `post`: the bounty draft, checked and pinned into a bounty, shown, and
 // published once the owner says yes.
 mod post;
-// `pull`: so far only the local state it keeps between runs. The command
-// comes in a later step, so outside the tests nothing uses the module yet
-// and the compiler would warn of dead code. `expect` (not `allow`) silences
-// that only while it is true: the step that wires the command in must
-// remove it.
+// `pull`: so far only the local state it keeps between runs, whose feed
+// cursors `post --open` already writes. The command comes in a later step,
+// so outside the tests most of the module is unused yet and the compiler
+// would warn of dead code. `expect` (not `allow`) silences that only while
+// it is true: the step that wires the command in must remove it.
 #[cfg_attr(
     not(test),
     expect(
         dead_code,
-        reason = "the pull command, its first user, comes in a later step"
+        reason = "the pull command, the module's main user, comes in a later step"
     )
 )]
 mod pull;
@@ -581,9 +577,9 @@ pub async fn run(cli: Cli, ctx: &Context) -> anyhow::Result<Report> {
         },
         // `match cli.command` moved only that field out of `cli`, so
         // `cli.no_input`, another field, can still be read here.
-        Command::Post { draft } => {
+        Command::Post { draft, open } => {
             let prompting = prompt::Prompting::from_no_input_flag(cli.no_input);
-            post::post(ctx, prompting, &draft).await
+            post::post(ctx, prompting, &draft, open).await
         }
         // `run::run` is the function `run` in the module `run`: a module
         // and a function live in different namespaces, so the two names
@@ -653,6 +649,7 @@ mod tests {
             &["circle", "remove", "pk"],
             &["circle", "show"],
             &["post", "draft.json"],
+            &["post", "--open", "draft.json"],
             &["run"],
             &[
                 "run",

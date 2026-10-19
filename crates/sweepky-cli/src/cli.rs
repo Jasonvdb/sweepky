@@ -145,10 +145,10 @@ pub enum Command {
         command: CircleCommand,
     },
 
-    /// Post a bounty from the draft file DRAFT, closed: only sweeps from
-    /// this identity's circle are read. Pins every target to exact SHAs,
-    /// shows the bounty (title, focus, suggested playbook, each target with
-    /// its SHAs, and the brief) and asks before it publishes
+    /// Post a bounty from the draft file DRAFT, closed unless --open: only
+    /// sweeps from this identity's circle are read. Pins every target to
+    /// exact SHAs, shows the bounty (title, focus, suggested playbook, each
+    /// target with its SHAs, and the brief) and asks before it publishes
     /// /pub/sweepky/bounties/ID.json, which anyone can read. With
     /// --no-input it shows the bounty and fails instead of asking, so
     /// nothing is posted.
@@ -163,6 +163,17 @@ pub enum Command {
         // a path that is not UTF-8 is still taken as typed.
         #[arg(value_name = "DRAFT")]
         draft: PathBuf,
+
+        /// Post the bounty open: sweeps from anyone are read, each labelled
+        /// by how far you trust its sweeper. After the yes, post finds
+        /// where each watched homeserver's events feed stands, and beside
+        /// the bounty it publishes /pub/sweepky/bounties/ID.discovered.json,
+        /// the list of strangers' sweeps `pull` finds, starting there.
+        //
+        // A plain flag, before or after DRAFT: clap reads `--open` wherever
+        // it comes among the subcommand's arguments.
+        #[arg(long)]
+        open: bool,
     },
 
     /// Start a sweep of the bounty at BOUNTY_URL, or without one of the
@@ -398,15 +409,34 @@ mod tests {
     }
 
     #[test]
-    fn post_takes_one_draft_path() {
+    fn post_takes_one_draft_path_and_open_on_either_side_of_it() {
         let cli = Cli::try_parse_from(["sweepky", "post", "draft.json"]).expect("parses");
         assert!(
-            matches!(&cli.command, Command::Post { draft } if draft == Path::new("draft.json")),
+            matches!(
+                &cli.command,
+                Command::Post { draft, open: false } if draft == Path::new("draft.json")
+            ),
             "{cli:?}"
         );
-        // Exactly one: none, or a second, is a usage error.
+        for args in [
+            ["sweepky", "post", "--open", "draft.json"],
+            ["sweepky", "post", "draft.json", "--open"],
+        ] {
+            let cli = Cli::try_parse_from(args).expect("parses");
+            assert!(
+                matches!(
+                    &cli.command,
+                    Command::Post { draft, open: true } if draft == Path::new("draft.json")
+                ),
+                "{args:?}: {cli:?}"
+            );
+        }
+        // Exactly one draft: none, or a second, is a usage error, and so is
+        // `--open` given a value.
         assert!(Cli::try_parse_from(["sweepky", "post"]).is_err());
+        assert!(Cli::try_parse_from(["sweepky", "post", "--open"]).is_err());
         assert!(Cli::try_parse_from(["sweepky", "post", "a.json", "b.json"]).is_err());
+        assert!(Cli::try_parse_from(["sweepky", "post", "--open=yes", "a.json"]).is_err());
     }
 
     #[test]
