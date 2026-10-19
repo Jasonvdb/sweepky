@@ -61,7 +61,8 @@
 mod manifest;
 mod owner_keys;
 mod sweep_dir;
-mod walk;
+// `pub(crate)`: `run` places a sweep with the walk's handle calls too.
+pub(crate) mod walk;
 
 use std::iter;
 use std::path::Path;

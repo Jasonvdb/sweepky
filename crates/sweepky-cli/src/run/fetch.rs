@@ -1,23 +1,42 @@
-//! `run`'s fetching half: each chosen target fetched into
-//! `./sweeps/<id>/target/<tid>/` by its exact SHA, its agent-instruction
-//! files stripped, and `scope.json` and `brief.md` written beside them.
+//! `run`'s fetching half: each chosen target fetched by its exact SHA, its
+//! agent-instruction files stripped, and `scope.json` and `brief.md`
+//! written beside them, all in a sweep directory built under the data
+//! directory and only then put in the project as `./sweeps/<id>/`.
 //!
-//! - [`SweepPaths`]: every path of one sweep, built from the project's own
-//!   path, the sweep's `RecordId` and each `TargetId`, which core holds to a
-//!   single path segment of ASCII letters, digits, `-` and `_`. Nothing a
-//!   repository or a record wrote as text, a `RepoPath` above all, is ever
-//!   joined onto them; a target's paths go into `scope.json` as data.
+//! - [`SweepPaths`]: every path of one sweep in the project, built from the
+//!   project's own path, the sweep's `RecordId` and each `TargetId`, which
+//!   core holds to a single path segment of ASCII letters, digits, `-` and
+//!   `_`. Nothing a repository or a record wrote as text, a `RepoPath`
+//!   above all, is ever joined onto them; a target's paths go into
+//!   `scope.json` as data.
 //! - [`check_sweep_dir`]: the check `run` makes before it publishes
 //!   anything: `sweeps/` must be a real directory or absent, never a link,
 //!   and `sweeps/<id>/` must not exist.
 //! - [`fetch_sweep`]: the fetch itself, which makes the same check again
-//!   before git runs and removes the half-made sweep directory if any step
-//!   fails. Flipping the public record to `aborted` is the run command's
-//!   job, not this module's.
+//!   before git runs and then builds the whole sweep directory in a new
+//!   staging directory of its own, `<data dir>/staging/<id>/`, removed
+//!   again with all it holds whatever happens. [`StagedSweep::place`] puts
+//!   the finished directory in the project (`place`). Flipping the public
+//!   record to `aborted` when a step fails is the run command's job, not
+//!   this module's.
+//!
+//! **Why stage, and not fetch into the project.** The project is the
+//! agent's to write, and a process an earlier, prompt-injected agent
+//! session left running there may still be at work (02). git reads a
+//! repository's own `.git/config` and `.git/info/attributes` whatever the
+//! runner's `-c` settings say, so a filter planted there would run as the
+//! user, outside the sandbox, at `git checkout`; and a directory on the way
+//! swapped for a link would send git, the strip's removals and the file
+//! writes wherever the link points. Under the data directory, which the
+//! sandbox keeps the agent from, git's working directory and its `.git`,
+//! the strip and every write are out of that process's reach, and the
+//! project gets the sweep only once it is whole, through handles that
+//! follow no link.
 //!
 //! **The git steps for one target**, every one through the hardened runner
 //! (`crate::git`: argv only, no config or credentials of the user's, hooks,
-//! submodules, LFS and symlinks off), in the target's own new directory:
+//! submodules, LFS and symlinks off), in the target's own new directory
+//! under the staging directory:
 //!
 //! 1. `git init --quiet --template=`: an empty repository; the empty
 //!    template copies in no hooks or other files.
@@ -53,7 +72,6 @@
 //! status text.
 
 use std::fs::{self, DirBuilder};
-use std::io::ErrorKind;
 // `DirBuilderExt` adds `.mode()` to `DirBuilder`, a Unix-only extension.
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
@@ -66,12 +84,17 @@ use sweepky_core::{
 };
 
 use super::CheckedBounty;
+use super::place::{already_there, place_sweep};
 use super::scope_file::{ScopeTarget, scope_json, write_new_file};
 use super::select::ChosenTarget;
 use super::strip::strip_agent_files;
+use crate::Dirs;
 use crate::git::{GitCommand, GitFailed, Limits, LocalSubcommand, Remote, RunGit, STDERR_CAP};
-use crate::private_fs::{lstat, refuse_unless_dir};
+use crate::private_fs::{ensure_private_dir, lstat, refuse_unless_dir};
 use crate::targets::{TargetRemote, TargetResolver};
+
+/// The directory of a sweep directory that holds one directory per target.
+const TARGETS: &str = "target";
 
 /// The quick local steps' limits (`init`, `config`, `rev-list`): a minute,
 /// and 64 KiB of output, room for `rev-list`'s one line of a commit with
@@ -101,70 +124,78 @@ const NOT_OUR_REF: &str = "not our ref";
 /// The check `run` makes before it publishes anything: that sweep `id` can
 /// go in `<project>/sweeps/<id>/`. `sweeps` must be absent or a real
 /// directory, not a link, and `sweeps/<id>` must not exist. Creates
-/// nothing; [`fetch_sweep`] checks again before git runs.
+/// nothing; [`fetch_sweep`] checks again before git runs, and
+/// [`StagedSweep::place`] once more, through handles, as it places.
 pub(crate) fn check_sweep_dir(project: &Path, id: RecordId) -> anyhow::Result<()> {
     SweepPaths::new(project, id)?.check_free()
 }
 
-/// What [`fetch_sweep`] made: the sweep directory, and each target as
-/// `scope.json` lists it.
+/// What [`StagedSweep::place`] put in `<project>/sweeps/<id>/`: each
+/// target as `scope.json` lists it.
 #[derive(Debug)]
 pub(crate) struct FetchedSweep {
-    /// `<project>/sweeps/<id>`.
-    pub(crate) dir: PathBuf,
     /// In the bounty's order. The `stripped` names are the repository's,
     /// so anything that prints one sanitises it first.
     pub(crate) targets: Vec<ScopeTarget>,
 }
 
-/// Fetches every target of `checked` into `<project>/sweeps/<id>/` for
-/// `sweep`, through `git` and `source`, and writes `scope.json` and
-/// `brief.md` there. On any failure the sweep directory is removed again,
-/// and nothing else under `sweeps/` is touched.
+/// Fetches every target of `checked` for `sweep` through `git` and
+/// `source`, strips each, and writes `scope.json` and `brief.md`, all in a
+/// new staging directory under `dirs`' data directory. Nothing is written
+/// in the project at `project` yet, whose paths `scope.json` names:
+/// [`StagedSweep::place`] puts the sweep there. The staging directory is
+/// removed again on any failure here, and once the sweep is placed.
 pub(crate) async fn fetch_sweep(
     git: &impl RunGit,
     source: &impl TargetResolver,
+    dirs: &Dirs,
     project: &Path,
     sweep: SweepRef,
     checked: &CheckedBounty,
-) -> anyhow::Result<FetchedSweep> {
+) -> anyhow::Result<StagedSweep> {
     let paths = SweepPaths::new(project, sweep.id)?;
     paths.check_free()?;
-    let half_made = paths.claim()?;
+    let staging = Staging::create(dirs, sweep.id)?;
+    let staged_targets = staging.dir.join(TARGETS);
+    fs::create_dir(&staged_targets)
+        .with_context(|| format!("could not create {}", staged_targets.display()))?;
     let mut targets = Vec::with_capacity(checked.targets.len());
     for chosen in &checked.targets {
-        let target = fetch_target(git, source, &paths, chosen)
+        let target = fetch_target(git, source, &paths, &staged_targets, chosen)
             .await
             .with_context(|| format!("could not fetch target {}", chosen.id))?;
         targets.push(target);
     }
     let output = dir_text(&paths.audit())?;
     let scope = scope_json(sweep, checked, &output, &targets)?;
-    write_new_file(&paths.root.join("scope.json"), &scope)?;
+    write_new_file(&staging.dir.join("scope.json"), &scope)?;
     // The brief as the owner wrote it, byte for byte: the agent reads it as
     // a file, and nothing here prints it.
     write_new_file(
-        &paths.root.join("brief.md"),
+        &staging.dir.join("brief.md"),
         checked.bounty.brief.as_bytes(),
     )?;
-    half_made.keep();
-    Ok(FetchedSweep {
-        dir: paths.root,
+    Ok(StagedSweep {
+        paths,
+        staging,
         targets,
     })
 }
 
-/// Fetches `chosen` into its directory under `paths`, checks it out,
-/// strips it, and describes it for `scope.json`.
+/// Fetches `chosen` into its own new directory in `staged_targets`, the
+/// staging directory's `target/`, checks it out, strips it, and describes
+/// it for `scope.json` by the path it will have in the project, from
+/// `paths`.
 async fn fetch_target(
     git: &impl RunGit,
     source: &impl TargetResolver,
     paths: &SweepPaths,
+    staged_targets: &Path,
     chosen: &ChosenTarget,
 ) -> anyhow::Result<ScopeTarget> {
     let plan = FetchPlan::of(&chosen.target);
     let remote = source.fetch_remote(plan.kind, plan.repo).await?;
-    let dir = paths.target(&chosen.id);
+    let dir = staged_targets.join(chosen.id.as_str());
     fs::create_dir(&dir).with_context(|| format!("could not create {}", dir.display()))?;
     make_repository(git, &dir).await?;
     git.run(&plan.fetch_command(git_remote(&remote)).in_dir(&dir))
@@ -175,7 +206,7 @@ async fn fetch_target(
     Ok(ScopeTarget {
         id: chosen.id.clone(),
         kind: plan.kind.into(),
-        path: dir_text(&dir)?,
+        path: dir_text(&paths.target(&chosen.id))?,
         scope: scope_of(git, &dir, &chosen.target).await?,
         stripped,
     })
@@ -228,7 +259,89 @@ async fn scope_of(
     })
 }
 
-/// Every path of one sweep under the project: `<project>/sweeps/<id>/` and
+/// A sweep [`fetch_sweep`] built and has not yet put in the project: its
+/// paths there, its staging directory, and each target as `scope.json`
+/// lists it.
+#[derive(Debug)]
+pub(crate) struct StagedSweep {
+    paths: SweepPaths,
+    staging: Staging,
+    targets: Vec<ScopeTarget>,
+}
+
+impl StagedSweep {
+    /// The staged sweep directory, `<data dir>/staging/<id>`, where the run
+    /// command writes the per-sweep marker, last, before it places the
+    /// sweep. The data directory is out of the agent's reach, so a path
+    /// there is safe to write by.
+    pub(crate) fn dir(&self) -> &Path {
+        &self.staging.dir
+    }
+
+    /// Puts the staged sweep in the project as `<project>/sweeps/<id>/`,
+    /// through directory handles that follow no link (`place`), and hands
+    /// back what it made. Refused, with nothing written through it, when
+    /// `sweeps` is a link or not a directory, or when anything at all is at
+    /// `sweeps/<id>`.
+    ///
+    /// Takes `self` by value: once this returns, placed or refused, the
+    /// rest of `self` is dropped, and the staging directory with it.
+    pub(crate) fn place(self) -> anyhow::Result<FetchedSweep> {
+        place_sweep(&self.staging.parent, &self.paths.project, self.paths.id)?;
+        // Moving a field out of `self` is allowed because `StagedSweep`
+        // itself has no `Drop`; `self.staging`, left behind, is dropped as
+        // the function returns.
+        Ok(FetchedSweep {
+            targets: self.targets,
+        })
+    }
+}
+
+/// The staging directory of one sweep, `<data dir>/staging/<id>/`: made new
+/// and 0700, and removed with all it holds when this is dropped, whether
+/// the sweep was placed (moved away, so nothing is left, or copied, so the
+/// original goes), a step failed or returned early with `?`, or the
+/// command was cancelled.
+#[derive(Debug)]
+struct Staging {
+    /// `<data dir>/staging`, which the sweep is placed from.
+    parent: PathBuf,
+    /// `<data dir>/staging/<id>`.
+    dir: PathBuf,
+}
+
+impl Staging {
+    /// Makes the staging directory of sweep `id` under `dirs`' data
+    /// directory, and `staging/` itself if need be, both 0700.
+    fn create(dirs: &Dirs, id: RecordId) -> anyhow::Result<Self> {
+        let parent = dirs.staging_dir();
+        // Made 0700 with any missing parents, or checked to be a real 0700
+        // directory when it is there already.
+        ensure_private_dir(&parent)?;
+        let dir = parent.join(id.to_string());
+        // Not `recursive`: the `mkdir` fails if anything at all is there, a
+        // link included, so the directory is this run's alone. 0700, so no
+        // other user of the machine reads the checkout, and, once placed,
+        // the audit the agent writes before `submit` encrypts it.
+        DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .with_context(|| format!("could not create {}", dir.display()))?;
+        Ok(Self { parent, dir })
+    }
+}
+
+/// Best effort: `drop` cannot return an error. The directory is under the
+/// data directory, which the agent cannot reach, and std's `remove_dir_all`
+/// never follows a link inside it. A process killed outright (`kill -9`)
+/// runs no `drop`, and leaves the directory behind.
+impl Drop for Staging {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Every path of one sweep in the project: `<project>/sweeps/<id>/` and
 /// what `run` puts in it.
 ///
 /// Built from the project's own path, the sweep's id and each target's id
@@ -236,6 +349,10 @@ async fn scope_of(
 /// is made, so `scope.json` can name every path under it as text.
 #[derive(Debug)]
 struct SweepPaths {
+    /// The project's own directory.
+    project: PathBuf,
+    /// The sweep's id, its directory's name.
+    id: RecordId,
     /// `<project>/sweeps`.
     sweeps: PathBuf,
     /// `<project>/sweeps/<id>`.
@@ -260,17 +377,17 @@ impl SweepPaths {
         }
         let sweeps = project.join("sweeps");
         let root = sweeps.join(id.to_string());
-        Ok(Self { sweeps, root })
-    }
-
-    /// `<project>/sweeps/<id>/target`, which holds one directory per target.
-    fn targets(&self) -> PathBuf {
-        self.root.join("target")
+        Ok(Self {
+            project: project.to_path_buf(),
+            id,
+            sweeps,
+            root,
+        })
     }
 
     /// `<project>/sweeps/<id>/target/<tid>`.
     fn target(&self, id: &TargetId) -> PathBuf {
-        self.targets().join(id.as_str())
+        self.root.join(TARGETS).join(id.as_str())
     }
 
     /// `<project>/sweeps/<id>/audit`, the playbook's output directory, which
@@ -281,99 +398,16 @@ impl SweepPaths {
 
     /// Refuses a `sweeps` that is a link or anything but a directory, and a
     /// sweep directory that is already there. Looks only, with `lstat`, so
-    /// no link is followed; creates nothing.
+    /// no link is followed; creates nothing. An early, friendly refusal:
+    /// the placement checks again, through handles.
     fn check_free(&self) -> anyhow::Result<()> {
         if let Some(seen) = lstat(&self.sweeps)? {
             refuse_unless_dir(&self.sweeps, &seen)?;
         }
         if lstat(&self.root)?.is_some() {
-            bail!(
-                "{} is already there; run makes a new directory for every sweep and never \
-                 writes into one that exists",
-                self.root.display()
-            );
+            bail!(already_there(&self.root.display().to_string()));
         }
         Ok(())
-    }
-
-    /// Makes `sweeps/` if need be, then `sweeps/<id>/`, 0700, and its
-    /// `target/`. The guard handed back removes `sweeps/<id>/` again, with
-    /// all it holds, unless it is kept.
-    fn claim(&self) -> anyhow::Result<HalfMade<'_>> {
-        self.ensure_sweeps()?;
-        // Not `recursive`: the `mkdir` fails if anything at all is there, a
-        // link included, so the directory is this run's alone. 0700, so no
-        // other user of the machine can read the audit the agent writes
-        // into it before `submit` encrypts it.
-        DirBuilder::new()
-            .mode(0o700)
-            .create(&self.root)
-            .with_context(|| {
-                format!(
-                    "could not create {}; run makes a new directory for every sweep",
-                    self.root.display()
-                )
-            })?;
-        // From here the directory is this run's: if the next step fails,
-        // `half_made` is dropped on the way out and removes it.
-        let half_made = HalfMade {
-            path: &self.root,
-            kept: false,
-        };
-        let targets = self.targets();
-        fs::create_dir(&targets)
-            .with_context(|| format!("could not create {}", targets.display()))?;
-        Ok(half_made)
-    }
-
-    /// Makes `sweeps/` unless something is there, then refuses whatever is
-    /// there, made just now or before, unless it is a real directory, so a
-    /// sweep is never made through a link.
-    fn ensure_sweeps(&self) -> anyhow::Result<()> {
-        match fs::create_dir(&self.sweeps) {
-            Ok(()) => {}
-            Err(err) if err.kind() == ErrorKind::AlreadyExists => {}
-            Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("could not create {}", self.sweeps.display()));
-            }
-        }
-        let seen = lstat(&self.sweeps)?
-            .with_context(|| format!("{} went away; try again", self.sweeps.display()))?;
-        refuse_unless_dir(&self.sweeps, &seen)
-    }
-}
-
-/// A sweep directory `run` is still filling. Dropped before
-/// [`HalfMade::keep`], whether a step failed, returned early with `?`, or
-/// the command was cancelled, it removes the directory and all it holds, so
-/// no half-made sweep is left for `submit` to find.
-///
-/// It borrows the path (the lifetime `'a`) from the [`SweepPaths`] it came
-/// from, so it cannot outlive them.
-struct HalfMade<'a> {
-    path: &'a Path,
-    kept: bool,
-}
-
-impl HalfMade<'_> {
-    /// The sweep is whole: keep it. Takes `self` by value, so the guard is
-    /// used up here and its `drop`, which runs at the end of this call,
-    /// finds `kept` set.
-    fn keep(mut self) {
-        self.kept = true;
-    }
-}
-
-/// Best effort: `drop` cannot return an error, and a directory left behind
-/// has no marker, so `submit` refuses it. std's `remove_dir_all` never
-/// follows a link inside it. A process killed outright (`kill -9`) runs no
-/// `drop`, and leaves the directory behind.
-impl Drop for HalfMade<'_> {
-    fn drop(&mut self) {
-        if !self.kept {
-            let _ = fs::remove_dir_all(self.path);
-        }
     }
 }
 
@@ -534,6 +568,7 @@ mod tests {
     use std::os::unix::fs::symlink;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+    use std::sync::{Mutex, Once};
     use std::time::Duration;
 
     use serde_json::{Value, json};
@@ -546,6 +581,7 @@ mod tests {
         FetchPlan, FetchedSweep, NOT_PARENTS_LINE, SweepPaths, check_sweep_dir, fetch_sweep,
         parent_count,
     };
+    use crate::Dirs;
     use crate::git::{
         AllowedProtocols, GitCommand, GitFailed, GitRunner, Limits, LocalSubcommand, Remote,
         RunGit, git_argv,
@@ -603,6 +639,21 @@ mod tests {
         }
     }
 
+    /// [`fetch_sweep`], then the placement: the sweep as the run command
+    /// makes it, the marker aside.
+    async fn fetch_and_place(
+        git: &impl RunGit,
+        source: &impl TargetResolver,
+        dirs: &Dirs,
+        project: &Path,
+        sweep: SweepRef,
+        checked: &CheckedBounty,
+    ) -> anyhow::Result<FetchedSweep> {
+        fetch_sweep(git, source, dirs, project, sweep, checked)
+            .await?
+            .place()
+    }
+
     /// The bounty `run` would have checked, with `targets` chosen through
     /// `source`'s policy as `select` chooses them.
     fn checked(targets: Value, source: &impl TargetResolver) -> CheckedBounty {
@@ -658,16 +709,15 @@ mod tests {
             let shas = Shas::read();
             let source = TargetSource::Fixture(fixture_targets());
             let home = private_temp();
-            let git = source
-                .git_runner(&dirs_in(&home), &test_git_env())
-                .expect("a runner");
+            let dirs = dirs_in(&home);
+            let git = source.git_runner(&dirs, &test_git_env()).expect("a runner");
             let project = private_temp();
             let sweep = SweepRef {
                 sweeper: random_pubky(),
                 id: bounty_id(),
             };
             let checked = checked(fixture_bounty_targets(&shas), &source);
-            let fetched = fetch_sweep(&git, &source, project.path(), sweep, &checked)
+            let fetched = fetch_and_place(&git, &source, &dirs, project.path(), sweep, &checked)
                 .await
                 .unwrap_or_else(|error| panic!("{error:#}"));
             Self {
@@ -814,9 +864,11 @@ mod tests {
             targets[3]["scope"]["command"],
             json!(["git", "diff", b, f2])
         );
-        // What `fetch_sweep` hands back is what the file says.
-        assert_eq!(run.fetched.dir, run.sweep_dir());
+        // What the placement hands back is what the file says.
         assert_eq!(run.fetched.targets.len(), 4);
+        for (fetched, listed) in run.fetched.targets.iter().zip(targets) {
+            assert_eq!(listed["path"], fetched.path.as_str());
+        }
     }
 
     #[tokio::test]
@@ -1064,9 +1116,8 @@ mod tests {
         let name: RepoName = "example.invalid/sweepky/links".parse().expect("a repo");
         let source = TargetSource::Fixture(FixtureTargets::new([(name.clone(), repo_dir)]));
         let home = private_temp();
-        let git = source
-            .git_runner(&dirs_in(&home), &test_git_env())
-            .expect("a runner");
+        let dirs = dirs_in(&home);
+        let git = source.git_runner(&dirs, &test_git_env()).expect("a runner");
         let project = private_temp();
         let sweep = SweepRef {
             sweeper: random_pubky(),
@@ -1076,11 +1127,15 @@ mod tests {
             json!([{ "id": "t1", "kind": "repo", "repo": name.to_string(), "rev": head }]),
             &source,
         );
-        let fetched = fetch_sweep(&git, &source, project.path(), sweep, &checked)
+        let fetched = fetch_and_place(&git, &source, &dirs, project.path(), sweep, &checked)
             .await
             .unwrap_or_else(|error| panic!("{error:#}"));
 
-        let target = fetched.dir.join("target").join("t1");
+        let target = project
+            .path()
+            .join("sweeps")
+            .join(sweep.id.to_string())
+            .join("target/t1");
         // The link outside is a plain file that holds the link's text, so
         // reading it reads nothing outside the copy.
         let pointer = fs::symlink_metadata(target.join("pointer")).expect("there");
@@ -1109,9 +1164,8 @@ mod tests {
         let shas = Shas::read();
         let source = TargetSource::Fixture(fixture_targets());
         let home = private_temp();
-        let git = source
-            .git_runner(&dirs_in(&home), &test_git_env())
-            .expect("a runner");
+        let dirs = dirs_in(&home);
+        let git = source.git_runner(&dirs, &test_git_env()).expect("a runner");
         let project = private_temp();
         // Another sweep's directory, which nothing may touch.
         let other = project.path().join("sweeps").join("0035G87EK4XFF");
@@ -1131,7 +1185,7 @@ mod tests {
             ]),
             &source,
         );
-        let error = fetch_sweep(&git, &source, project.path(), sweep, &checked)
+        let error = fetch_and_place(&git, &source, &dirs, project.path(), sweep, &checked)
             .await
             .expect_err("not served");
         let message = format!("{error:#}");
@@ -1145,7 +1199,10 @@ mod tests {
         // Nothing git wrote reaches the message.
         assert!(!message.contains("our ref"), "{message}");
         assert!(!message.contains("upload-pack"), "{message}");
-        // The half-made sweep is gone; the other one is as it was.
+        // The half-made sweep is gone from the staging directory and was
+        // never in the project; the other one is as it was.
+        let staged = dirs.staging_dir().join(sweep.id.to_string());
+        assert!(fs::symlink_metadata(staged).is_err());
         let sweeps = project.path().join("sweeps");
         assert!(fs::symlink_metadata(sweeps.join(sweep.id.to_string())).is_err());
         let left: Vec<String> = fs::read_dir(&sweeps)
@@ -1177,6 +1234,8 @@ mod tests {
             id: bounty_id(),
         };
         let elsewhere = private_temp();
+        let home = private_temp();
+        let dirs = dirs_in(&home);
         // What the refusal says, and a closure that lays the project out.
         // `&dyn Fn` lets four different closures share one array type.
         type Arrange<'a> = &'a dyn Fn(&Path);
@@ -1211,11 +1270,13 @@ mod tests {
             assert!(message.contains(expected), "{message}");
             // The fetch refuses the same way, before any git runs.
             let git = RecordingGit::succeeding(AllowedProtocols::HttpsAndFile, b"");
-            let error = fetch_sweep(&git, &source, project.path(), sweep, &checked)
+            let error = fetch_sweep(&git, &source, &dirs, project.path(), sweep, &checked)
                 .await
                 .expect_err(expected);
             assert!(format!("{error:#}").contains(expected), "{error:#}");
             assert_eq!(git.argv(), Vec::<Vec<String>>::new());
+            // Refused before anything was staged, too.
+            assert!(fs::symlink_metadata(dirs.staging_dir()).is_err());
         }
         // Nothing was made through the link, and what was there stays.
         assert_eq!(fs::read_dir(elsewhere.path()).expect("list").count(), 0);
@@ -1224,6 +1285,191 @@ mod tests {
         check_sweep_dir(project.path(), sweep.id).expect("no sweeps/ yet");
         fs::create_dir(project.path().join("sweeps")).expect("mkdir");
         check_sweep_dir(project.path(), sweep.id).expect("a real sweeps/");
+    }
+
+    /// A runner that hands every command to `inner`, noting the directory
+    /// each one runs in, and calls `plant` once, before the first: what a
+    /// process the agent left running in the project could do while `run`
+    /// fetches.
+    struct Planting<'a, G> {
+        inner: G,
+        plant: &'a dyn Fn(),
+        planted: Once,
+        dirs: Mutex<Vec<PathBuf>>,
+    }
+
+    impl<'a, G> Planting<'a, G> {
+        fn new(inner: G, plant: &'a dyn Fn()) -> Self {
+            Self {
+                inner,
+                plant,
+                planted: Once::new(),
+                dirs: Mutex::default(),
+            }
+        }
+
+        fn dirs(&self) -> Vec<PathBuf> {
+            self.dirs.lock().expect("lock").clone()
+        }
+    }
+
+    impl<G: RunGit> RunGit for Planting<'_, G> {
+        async fn run(&self, command: &GitCommand) -> anyhow::Result<Vec<u8>> {
+            self.planted.call_once(|| (self.plant)());
+            let dir = command.dir().expect("run gives every command a directory");
+            self.dirs.lock().expect("lock").push(dir.to_path_buf());
+            self.inner.run(command).await
+        }
+    }
+
+    #[tokio::test]
+    async fn git_runs_only_under_the_data_directory_never_in_the_project() {
+        let shas = Shas::read();
+        let source = TargetSource::Fixture(fixture_targets());
+        let home = private_temp();
+        let dirs = dirs_in(&home);
+        let git = Planting::new(
+            source.git_runner(&dirs, &test_git_env()).expect("a runner"),
+            &|| {},
+        );
+        let project = private_temp();
+        let sweep = SweepRef {
+            sweeper: random_pubky(),
+            id: bounty_id(),
+        };
+        let checked = checked(fixture_bounty_targets(&shas), &source);
+
+        fetch_and_place(&git, &source, &dirs, project.path(), sweep, &checked)
+            .await
+            .unwrap_or_else(|error| panic!("{error:#}"));
+
+        // init, config, fetch and checkout for each of the four targets,
+        // and rev-list for the two commits: each in a directory under the
+        // data directory, none in the project the agent can write.
+        let ran_in = git.dirs();
+        assert_eq!(ran_in.len(), 4 * 4 + 2, "{ran_in:?}");
+        for dir in &ran_in {
+            assert!(dir.starts_with(dirs.data()), "{}", dir.display());
+            assert!(!dir.starts_with(project.path()), "{}", dir.display());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_git_config_planted_in_the_project_during_the_fetch_is_never_read() {
+        let shas = Shas::read();
+        let source = TargetSource::Fixture(fixture_targets());
+        let home = private_temp();
+        let dirs = dirs_in(&home);
+        let project = private_temp();
+        let outside = private_temp();
+        let sweep = SweepRef {
+            sweeper: random_pubky(),
+            id: bounty_id(),
+        };
+        // While git runs, a filter is planted where the target's `.git`
+        // goes in the project: were git to read that repository's own
+        // config and attributes, its checkout would run the command.
+        let canary = outside.path().join("canary");
+        let planted = project
+            .path()
+            .join("sweeps")
+            .join(sweep.id.to_string())
+            .join("target/t1/.git");
+        let config = format!(
+            "[filter \"probe\"]\n\tsmudge = touch {}\n",
+            canary.display()
+        );
+        let plant = || {
+            fs::create_dir_all(planted.join("info")).expect("mkdir");
+            fs::write(planted.join("config"), &config).expect("write");
+            fs::write(planted.join("info/attributes"), "* filter=probe\n").expect("write");
+        };
+        let git = Planting::new(
+            source.git_runner(&dirs, &test_git_env()).expect("a runner"),
+            &plant,
+        );
+        let repo = fixture_repo().to_string();
+        let checked = checked(
+            json!([{ "id": "t1", "kind": "repo", "repo": repo, "rev": shas.get("M") }]),
+            &source,
+        );
+
+        let error = fetch_and_place(&git, &source, &dirs, project.path(), sweep, &checked)
+            .await
+            .expect_err("refused");
+
+        // The filter never ran, and the sweep was not put where something
+        // already was: the planted files are as they were.
+        assert!(fs::symlink_metadata(&canary).is_err(), "git ran the filter");
+        let message = format!("{error:#}");
+        assert!(message.contains("already there"), "{message}");
+        assert_eq!(
+            fs::read_to_string(planted.join("config")).expect("read"),
+            config
+        );
+        assert_eq!(
+            fs::read_to_string(planted.join("info/attributes")).expect("read"),
+            "* filter=probe\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_link_swapped_in_during_the_fetch_is_refused_and_nothing_is_written_through_it() {
+        let source = TargetSource::Fixture(fixture_targets());
+        let repo = fixture_repo().to_string();
+        let checked = checked(
+            json!([{ "id": "t1", "kind": "repo", "repo": repo, "rev": SYNTHETIC_SHA }]),
+            &source,
+        );
+        let sweep = SweepRef {
+            sweeper: random_pubky(),
+            id: bounty_id(),
+        };
+        let elsewhere = private_temp();
+        let sweep_dir = |project: &Path| project.join("sweeps").join(sweep.id.to_string());
+        // What the refusal says, and what a process left in the project
+        // does once git has started: `sweeps`, the sweep directory or its
+        // `target` made a link to a directory elsewhere. The checks before
+        // git saw a project with none of them.
+        type Plant<'a> = &'a dyn Fn(&Path);
+        let cases: [(&str, Plant<'_>); 3] = [
+            ("symbolic link", &|project: &Path| {
+                symlink(elsewhere.path(), project.join("sweeps")).expect("symlink");
+            }),
+            ("already there", &|project: &Path| {
+                fs::create_dir(project.join("sweeps")).expect("mkdir");
+                symlink(elsewhere.path(), sweep_dir(project)).expect("symlink");
+            }),
+            ("already there", &|project: &Path| {
+                fs::create_dir_all(sweep_dir(project)).expect("mkdir");
+                symlink(elsewhere.path(), sweep_dir(project).join("target")).expect("symlink");
+            }),
+        ];
+        for (expected, plant) in cases {
+            let home = private_temp();
+            let dirs = dirs_in(&home);
+            let project = private_temp();
+            let plant_here = || plant(project.path());
+            // git itself is a fake here, which succeeds and writes nothing:
+            // the placement is what is tested.
+            let git = Planting::new(
+                RecordingGit::succeeding(AllowedProtocols::HttpsAndFile, b""),
+                &plant_here,
+            );
+
+            let error = fetch_and_place(&git, &source, &dirs, project.path(), sweep, &checked)
+                .await
+                .expect_err(expected);
+
+            let message = format!("{error:#}");
+            assert!(message.contains(expected), "{message}");
+            assert!(!git.dirs().is_empty(), "git ran");
+            // The staged sweep is gone with its guard.
+            let staged = dirs.staging_dir().join(sweep.id.to_string());
+            assert!(fs::symlink_metadata(staged).is_err(), "{expected}");
+        }
+        // Nothing was written through any of the links.
+        assert_eq!(fs::read_dir(elsewhere.path()).expect("list").count(), 0);
     }
 
     #[test]

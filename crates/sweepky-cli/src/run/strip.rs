@@ -14,6 +14,12 @@
 //!   `lstat` does, and descends only into real directories; a removal never
 //!   follows a link either. With `core.symlinks=false` the checkout wrote
 //!   none anyway, so this is the second line.
+//! - **Only ever in the staging tree.** `fetch` calls it on a target's copy
+//!   under `<data dir>/staging/`, before the sweep is put in the project, so
+//!   no process the agent left running can reach the tree while it runs.
+//!   That is why walking by path is safe here: nothing can swap a directory
+//!   on the way for a link between a listing and a removal. Never point it
+//!   at a directory in the project.
 //!
 //! What stripping cannot reach is git's history: a `git diff` the agent runs
 //! (a commit or pull request target's scope command) still shows a changed
@@ -41,7 +47,8 @@ const AGENT_FILES: [&str; 5] = [
 
 /// Removes every entry under `root` named as one of [`AGENT_FILES`], in any
 /// case, at any depth, and returns what it removed: each path relative to
-/// `root`, `/`-separated, a directory with a trailing `/`, sorted.
+/// `root`, `/`-separated, a directory with a trailing `/`, sorted. `root` is
+/// a target's copy in the staging tree, never the project (module docs).
 ///
 /// A path that is not UTF-8 is listed with `U+FFFD` in place of what is not;
 /// the list says what went, it is never a path to open.

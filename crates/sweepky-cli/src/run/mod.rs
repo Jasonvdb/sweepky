@@ -22,14 +22,18 @@
 //!    with a fresh session, signed out again at once
 //!    ([`LockedSessionPublisher`]). A refused write ends the run here: no
 //!    git has run and no directory was made.
-//! 3. **Fetch, outside the lock.** `fetch::fetch_sweep` fetches each
-//!    target, strips it and writes `scope.json` and `brief.md`; then the
-//!    per-sweep marker `sweeps/<id>/.sweepky/sweep.json` (`marker`) is
-//!    written, last.
+//! 3. **Fetch, outside the lock.** `fetch::fetch_sweep` builds the sweep
+//!    directory under the data directory, out of the agent's reach: it
+//!    fetches each target, strips it and writes `scope.json` and
+//!    `brief.md`; then the per-sweep marker `.sweepky/sweep.json`
+//!    (`marker`) is written there, last; then `place` moves the whole
+//!    directory into the project as `sweeps/<id>/`, through handles that
+//!    follow no link.
 //! 4. **Or abort.** If any step of 3 fails, an unserved SHA among them,
-//!    the sweep directory is gone (the fetch's own guard, or a removal
-//!    here when only the marker failed) and the record is flipped to
-//!    `aborted`, with `finishedAt`, under the lock once more. `aborted` is
+//!    nothing of the sweep is left: the staging directory goes with the
+//!    fetch's own guard, and the project never got a part of it (a copy
+//!    across filesystems that fails removes itself). The record is flipped
+//!    to `aborted`, with `finishedAt`, under the lock once more. `aborted` is
 //!    final: `pull` re-fetches only `running` sweeps and the board shows an
 //!    aborted one struck. A flip that fails too is said in the error, in
 //!    fixed text.
@@ -52,15 +56,19 @@
 //!   [`CheckedBounty::summary`]: the checking half (above), with `select`,
 //!   which decides from the records alone, and `pick`, which picks the
 //!   bounty and target without a URL through `select`'s own rules.
-//! - `fetch`: the check that `./sweeps/<id>/` can be made, and the fetch:
-//!   each chosen target by its exact SHA, at depth 2, from its one checked
-//!   remote, into `./sweeps/<id>/target/<tid>/`, checked out with every
-//!   link written as a plain file; `strip` takes the agent-instruction
-//!   files out of each copy at every depth and in any case; `scope_file`
-//!   writes `scope.json`, rebuilt from the bounty's checked targets, and
-//!   `brief.md`. A failure removes the half-made sweep directory.
+//! - `fetch`: the check that `./sweeps/<id>/` can be made, and the fetch,
+//!   into a staging directory under the data directory: each chosen target
+//!   by its exact SHA, at depth 2, from its one checked remote, into
+//!   `target/<tid>/`, checked out with every link written as a plain file;
+//!   `strip` takes the agent-instruction files out of each copy at every
+//!   depth and in any case; `scope_file` writes `scope.json`, rebuilt from
+//!   the bounty's checked targets, and `brief.md`. A failure removes the
+//!   staging directory.
 //! - `marker`: the per-sweep marker, written last, all at once and never
 //!   through a link.
+//! - `place`: the finished sweep moved into the project in one step, or
+//!   copied when the data directory is on another filesystem, through
+//!   directory handles that follow no link and never replace anything.
 //! - [`PublishRecord`], the seam the sweep record is written through, so
 //!   the order above is tested with a fake storage and the fixture source.
 //!
@@ -80,11 +88,11 @@
 mod fetch;
 mod marker;
 mod pick;
+mod place;
 mod scope_file;
 mod select;
 mod strip;
 
-use std::fs;
 use std::path::Path;
 
 use anyhow::{Context as _, bail};
@@ -191,6 +199,7 @@ pub(crate) async fn run(
     let git = ctx.targets.git_runner(&ctx.dirs, &ctx.git_env)?;
     let new = NewSweep {
         project: &ctx.cwd,
+        dirs: &ctx.dirs,
         sweep: SweepRef {
             sweeper: request.sweeper,
             id: clock::new_record_id()?,
@@ -216,12 +225,14 @@ pub(crate) fn logged_in_sweeper(dirs: &Dirs) -> anyhow::Result<Pubky> {
     Ok(login.pubky)
 }
 
-/// One sweep `run` starts: the project it goes in, its record's address
-/// (the sweeper and a new id), the bounty it sweeps, and the playbook the
-/// project's `init` recorded, if any. It borrows all but the address (the
-/// lifetime `'a`) from `run`, which keeps them.
+/// One sweep `run` starts: the project it goes in, the directories it is
+/// staged under first, its record's address (the sweeper and a new id),
+/// the bounty it sweeps, and the playbook the project's `init` recorded, if
+/// any. It borrows all but the address (the lifetime `'a`) from `run`,
+/// which keeps them.
 struct NewSweep<'a> {
     project: &'a Path,
+    dirs: &'a Dirs,
     sweep: SweepRef,
     checked: &'a CheckedBounty,
     playbook: Option<&'a Playbook>,
@@ -300,10 +311,10 @@ async fn start_sweep(
         .publish(&path, record_bytes(&running)?)
         .await
         .context("could not publish the sweep as running, so run fetched nothing")?;
-    match fetch_and_mark(git, source, new, &running).await {
+    match fetch_mark_and_place(git, source, new, &running).await {
         Ok(fetched) => Ok(fetched),
-        // `running` is moved into `abort`: the borrow `fetch_and_mark` took
-        // ended with it.
+        // `running` is moved into `abort`: the borrow
+        // `fetch_mark_and_place` took ended with it.
         Err(failure) => Err(abort(publisher, &path, running, failure).await),
     }
 }
@@ -342,26 +353,20 @@ pub(crate) fn record_bytes(record: &Sweep) -> anyhow::Result<Vec<u8>> {
     serde_json::to_vec(record).context("could not write the sweep record")
 }
 
-/// Fetches `new`'s targets into its sweep directory, then writes the
-/// marker of `running`, last. A marker that cannot be written takes the
-/// directory with it, as a failed fetch does, so no sweep is left without
-/// one.
-async fn fetch_and_mark(
+/// Fetches `new`'s targets into a staging directory, writes the marker of
+/// `running` there, last, then puts the whole sweep in the project. If any
+/// step fails, `?` returns early and the staged sweep is dropped, taking
+/// its staging directory with it, so the project gets no sweep without a
+/// marker.
+async fn fetch_mark_and_place(
     git: &impl RunGit,
     source: &impl TargetResolver,
     new: &NewSweep<'_>,
     running: &Sweep,
 ) -> anyhow::Result<FetchedSweep> {
-    let fetched = fetch_sweep(git, source, new.project, new.sweep, new.checked).await?;
-    let marker = SweepMarker::new(new.sweep, running, new.playbook);
-    if let Err(error) = marker.write_into(&fetched.dir) {
-        // Best effort, as the fetch's own guard is: a directory left behind
-        // has no marker, so `submit` refuses it. `remove_dir_all` never
-        // follows a link inside it.
-        let _ = fs::remove_dir_all(&fetched.dir);
-        return Err(error);
-    }
-    Ok(fetched)
+    let staged = fetch_sweep(git, source, new.dirs, new.project, new.sweep, new.checked).await?;
+    SweepMarker::new(new.sweep, running, new.playbook).write_into(staged.dir())?;
+    staged.place()
 }
 
 /// The error `run` stops with when a step after the running write failed
@@ -611,6 +616,7 @@ fn shown_repo(repo: &RepoName) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
     use std::fs;
     use std::io;
     use std::os::unix::fs::symlink;
@@ -632,6 +638,7 @@ mod tests {
         abort, check_bounty, parse_bounty_url, put_record, record_bytes, require_project, run,
         running_record, start_sweep,
     };
+    use crate::Dirs;
     use crate::git::{GitCommand, GitRunner, RunGit};
     use crate::identity::Refusal;
     use crate::init::{self, MARKER};
@@ -964,14 +971,22 @@ mod tests {
         json!({ "id": "t1", "kind": "commit", "repo": fixture_repo().to_string(), "rev": rev })
     }
 
-    /// A new sweep of `checked` in `project`, by a random sweeper.
+    /// Directories for a test in which nothing touches the disk.
+    fn untouched_dirs() -> Dirs {
+        Dirs::resolve(None, Some(OsStr::new("/abs/home"))).expect("an absolute path")
+    }
+
+    /// A new sweep of `checked` in `project`, staged under `dirs`, by a
+    /// random sweeper.
     fn new_sweep<'a>(
         project: &'a Path,
+        dirs: &'a Dirs,
         checked: &'a CheckedBounty,
         playbook: Option<&'a Playbook>,
     ) -> NewSweep<'a> {
         NewSweep {
             project,
+            dirs,
             sweep: SweepRef {
                 sweeper: random_pubky(),
                 id: bounty_id(),
@@ -994,11 +1009,12 @@ mod tests {
             .await
             .expect("accepted");
         let project = Path::new("/abs/project");
+        let dirs = untouched_dirs();
         let started_at = STARTED_AT.parse().expect("a time");
 
         // No playbook recorded by `init`: the placeholder.
-        let record =
-            running_record(&new_sweep(project, &checked, None), started_at).expect("a record");
+        let record = running_record(&new_sweep(project, &dirs, &checked, None), started_at)
+            .expect("a record");
         let bytes = record_bytes(&record).expect("written");
         assert_eq!(
             serde_json::from_slice::<Value>(&bytes).expect("JSON"),
@@ -1019,8 +1035,11 @@ mod tests {
         // The playbook `init` recorded, when there is one.
         let playbook: Playbook = PLAYBOOK.parse().expect("a playbook");
         let started_at = STARTED_AT.parse().expect("a time");
-        let record = running_record(&new_sweep(project, &checked, Some(&playbook)), started_at)
-            .expect("a record");
+        let record = running_record(
+            &new_sweep(project, &dirs, &checked, Some(&playbook)),
+            started_at,
+        )
+        .expect("a record");
         assert_eq!(record.playbook, playbook);
     }
 
@@ -1030,18 +1049,17 @@ mod tests {
         let checked = fixture_bounty(json!([commit_target(shas["M"].as_str())])).await;
         let playbook: Playbook = PLAYBOOK.parse().expect("a playbook");
         let project = private_temp();
-        let new = new_sweep(project.path(), &checked, Some(&playbook));
-        let path = paths::sweep_record(new.sweep.id);
-        let sweep_dir = project.path().join("sweeps").join(new.sweep.id.to_string());
-        let source = TargetSource::Fixture(fixture_targets());
         // Declared before the runner, so the runner, whose private HOME is
         // under it, is dropped first.
         let home = private_temp();
+        let dirs = dirs_in(&home);
+        let new = new_sweep(project.path(), &dirs, &checked, Some(&playbook));
+        let path = paths::sweep_record(new.sweep.id);
+        let sweep_dir = project.path().join("sweeps").join(new.sweep.id.to_string());
+        let source = TargetSource::Fixture(fixture_targets());
         let storage = FakeOwnStorage::default();
         let git = WatchedGit {
-            git: source
-                .git_runner(&dirs_in(&home), &test_git_env())
-                .expect("a runner"),
+            git: source.git_runner(&dirs, &test_git_env()).expect("a runner"),
             storage: &storage,
             marker: sweep_dir.join(".sweepky/sweep.json"),
             seen: Mutex::default(),
@@ -1071,14 +1089,16 @@ mod tests {
         assert_eq!(marker["bounty"], checked.bounty_ref.to_string());
         assert_eq!(marker["targets"], json!(["t1"]));
         assert_eq!(marker["playbook"], PLAYBOOK);
-        assert_eq!(fetched.dir, sweep_dir);
+        assert_eq!(fetched.targets.len(), 1);
     }
 
     #[tokio::test]
     async fn a_refused_running_write_runs_no_git_and_makes_no_sweep_directory() {
         let checked = fixture_bounty(json!([commit_target(SYNTHETIC_SHA)])).await;
         let project = private_temp();
-        let new = new_sweep(project.path(), &checked, None);
+        let home = private_temp();
+        let dirs = dirs_in(&home);
+        let new = new_sweep(project.path(), &dirs, &checked, None);
         let path = paths::sweep_record(new.sweep.id);
         let source = TargetSource::Fixture(fixture_targets());
         let storage = FakeOwnStorage::refusing(&path, StatusCode::FORBIDDEN, SERVER_TEXT);
@@ -1095,19 +1115,19 @@ mod tests {
         assert_eq!(storage.puts(), [path.as_str()]);
         assert_eq!(git.argv(), Vec::<Vec<String>>::new());
         assert!(fs::symlink_metadata(project.path().join("sweeps")).is_err());
+        assert!(fs::symlink_metadata(dirs.staging_dir()).is_err());
     }
 
     #[tokio::test]
     async fn an_unserved_sha_flips_the_record_to_aborted_and_removes_the_sweep() {
         let checked = fixture_bounty(json!([commit_target(SYNTHETIC_SHA)])).await;
         let project = private_temp();
-        let new = new_sweep(project.path(), &checked, None);
+        let home = private_temp();
+        let dirs = dirs_in(&home);
+        let new = new_sweep(project.path(), &dirs, &checked, None);
         let path = paths::sweep_record(new.sweep.id);
         let source = TargetSource::Fixture(fixture_targets());
-        let home = private_temp();
-        let git = source
-            .git_runner(&dirs_in(&home), &test_git_env())
-            .expect("a runner");
+        let git = source.git_runner(&dirs, &test_git_env()).expect("a runner");
         let storage = FakeOwnStorage::default();
 
         let error = start_sweep(&storage, &git, &source, &new)
@@ -1131,15 +1151,18 @@ mod tests {
         expected.status = KnownSweepStatus::Aborted.into();
         expected.finished_at = Some(aborted.finished_at.clone().expect("finishedAt is set"));
         assert_eq!(aborted, expected);
-        // No sweep directory, so no marker either.
+        // No sweep directory, so no marker either, and nothing staged.
         let sweep_dir = project.path().join("sweeps").join(new.sweep.id.to_string());
         assert!(fs::symlink_metadata(&sweep_dir).is_err());
+        let staged = dirs.staging_dir().join(new.sweep.id.to_string());
+        assert!(fs::symlink_metadata(&staged).is_err());
     }
 
     #[tokio::test]
     async fn a_refused_flip_to_aborted_is_reported_with_the_failure_in_fixed_text() {
         let checked = fixture_bounty(json!([commit_target(SYNTHETIC_SHA)])).await;
-        let new = new_sweep(Path::new("/abs/project"), &checked, None);
+        let dirs = untouched_dirs();
+        let new = new_sweep(Path::new("/abs/project"), &dirs, &checked, None);
         let path = paths::sweep_record(new.sweep.id);
         let running = running_record(&new, STARTED_AT.parse().expect("a time")).expect("a record");
         let storage =

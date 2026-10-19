@@ -42,8 +42,9 @@ use sweepky_core::{BountyRef, Playbook, SchemaVersion, Sweep, SweepRef, TargetId
 
 use crate::private_fs::write_private_file;
 
-/// The marker's directory, directly inside the sweep's.
-const MARKER_DIR: &str = ".sweepky";
+/// The marker's directory, directly inside the sweep's. `place` copies it
+/// last when it must copy a sweep into the project.
+pub(super) const MARKER_DIR: &str = ".sweepky";
 
 /// The marker's file, inside [`MARKER_DIR`].
 const MARKER_FILE: &str = "sweep.json";

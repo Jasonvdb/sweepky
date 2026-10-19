@@ -1,5 +1,6 @@
 //! `submit`'s walk of a sweep directory, and the file calls it is built
-//! from, which [`sweep_dir`](super::sweep_dir) uses as well.
+//! from, which [`sweep_dir`](super::sweep_dir) uses as well, and `run`'s
+//! placement of a sweep in the project (`run::place`).
 //!
 //! The agent wrote the sweep directory after reading untrusted code, and may
 //! have left a process running that changes it while `submit` reads it
@@ -101,7 +102,7 @@ const SCRATCH: &CStr = c"scratch";
 /// (`O_NONBLOCK`), and not handed to any program this one starts
 /// (`O_CLOEXEC`). `union` is the `const` form of `|`, so this can be a
 /// constant.
-pub(super) const DIR_FLAGS: OFlags = OFlags::RDONLY
+pub(crate) const DIR_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
     .union(OFlags::NOFOLLOW)
     .union(OFlags::NONBLOCK)
@@ -111,7 +112,7 @@ pub(super) const DIR_FLAGS: OFlags = OFlags::RDONLY
 /// `O_NOCTTY`, so a terminal device swapped in never becomes this process's
 /// terminal. `O_NONBLOCK` makes the open of a FIFO return at once instead
 /// of waiting for a writer; the `fstat` after it then refuses the FIFO.
-const FILE_FLAGS: OFlags = OFlags::RDONLY
+pub(crate) const FILE_FLAGS: OFlags = OFlags::RDONLY
     .union(OFlags::NOFOLLOW)
     .union(OFlags::NONBLOCK)
     .union(OFlags::NOCTTY)
@@ -393,7 +394,7 @@ fn audit_path(at: &[CString], name: &CStr) -> Option<String> {
 /// The names in the directory `dir`, `.` and `..` left out, sorted; `None`
 /// when it holds more than `limit`, found before any name past the limit is
 /// kept. `shown` names the directory in an error.
-pub(super) fn list_entries(
+pub(crate) fn list_entries(
     dir: BorrowedFd<'_>,
     shown: &str,
     limit: usize,
@@ -423,7 +424,7 @@ pub(super) fn list_entries(
 /// What is at `name` in `dir`, the entry itself and never what a link there
 /// points at (`statat` with `AT_SYMLINK_NOFOLLOW`), or `None` when nothing
 /// is. `shown` names it in an error.
-pub(super) fn entry_at(
+pub(crate) fn entry_at(
     dir: BorrowedFd<'_>,
     name: &CStr,
     shown: &str,
@@ -436,7 +437,7 @@ pub(super) fn entry_at(
 }
 
 /// The kind of entry `stat` describes.
-pub(super) fn kind(stat: &Stat) -> FileType {
+pub(crate) fn kind(stat: &Stat) -> FileType {
     FileType::from_raw_mode(stat.st_mode)
 }
 
@@ -547,7 +548,7 @@ fn check_unchanged(seen: &Stat, file: impl AsFd, shown: &str) -> anyhow::Result<
 
 /// Whether `a` and `b` describe the same entry: the same kind, on the same
 /// device, at the same inode.
-fn same_entry(a: &Stat, b: &Stat) -> bool {
+pub(crate) fn same_entry(a: &Stat, b: &Stat) -> bool {
     kind(a) == kind(b) && a.st_dev == b.st_dev && a.st_ino == b.st_ino
 }
 

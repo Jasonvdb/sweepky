@@ -24,9 +24,12 @@
 //! | Entry | What |
 //! |---|---|
 //! | `git-home-<id>/` | git's `HOME` while one command (`post`, `run`) runs it: new, empty and 0700, removed when the command ends (`crate::git`) |
+//! | `staging/<id>/` | the sweep directory `run` builds before it moves it into the project's `sweeps/<id>/`: new and 0700, removed when `run` ends (`run::fetch`) |
 //!
 //! The data directory's other subtrees (P2c) come later. Every file here
-//! is written with [`crate::private_fs`]: directories 0700, files 0600.
+//! is written with [`crate::private_fs`]: directories 0700, files 0600;
+//! the one exception is what git checks out under `staging/<id>/`, which
+//! that 0700 directory keeps from other users.
 //!
 //! **`XDG_CONFIG_HOME` and `XDG_DATA_HOME` are ignored, on purpose.** The
 //! sandbox template `init` writes into a sweeper project denies reads of
@@ -167,6 +170,13 @@ impl Dirs {
     pub(crate) fn git_home_dir(&self, id: &RecordId) -> PathBuf {
         self.data.join(format!("git-home-{id}"))
     }
+
+    /// `data/staging/`: where `run` builds each sweep directory, one
+    /// `staging/<id>/` per sweep, out of reach of the agent, which can
+    /// write only in its project.
+    pub(crate) fn staging_dir(&self) -> PathBuf {
+        self.data.join("staging")
+    }
 }
 
 /// `value` as a path, if it is non-empty and absolute; `variable` names it in
@@ -264,5 +274,6 @@ mod tests {
             dirs.git_home_dir(&id),
             Path::new("/x/share/git-home-0035G87EK4XFE")
         );
+        assert_eq!(dirs.staging_dir(), Path::new("/x/share/staging"));
     }
 }

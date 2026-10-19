@@ -20,9 +20,9 @@
 //!   empty environment (`env_clear`) and gets back exactly [`child_env`]'s
 //!   list: `PATH`, the proxy and CA variables `main.rs` captured
 //!   ([`GitEnv`]), a private `HOME`, and fixed values that switch off the
-//!   system and user config, the terminal prompt and LFS. So no `GIT_DIR`,
-//!   `GIT_CONFIG_PARAMETERS`, `GIT_ASKPASS` or `SSH_ASKPASS` from the
-//!   user's shell reaches git.
+//!   system and user config, the terminal prompt, replace refs and LFS. So
+//!   no `GIT_DIR`, `GIT_CONFIG_PARAMETERS`, `GIT_ASKPASS` or `SSH_ASKPASS`
+//!   from the user's shell reaches git.
 //! - **No config but ours.** `GIT_CONFIG_NOSYSTEM=1` and
 //!   `GIT_CONFIG_GLOBAL=/dev/null` skip `/etc/gitconfig` and
 //!   `~/.gitconfig`; the private `HOME` has no `~/.gitconfig`,
@@ -30,6 +30,8 @@
 //!   `GIT_CEILING_DIRECTORIES` stops git's search for a repository at the
 //!   data directory, so a repository higher up, such as a home directory
 //!   kept in git, cannot lend its `.git/config`.
+//!   `GIT_NO_REPLACE_OBJECTS=1` makes git ignore `refs/replace/`, so no
+//!   replace ref can make one object stand for another under a pinned SHA.
 //! - **Every credential path off.** `credential.helper=` (an empty value
 //!   empties the list of helpers, Apple git's bundled `osxkeychain`
 //!   included), `core.askPass=`, `GIT_TERMINAL_PROMPT=0`, and standard input
@@ -137,7 +139,8 @@ impl GitEnv {
 /// first, then the proxy and CA variables that were set), `HOME` the
 /// private directory `home`, `GIT_CEILING_DIRECTORIES` the data directory
 /// `ceiling` above it, and the fixed values that switch off the system and
-/// user config, the terminal prompt and LFS, and pin messages to English.
+/// user config, the terminal prompt, replace refs and LFS, and pin messages
+/// to English.
 ///
 /// Pure, so a test checks the whole list. [`GitRunner`] calls
 /// `env_clear()` first, so this list is the child's whole environment.
@@ -150,6 +153,7 @@ pub(crate) fn child_env(
         ("GIT_CONFIG_NOSYSTEM", "1"),
         ("GIT_CONFIG_GLOBAL", "/dev/null"),
         ("GIT_TERMINAL_PROMPT", "0"),
+        ("GIT_NO_REPLACE_OBJECTS", "1"),
         ("GIT_LFS_SKIP_SMUDGE", "1"),
         ("LC_ALL", "C"),
     ];
@@ -401,6 +405,14 @@ impl GitCommand {
     pub(crate) fn in_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.dir = Some(dir.into());
         self
+    }
+
+    /// The directory git runs in, `None` for the runner's private `HOME`.
+    /// `cfg(test)`, so a test's fake [`RunGit`] can check where each command
+    /// would have run; nothing else needs to ask.
+    #[cfg(test)]
+    pub(crate) fn dir(&self) -> Option<&Path> {
+        self.dir.as_deref()
     }
 }
 
@@ -1169,6 +1181,7 @@ mod tests {
             ("GIT_CONFIG_NOSYSTEM", "1"),
             ("GIT_CONFIG_GLOBAL", "/dev/null"),
             ("GIT_TERMINAL_PROMPT", "0"),
+            ("GIT_NO_REPLACE_OBJECTS", "1"),
             ("GIT_LFS_SKIP_SMUDGE", "1"),
             ("LC_ALL", "C"),
         ];
