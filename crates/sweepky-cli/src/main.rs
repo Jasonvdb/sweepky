@@ -13,10 +13,11 @@
 //!    the library and its tests never depend on the process environment;
 //! 4. resolves the config and data directories ([`Dirs`], from `HOME` or
 //!    `SWEEPKY_HOME`), reads the working directory, reads the passphrase when
-//!    `--passphrase-file` names one ([`Passphrase::from_file`]), builds the
-//!    [`Network`] (production, or the local testnet under `--testnet` /
-//!    `SWEEPKY_TESTNET`) and the [`Context`] around them, standard input and
-//!    standard error, then runs the command;
+//!    `--passphrase-file` names one ([`Passphrase::from_file`]), captures the
+//!    variables git may see ([`GitEnv`]: `PATH` and the proxy and CA
+//!    variables), builds the [`Network`] (production, or the local testnet
+//!    under `--testnet` / `SWEEPKY_TESTNET`) and the [`Context`] around them,
+//!    standard input and standard error, then runs the command;
 //! 5. prints the command's report, or `error: ...` and exits with status 1.
 //!
 //! `anyhow` is used here and in the library alike: this crate only has to
@@ -46,7 +47,7 @@ use std::process::ExitCode;
 use anyhow::Context as _;
 use clap::Parser;
 use sweepky_cli::{
-    Cli, Context, Dirs, Network, Passphrase, Report, StderrWriter, StdinReader, run,
+    Cli, Context, Dirs, GitEnv, Network, Passphrase, Report, StderrWriter, StdinReader, run,
     run_without_context, select_kind,
 };
 
@@ -117,6 +118,10 @@ async fn execute(cli: Cli) -> anyhow::Result<Report> {
         // before it acts; its report goes to standard output at the end.
         stderr: StderrWriter::new(std::io::stderr()),
         passphrase,
+        // The only variables git will see of this environment, read here
+        // so that the library reads none: `capture` asks `var_os` for each
+        // name on its fixed list and keeps the ones that are set.
+        git_env: GitEnv::capture(std::env::var_os),
     };
     run(cli, &ctx).await
 }

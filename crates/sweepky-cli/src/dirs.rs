@@ -18,9 +18,15 @@
 //! | `identities/<name>.key` | a dedicated identity's secret (`login --identity`) |
 //! | `identities/<name>.json` | that identity's public details |
 //!
-//! Pinned owner keys (P2b) and the data directory's subtrees (P2c) come later.
-//! Every file here is written with [`crate::private_fs`]: directories 0700,
-//! files 0600.
+//! The data directory holds, so far:
+//!
+//! | Entry | What |
+//! |---|---|
+//! | `git-home-<id>/` | git's `HOME` while one command (`post`, `run`) runs it: new, empty and 0700, removed when the command ends (`crate::git`) |
+//!
+//! Pinned owner keys (P2b) and the data directory's other subtrees (P2c)
+//! come later. Every file here is written with [`crate::private_fs`]:
+//! directories 0700, files 0600.
 //!
 //! **`XDG_CONFIG_HOME` and `XDG_DATA_HOME` are ignored, on purpose.** The
 //! sandbox template `init` writes into a sweeper project denies reads of
@@ -42,6 +48,8 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use anyhow::bail;
+
+use sweepky_core::RecordId;
 
 use crate::identity::IdentityName;
 
@@ -144,6 +152,14 @@ impl Dirs {
     pub fn identity_file(&self, name: &IdentityName) -> PathBuf {
         self.identities_dir().join(format!("{name}.json"))
     }
+
+    /// `data/git-home-<id>/`: git's private `HOME` for one command, with
+    /// `id` a new record id, so each command gets a directory of its own.
+    /// A [`RecordId`] is 13 characters of `0-9` and `A-Z`, so the name is
+    /// one plain path segment.
+    pub(crate) fn git_home_dir(&self, id: &RecordId) -> PathBuf {
+        self.data.join(format!("git-home-{id}"))
+    }
 }
 
 /// `value` as a path, if it is non-empty and absolute; `variable` names it in
@@ -231,6 +247,11 @@ mod tests {
         assert_eq!(
             dirs.identity_file(&name),
             Path::new("/x/config/identities/throwaway.json")
+        );
+        let id = "0035G87EK4XFE".parse().expect("valid record id");
+        assert_eq!(
+            dirs.git_home_dir(&id),
+            Path::new("/x/share/git-home-0035G87EK4XFE")
         );
     }
 }

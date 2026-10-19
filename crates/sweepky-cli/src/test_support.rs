@@ -3,23 +3,24 @@
 //! [`FileSnapshot`] that tells whether a file was written at all, a random
 //! public key, a [`Context`] for a test ([`test_context`], on an
 //! [`offline_network`] or a testnet's) with a [`SharedBuffer`] that keeps
-//! what it writes to standard error, a [`FakeKeyStore`] in place of a
-//! homeserver's `keys/`, the passphrase the tests wrap secret files with and
-//! a byte search to check a wrapped file shows none of its secret, and a
-//! compile-time check that a secret type implements none of the traits that
-//! would print or copy it.
+//! what it writes to standard error, the [`GitEnv`] the tests run git with
+//! and the inert fixture repository they run it against, a
+//! [`FakeKeyStore`] in place of a homeserver's `keys/`, the passphrase the
+//! tests wrap secret files with and a byte search to check a wrapped file
+//! shows none of its secret, and a compile-time check that a secret type
+//! implements none of the traits that would print or copy it.
 //!
 //! Compiled only for `cargo test` (`#[cfg(test)]` on its `mod` line in
 //! `lib.rs`), so nothing here reaches the binary, and like any test code it
 //! may panic.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, Permissions};
 use std::io::{self, BufRead, ErrorKind, Write};
 // `MetadataExt` adds `.mode()` and `.ino()` to `Metadata`; `PermissionsExt`
 // adds `Permissions::from_mode`.
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use pubky::errors::RequestError;
@@ -28,7 +29,7 @@ use sweepky_core::{DeviceId, Pubky, Zeroizing};
 use tempfile::TempDir;
 
 use crate::device::{KeyIds, KeyStore, PublicKeys};
-use crate::{Context, Dirs, Network, StderrWriter, StdinReader};
+use crate::{Context, Dirs, GitEnv, Network, StderrWriter, StdinReader};
 
 /// A fresh private directory to work in, created 0700 (`tempfile` passes
 /// `permissions` to the `mkdir` itself; its default would follow the
@@ -107,7 +108,8 @@ impl Write for SharedBuffer {
 /// A [`Context`] for a test, and the buffer that keeps what it writes to
 /// standard error: `network`, the directories under `home` (as
 /// `SWEEPKY_HOME=<home>` gives them), `home` itself as the working
-/// directory, `stdin` as standard input, and no passphrase.
+/// directory, `stdin` as standard input, no passphrase, and
+/// [`test_git_env`] for git.
 ///
 /// The fields are public, so a test that needs another working directory
 /// sets `ctx.cwd` afterwards.
@@ -126,8 +128,111 @@ pub(crate) fn test_context(
         // the test reads.
         stderr: StderrWriter::new(stderr.clone()),
         passphrase: None,
+        git_env: test_git_env(),
     };
     (ctx, stderr)
+}
+
+/// What the tests let git see: this test process's `PATH`, so git is found
+/// where the developer's or CI's shell finds it, and none of the proxy or
+/// CA variables, so a test never depends on the machine's network setup.
+/// Test code, so it may read the environment; the library never does.
+pub(crate) fn test_git_env() -> GitEnv {
+    GitEnv::capture(|name| {
+        if name == "PATH" {
+            std::env::var_os(name)
+        } else {
+            None
+        }
+    })
+}
+
+/// `fixtures/target-repo.git`, as an absolute path, after checking that its
+/// files are inert: the check `tests/fixture_target_repo.rs` makes before
+/// any of its git commands, made again here because a unit test cannot call
+/// an integration test's code. Read without git: exactly the minimal
+/// `config`, `HEAD` naming `main`, no `hooks/`, the four loose refs and one
+/// pack, and no link or special file anywhere. A test that runs git against
+/// the fixture gets its path from here, so the check always comes first.
+pub(crate) fn inert_target_repo() -> PathBuf {
+    // `env!` reads `CARGO_MANIFEST_DIR` when the test is compiled: this
+    // crate's directory, whatever directory the test later runs in.
+    let dir = fs::canonicalize(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/target-repo.git"),
+    )
+    .expect("the fixture repository");
+    let read = |name: &str| fs::read_to_string(dir.join(name)).expect("a fixture file");
+    assert_eq!(
+        read("config"),
+        "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n",
+        "the fixture's config must be exactly the minimal one"
+    );
+    assert_eq!(read("HEAD"), "ref: refs/heads/main\n");
+    assert_eq!(
+        fs::symlink_metadata(dir.join("hooks"))
+            .map_err(|error| error.kind())
+            .err(),
+        Some(ErrorKind::NotFound),
+        "the fixture must not have a hooks entry"
+    );
+    let (packs, others): (BTreeSet<String>, BTreeSet<String>) = regular_files_under(&dir)
+        .into_iter()
+        .partition(|path| path.starts_with("objects/pack/"));
+    let expected: BTreeSet<String> = [
+        "HEAD",
+        "config",
+        "refs/heads/main",
+        "refs/heads/topic",
+        "refs/pull/1/head",
+        "refs/tags/v0.1.0",
+    ]
+    .map(String::from)
+    .into();
+    assert_eq!(others, expected, "only these files outside objects/pack/");
+    let names: Vec<&str> = packs
+        .iter()
+        .filter_map(|path| path.strip_prefix("objects/pack/pack-"))
+        .collect();
+    // One `pack-<sha>.pack` and its `.idx`: two names, one SHA.
+    let shas: BTreeSet<&str> = names
+        .iter()
+        .filter_map(|name| name.strip_suffix(".pack").or(name.strip_suffix(".idx")))
+        .collect();
+    assert_eq!(
+        (packs.len(), names.len(), shas.len()),
+        (2, 2, 1),
+        "exactly one pack and its index: {packs:?}"
+    );
+    dir
+}
+
+/// Every regular file under `dir`, `/`-separated and relative to it.
+/// Panics on a symlink or anything else that is neither a file nor a
+/// directory, because git would follow a link out of the fixture.
+fn regular_files_under(dir: &Path) -> BTreeSet<String> {
+    let mut found = BTreeSet::new();
+    // A stack of directories still to list, relative to `dir`.
+    let mut pending = vec![String::new()];
+    while let Some(relative) = pending.pop() {
+        for entry in fs::read_dir(dir.join(&relative)).expect("a listing") {
+            let entry = entry.expect("an entry");
+            let name = entry.file_name().into_string().expect("a UTF-8 name");
+            let path = if relative.is_empty() {
+                name
+            } else {
+                format!("{relative}/{name}")
+            };
+            // `DirEntry::file_type` does not follow a link.
+            let kind = entry.file_type().expect("a file type");
+            if kind.is_dir() {
+                pending.push(path);
+            } else {
+                assert!(kind.is_file(), "{path} is not a plain file");
+                found.insert(path);
+            }
+        }
+    }
+    found
 }
 
 /// The passphrase the tests wrap secret files with, through

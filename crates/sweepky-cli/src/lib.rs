@@ -103,6 +103,15 @@
 //!   yes-or-no question on standard error whose answer is one line of at
 //!   most 1 KiB, `y` or `yes` in any case being yes and anything else no.
 //!   Under the global `--no-input` it fails at once and reads nothing.
+//! - `git`, the one way `post` and `run` run git: `GitRunner`, behind the
+//!   `RunGit` seam, starts git with its arguments as an argv vector, an
+//!   environment that is an allowlist of what `main.rs` captured
+//!   ([`GitEnv`]), no system or user config, every credential path off,
+//!   only allowlisted transports, no redirects, hooks, submodules or LFS,
+//!   and a fresh private `HOME` under the data directory, removed when the
+//!   runner is dropped; each run is timed and its output capped, and an
+//!   error never quotes git. With it, the parser of `git ls-remote`'s
+//!   output.
 //!
 //! The rules that hold for everything here (see "Rust conventions" in
 //! `docs/plan/03-cli-and-skill.md`):
@@ -155,6 +164,8 @@ mod clock;
 // records are read and written through.
 mod device;
 mod dirs;
+// The one way `post` and `run` run git: hardened, bounded and timed.
+mod git;
 // The identity name, secret file, details file and refusal rules of
 // `login --identity`.
 mod identity;
@@ -203,6 +214,7 @@ use anyhow::bail;
 
 pub use cli::{CircleCommand, Cli, Command, KeysCommand};
 pub use dirs::Dirs;
+pub use git::GitEnv;
 pub use identity::IdentityName;
 pub use network::{
     CLIENT_ID, Network, NetworkKind, NetworkSettings, PRODUCTION_HOMESERVER, SWEEPKY_CAPABILITY,
@@ -248,6 +260,11 @@ pub struct Context {
     /// command line that has the flag when this is `None`, so the flag can
     /// never be dropped on the way and leave files written unwrapped.
     pub passphrase: Option<Passphrase>,
+    /// What git may see of this process's environment: `PATH` and the
+    /// proxy and CA variables, which `main.rs` captures with
+    /// [`GitEnv::capture`]. Every git that `post` and `run` start gets these
+    /// and the runner's own fixed values, nothing else.
+    pub git_env: GitEnv,
 }
 
 /// Where a command writes the lines it says along the way, rather than in

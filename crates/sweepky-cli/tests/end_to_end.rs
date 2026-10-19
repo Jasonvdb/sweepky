@@ -22,7 +22,9 @@ use clap::Parser;
 use pubky::{ClientId, Keypair, PublicKey};
 use pubky_testnet::EphemeralTestnet;
 use serde_json::{Value, json};
-use sweepky_cli::{CLIENT_ID, Cli, Context, Dirs, Network, Report, StderrWriter, StdinReader, run};
+use sweepky_cli::{
+    CLIENT_ID, Cli, Context, Dirs, GitEnv, Network, Report, StderrWriter, StdinReader, run,
+};
 use sweepky_core::{
     Circle, DeviceIdentity, DeviceKey, MAX_RECORD_BYTES, Pubky, SecretString, Zeroizing,
 };
@@ -213,6 +215,16 @@ async fn end_to_end() {
         // No --passphrase-file: the secret files are written plain, as the
         // test reads them.
         passphrase: None,
+        // git is found through this test's PATH, and sees none of the
+        // proxy or CA variables: the targets come from the fixture
+        // repository on this disk.
+        git_env: GitEnv::capture(|name| {
+            if name == "PATH" {
+                std::env::var_os(name)
+            } else {
+                None
+            }
+        }),
     };
     // The test looks at the files through the context's own `Dirs`.
     let dirs = &ctx.dirs;
