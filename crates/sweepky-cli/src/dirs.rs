@@ -14,13 +14,23 @@
 //! | `credential.lock` | the writers' lock |
 //! | `login.json` | which login this install uses |
 //! | `installs.json` | the device ids this owner's own installs created |
+//! | `owner-keys.json` | per bounty owner, the keys `submit` last encrypted a sweep to, pinned (`crate::pins`) |
 //! | `device.key` | this install's age identity |
 //! | `identities/<name>.key` | a dedicated identity's secret (`login --identity`) |
 //! | `identities/<name>.json` | that identity's public details |
 //!
-//! Pinned owner keys (P2b) and the data directory's subtrees (P2c) come later.
-//! Every file here is written with [`crate::private_fs`]: directories 0700,
-//! files 0600.
+//! The data directory holds, so far:
+//!
+//! | Entry | What |
+//! |---|---|
+//! | `git-home-<id>/` | git's `HOME` while one command (`post`, `run`) runs it: new, empty and 0700, removed when the command ends (`crate::git`) |
+//! | `staging/<id>/` | the sweep directory `run` builds before it moves it into the project's `sweeps/<id>/`: new and 0700, removed when `run` ends (`run::fetch`) |
+//! | `sweeps/<id>.json` | what `run` fetched for sweep `id`, which `submit` builds the manifest's commits from: written by `run`, removed once the sweep's record says `done` or `aborted` (`crate::sweep_state`) |
+//!
+//! The data directory's other subtrees (P2c) come later. Every file here
+//! is written with [`crate::private_fs`]: directories 0700, files 0600;
+//! the one exception is what git checks out under `staging/<id>/`, which
+//! that 0700 directory keeps from other users.
 //!
 //! **`XDG_CONFIG_HOME` and `XDG_DATA_HOME` are ignored, on purpose.** The
 //! sandbox template `init` writes into a sweeper project denies reads of
@@ -42,6 +52,8 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use anyhow::bail;
+
+use sweepky_core::RecordId;
 
 use crate::identity::IdentityName;
 
@@ -121,6 +133,13 @@ impl Dirs {
         self.config.join("installs.json")
     }
 
+    /// `config/owner-keys.json`: per bounty owner, the device keys `submit`
+    /// last encrypted a sweep to, which it compares that owner's `keys/`
+    /// with the next time.
+    pub(crate) fn owner_keys_file(&self) -> PathBuf {
+        self.config.join("owner-keys.json")
+    }
+
     /// `config/device.key`: this install's age identity.
     pub fn device_key_file(&self) -> PathBuf {
         self.config.join("device.key")
@@ -143,6 +162,34 @@ impl Dirs {
     /// `config/identities/<name>.json`: that identity's public details.
     pub fn identity_file(&self, name: &IdentityName) -> PathBuf {
         self.identities_dir().join(format!("{name}.json"))
+    }
+
+    /// `data/git-home-<id>/`: git's private `HOME` for one command, with
+    /// `id` a new record id, so each command gets a directory of its own.
+    /// A [`RecordId`] is 13 characters of `0-9` and `A-Z`, so the name is
+    /// one plain path segment.
+    pub(crate) fn git_home_dir(&self, id: &RecordId) -> PathBuf {
+        self.data.join(format!("git-home-{id}"))
+    }
+
+    /// `data/staging/`: where `run` builds each sweep directory, one
+    /// `staging/<id>/` per sweep, out of reach of the agent, which can
+    /// write only in its project.
+    pub(crate) fn staging_dir(&self) -> PathBuf {
+        self.data.join("staging")
+    }
+
+    /// `data/sweeps/`: what `run` fetched for each sweep not yet finished,
+    /// one file per sweep, out of reach of the agent.
+    pub(crate) fn sweep_snapshots_dir(&self) -> PathBuf {
+        self.data.join("sweeps")
+    }
+
+    /// `data/sweeps/<id>.json`: what `run` fetched for sweep `id`. A
+    /// [`RecordId`] is one plain path segment, as for
+    /// [`git_home_dir`](Self::git_home_dir).
+    pub(crate) fn sweep_snapshot_file(&self, id: &RecordId) -> PathBuf {
+        self.sweep_snapshots_dir().join(format!("{id}.json"))
     }
 }
 
@@ -223,6 +270,10 @@ mod tests {
         assert_eq!(dirs.login_file(), Path::new("/x/config/login.json"));
         assert_eq!(dirs.installs_file(), Path::new("/x/config/installs.json"));
         assert_eq!(dirs.device_key_file(), Path::new("/x/config/device.key"));
+        assert_eq!(
+            dirs.owner_keys_file(),
+            Path::new("/x/config/owner-keys.json")
+        );
         assert_eq!(dirs.identities_dir(), Path::new("/x/config/identities"));
         assert_eq!(
             dirs.identity_key_file(&name),
@@ -231,6 +282,16 @@ mod tests {
         assert_eq!(
             dirs.identity_file(&name),
             Path::new("/x/config/identities/throwaway.json")
+        );
+        let id = "0035G87EK4XFE".parse().expect("valid record id");
+        assert_eq!(
+            dirs.git_home_dir(&id),
+            Path::new("/x/share/git-home-0035G87EK4XFE")
+        );
+        assert_eq!(dirs.staging_dir(), Path::new("/x/share/staging"));
+        assert_eq!(
+            dirs.sweep_snapshot_file(&id),
+            Path::new("/x/share/sweeps/0035G87EK4XFE.json")
         );
     }
 }

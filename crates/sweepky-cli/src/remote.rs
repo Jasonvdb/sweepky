@@ -5,9 +5,14 @@
 //!   the signed-in user's own; a 404 is `None`, "no such record".
 //! - [`list_dir`] lists one directory of an owner, page by page, into the
 //!   Sweepky files it holds; a 404 is an empty directory.
+//! - [`get_unredirected`], the one anonymous `GET` Sweepky sends itself:
+//!   `get_public`'s, each listing page's and each of GitHub's (in
+//!   `targets::github`).
 //! - [`write_refusal`] turns the two answers a homeserver gives a write it
 //!   will not take, 403 and 507, into the message `login` aborts with, and
 //!   [`request_error`] turns every other SDK error into a message.
+//!   [`upload_error`] says what a failed upload of a sweep package means:
+//!   413, 429 and 507 in `submit`'s own words, anything else as for a write.
 //! - [`pubky_of`] and [`public_key_of`] convert between core's `Pubky` and
 //!   the SDK's `PublicKey`, the owner these helpers take, so the commands
 //!   share one conversion.
@@ -36,6 +41,19 @@
 //!   line over [`MAX_LISTING_LINE_BYTES`], a line that is not UTF-8 or not a
 //!   resource URL, a page with more entries than were asked for, and a
 //!   listing past [`ListLimits`]' entry and page counts.
+//! - **A redirected answer is refused, never used.** The SDK's HTTP client
+//!   follows redirects to any host and scheme (pubky 0.16.2 sets no
+//!   `redirect::Policy`, so reqwest's default of up to 10 applies), and a
+//!   homeserver or GitHub is someone else's machine. So every request
+//!   Sweepky sends itself goes through [`get_unredirected`], which keeps the
+//!   URL the request went to and refuses the answer when reqwest reports
+//!   another one ([`check_not_redirected`]): before its status is looked at,
+//!   so a redirected 404 is not an empty directory either, and before a
+//!   byte of its body is read. reqwest has still sent the redirected request
+//!   by then, possibly to a host inside the sweeper's network; the guard
+//!   refuses its answer, it cannot stop the request. The SDK's own requests
+//!   (sign-up, sign-in, sign-out and a session's reads and writes, so
+//!   [`get_own`] too) are not Sweepky's to guard and still follow redirects.
 //! - **Entries are checked, not trusted.** An entry of another owner, or
 //!   outside the directory asked for, is skipped and counted, and so is one
 //!   [`SweepkyPath::parse`] does not accept, such as a `keys/` file whose
@@ -56,7 +74,7 @@ use anyhow::{Context as _, anyhow, bail};
 // back is `reqwest`'s and cannot be named here, which is why the read loop
 // takes a closure rather than a response (see `read_capped`).
 use pubky::errors::RequestError;
-use pubky::{Method, Pubky, PubkyResource, PubkySession, PublicKey, StatusCode};
+use pubky::{Method, Pubky, PubkyHttpClient, PubkyResource, PubkySession, PublicKey, StatusCode};
 use sweepky_core::Zeroizing;
 use sweepky_core::paths::SweepkyPath;
 use url::Url;
@@ -73,6 +91,23 @@ pub(crate) const WRITE_FORBIDDEN: &str = "the homeserver refused the write (HTTP
 /// identity's storage quota is used up.
 pub(crate) const QUOTA_FULL: &str =
     "the homeserver refused the write (HTTP 507): storage quota full; use a dedicated identity";
+
+/// What `submit` says when the homeserver answers its upload of a sweep
+/// package with a 413: the package, which the padding has made at most 32
+/// MiB, is more than this homeserver takes in one write.
+pub(crate) const PACKAGE_TOO_LARGE: &str = "the homeserver refused the upload (HTTP 413): the \
+     package is too large for this homeserver";
+
+/// What `submit` says when the homeserver answers its upload with a 429:
+/// it throttles this user's writes for now (06, "Production homeserver": a
+/// throttled write gets a 429 with `Retry-After`).
+pub(crate) const RATE_LIMITED: &str =
+    "the homeserver refused the upload (HTTP 429): rate limited; try again later";
+
+/// What `submit` says when the homeserver answers its upload with a 507:
+/// this identity's storage has no room for the package.
+pub(crate) const UPLOAD_QUOTA_FULL: &str = "the homeserver refused the upload (HTTP 507): storage quota full, so there is no room for \
+     the package";
 
 /// The HTTP status of an SDK error that is a homeserver's answer, or `None`
 /// for any other error (a transport failure, a pkarr lookup, a bad URL).
@@ -110,6 +145,22 @@ pub(crate) fn write_error(error: &pubky::Error) -> anyhow::Error {
         Some(message) => anyhow::Error::msg(message),
         None => request_error(error),
     }
+}
+
+/// A failed upload of a sweep package as the message to stop with:
+/// [`PACKAGE_TOO_LARGE`], [`RATE_LIMITED`] and [`UPLOAD_QUOTA_FULL`] for
+/// 413, 429 and 507, and [`write_error`]'s for anything else. Fixed text
+/// and the status, never the server's words. Which of these leave the
+/// sweep to be submitted again is `submit`'s decision, made from
+/// [`status_of`].
+pub(crate) fn upload_error(error: &pubky::Error) -> anyhow::Error {
+    let message = match status_of(error) {
+        Some(StatusCode::PAYLOAD_TOO_LARGE) => PACKAGE_TOO_LARGE,
+        Some(StatusCode::TOO_MANY_REQUESTS) => RATE_LIMITED,
+        Some(StatusCode::INSUFFICIENT_STORAGE) => UPLOAD_QUOTA_FULL,
+        _ => return write_error(error),
+    };
+    anyhow::Error::msg(message)
 }
 
 /// An SDK error as a message that quotes nothing it holds: the status for a
@@ -168,11 +219,7 @@ pub(crate) struct BodyTooLarge {
 
 impl fmt::Display for BodyTooLarge {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "the homeserver's answer is over the {}-byte limit",
-            self.cap
-        )
+        write!(f, "the server's answer is over the {}-byte limit", self.cap)
     }
 }
 
@@ -335,12 +382,14 @@ pub(crate) fn public_key_of(pubky: &sweepky_core::Pubky) -> anyhow::Result<Publi
 }
 
 /// Reads `path` of `owner`'s public storage, at most `cap` bytes, or `None`
-/// when there is no such file.
+/// when there is no such file (a 404).
 ///
 /// No session: the owner's homeserver is resolved through pkarr and asked
-/// anonymously, the SDK's public-storage path. The owner and path go in as
-/// the SDK's `(PublicKey, path)` pair, so no URL is put together from
-/// strings here. Parse a record with its type's `from_json` and pass
+/// anonymously, with the request the SDK's public storage sends (a `GET` of
+/// the resource's transport URL), sent through [`get_unredirected`] so a
+/// redirected answer is refused. The owner and path go in as the SDK's
+/// `PubkyResource`, so no URL is put together from strings here. Parse a
+/// record with its type's `from_json` and pass
 /// [`MAX_RECORD_BYTES`](sweepky_core::MAX_RECORD_BYTES) as `cap`.
 ///
 /// `path` appears in the error message, so pass one built by
@@ -353,23 +402,14 @@ pub(crate) async fn get_public(
 ) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
     // An `async` block is a future that runs the code inside when awaited;
     // `?` inside it returns from the block, not from `get_public`, so the
-    // context below is added to every error the block can give. A block has
-    // no declared return type, so its last line is `anyhow::Ok(..)`, which
-    // is `Ok` with the error type spelled out for the compiler.
+    // context below is added to every error the block can give.
     async {
-        let answer = pubky.public_storage().get((owner, path)).await;
-        // `let ... else`: bind the response when there is one, return
-        // `None` for a 404.
-        let Some(mut response) = absent_on_not_found(answer).map_err(|e| request_error(&e))? else {
-            return Ok(None);
-        };
-        // `content_length()` is read first, while nothing borrows the
-        // response; the closure then borrows it mutably for the reads.
-        let body = read_capped(response.content_length(), cap, async || {
-            response.chunk().await
-        })
-        .await?;
-        anyhow::Ok(Some(body))
+        // `clone` because the resource keeps its own copy of the key; a
+        // `PublicKey` holds no heap data, so the copy is cheap.
+        let resource = PubkyResource::new(owner.clone(), path).map_err(|e| request_error(&e))?;
+        let url = resource.to_transport_url().map_err(|e| request_error(&e))?;
+        // A 404 is `None`, "no such record", as for a listing page.
+        get_unredirected(pubky.client(), url, &[], cap, page_status).await
     }
     .await
     .with_context(|| format!("could not read {path} of {}", owner.z32()))
@@ -678,20 +718,25 @@ fn parse_entry(line: &str) -> Option<PubkyResource> {
     }
 }
 
-/// What a listing page's status says to do.
+/// What an answer's status says to do with its body, as the
+/// `read_status` of [`get_unredirected`] decides it: named for the listing
+/// page it was first written for, it serves every answer that function
+/// reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PageStatus {
-    /// 2xx: read the page.
+pub(crate) enum PageStatus {
+    /// 2xx: read the body.
     Read,
-    /// 404: the directory is empty, or does not exist, which for a
-    /// homeserver is the same (it answers 404 "Directory Not Found" for a
-    /// directory with nothing in it).
+    /// 404: there is nothing to read. For a listing, the directory is
+    /// empty, or does not exist, which for a homeserver is the same (it
+    /// answers 404 "Directory Not Found" for a directory with nothing in
+    /// it); for a record, there is no such record.
     Empty,
 }
 
-/// What `status` means for a listing page, or an error naming the status
-/// alone for anything but 2xx and 404. The body of an error answer is never
-/// read.
+/// What `status` means for a homeserver's answer, a listing page or a
+/// record, or an error naming the status alone for anything but 2xx and
+/// 404. It is given the status alone, so it cannot read an error answer's
+/// body.
 fn page_status(status: StatusCode) -> anyhow::Result<PageStatus> {
     if status == StatusCode::NOT_FOUND {
         Ok(PageStatus::Empty)
@@ -776,30 +821,103 @@ pub(crate) async fn list_dir(
     .with_context(|| format!("could not list {dir} of {}", owner.z32()))
 }
 
-/// One listing page: an anonymous `GET` of `url`, its body read through
-/// [`read_capped`] with `cap`, or `None` for a 404. Any other non-2xx answer
-/// is an error naming the status, and its body is never read.
+/// One listing page: an anonymous `GET` of `url` through
+/// [`get_unredirected`], its body read with `cap`, or `None` for a 404. Any
+/// other non-2xx answer is an error naming the status, and its body is
+/// never read.
 async fn fetch_page(
     pubky: &Pubky,
     url: Url,
     cap: usize,
 ) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
-    let request = pubky
-        .client()
+    get_unredirected(pubky.client(), url, &[], cap, page_status).await
+}
+
+/// What a request that ended at another URL than the one it was sent to is
+/// refused with. Fixed text: neither URL, which a server chose.
+const REDIRECTED: &str =
+    "the server answered through a redirect, which Sweepky refuses: nothing in the answer was used";
+
+/// Sends an anonymous `GET` of `url` through `client`, the SDK's HTTP
+/// client, with `headers` added, and reads its body, at most `cap` bytes,
+/// through [`read_capped`]: the one way Sweepky sends a request itself.
+///
+/// In order, so that nothing is used that should not be:
+///
+/// 1. The answer is refused when it came through a redirect
+///    ([`check_not_redirected`]), whatever its status.
+/// 2. `read_status` is given the status alone and decides: read the body
+///    ([`PageStatus::Read`]), hand back `None` ([`PageStatus::Empty`]), or
+///    fail. An error answer's body is never read.
+/// 3. The body is read under the cap.
+///
+/// Every error is fixed text, the status, or [`request_error`]'s: never the
+/// server's words or a URL.
+pub(crate) async fn get_unredirected(
+    client: &PubkyHttpClient,
+    url: Url,
+    headers: &[(&'static str, &'static str)],
+    cap: usize,
+    read_status: impl FnOnce(StatusCode) -> anyhow::Result<PageStatus>,
+) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
+    // `request_async` is the SDK's own way to address a URL: it resolves a
+    // Pubky host through pkarr and may rewrite the URL (an ICANN domain in
+    // place of the key, or a legacy homeserver's path). The URL to compare
+    // with is therefore the one in the request it builds, not `url`.
+    let mut builder = client
         .request_async(Method::GET, url)
         .await
         .map_err(|e| request_error(&e))?;
-    // `send` fails with `reqwest`'s error; `.into()` makes it the SDK's,
-    // whose variants `request_error` knows.
-    let mut response = request.send().await.map_err(|e| request_error(&e.into()))?;
-    if page_status(response.status())? == PageStatus::Empty {
+    // `&(name, value)` takes each pair apart, copying out its two
+    // `&'static str`s; `header` consumes the builder and hands it back.
+    for &(name, value) in headers {
+        builder = builder.header(name, value);
+    }
+    // `build_split` takes the builder apart into its client and the
+    // finished request, so the request's URL can be kept before
+    // `execute` sends it. (`send` would do both in one step, and keep no
+    // URL to compare with.) Both fail with `reqwest`'s error; `.into()`
+    // makes it the SDK's, whose variants `request_error` knows.
+    let (http, request) = builder.build_split();
+    let request = request.map_err(|e| request_error(&e.into()))?;
+    let sent = request.url().clone();
+    let mut response = http
+        .execute(request)
+        .await
+        .map_err(|e| request_error(&e.into()))?;
+    check_not_redirected(&sent, response.url())?;
+    if read_status(response.status())? == PageStatus::Empty {
         return Ok(None);
     }
+    // `content_length()` is read first, while nothing borrows the
+    // response; the closure then borrows it mutably for the reads.
     let body = read_capped(response.content_length(), cap, async || {
         response.chunk().await
     })
     .await?;
     Ok(Some(body))
+}
+
+/// Refuses an answer whose URL, `received`, is not `sent`, the URL its
+/// request went to: [`REDIRECTED`] for another scheme, host, port, path or
+/// query. Pure, so the tests check it without a network.
+///
+/// reqwest follows a redirect by itself and reports the URL of the last
+/// request it made as the answer's, so any difference means the answer
+/// came from a request Sweepky did not choose to send. With no redirect
+/// that URL is the one sent, parsed again from its text, so the parts are
+/// compared rather than the text, and `port_or_known_default` reads
+/// `https://h/` and `https://h:443/` as the one port they are.
+pub(crate) fn check_not_redirected(sent: &Url, received: &Url) -> anyhow::Result<()> {
+    let same = sent.scheme() == received.scheme()
+        && sent.host() == received.host()
+        && sent.port_or_known_default() == received.port_or_known_default()
+        && sent.path() == received.path()
+        && sent.query() == received.query();
+    if !same {
+        bail!(REDIRECTED);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -813,8 +931,9 @@ mod tests {
 
     use super::{
         BodyTooLarge, CappedBody, ListLimits, ListingError, ListingParser, MAX_LISTING_LINE_BYTES,
-        PageStatus, QUOTA_FULL, WRITE_FORBIDDEN, absent_on_not_found, page_status, page_url,
-        read_capped, request_error, status_of, write_error, write_refusal,
+        PACKAGE_TOO_LARGE, PageStatus, QUOTA_FULL, RATE_LIMITED, UPLOAD_QUOTA_FULL,
+        WRITE_FORBIDDEN, absent_on_not_found, check_not_redirected, page_status, page_url,
+        read_capped, request_error, status_of, upload_error, write_error, write_refusal,
     };
 
     /// What the server text in these tests tries to do: move the cursor, set
@@ -920,6 +1039,31 @@ mod tests {
         );
         for error in [server(StatusCode::NOT_FOUND), not_an_answer()] {
             let message = shown(request_error(&error));
+            assert!(!message.contains("pwned"), "{message}");
+            assert!(!message.chars().any(char::is_control), "{message:?}");
+        }
+    }
+
+    #[test]
+    fn an_upload_s_413_429_and_507_say_what_they_mean_for_the_package() {
+        let shown = |status| format!("{:#}", upload_error(&server(status)));
+        assert_eq!(shown(StatusCode::PAYLOAD_TOO_LARGE), PACKAGE_TOO_LARGE);
+        assert!(PACKAGE_TOO_LARGE.contains("the package is too large for this homeserver"));
+        assert_eq!(shown(StatusCode::TOO_MANY_REQUESTS), RATE_LIMITED);
+        assert!(RATE_LIMITED.contains("rate limited; try again later"));
+        assert_eq!(shown(StatusCode::INSUFFICIENT_STORAGE), UPLOAD_QUOTA_FULL);
+        assert!(UPLOAD_QUOTA_FULL.contains("storage quota full"));
+        // Anything else as for any write: a 403's message, the status alone,
+        // or a fixed sentence for an error that is not an answer.
+        assert_eq!(shown(StatusCode::FORBIDDEN), WRITE_FORBIDDEN);
+        assert_eq!(
+            shown(StatusCode::BAD_GATEWAY),
+            "the homeserver answered 502 Bad Gateway"
+        );
+        for message in [
+            shown(StatusCode::PAYLOAD_TOO_LARGE),
+            format!("{:#}", upload_error(&not_an_answer())),
+        ] {
             assert!(!message.contains("pwned"), "{message}");
             assert!(!message.chars().any(char::is_control), "{message:?}");
         }
@@ -1204,6 +1348,56 @@ mod tests {
                 .err(),
             Some(ListingError::NoCursor)
         );
+    }
+
+    #[test]
+    fn the_redirect_guard_accepts_only_the_url_that_was_sent() {
+        let owner = Keypair::random().public_key();
+        let listing = page_url(&keys_dir(&owner), 100, None).expect("a URL");
+        let github =
+            url::Url::parse("https://api.github.com/repos/org/name/pulls/42").expect("a URL");
+        for sent in [listing, github] {
+            // The URL that was sent, as reqwest reports it back: parsed
+            // again from its text, and with https's own port written out.
+            let reparsed = url::Url::parse(sent.as_str()).expect("a URL");
+            let mut default_port = sent.clone();
+            default_port.set_port(Some(443)).expect("a port");
+            for received in [&sent, &reparsed, &default_port] {
+                assert!(check_not_redirected(&sent, received).is_ok(), "{received}");
+            }
+            // Any other scheme, host, port, path or query: the answer came
+            // from a request reqwest made after a redirect.
+            let changed = |change: fn(&mut url::Url)| {
+                let mut url = sent.clone();
+                change(&mut url);
+                url
+            };
+            for (what, received) in [
+                (
+                    "scheme",
+                    changed(|url| url.set_scheme("http").expect("http")),
+                ),
+                (
+                    "host",
+                    changed(|url| url.set_host(Some("internal.example")).expect("a host")),
+                ),
+                (
+                    "port",
+                    changed(|url| url.set_port(Some(8443)).expect("a port")),
+                ),
+                ("path", changed(|url| url.set_path("/elsewhere"))),
+                ("query", changed(|url| url.set_query(Some("limit=1")))),
+            ] {
+                let error = check_not_redirected(&sent, &received).expect_err(what);
+                let message = format!("{error:#}");
+                assert!(message.contains("redirect"), "{what}: {message}");
+                // Neither URL is quoted.
+                assert!(!message.contains("internal.example"), "{what}: {message}");
+                assert!(!message.contains("/elsewhere"), "{what}: {message}");
+                assert!(!message.contains(&owner.z32()), "{what}: {message}");
+                assert!(!message.contains("api.github.com"), "{what}: {message}");
+            }
+        }
     }
 
     #[test]

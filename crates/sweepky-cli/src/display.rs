@@ -1,4 +1,5 @@
-//! Showing text a stranger wrote in a terminal: [`sanitize`].
+//! Showing text a stranger wrote in a terminal: [`sanitize`], and
+//! [`sanitize_multiline`] for text of several lines.
 //!
 //! Every string in a record is written by whoever owns that record, and the
 //! homeserver serves whatever bytes it likes, so a key's `label`, a circle's
@@ -35,6 +36,13 @@
 //! names how many characters of the text to show, and anything longer is cut
 //! there and marked with [`TRUNCATED`].
 //!
+//! [`sanitize_multiline`] is the same with two exceptions, newline (`\n`)
+//! and tab (`\t`), which it keeps, for text such as a bounty's markdown
+//! brief. Every other control, `\r` among them, is escaped as before, so a
+//! line can end but cannot be rewritten in place. [`first_changed_char`]
+//! says where either sanitiser would first change a text, which is how
+//! `post` refuses public text that would not print as it was written.
+//!
 //! The lists follow Unicode 16.0 (`DerivedCoreProperties.txt` for
 //! `Default_Ignorable_Code_Point`, `UnicodeData.txt` for `Cf`). A later
 //! Unicode version may add format characters; the tests pin every range the
@@ -47,6 +55,22 @@ pub(crate) const MAX_LABEL_CHARS: usize = 64;
 
 /// What `sanitize` puts after text it cut short.
 pub(crate) const TRUNCATED: &str = "\u{2026}(truncated)";
+
+/// Whether text is shown as one line or as several, which decides what
+/// happens to a newline and a tab.
+///
+/// An enum rather than a `bool`, so a call reads
+/// `first_changed_char(text, Layout::MultiLine)` rather than
+/// `first_changed_char(text, true)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Layout {
+    /// One line, such as a label or a title: a newline and a tab are
+    /// escaped like every other control. How [`sanitize`] shows text.
+    OneLine,
+    /// Lines of text, such as a bounty's brief: a newline and a tab are
+    /// kept. How [`sanitize_multiline`] shows text.
+    MultiLine,
+}
 
 /// `text` made safe to print in a terminal: at most `max_chars` of its
 /// characters, each one that could drive the terminal or hide in it written
@@ -61,6 +85,18 @@ pub(crate) const TRUNCATED: &str = "\u{2026}(truncated)";
 // text comes back unchanged, but the caller then owns one value either way,
 // and a label is short.
 pub(crate) fn sanitize(text: &str, max_chars: usize) -> String {
+    sanitize_as(text, max_chars, Layout::OneLine)
+}
+
+/// [`sanitize`] for text of several lines, such as a bounty's brief: the
+/// same, except that a newline and a tab are kept as they are.
+pub(crate) fn sanitize_multiline(text: &str, max_chars: usize) -> String {
+    sanitize_as(text, max_chars, Layout::MultiLine)
+}
+
+/// The sanitiser for `layout`: what [`sanitize`] and
+/// [`sanitize_multiline`] both run.
+fn sanitize_as(text: &str, max_chars: usize, layout: Layout) -> String {
     let mut shown = String::with_capacity(text.len().min(max_chars.saturating_mul(4)));
     // `chars()` walks the string one Unicode scalar value at a time, decoding
     // the UTF-8 itself, so no index is ever computed here. `take` stops after
@@ -69,7 +105,7 @@ pub(crate) fn sanitize(text: &str, max_chars: usize) -> String {
     for c in chars.by_ref().take(max_chars) {
         if c == '\\' {
             shown.push_str("\\\\");
-        } else if must_escape(c) {
+        } else if is_escaped(c, layout) {
             // `escape_unicode` yields `\u{1b}` for ESC: a backslash, `u`, and
             // the code point in lower-case hex between braces.
             shown.extend(c.escape_unicode());
@@ -84,6 +120,49 @@ pub(crate) fn sanitize(text: &str, max_chars: usize) -> String {
         shown.push_str(TRUNCATED);
     }
     shown
+}
+
+/// Where a character is in a text: its line and its column on that line,
+/// both counted from 1, the column in characters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TextPosition {
+    /// The line, from 1.
+    pub(crate) line: usize,
+    /// The character on that line, from 1.
+    pub(crate) column: usize,
+}
+
+/// Where `text` first holds a character that the sanitiser for `layout`
+/// would not show as itself (a backslash, which it doubles, or one it
+/// escapes), or `None` when there is none. `None` is exactly when that
+/// sanitiser, given room for the whole text, gives it back unchanged: both
+/// ask [`is_escaped`] and treat a backslash the same way.
+///
+/// It says where the character is and never what it is, so a caller can
+/// refuse a stranger's text without repeating it.
+pub(crate) fn first_changed_char(text: &str, layout: Layout) -> Option<TextPosition> {
+    let mut position = TextPosition { line: 1, column: 0 };
+    for c in text.chars() {
+        // At most one step per character of a `&str`, which is shorter
+        // than `usize::MAX` bytes, so neither count can overflow.
+        position.column += 1;
+        if c == '\\' || is_escaped(c, layout) {
+            return Some(position);
+        }
+        if c == '\n' {
+            position.line += 1;
+            position.column = 0;
+        }
+    }
+    None
+}
+
+/// Whether the sanitiser for `layout` writes `c` as a `\u{..}` escape:
+/// every character [`must_escape`] lists, except a newline and a tab in
+/// [`Layout::MultiLine`].
+fn is_escaped(c: char, layout: Layout) -> bool {
+    let kept_line_break = layout == Layout::MultiLine && matches!(c, '\n' | '\t');
+    must_escape(c) && !kept_line_break
 }
 
 /// Whether `c` is one of the characters [`sanitize`] escapes, by the list in
@@ -175,44 +254,46 @@ const ESCAPED_RANGES: &[(u32, u32)] = &[
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_LABEL_CHARS, TRUNCATED, sanitize};
+    use super::{MAX_LABEL_CHARS, TRUNCATED, sanitize, sanitize_multiline};
 
     /// `c` as `sanitize` must show it: Rust's `\u{..}` escape, lower-case hex.
     fn escaped(c: char) -> String {
         c.escape_unicode().to_string()
     }
 
+    /// Every range the sanitiser must escape, by its first and last
+    /// character and a few in between, named so a failure says which.
+    /// `sanitize_multiline` escapes all of them but TAB and LF.
+    const MUST_ESCAPE: [(&str, &[u32]); 7] = [
+        (
+            "C0 controls, NUL, BEL, BS, TAB, LF, CR and ESC among them",
+            &[0x00, 0x07, 0x08, 0x09, 0x0A, 0x0D, 0x1B, 0x1F],
+        ),
+        ("DEL", &[0x7F]),
+        (
+            "C1 controls, NEL and the one-byte CSI among them",
+            &[0x80, 0x85, 0x9B, 0x9F],
+        ),
+        (
+            "bidi controls",
+            &[
+                0x061C, 0x200E, 0x200F, 0x202A, 0x202B, 0x202C, 0x202D, 0x202E, 0x2066, 0x2067,
+                0x2068, 0x2069,
+            ],
+        ),
+        (
+            "zero-width and default-ignorable characters",
+            &[
+                0x200B, 0x200C, 0x200D, 0x2060, 0x2061, 0x2062, 0x2063, 0x2064, 0xFEFF, 0x00AD,
+            ],
+        ),
+        ("the tag block", &[0xE0000, 0xE0001, 0xE0041, 0xE007F]),
+        ("line and paragraph separators", &[0x2028, 0x2029]),
+    ];
+
     #[test]
     fn sanitize_escapes_controls_and_reordering() {
-        // Every range the sanitiser must escape, by its first and last
-        // character and a few in between, named so a failure says which.
-        let must_escape: [(&str, &[u32]); 7] = [
-            (
-                "C0 controls, NUL, BEL, BS, TAB, LF, CR and ESC among them",
-                &[0x00, 0x07, 0x08, 0x09, 0x0A, 0x0D, 0x1B, 0x1F],
-            ),
-            ("DEL", &[0x7F]),
-            (
-                "C1 controls, NEL and the one-byte CSI among them",
-                &[0x80, 0x85, 0x9B, 0x9F],
-            ),
-            (
-                "bidi controls",
-                &[
-                    0x061C, 0x200E, 0x200F, 0x202A, 0x202B, 0x202C, 0x202D, 0x202E, 0x2066, 0x2067,
-                    0x2068, 0x2069,
-                ],
-            ),
-            (
-                "zero-width and default-ignorable characters",
-                &[
-                    0x200B, 0x200C, 0x200D, 0x2060, 0x2061, 0x2062, 0x2063, 0x2064, 0xFEFF, 0x00AD,
-                ],
-            ),
-            ("the tag block", &[0xE0000, 0xE0001, 0xE0041, 0xE007F]),
-            ("line and paragraph separators", &[0x2028, 0x2029]),
-        ];
-        for (group, codes) in must_escape {
+        for (group, codes) in MUST_ESCAPE {
             for &code in codes {
                 let c = char::from_u32(code).expect("a valid char");
                 let shown = sanitize(&format!("a{c}b"), MAX_LABEL_CHARS);
@@ -285,5 +366,38 @@ mod tests {
             shown,
             format!("{}{TRUNCATED}", escaped('\u{e007f}').repeat(3))
         );
+    }
+
+    #[test]
+    fn sanitize_multiline_keeps_newline_and_tab_and_escapes_the_rest() {
+        // Lines and indentation, as a markdown brief has them, come through.
+        let brief = "# Scope\n\n\tsrc/auth/\n- sessions\n";
+        assert_eq!(sanitize_multiline(brief, 1000), brief);
+
+        // Every other character `sanitize` escapes, `\r` and ESC among
+        // them, is escaped here too.
+        for (group, codes) in MUST_ESCAPE {
+            for &code in codes.iter().filter(|&&code| code != 0x09 && code != 0x0A) {
+                let c = char::from_u32(code).expect("a valid char");
+                assert_eq!(
+                    sanitize_multiline(&format!("a{c}\nb"), 1000),
+                    format!("a{}\nb", escaped(c)),
+                    "{group}: U+{code:04X}"
+                );
+            }
+        }
+        // A backslash is doubled, as in `sanitize`.
+        assert_eq!(sanitize_multiline("a\\n\nb", 1000), "a\\\\n\nb");
+    }
+
+    #[test]
+    fn sanitize_multiline_cuts_by_characters() {
+        // The cut counts characters, a kept newline as one, and is marked.
+        let text = "\u{e9}\n".repeat(3);
+        assert_eq!(
+            sanitize_multiline(&text, 3),
+            format!("\u{e9}\n\u{e9}{TRUNCATED}")
+        );
+        assert_eq!(sanitize_multiline(&text, 6), text);
     }
 }

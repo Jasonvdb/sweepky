@@ -44,6 +44,17 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "FILE")]
     pub passphrase_file: Option<PathBuf>,
 
+    /// Never stop to ask a question. Where a command needs an answer, such
+    /// as `post` confirming a bounty's title and brief, or `submit` finding
+    /// keys the owner added since the last submit, it fails instead and says
+    /// what it would have asked.
+    //
+    // Global, like --testnet. `run` hands it, as a `prompt::Prompting`, to
+    // each command that asks; the context does not carry it, so this field
+    // is the one place it lives.
+    #[arg(long, global = true)]
+    pub no_input: bool,
+
     /// The command to run.
     #[command(subcommand)]
     pub command: Command,
@@ -132,6 +143,93 @@ pub enum Command {
         /// What to do with it.
         #[command(subcommand)]
         command: CircleCommand,
+    },
+
+    /// Post a bounty from the draft file DRAFT, closed: only sweeps from
+    /// this identity's circle are read. Pins every target to exact SHAs,
+    /// shows the bounty (title, focus, suggested playbook, each target with
+    /// its SHAs, and the brief) and asks before it publishes
+    /// /pub/sweepky/bounties/ID.json, which anyone can read. With
+    /// --no-input it shows the bounty and fails instead of asking, so
+    /// nothing is posted.
+    Post {
+        /// The bounty draft: a JSON file with the title, an optional focus,
+        /// the markdown brief, an optional suggested playbook and the
+        /// targets, unpinned, and no other field. Public once posted.
+        //
+        // A path, not the text: a multi-line brief and several targets fit
+        // a file, and stay out of the argument list, where clap would echo
+        // them back in a usage error. `PathBuf`, as for `init`'s `DIR`, so
+        // a path that is not UTF-8 is still taken as typed.
+        #[arg(value_name = "DRAFT")]
+        draft: PathBuf,
+    },
+
+    /// Start a sweep of the bounty at BOUNTY_URL, or without one of the
+    /// target your circle has swept least, in the init project this is run
+    /// in: check that you may run it, publish
+    /// /pub/sweepky/sweeps/ID.json as running, fetch each target by its
+    /// pinned SHA into sweeps/ID/target/TID/ with its agent-instruction
+    /// files stripped, and write scope.json, brief.md and the
+    /// sweeps/ID/.sweepky/sweep.json marker. If a fetch fails, the sweep is
+    /// marked aborted and its directory removed. Then run Claude Code here,
+    /// /sweepky, and `sweepky submit`.
+    Run {
+        /// The bounty's pubky:// URL, as `sweepky post` printed it. Without
+        /// one, run picks, from the open bounties of your circle's members
+        /// (or of the circle --circle names), the target their sweep
+        /// records name least, and sweeps that target alone.
+        //
+        // Plain text, checked by `run`, for the same reason as
+        // `--homeserver`: clap's own parse error would quote the value,
+        // and a key pasted in the wrong place must not be printed back.
+        #[arg(value_name = "BOUNTY_URL")]
+        bounty: Option<String>,
+
+        /// Sweep only the target with this id, instead of every target this
+        /// build can sweep. Needs BOUNTY_URL.
+        #[arg(long, value_name = "TID")]
+        target: Option<String>,
+
+        /// Check the bounty against the circle ADMIN keeps, instead of its
+        /// owner's own: both the owner and you must be in it. Without
+        /// BOUNTY_URL, pick from that circle instead of your own. ADMIN is
+        /// a pubky, with or without the `pubky` prefix.
+        #[arg(long, value_name = "ADMIN")]
+        circle: Option<String>,
+    },
+
+    /// Finish a sweep once the agent has exited: check the sweep directory
+    /// and walk it without following a link, build the package from its
+    /// audit/ (Cloudflare's findings.json converted), check the bounty
+    /// owner's keys against the ones pinned when you last submitted to them
+    /// and ask about new ones, print the file list, encrypt the package to
+    /// the owner's keys and this install's own, upload
+    /// /pub/sweepky/sweeps/ID.age and mark the sweep done. A homeserver that
+    /// refuses the package marks it aborted, which is final; a network
+    /// error or a rate limit leaves it running, to submit again.
+    Submit {
+        /// The sweep directory, as `sweepky run` printed it: sweeps/ID from
+        /// the init project, or that path in full. Without it, submit must
+        /// be run in the init project's own directory, and takes the one
+        /// sweep there not yet submitted.
+        //
+        // `PathBuf`, as for `init`'s `DIR`, so a path that is not UTF-8 is
+        // still taken as typed; `submit` checks it and never quotes it.
+        #[arg(long, value_name = "DIR")]
+        run_dir: Option<PathBuf>,
+
+        /// The playbook the agent followed, as the sweep's public record
+        /// and the package name it, such as
+        /// cloudflare/security-audit@c1c8a8c: up to 64 of A-Z a-z 0-9 . _ /
+        /// -, then optionally @ and 7 to 40 hex digits of a commit. Needed
+        /// while the record names none (until init records one).
+        //
+        // Plain text, checked by `submit`, as `run`'s arguments are: clap's
+        // own parse error would quote it, and a key pasted here must be
+        // refused before it reaches a public record.
+        #[arg(long, value_name = "NAME")]
+        playbook: Option<String>,
     },
 }
 
@@ -281,6 +379,101 @@ mod tests {
         }
         let cli = Cli::try_parse_from(["sweepky", "logout"]).expect("parses");
         assert_eq!(cli.passphrase_file, None);
+    }
+
+    #[test]
+    fn no_input_is_a_global_flag_off_by_default() {
+        // Before or after the command, as for --testnet, and with any
+        // command: `run` hands it to the commands that ask a question.
+        for args in [
+            ["sweepky", "--no-input", "keys", "list"],
+            ["sweepky", "keys", "list", "--no-input"],
+            ["sweepky", "--no-input", "init", "d"],
+        ] {
+            let cli = Cli::try_parse_from(args).expect("parses");
+            assert!(cli.no_input, "{args:?}");
+        }
+        let cli = Cli::try_parse_from(["sweepky", "keys", "list"]).expect("parses");
+        assert!(!cli.no_input);
+    }
+
+    #[test]
+    fn post_takes_one_draft_path() {
+        let cli = Cli::try_parse_from(["sweepky", "post", "draft.json"]).expect("parses");
+        assert!(
+            matches!(&cli.command, Command::Post { draft } if draft == Path::new("draft.json")),
+            "{cli:?}"
+        );
+        // Exactly one: none, or a second, is a usage error.
+        assert!(Cli::try_parse_from(["sweepky", "post"]).is_err());
+        assert!(Cli::try_parse_from(["sweepky", "post", "a.json", "b.json"]).is_err());
+    }
+
+    #[test]
+    fn run_takes_an_optional_url_a_target_and_a_circle() {
+        let url = "pubky://owner/pub/sweepky/bounties/0035G87EK4XFE.json";
+        let cli =
+            Cli::try_parse_from(["sweepky", "run", url, "--target", "t1", "--circle", "admin"])
+                .expect("parses");
+        let Command::Run {
+            bounty,
+            target,
+            circle,
+        } = &cli.command
+        else {
+            panic!("run parses as Run: {cli:?}");
+        };
+        assert_eq!(bounty.as_deref(), Some(url));
+        assert_eq!(target.as_deref(), Some("t1"));
+        assert_eq!(circle.as_deref(), Some("admin"));
+
+        // Each is optional to clap: `run` says what a missing URL means. All
+        // three are plain text, which `run` checks, so a value clap would
+        // refuse, and quote, never reaches clap's own parse.
+        let cli = Cli::try_parse_from(["sweepky", "run"]).expect("parses");
+        assert!(matches!(
+            cli.command,
+            Command::Run {
+                bounty: None,
+                target: None,
+                circle: None
+            }
+        ));
+        // One URL at most.
+        assert!(Cli::try_parse_from(["sweepky", "run", url, url]).is_err());
+    }
+
+    #[test]
+    fn submit_takes_an_optional_run_dir_and_playbook() {
+        let cli = Cli::try_parse_from([
+            "sweepky",
+            "submit",
+            "--run-dir",
+            "sweeps/0035G87EK4XFE",
+            "--playbook",
+            "cloudflare/security-audit@c1c8a8c",
+        ])
+        .expect("parses");
+        let Command::Submit { run_dir, playbook } = &cli.command else {
+            panic!("submit parses as Submit: {cli:?}");
+        };
+        assert_eq!(run_dir.as_deref(), Some(Path::new("sweeps/0035G87EK4XFE")));
+        assert_eq!(
+            playbook.as_deref(),
+            Some("cloudflare/security-audit@c1c8a8c")
+        );
+
+        // Both optional to clap, and both plain text that `submit` checks.
+        let cli = Cli::try_parse_from(["sweepky", "submit"]).expect("parses");
+        assert!(matches!(
+            cli.command,
+            Command::Submit {
+                run_dir: None,
+                playbook: None
+            }
+        ));
+        // No positional argument.
+        assert!(Cli::try_parse_from(["sweepky", "submit", "sweeps/0035G87EK4XFE"]).is_err());
     }
 
     #[test]

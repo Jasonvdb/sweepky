@@ -1,17 +1,18 @@
 //! The `sweepky` command-line tool, as a library. `src/main.rs` is a thin
 //! binary on top of it.
 //!
-//! Why a library: [`run`] executes a command given a [`Context`], and the
+//! Why a library: [`run`](fn@run) executes a command given a [`Context`], and the
 //! context carries the [`Network`] to talk to: the Pubky client, the auth relay
 //! URL and the default homeserver. The binary builds that from `--testnet` /
 //! `SWEEPKY_TESTNET` or the production defaults; the end-to-end test builds it
 //! from a local `EphemeralTestnet` instead ([`Network::injected`]), so the same
 //! code runs against a throwaway network with nothing reaching production.
 //!
-//! What is here so far (P2a):
+//! What is here so far (P2a, then P2b):
 //!
-//! - [`Cli`] and [`Command`], the arguments, parsed with clap. `--testnet` is a
-//!   global flag, so it goes before or after the command.
+//! - [`Cli`] and [`Command`], the arguments, parsed with clap. `--testnet`,
+//!   `--passphrase-file` and `--no-input` are global flags, so each goes
+//!   before or after the command.
 //! - [`Network`], its pure [`NetworkSettings`] and [`NetworkKind`], and
 //!   [`select_kind`], which turns the flag and the variable into a kind and
 //!   refuses a value it does not know instead of falling back to production.
@@ -22,7 +23,8 @@
 //!   the binary runs it through [`run_without_context`] before it reads
 //!   HOME or the passphrase file or builds a network.
 //! - `clock::now()`, the current time for a record's time fields
-//!   (`createdAt`, `revokedAt`, ...), as RFC 3339 in UTC to the second.
+//!   (`createdAt`, `revokedAt`, ...), as RFC 3339 in UTC to the second, and
+//!   `clock::new_record_id()`, the id of a new bounty, sweep or device key.
 //! - [`Dirs`], the config and data directories (`~/.config/sweepky/` and
 //!   `~/.local/share/sweepky/`, or both under `SWEEPKY_HOME`) and the paths
 //!   of the files in them.
@@ -42,13 +44,16 @@
 //! - `remote`, the network helpers every command shares: reads of public
 //!   records and of the user's own (a 404 is no record), directory listings
 //!   (a 404 is an empty directory), every body capped before it is buffered
-//!   and every listing capped by line, page and total; and the messages for
-//!   a refused write (403 and 507) and every other SDK error, which never
+//!   and every listing capped by line, page and total, and every request
+//!   Sweepky sends itself refusing an answer that came through a redirect;
+//!   the messages for a refused write (403 and 507), a refused upload of a
+//!   sweep package (413, 429 and 507) and every other SDK error, which never
 //!   quote the server or the request URL; and the conversions between core's
 //!   `Pubky` and the SDK's `PublicKey`.
 //! - `display`, the terminal sanitiser: a stranger's text with its control,
 //!   bidi and invisible characters written as visible `\u{..}` escapes, cut
-//!   to a length.
+//!   to a length; a multi-line form that keeps newlines and tabs; and where
+//!   either would first change a text.
 //! - `login --identity <name>` (`login`): creates or reuses a dedicated
 //!   identity, signs it up on its homeserver the first time, signs in,
 //!   runs the shared tail on this install's first login, records the login
@@ -65,6 +70,9 @@
 //! - `installs`, `installs.json`: per owner, the device ids this owner's
 //!   installs created here, which `login`, `keys list` and `pull` compare
 //!   `keys/` against, and the alarm for an id it does not hold.
+//! - `pins`, `owner-keys.json`: per bounty owner, the device keys `submit`
+//!   last encrypted a sweep to, each id with its key, which `submit`
+//!   compares that owner's `keys/` with the next time.
 //! - `keys list` and `keys revoke <deviceId>` (`keys`): the identity's
 //!   published device keys, read from public storage with no session, each
 //!   unknown id alarmed on, each key this build cannot encrypt to flagged by
@@ -96,6 +104,88 @@
 //!   unwrapped on read whenever a file starts with an age header, a wrapped
 //!   file read without the passphrase being an error that says how to give
 //!   it.
+//! - `prompt`, standard input and the one question a command asks on it:
+//!   [`StdinReader`], the context's standard input, and `confirm`, a
+//!   yes-or-no question on standard error whose answer is one line of at
+//!   most 1 KiB, `y` or `yes` in any case being yes and anything else no.
+//!   Under the global `--no-input` it fails at once and reads nothing.
+//! - `git`, the one way `post` and `run` run git: `GitRunner`, behind the
+//!   `RunGit` seam, starts git with its arguments as an argv vector, an
+//!   environment that is an allowlist of what `main.rs` captured
+//!   ([`GitEnv`]), no system or user config, every credential path off,
+//!   only allowlisted transports, no redirects, hooks, submodules or LFS,
+//!   and a fresh private `HOME` under the data directory, removed when the
+//!   runner is dropped; each run is timed and its output capped, and an
+//!   error never quotes git. `ls-remote` and `fetch` name their repository
+//!   only through a checked `git::Remote`. With it, the parser of
+//!   `git ls-remote`'s output.
+//! - `targets`, where `post` and `run` get a target's repository from:
+//!   the `TargetResolver` seam, which pins a revision to a full SHA with
+//!   an anonymous `git ls-remote` (annotated tags peeled), gives a pull
+//!   request's base, head and merge base (from GitHub's unauthenticated
+//!   API, for the real source), names the remote `run` fetches from and
+//!   applies the target policy; [`TargetSource`], the context's
+//!   choice of source; the real source, over https only, and the fixture
+//!   source over the bare repository under `fixtures/`, for the tests; the
+//!   checked revision; and the host policy (`targets::host`): `is_public`,
+//!   the pure classifier that refuses loopback, private, link-local and
+//!   otherwise reserved addresses, IPv6 forms that carry such an IPv4
+//!   address included, the `ResolveHost` seam, over the system resolver,
+//!   and `HttpsRemote`, the `https://<repo>` remote that git's network
+//!   commands take, made only for a host whose every address is public.
+//! - `post <draft.json>` (`post`), for a bounty that is not `--open`: the
+//!   bounty draft, read with a cap and checked as strictly as a stranger's
+//!   record, its public text held to what the sanitiser prints unchanged;
+//!   every target checked against the target policy and pinned through the
+//!   context's target source; the bounty shown, sanitised, on standard
+//!   error, and published as `bounties/<id>.json` under the writers' lock
+//!   with a fresh session only once the owner says yes.
+//! - `own_storage`, `OwnStorage`: the seam through which `post`, `run` and
+//!   `submit` write the signed-in user's own records and read them back,
+//!   with a fake for the unit tests that can refuse a chosen write.
+//! - `records`, `PublicRecords`: the seam through which `run` and `submit`
+//!   read anyone's public bounty, circle and sweep records, and `run` lists
+//!   their bounties and sweeps, with no session, each capped and parsed by
+//!   core, each listing bounded, with a fake for the unit tests.
+//! - `run [<bounty-url>] [--target <tid>] [--circle <admin>]` (`run`): in
+//!   the `init` project it must be run in, whose marker may name a
+//!   playbook, it checks the bounty's `pubky://` URL (anything else refused
+//!   unquoted), whether this sweeper may run the bounty (status `open`,
+//!   then `open: true` or the owner's own circle listing the sweeper, or
+//!   with `--circle` both in that circle) and which targets it sweeps
+//!   (every one this build can, or `--target`'s, case-colliding ids and
+//!   the target policy refused), and shows the bounty, its title and focus
+//!   sanitised and never its brief. Then it publishes `sweeps/<id>.json` as
+//!   `running` under the writers' lock with a fresh session, and, outside
+//!   the lock, fetches each target by its exact SHA, at depth 2, into
+//!   `./sweeps/<id>/target/<tid>/`, links checked out as plain files, the
+//!   agent-instruction files stripped at every depth and in any case,
+//!   writes `scope.json` and `brief.md` beside them, and last the marker
+//!   `sweeps/<id>/.sweepky/sweep.json`. If any of that fails, the sweep
+//!   directory is removed and the record flipped to `aborted`. The report
+//!   says what to run next. Without a URL it first picks, from the open
+//!   bounties of the circle's members (`--circle`'s, else this install's
+//!   own circle), the target their sweep records name least, reading
+//!   within fixed bounds, and then runs it as for its URL and `--target`.
+//! - `submit [--run-dir <dir>] [--playbook <name>]` (`submit`): it finds
+//!   and checks the sweep directory, walks it through open handles without
+//!   following a link, refusing links, hard links and special files within
+//!   caps, and reads `audit/`; reads the sweep's own record, which must say
+//!   `running`, and its bounty; builds the manifest from those two and the
+//!   commits `run` fetched, which the bounty must still pin, and the
+//!   package from `audit/`, Cloudflare's findings converted; checks
+//!   the owner's keys against their pin, asking about new ones (or failing
+//!   under `--no-input`); prints the file list; and seals the package to
+//!   the owner's keys and this install's own. Then, under the writers' lock
+//!   with a fresh session, it reads the record back, writes the pin,
+//!   uploads `sweeps/<id>.age` and flips the record to `done`; a refused
+//!   upload flips it to `aborted`, which is final, and a 429 or a network
+//!   error leaves it `running`. Last, it stamps the sweep directory as
+//!   submitted.
+//! - `sweep_state`, `<data dir>/sweeps/<id>.json`: what `run` fetched for
+//!   a sweep, each target's pins and the commit checked out, kept where
+//!   the agent cannot write, which `submit` builds the manifest's
+//!   `targetShas` from and removes once the record is final.
 //!
 //! The rules that hold for everything here (see "Rust conventions" in
 //! `docs/plan/03-cli-and-skill.md`):
@@ -148,6 +238,8 @@ mod clock;
 // records are read and written through.
 mod device;
 mod dirs;
+// The one way `post` and `run` run git: hardened, bounded and timed.
+mod git;
 // The identity name, secret file, details file and refusal rules of
 // `login --identity`.
 mod identity;
@@ -164,41 +256,82 @@ mod login;
 // delete this install's files, in that order.
 mod logout;
 mod network;
+// `OwnStorage`: the signed-in user's own files, written and read back by
+// `post`, `run` and `submit`.
+mod own_storage;
 // `--passphrase-file` and the one way every secret file is written and read,
 // wrapped with that passphrase or plain.
 mod passphrase;
+// `owner-keys.json`: the keys of each bounty owner `submit` last encrypted
+// a sweep to, pinned so a key added later is noticed.
+mod pins;
+// `post`: the bounty draft, checked and pinned into a bounty, shown, and
+// published once the owner says yes.
+mod post;
 // Owner-only files and directories, which every secret and state file goes
 // through.
 mod private_fs;
+// Standard input, and the one yes-or-no question a command asks on it.
+mod prompt;
+// `PublicRecords`: anyone's public bounty, circle and sweep records, read
+// with a cap and parsed by core, and bounded listings of their bounties and
+// sweeps, with a fake for the unit tests.
+mod records;
 // Bounded reads of remote records and listings, the write-error mapping and
 // the key conversions. `login` and `keys` use the write errors and the
 // conversions, and the key stores the reads of the user's own records, of
 // anyone's public records and the listing.
 mod remote;
+// `run`: the bounty checked (or, without a URL, a target picked from the
+// circle's open bounties), the sweep published as running, the targets
+// fetched, stripped and scoped, and the per-sweep marker written last; or
+// the sweep aborted.
+mod run;
+// `submit`: the sweep directory found, checked and walked without following
+// a link; the manifest from the sweep's own record, its bounty and what `run`
+// fetched; the
+// package sealed to the bounty owner's pinned keys and this install's;
+// uploaded, and the record flipped, under the writers' lock.
+mod submit;
+// What `run` fetched for each sweep, kept under the data directory, which
+// `submit` builds the manifest's commits from.
+mod sweep_state;
 // The per-command session: the writers' lock, a fresh sign-in and a sign-out
 // that is always attempted. `login` holds its lock; `keys revoke` is the
 // first command to run in a whole session; `logout` runs the sign-in and the
 // sign-out itself, because it deletes files after the sign-out.
 mod session;
 mod state;
+// Where `post` and `run` get a target's repository from, and the network
+// policy for its host. `TargetSource` is public, for the context, and so is
+// the fixture source, for the end-to-end test only.
+mod targets;
 // Fixtures the unit tests of several modules share. `cfg(test)` compiles it
 // only for `cargo test`, so it never reaches the binary.
 #[cfg(test)]
 mod test_support;
 
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::{Mutex, PoisonError};
 
 use anyhow::bail;
 
 pub use cli::{CircleCommand, Cli, Command, KeysCommand};
 pub use dirs::Dirs;
+pub use git::GitEnv;
 pub use identity::IdentityName;
 pub use network::{
     CLIENT_ID, Network, NetworkKind, NetworkSettings, PRODUCTION_HOMESERVER, SWEEPKY_CAPABILITY,
     TESTNET_HOMESERVER, TESTNET_RELAY_URL, select_kind,
 };
 pub use passphrase::Passphrase;
+pub use prompt::StdinReader;
+// `targets` is a private module, but an item declared `pub` inside it can
+// still be re-exported here as part of the library's public API.
+pub use targets::TargetSource;
+#[doc(hidden)]
+pub use targets::fixture::FixtureTargets;
 
 /// This crate's version, `version` from Cargo.toml, which `sweepky --version`
 /// prints.
@@ -210,24 +343,42 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Everything a command needs from outside itself, handed in by the caller.
 ///
 /// The binary builds one from the arguments and the environment; a test builds
-/// one around a local testnet, a temporary `SWEEPKY_HOME` and a buffer for
-/// what would go to standard error. Later commands add the standard input
-/// here, so that no command reaches for a global.
+/// one around a local testnet, a temporary `SWEEPKY_HOME`, the answers it
+/// gives and a buffer for what would go to standard error. The working
+/// directory and standard input are here too, so that no command reaches
+/// for a global.
 pub struct Context {
     /// The network every command talks to.
     pub network: Network,
     /// Where this install keeps its secrets and state.
     pub dirs: Dirs,
+    /// The directory the command was run in, as an absolute path: the one
+    /// `main.rs` reads with `std::env::current_dir()`, or one a test
+    /// chooses. `run` and `submit` find their `init` project from it;
+    /// nothing below `main.rs` asks the process for it.
+    pub cwd: PathBuf,
+    /// Where a command reads the answer to a question it asks (see
+    /// [`StdinReader`]): standard input in the binary, fixed bytes in a test.
+    pub stdin: StdinReader,
     /// Where a command writes what it has to say before it is done: a
     /// warning before it acts, or that it is waiting for another command.
     pub stderr: StderrWriter,
     /// The passphrase from `--passphrase-file`, which the caller reads with
-    /// [`Passphrase::from_file`] before [`run`]: `login` wraps the secret
+    /// [`Passphrase::from_file`] before [`run`](fn@run): `login` wraps the secret
     /// files it creates with it, and every command that reads a wrapped one
-    /// unwraps it with it. `None` without the flag; [`run`] refuses a
+    /// unwraps it with it. `None` without the flag; [`run`](fn@run) refuses a
     /// command line that has the flag when this is `None`, so the flag can
     /// never be dropped on the way and leave files written unwrapped.
     pub passphrase: Option<Passphrase>,
+    /// What git may see of this process's environment: `PATH` and the
+    /// proxy and CA variables, which `main.rs` captures with
+    /// [`GitEnv::capture`]. Every git that `post` and `run` start gets these
+    /// and the runner's own fixed values, nothing else.
+    pub git_env: GitEnv,
+    /// Where `post` and `run` get targets' repositories from:
+    /// [`TargetSource::Real`] in the binary, the fixture repository in the
+    /// tests.
+    pub targets: TargetSource,
 }
 
 /// Where a command writes the lines it says along the way, rather than in
@@ -258,13 +409,19 @@ impl StderrWriter {
     /// Writes `text` and a newline, and flushes, so the line is out before
     /// the command goes on.
     pub(crate) fn line(&self, text: &str) -> anyhow::Result<()> {
+        self.write_flushed(&format!("{text}\n"))
+    }
+
+    /// Writes `text` as it is, adding no newline, and flushes: how a
+    /// question is asked (`prompt::confirm`), so the answer is typed on the
+    /// same line.
+    pub(crate) fn write_flushed(&self, text: &str) -> anyhow::Result<()> {
         // `lock` fails only if another thread panicked while holding the
         // lock ("poisoned"). A writer has no state that a panic could leave
         // half-changed, so the guard is taken back with `into_inner` rather
         // than failing the command.
         let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
         writer.write_all(text.as_bytes())?;
-        writer.write_all(b"\n")?;
         writer.flush()?;
         Ok(())
     }
@@ -295,7 +452,7 @@ impl Report {
 
 /// Runs `cli` when its command needs nothing from a [`Context`], and hands
 /// back `None` for every other command, which the caller then runs with
-/// [`run`].
+/// [`run`](fn@run).
 ///
 /// `init <dir>` is the one such command so far: it works only in the
 /// directory it is given. The binary calls this before it builds the
@@ -303,12 +460,12 @@ impl Report {
 /// the `--passphrase-file` (it writes no secret file, so there is nothing to
 /// wrap), and never builds a Pubky client: a production client starts a DHT
 /// node that contacts public servers, which a local command has no reason
-/// to do. [`run`] still runs `init` when given a context, so a caller that
+/// to do. [`run`](fn@run) still runs `init` when given a context, so a caller that
 /// always builds one, such as the end-to-end test, can run every command
-/// through [`run`] alone.
+/// through [`run`](fn@run) alone.
 ///
 /// `Option<Result<…>>` keeps the two answers apart: `None` is "not one of
-/// mine, build the context and call [`run`]", and `Some` carries the
+/// mine, build the context and call [`run`](fn@run)", and `Some` carries the
 /// command's own success or failure.
 pub fn run_without_context(cli: &Cli) -> Option<anyhow::Result<Report>> {
     // Every variant is named, with no `_` arm, so a command added later does
@@ -316,9 +473,13 @@ pub fn run_without_context(cli: &Cli) -> Option<anyhow::Result<Report>> {
     // Matching on `&cli.command` borrows it, so `dir` is a `&PathBuf`.
     match &cli.command {
         Command::Init { dir } => Some(init::init(dir)),
-        Command::Login { .. } | Command::Logout | Command::Keys { .. } | Command::Circle { .. } => {
-            None
-        }
+        Command::Login { .. }
+        | Command::Logout
+        | Command::Keys { .. }
+        | Command::Circle { .. }
+        | Command::Post { .. }
+        | Command::Run { .. }
+        | Command::Submit { .. } => None,
     }
 }
 
@@ -326,8 +487,10 @@ pub fn run_without_context(cli: &Cli) -> Option<anyhow::Result<Report>> {
 ///
 /// The caller has already chosen the network: the binary from
 /// [`Cli::testnet`] and `SWEEPKY_TESTNET` through [`select_kind`], a test by
-/// injecting one. `async` because most commands wait on the network; `init`
-/// does only a few small file operations, which are fine to do directly here.
+/// injecting one. [`Cli::no_input`] is not in the context: `run` hands it,
+/// as a `prompt::Prompting`, to each command that asks a question. `async`
+/// because most commands wait on the network; `init` does only a few small
+/// file operations, which are fine to do directly here.
 /// (The binary runs `init` through [`run_without_context`] instead, so it
 /// never builds a context for it.)
 pub async fn run(cli: Cli, ctx: &Context) -> anyhow::Result<Report> {
@@ -370,6 +533,24 @@ pub async fn run(cli: Cli, ctx: &Context) -> anyhow::Result<Report> {
             CircleCommand::Remove { pubky } => circle::remove(ctx, &pubky).await,
             CircleCommand::Show { admin } => circle::show(ctx, admin.as_deref()).await,
         },
+        // `match cli.command` moved only that field out of `cli`, so
+        // `cli.no_input`, another field, can still be read here.
+        Command::Post { draft } => {
+            let prompting = prompt::Prompting::from_no_input_flag(cli.no_input);
+            post::post(ctx, prompting, &draft).await
+        }
+        // `run::run` is the function `run` in the module `run`: a module
+        // and a function live in different namespaces, so the two names
+        // do not clash with this function's own.
+        Command::Run {
+            bounty,
+            target,
+            circle,
+        } => run::run(ctx, bounty.as_deref(), target.as_deref(), circle.as_deref()).await,
+        Command::Submit { run_dir, playbook } => {
+            let prompting = prompt::Prompting::from_no_input_flag(cli.no_input);
+            submit::submit(ctx, prompting, run_dir.as_deref(), playbook.as_deref()).await
+        }
     }
 }
 
@@ -425,11 +606,39 @@ mod tests {
             &["circle", "add", "pk"],
             &["circle", "remove", "pk"],
             &["circle", "show"],
+            &["post", "draft.json"],
+            &["run"],
+            &[
+                "run",
+                "pubky://owner/pub/sweepky/bounties/0035G87EK4XFE.json",
+                "--target",
+                "t1",
+                "--circle",
+                "admin",
+            ],
+            &["submit"],
+            &[
+                "submit",
+                "--run-dir",
+                "sweeps/0035G87EK4XFE",
+                "--playbook",
+                "cloudflare/security-audit@c1c8a8c",
+            ],
         ];
         for args in commands {
-            let cli = Cli::try_parse_from(std::iter::once("sweepky").chain(args.iter().copied()))
+            // With and without `--no-input`, which changes nothing here: the
+            // commands that ask a question all run with the context. An
+            // `Option` is an iterator of zero or one items, so `chain(flag)`
+            // adds the flag only when it is `Some`.
+            for flag in [None, Some("--no-input")] {
+                let cli = Cli::try_parse_from(
+                    std::iter::once("sweepky")
+                        .chain(args.iter().copied())
+                        .chain(flag),
+                )
                 .expect("parses");
-            assert!(run_without_context(&cli).is_none(), "{args:?}");
+                assert!(run_without_context(&cli).is_none(), "{args:?} {flag:?}");
+            }
         }
     }
 

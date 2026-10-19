@@ -233,6 +233,25 @@ pub enum KnownTarget {
     Repo(RepoTarget),
 }
 
+impl KnownTarget {
+    /// The commit the sweep reviews: a pull request's `head`, or the `rev`
+    /// of a commit or repository target. It is the commit `run` checks out
+    /// for the target and the one `submit` records for it in the manifest's
+    /// `targetShas`. A pull request's `base` and `mergeBase` only say where
+    /// its diff starts.
+    // `match self` on a `&KnownTarget` binds each inner view by reference, so
+    // nothing is copied, and the returned `&GitSha` borrows from `self`. No
+    // `_` arm: a kind added later does not compile until someone decides
+    // which of its commits is the reviewed one.
+    pub fn reviewed_commit(&self) -> &GitSha {
+        match self {
+            Self::Pr(pr) => pr.head(),
+            Self::Commit(commit) => commit.rev(),
+            Self::Repo(repo) => repo.rev(),
+        }
+    }
+}
+
 /// A checked pull request target: `{repo, number, base, head, mergeBase}`.
 ///
 /// The sweep covers the diff from `mergeBase` to `head`, which is the
@@ -633,6 +652,17 @@ mod tests {
         let whole = Target::repo(id("t4"), repo(), sha(REV), Vec::new());
         assert_eq!(serde_json::to_value(&whole).unwrap(), whole_repo_json());
         assert_eq!(known_repo(&whole).paths(), None);
+    }
+
+    #[test]
+    fn the_reviewed_commit_is_a_prs_head_and_any_other_targets_rev() {
+        // The `KnownTarget` each call returns is a temporary that lives to
+        // the end of its `assert_eq!`, long enough to borrow the commit from.
+        let known = |target: Target| target.known().unwrap().unwrap();
+        assert_eq!(known(sample_pr()).reviewed_commit().as_str(), HEAD);
+        assert_eq!(known(sample_commit()).reviewed_commit().as_str(), REV);
+        let narrowed = sample_repo(vec![path("src/auth/")]);
+        assert_eq!(known(narrowed).reviewed_commit().as_str(), REV);
     }
 
     #[test]

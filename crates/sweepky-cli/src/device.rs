@@ -2,10 +2,11 @@
 //! encrypted to this install, its public record `keys/<deviceId>.json`, and
 //! [`KeyStore`], the seam that record is read and written through.
 //!
-//! - [`new_device_id`] names a new install's key: a [`RecordId`] made from
-//!   the clock, 13 characters of upper-case Crockford base32, such as
-//!   `0035G87EK4XFE`. That is always a valid [`DeviceId`], and it sorts by
-//!   when the install was made, as every other Sweepky id does.
+//! - [`new_device_id`] names a new install's key: a record id made from the
+//!   clock ([`clock::new_record_id`]), 13 characters of upper-case Crockford
+//!   base32, such as `0035G87EK4XFE`. That is always a valid [`DeviceId`],
+//!   and it sorts by when the install was made, as every other Sweepky id
+//!   does.
 //! - [`device_key_record`] is the record `login` publishes:
 //!   `{"schemaVersion":1,"alg":"age-x25519","recipient":"age1…",
 //!   "label":"sweepky-cli","createdAt":"<RFC 3339>","revokedAt":null}`,
@@ -40,8 +41,8 @@ use pubky::{PubkySession, PublicKey};
 use sweepky_core::paths::{self, SweepkyPath};
 use sweepky_core::{
     AgeRecipient, DeviceId, DeviceIdentity, DeviceKey, DeviceKeyError, ExposeSecret, KnownKeyAlg,
-    MAX_RECORD_BYTES, MAX_WRAPPED_BYTES, RecordId, RecordTime, SchemaVersion, SecretString,
-    Timestamp, UnknownFields, Zeroizing,
+    MAX_RECORD_BYTES, MAX_WRAPPED_BYTES, RecordTime, SchemaVersion, SecretString, UnknownFields,
+    Zeroizing,
 };
 
 use crate::Dirs;
@@ -64,23 +65,16 @@ const MAX_DEVICE_KEY_FILE_BYTES: usize = MAX_WRAPPED_BYTES;
 /// file is a secret, so no message quotes any of it.
 const NOT_A_DEVICE_KEY: &str = "is not a Sweepky device key: one age identity and nothing else";
 
-/// A new device id, from the clock.
-///
-/// `Timestamp::now()` is microseconds since 1970, with its last byte a
-/// random "clock id" that pubky-timestamp picks once per process, so two
-/// installs that start in the same microsecond still differ, and it never
-/// repeats within a process. It panics on a clock set before 1970, so this
-/// function first asks `clock::now()`, which refuses such a clock with a
-/// message instead. The check lives here rather than with each caller, so
-/// that no caller can forget it.
+/// A new device id, from the clock: a new record id
+/// ([`clock::new_record_id`], which checks the clock first) written out, so
+/// two installs never share one and the ids sort by when each install was
+/// made.
 pub(crate) fn new_device_id() -> anyhow::Result<DeviceId> {
-    // Only the check is wanted; the time it reads is dropped.
-    clock::now()?;
-    let id = RecordId::from_timestamp(Timestamp::now());
     // 13 characters of `0-9` and `A-Z` always pass the device-id check, so
     // this cannot fail; the parse still runs the check, and its error is
     // returned rather than unwrapped, because nothing here may panic.
-    id.to_string()
+    clock::new_record_id()?
+        .to_string()
         .parse()
         .context("could not make a device id from the clock")
 }

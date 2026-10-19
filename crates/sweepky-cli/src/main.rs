@@ -8,13 +8,17 @@
 //!    the `--passphrase-file` and builds no network client, and works with
 //!    HOME unset;
 //! 3. for every other command, reads the environment. This file is the only
-//!    place that does, with `std::env::var_os`, and it passes each value in,
-//!    so the library and its tests never depend on the process environment;
+//!    place that does, with `std::env::var_os` and, for the working
+//!    directory, `std::env::current_dir`, and it passes each value in, so
+//!    the library and its tests never depend on the process environment;
 //! 4. resolves the config and data directories ([`Dirs`], from `HOME` or
-//!    `SWEEPKY_HOME`), reads the passphrase when `--passphrase-file` names
-//!    one ([`Passphrase::from_file`]), builds the [`Network`] (production, or
-//!    the local testnet under `--testnet` / `SWEEPKY_TESTNET`) and the
-//!    [`Context`] around them and standard error, then runs the command;
+//!    `SWEEPKY_HOME`), reads the working directory, reads the passphrase when
+//!    `--passphrase-file` names one ([`Passphrase::from_file`]), captures the
+//!    variables git may see ([`GitEnv`]: `PATH` and the proxy and CA
+//!    variables), builds the [`Network`] (production, or the local testnet
+//!    under `--testnet` / `SWEEPKY_TESTNET`) and the [`Context`] around them,
+//!    standard input, standard error and the real [`TargetSource`], then
+//!    runs the command;
 //! 5. prints the command's report, or `error: ...` and exits with status 1.
 //!
 //! `anyhow` is used here and in the library alike: this crate only has to
@@ -36,13 +40,16 @@
     clippy::unreachable
 )]
 
-use std::io::Write;
+use std::io::{BufReader, Write};
 use std::process::ExitCode;
 
+// `as _` brings `.context(...)` into scope without the name `Context`, which
+// is the library's type here.
+use anyhow::Context as _;
 use clap::Parser;
 use sweepky_cli::{
-    Cli, Context, Dirs, Network, Passphrase, Report, StderrWriter, run, run_without_context,
-    select_kind,
+    Cli, Context, Dirs, GitEnv, Network, Passphrase, Report, StderrWriter, StdinReader,
+    TargetSource, run, run_without_context, select_kind,
 };
 
 /// `#[tokio::main]` turns this `async fn main` into an ordinary `fn main`
@@ -87,6 +94,10 @@ async fn execute(cli: Cli) -> anyhow::Result<Report> {
     let home = std::env::var_os("HOME");
     let sweepky_home = std::env::var_os("SWEEPKY_HOME");
     let dirs = Dirs::resolve(home.as_deref(), sweepky_home.as_deref())?;
+    // The working directory, absolute, which `run` and `submit` find their
+    // project from. It fails only when the directory has gone or cannot be
+    // read, and then before anything is done.
+    let cwd = std::env::current_dir().context("could not read the current directory")?;
     // The passphrase, when --passphrase-file names one, also before the
     // network: a missing or unreadable file fails with nothing done. `map`
     // reads it only when the flag is there, and `transpose` turns the
@@ -99,10 +110,22 @@ async fn execute(cli: Cli) -> anyhow::Result<Report> {
     let ctx = Context {
         network: Network::for_kind(kind)?,
         dirs,
+        cwd,
+        // The answers to a command's questions. A `BufReader` around `Stdin`,
+        // because `Stdin` itself is not `BufRead` and its lock is not `Send`
+        // (see `StdinReader::new`).
+        stdin: StdinReader::new(BufReader::new(std::io::stdin())),
         // A command's warnings go straight to standard error, so they appear
         // before it acts; its report goes to standard output at the end.
         stderr: StderrWriter::new(std::io::stderr()),
         passphrase,
+        // The only variables git will see of this environment, read here
+        // so that the library reads none: `capture` asks `var_os` for each
+        // name on its fixed list and keeps the ones that are set.
+        git_env: GitEnv::capture(std::env::var_os),
+        // Real repositories, over https alone. The binary never builds the
+        // fixture source, the one that allows git's `file` transport.
+        targets: TargetSource::Real,
     };
     run(cli, &ctx).await
 }

@@ -224,18 +224,17 @@ fn read_logged_in_identity(
 
 #[cfg(test)]
 mod tests {
-    use std::io::{self, Write};
-    use std::sync::{Arc, Mutex};
+    use std::io;
 
     use anyhow::bail;
     use pubky_testnet::EphemeralTestnet;
 
     use super::{read_logged_in_identity, with_writer_session};
+    use crate::Network;
     use crate::identity::{IdentityMeta, IdentityName, IdentitySecret};
     use crate::passphrase::{NeedsPassphrase, Passphrase};
     use crate::state::{LoginState, create_identity, write_login_state};
-    use crate::test_support::{TEST_PASSPHRASE, dirs_in, private_temp, random_pubky};
-    use crate::{Context, Network, StderrWriter};
+    use crate::test_support::{TEST_PASSPHRASE, dirs_in, private_temp, random_pubky, test_context};
 
     #[test]
     fn wrapped_identity_signs_in_only_with_its_passphrase() {
@@ -269,28 +268,6 @@ mod tests {
         );
     }
 
-    /// A writer the test keeps a handle on: the context writes into it, the
-    /// test reads what was written. `Arc<Mutex<…>>` is shared ownership of
-    /// one buffer, which both sides lock to use.
-    #[derive(Clone, Default)]
-    struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
-
-    impl SharedBuffer {
-        fn text(&self) -> String {
-            String::from_utf8(self.0.lock().expect("lock").clone()).expect("UTF-8")
-        }
-    }
-
-    impl Write for SharedBuffer {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.0.lock().expect("lock").write(bytes)
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
     /// A file under the capability's directory, for the probe writes.
     const PROBE: &str = "/pub/sweepky/session-probe.txt";
 
@@ -303,17 +280,16 @@ mod tests {
             .await
             .expect("testnet starts");
         let temp = private_temp();
-        let stderr = SharedBuffer::default();
-        let ctx = Context {
-            network: Network::injected(
+        // `io::empty()` as standard input: nothing here asks a question.
+        let (ctx, stderr) = test_context(
+            Network::injected(
                 testnet.sdk().expect("client"),
                 format!("{}inbox", testnet.http_relay().local_url()),
                 testnet.homeserver_app().public_key(),
             ),
-            dirs: dirs_in(&temp),
-            stderr: StderrWriter::new(stderr.clone()),
-            passphrase: None,
-        };
+            &temp,
+            io::empty(),
+        );
 
         // Without a login there is no session to open, and the body never
         // runs.

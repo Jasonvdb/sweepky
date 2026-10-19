@@ -6,25 +6,32 @@
 //! There is one test function and it is built up phase by phase: P2a's
 //! steps use the throwaway identity `throwaway` (not A, B or C, because
 //! `logout` deletes the identity it runs on), and P2b to P2d add their steps
-//! for A, B and C after these, without reordering them.
+//! for A, B and C after these, without reordering them. Each identity has a
+//! `SWEEPKY_HOME`, and so a `Context`, of its own, as on separate machines.
 //!
 //! It needs Postgres for the testnet's homeserver, through
 //! `TEST_PUBKY_CONNECTION_STRING`. `#[pubky_testnet::test]` drops the test
 //! databases when the test ends, even when it fails.
 
 use std::fs;
-use std::io::{self, Write};
-use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::io::{self, BufRead, Cursor, Write};
+use std::os::unix::fs::{MetadataExt, symlink};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use clap::Parser;
 use pubky::{ClientId, Keypair, PublicKey};
 use pubky_testnet::EphemeralTestnet;
 use serde_json::{Value, json};
-use sweepky_cli::{CLIENT_ID, Cli, Context, Dirs, Network, Report, StderrWriter, run};
+use sweepky_cli::{
+    CLIENT_ID, Cli, Context, Dirs, FixtureTargets, GitEnv, Network, Report, StderrWriter,
+    StdinReader, TargetSource, run,
+};
 use sweepky_core::{
-    Circle, DeviceIdentity, DeviceKey, MAX_RECORD_BYTES, Pubky, SecretString, Zeroizing,
+    Bounty, BountyRef, Circle, DeviceIdentity, DeviceKey, GitSha, KnownBountyStatus,
+    KnownSweepStatus, KnownTarget, MAX_CIPHERTEXT_BYTES, MAX_RECORD_BYTES, Playbook, Pubky,
+    RecordId, RepoName, RepoPath, SecretString, Sweep, SweepRef, Zeroizing, open_package,
+    parse_audit_findings, paths,
 };
 
 /// What the context writes to standard error, kept where the test can read
@@ -182,12 +189,180 @@ fn identity_seed(key_file: &Path) -> Zeroizing<[u8; 32]> {
     seed
 }
 
+/// The synthetic name the fixture source serves `fixtures/target-repo.git`
+/// under: a host under `example.invalid`, which no resolver answers.
+const FIXTURE_REPO: &str = "example.invalid/sweepky/target-repo";
+
+/// The fixture source the test's targets come from: [`FIXTURE_REPO`] mapped
+/// to `fixtures/target-repo.git`, whose files `tests/fixture_target_repo.rs`
+/// checks are inert. `env!` reads `CARGO_MANIFEST_DIR` when the test is
+/// compiled, so the path holds whatever directory the test runs in.
+fn fixture_targets() -> TargetSource {
+    let repo: RepoName = FIXTURE_REPO.parse().expect("a repo name");
+    let path = fs::canonicalize(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/target-repo.git"),
+    )
+    .expect("the fixture repository");
+    TargetSource::Fixture(FixtureTargets::new([(repo, path)]))
+}
+
+/// The SHA `fixtures/README.md` records for `name`, a commit of the
+/// fixture repository (R, A, B, M, F2, …), in a row of the form
+/// ``| name | `<sha>` | …`` of its `target-repo.git` section. A test binary
+/// cannot call `tests/fixture_target_repo.rs`'s own reader, so this is a
+/// small one of its own; the README stays the one place the SHAs are
+/// written.
+fn recorded_sha(name: &str) -> GitSha {
+    let readme =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/README.md"))
+            .expect("fixtures/README.md");
+    let section = readme
+        .split("\n## ")
+        .find(|section| section.starts_with("`target-repo.git`"))
+        .expect("fixtures/README.md has a `target-repo.git` section");
+    let row = format!("| {name} | `");
+    section
+        .lines()
+        .find_map(|line| line.strip_prefix(row.as_str()))
+        .and_then(|rest| rest.split('`').next())
+        .expect("the README records the commit")
+        .parse()
+        .expect("a SHA")
+}
+
+/// A context for one identity: the testnet's client injected, `home` as
+/// its `SWEEPKY_HOME` and working directory, `stdin` as its standard input,
+/// and the buffer that keeps what it writes to standard error.
+fn context(
+    testnet: &EphemeralTestnet,
+    home: &Path,
+    stdin: impl BufRead + Send + 'static,
+) -> (Context, SharedBuffer) {
+    // `local_url()` ends with `/`, so this is `http://localhost:<port>/inbox`.
+    let relay = format!("{}inbox", testnet.http_relay().local_url());
+    let stderr = SharedBuffer::default();
+    let ctx = Context {
+        network: Network::injected(
+            testnet.sdk().expect("client"),
+            relay,
+            testnet.homeserver_app().public_key(),
+        ),
+        dirs: Dirs::resolve(None, Some(home.as_os_str())).expect("absolute"),
+        cwd: home.to_path_buf(),
+        stdin: StdinReader::new(stdin),
+        // A clone of the handle: the context writes into the buffer the
+        // test reads.
+        stderr: StderrWriter::new(stderr.clone()),
+        // No --passphrase-file: the secret files are written plain, as the
+        // test reads them.
+        passphrase: None,
+        // git is found through this test's PATH, and sees none of the
+        // proxy or CA variables: the targets come from the fixture
+        // repository on this disk.
+        git_env: GitEnv::capture(|name| {
+            if name == "PATH" {
+                std::env::var_os(name)
+            } else {
+                None
+            }
+        }),
+        // Targets from the fixture repository, so nothing reaches a real
+        // repository host.
+        targets: fixture_targets(),
+    };
+    (ctx, stderr)
+}
+
+/// The playbook B's sweeps name: the pinned Cloudflare skill.
+const PLAYBOOK: &str = "cloudflare/security-audit@c1c8a8c";
+
+/// The three files of `fixtures/cloudflare/`, the synthetic run directory
+/// of a Cloudflare-format sweep.
+const CLOUDFLARE_FILES: [&str; 3] = ["REPORT.md", "coverage-ledger.json", "findings.json"];
+
+/// `fixtures/cloudflare/<name>`.
+fn cloudflare_fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/cloudflare")
+        .join(name)
+}
+
+/// The device key of the install whose directories are `dirs`, read from
+/// its plain `device.key` (the test passes no `--passphrase-file`): the
+/// age identity string alone, which goes straight into a `SecretString`.
+fn device_identity(dirs: &Dirs) -> DeviceIdentity {
+    let bytes = Zeroizing::new(fs::read(dirs.device_key_file()).expect("device.key"));
+    let text = std::str::from_utf8(&bytes).expect("UTF-8");
+    DeviceIdentity::from_secret(&SecretString::from(text)).expect("an age identity")
+}
+
+/// The pubky `ctx`'s install is logged in as, from its `login.json`.
+fn logged_in(ctx: &Context) -> Pubky {
+    json(&ctx.dirs.login_file())["pubky"]
+        .as_str()
+        .expect("a pubky")
+        .parse()
+        .expect("a pubky")
+}
+
+/// The ids of the sweep directories in `sweeps`, a project's `sweeps/`.
+fn sweep_ids(sweeps: &Path) -> Vec<RecordId> {
+    fs::read_dir(sweeps)
+        .expect("sweeps/")
+        .map(|entry| {
+            let name = entry.expect("an entry").file_name();
+            name.to_str().expect("UTF-8").parse().expect("a record id")
+        })
+        .collect()
+}
+
+/// Has `ctx` run `bounty` once more in its project, whose `sweeps/` is
+/// `sweeps`, and fills the new sweep's `audit/` from `fixtures/cloudflare/`,
+/// as Cloudflare's skill would leave it. Returns the new sweep's id.
+async fn cloudflare_sweep(ctx: &Context, bounty: &BountyRef, sweeps: &Path) -> RecordId {
+    let before = sweep_ids(sweeps);
+    sweepky(ctx, &["run", &bounty.to_string()])
+        .await
+        .expect("the bounty runs");
+    let id = sweep_ids(sweeps)
+        .into_iter()
+        .find(|id| !before.contains(id))
+        .expect("a new sweep directory");
+    let audit = sweeps.join(id.to_string()).join("audit");
+    fs::create_dir(&audit).expect("audit/");
+    for name in CLOUDFLARE_FILES {
+        fs::copy(cloudflare_fixture(name), audit.join(name)).expect("copy");
+    }
+    id
+}
+
+/// `user`'s sweep record `id`, read anonymously within the record cap.
+async fn read_sweep(testnet: &EphemeralTestnet, user: &PublicKey, id: RecordId) -> Sweep {
+    let record = get_capped(testnet, user, &paths::sweep_record(id), MAX_RECORD_BYTES).await;
+    Sweep::from_json(&record).expect("a sweep record")
+}
+
+/// Whether anyone can see `user`'s package of the sweep `id`.
+async fn package_exists(testnet: &EphemeralTestnet, user: &PublicKey, id: RecordId) -> bool {
+    testnet
+        .sdk()
+        .expect("client")
+        .public_storage()
+        .exists((user, paths::sweep_package(id).as_str()))
+        .await
+        .expect("the path is public")
+}
+
 /// A signup token in a form the homeserver rejects (400) before it looks at
 /// anything else, so a `login` that sent a signup with it would fail. Passed
 /// where `login` must not sign up, it proves that no signup was sent.
 const TRIPWIRE_TOKEN: &str = "not-a-signup-code";
 
-#[tokio::test]
+// `multi_thread`: tokio's runtime with worker threads, the kind
+// `#[tokio::main]` builds for the binary, rather than `#[tokio::test]`'s
+// default of one thread, so the two `submit`s P2b runs at once run as they
+// would in the binary.
+#[tokio::test(flavor = "multi_thread")]
 #[pubky_testnet::test]
 async fn end_to_end() {
     let testnet = EphemeralTestnet::builder()
@@ -196,20 +371,12 @@ async fn end_to_end() {
         .await
         .expect("the testnet starts");
     let homeserver = testnet.homeserver_app().public_key();
-    // `local_url()` ends with `/`, so this is `http://localhost:<port>/inbox`.
-    let relay = format!("{}inbox", testnet.http_relay().local_url());
 
-    // SWEEPKY_HOME for this test: a fresh directory that deletes itself.
+    // SWEEPKY_HOME for the throwaway identity: a fresh directory that
+    // deletes itself. An empty standard input: P2a's commands ask nothing,
+    // and a question would read the end of the input, which is no.
     let home = tempfile::tempdir().expect("temp dir");
-    let stderr = SharedBuffer::default();
-    let ctx = Context {
-        network: Network::injected(testnet.sdk().expect("client"), relay, homeserver.clone()),
-        dirs: Dirs::resolve(None, Some(home.path().as_os_str())).expect("absolute"),
-        stderr: StderrWriter::new(stderr.clone()),
-        // No --passphrase-file: the secret files are written plain, as the
-        // test reads them.
-        passphrase: None,
-    };
+    let (ctx, stderr) = context(&testnet, home.path(), io::empty());
     // The test looks at the files through the context's own `Dirs`.
     let dirs = &ctx.dirs;
 
@@ -641,4 +808,563 @@ async fn end_to_end() {
         .expect_err("no login any more");
     assert!(format!("{err:#}").contains("not logged in"), "{err:#}");
     assert_eq!(stderr.text(), "", "nothing on standard error");
+
+    // ----- P2b: A posts a closed bounty for a circle that holds B -----
+
+    // A, the owner, and B, a member of A's circle, each with a SWEEPKY_HOME
+    // of their own. A answers yes to the one question `post` asks; B is
+    // asked nothing.
+    let a_home = tempfile::tempdir().expect("temp dir");
+    let (a, a_stderr) = context(&testnet, a_home.path(), Cursor::new(b"y\n".to_vec()));
+    let b_home = tempfile::tempdir().expect("temp dir");
+    // `mut`: B's working directory becomes its project before `run`.
+    let (mut b, b_stderr) = context(&testnet, b_home.path(), io::empty());
+    sweepky(&a, &["login", "--identity", "a"])
+        .await
+        .expect("A logs in");
+    sweepky(&b, &["login", "--identity", "b"])
+        .await
+        .expect("B logs in");
+    let a_pubky = logged_in(&a);
+    let b_pubky = logged_in(&b);
+    let a_user = PublicKey::try_from_z32(&a_pubky.to_string()).expect("a key");
+
+    // A's circle, with B in it, as anyone reads it.
+    sweepky(&a, &["circle", "create", "A's circle"])
+        .await
+        .expect("circle create");
+    sweepky(&a, &["circle", "add", &b_pubky.to_string(), "--label", "B"])
+        .await
+        .expect("circle add");
+    let roster = get_capped(
+        &testnet,
+        &a_user,
+        "/pub/sweepky/circle.json",
+        MAX_RECORD_BYTES,
+    )
+    .await;
+    let roster = Circle::from_json(&roster).expect("a circle record");
+    assert_eq!(roster.admin, a_pubky);
+    assert!(roster.is_in_roster(b_pubky));
+
+    // The draft A's agent would write, in a file of its own: one target of
+    // each kind in the fixture repository.
+    const TITLE: &str = "Session handling in the fixture repository";
+    const BRIEF: &str = "Look at how sessions expire and are revoked.\n\n- `session.rs`\n";
+    let drafts = tempfile::tempdir().expect("temp dir");
+    let draft = drafts.path().join("bounty.json");
+    let draft_json = json!({
+        "title": TITLE,
+        "brief": BRIEF,
+        "playbook": "cloudflare/security-audit@c1c8a8c",
+        "targets": [
+            { "kind": "repo", "repo": FIXTURE_REPO, "ref": "main", "paths": ["src/auth/"] },
+            { "kind": "commit", "repo": FIXTURE_REPO, "ref": "main" },
+            { "kind": "pr", "repo": FIXTURE_REPO, "number": 1 },
+        ],
+    });
+    fs::write(&draft, serde_json::to_vec(&draft_json).expect("JSON")).expect("written");
+
+    let report = sweepky(&a, &["post", draft.to_str().expect("a UTF-8 path")])
+        .await
+        .expect("A posts the bounty");
+
+    // A was shown the bounty and asked once; B, nothing.
+    let shown = a_stderr.text();
+    assert!(shown.contains(&format!("  Title: {TITLE}\n")), "{shown}");
+    assert_eq!(shown.matches("[y/N] ").count(), 1, "{shown}");
+    assert_eq!(b_stderr.text(), "", "B is asked nothing");
+    // The report's last line is the bounty's URL, under A's own pubky.
+    let url = report.text().lines().last().expect("a report");
+    let posted: BountyRef = url.parse().expect("a bounty URL");
+    assert_eq!(posted.owner, a_pubky);
+
+    // Anyone can read the bounty, closed and open for sweeps, every target
+    // pinned to the fixture's SHAs: the repo at M narrowed to `src/auth/`,
+    // the commit M, and pull request 1 based on M with head F2, the two
+    // meeting at B.
+    let record = get_capped(
+        &testnet,
+        &a_user,
+        &paths::bounty(posted.id),
+        MAX_RECORD_BYTES,
+    )
+    .await;
+    let bounty = Bounty::from_json(&record).expect("a bounty record");
+    assert!(!bounty.open, "a closed bounty");
+    assert_eq!(bounty.status().as_known(), Some(KnownBountyStatus::Open));
+    assert_eq!(
+        (bounty.title.as_str(), bounty.brief.as_str()),
+        (TITLE, BRIEF)
+    );
+    let targets: Vec<KnownTarget> = bounty
+        .targets
+        .iter()
+        .map(|target| target.known().expect("well formed").expect("a known kind"))
+        .collect();
+    let [
+        KnownTarget::Repo(narrowed),
+        KnownTarget::Commit(commit),
+        KnownTarget::Pr(pr),
+    ] = targets.as_slice()
+    else {
+        panic!("a repo, a commit and a pr target: {targets:?}");
+    };
+    let (m, f2, b_sha) = (recorded_sha("M"), recorded_sha("F2"), recorded_sha("B"));
+    assert_eq!(narrowed.rev(), &m);
+    assert_eq!(
+        narrowed
+            .paths()
+            .map(|paths| paths.iter().map(RepoPath::as_str).collect::<Vec<_>>()),
+        Some(vec!["src/auth/"])
+    );
+    assert_eq!(commit.rev(), &m);
+    assert_eq!(pr.number().get(), 1);
+    assert_eq!((pr.base(), pr.head(), pr.merge_base()), (&m, &f2, &b_sha));
+
+    // ----- P2b: B runs A's bounty in an init project -----
+
+    // B's project, made by the minimal `init`; B then works in it, as
+    // `run` must be run in the project's own directory.
+    let b_projects = tempfile::tempdir().expect("temp dir");
+    let project = b_projects.path().join("project");
+    sweepky(&b, &["init", project.to_str().expect("a UTF-8 path")])
+        .await
+        .expect("B's init");
+    b.cwd = project.clone();
+
+    let report = sweepky(&b, &["run", &posted.to_string()])
+        .await
+        .expect("B runs A's bounty");
+
+    // B was shown why it may run the bounty, and the report says what to
+    // run next. One sweep directory, named by the sweep's id.
+    let shown = b_stderr.text();
+    assert!(shown.contains(&format!("Bounty {posted}\n")), "{shown}");
+    assert!(
+        shown.contains("Closed: you are in its owner's circle"),
+        "{shown}"
+    );
+    let sweeps = project.join("sweeps");
+    let ids: Vec<String> = fs::read_dir(&sweeps)
+        .expect("sweeps/")
+        .map(|entry| {
+            entry
+                .expect("an entry")
+                .file_name()
+                .into_string()
+                .expect("UTF-8")
+        })
+        .collect();
+    let [id] = ids.as_slice() else {
+        panic!("one sweep directory: {ids:?}");
+    };
+    let sweep = SweepRef {
+        sweeper: b_pubky,
+        id: id.parse::<RecordId>().expect("a record id"),
+    };
+    let text = report.text();
+    for next in [
+        "claude --setting-sources project,local".to_owned(),
+        "/sweepky".to_owned(),
+        format!("sweepky submit --run-dir sweeps/{id}"),
+    ] {
+        assert!(text.contains(&next), "{next} not in {text}");
+    }
+
+    // Anyone can read B's sweep record: running, for A's bounty, with all
+    // three targets, and the placeholder playbook, since B's `init`
+    // recorded none.
+    let b_user = PublicKey::try_from_z32(&b_pubky.to_string()).expect("a key");
+    let record = get_capped(
+        &testnet,
+        &b_user,
+        &paths::sweep_record(sweep.id),
+        MAX_RECORD_BYTES,
+    )
+    .await;
+    let record = Sweep::from_json(&record).expect("a sweep record");
+    assert_eq!(record.status.as_known(), Some(KnownSweepStatus::Running));
+    assert_eq!(record.bounty, posted);
+    let target_ids: Vec<&str> = record.targets.iter().map(|id| id.as_str()).collect();
+    assert_eq!(target_ids, ["t1", "t2", "t3"]);
+    assert_eq!(record.playbook.as_str(), "unspecified");
+    assert_eq!(record.finished_at, None);
+
+    // Each target holds its pinned commit, checked out detached, so
+    // `.git/HEAD` is the SHA itself: the repo and the commit target at M,
+    // the pull request at its head F2.
+    // The fixture's planted agent files are gone from each, and scope.json
+    // lists them for that target.
+    let planted = [
+        ".claude/",
+        ".mcp.json",
+        "AGENTS.md",
+        "CLAUDE.local.md",
+        "CLAUDE.md",
+        "src/auth/CLAUDE.md",
+    ];
+    let sweep_dir = sweeps.join(id);
+    let scope = json(&sweep_dir.join("scope.json"));
+    for (index, (tid, commit)) in [("t1", &m), ("t2", &m), ("t3", &f2)]
+        .into_iter()
+        .enumerate()
+    {
+        let target = sweep_dir.join("target").join(tid);
+        assert_eq!(
+            fs::read_to_string(target.join(".git/HEAD")).expect("HEAD"),
+            format!("{commit}\n"),
+            "{tid}"
+        );
+        assert_eq!(scope["targets"][index]["id"], tid);
+        assert_eq!(scope["targets"][index]["stripped"], json!(planted), "{tid}");
+        for relative in planted {
+            assert_gone(&target.join(relative));
+        }
+    }
+
+    // The per-sweep marker names the sweep and the bounty.
+    let marker = json(&sweep_dir.join(".sweepky/sweep.json"));
+    assert_eq!(marker["sweep"], sweep.to_string());
+    assert_eq!(marker["bounty"], posted.to_string());
+    assert_eq!(marker["targets"], json!(["t1", "t2", "t3"]));
+
+    // What B fetched, kept under B's data directory, out of the agent's
+    // reach, 0600: what B's submit takes the manifest's commits from.
+    let snapshot_file = b.dirs.data().join(format!("sweeps/{id}.json"));
+    assert_eq!(mode(&snapshot_file), 0o600);
+
+    // ----- P2b: B submits a Cloudflare-format sweep -----
+
+    // What the agent leaves, Cloudflare's skill having written its output
+    // into audit/: the synthetic Cloudflare run directory.
+    let audit = sweep_dir.join("audit");
+    fs::create_dir(&audit).expect("audit/");
+    for name in CLOUDFLARE_FILES {
+        fs::copy(cloudflare_fixture(name), audit.join(name)).expect("copy");
+    }
+    let submit_args = [
+        "submit",
+        "--run-dir",
+        &format!("sweeps/{id}"),
+        "--playbook",
+        PLAYBOOK,
+    ];
+
+    // A rewrites t1's pinned revision, M, to F2 after B fetched it, with
+    // A's own root key, as A's homeserver could too. B's submit refuses:
+    // its manifest would say F2 was swept. Nothing is published, and the
+    // snapshot stays for the next try.
+    let as_posted: Value = serde_json::from_slice(
+        &get_capped(
+            &testnet,
+            &a_user,
+            &paths::bounty(posted.id),
+            MAX_RECORD_BYTES,
+        )
+        .await,
+    )
+    .expect("JSON");
+    let mut rewritten = as_posted.clone();
+    rewritten["targets"][0]["rev"] = json!(f2.as_str());
+    let a_key_file = a.dirs.config().join("identities/a.key");
+    publish_as(&testnet, &a_key_file, &paths::bounty(posted.id), &rewritten).await;
+    let error = sweepky(&b, &submit_args)
+        .await
+        .expect_err("the bounty changed since the run");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("the bounty's targets changed since this sweep was run"),
+        "{message}"
+    );
+    assert!(!package_exists(&testnet, &b_user, sweep.id).await);
+    assert_eq!(
+        read_sweep(&testnet, &b_user, sweep.id)
+            .await
+            .status
+            .as_known(),
+        Some(KnownSweepStatus::Running)
+    );
+    assert_eq!(mode(&snapshot_file), 0o600);
+
+    // A puts the bounty back as posted, and B's submit goes through.
+    publish_as(&testnet, &a_key_file, &paths::bounty(posted.id), &as_posted).await;
+    let report = sweepky(&b, &submit_args)
+        .await
+        .expect("B submits the sweep");
+    assert!(
+        report.text().contains(&sweep.to_string()),
+        "{}",
+        report.text()
+    );
+    // B was shown the conversion and the packaged files, and asked
+    // nothing: this is B's first submit to A, so A's keys are pinned
+    // without a word.
+    let shown = b_stderr.text();
+    assert!(shown.contains("Cloudflare's format"), "{shown}");
+    for name in CLOUDFLARE_FILES {
+        assert!(shown.contains(&format!("  audit/{name} (")), "{shown}");
+    }
+    assert!(!shown.contains("[y/N]"), "{shown}");
+
+    // Anyone can read B's sweep record: done, finished, with the playbook
+    // given.
+    let record = get_capped(
+        &testnet,
+        &b_user,
+        &paths::sweep_record(sweep.id),
+        MAX_RECORD_BYTES,
+    )
+    .await;
+    let record = Sweep::from_json(&record).expect("a sweep record");
+    assert_eq!(record.status.as_known(), Some(KnownSweepStatus::Done));
+    assert!(record.finished_at.is_some());
+    assert_eq!(record.playbook.as_str(), PLAYBOOK);
+
+    // Anyone can download the package, within the cap a reader applies;
+    // A's device key opens it, and its findings are the fixture's,
+    // converted.
+    let sealed = get_capped(
+        &testnet,
+        &b_user,
+        &paths::sweep_package(sweep.id),
+        MAX_CIPHERTEXT_BYTES,
+    )
+    .await;
+    let a_device = device_identity(&a.dirs);
+    let package = open_package(&sealed, &a_device, &sweep, &record).expect("A opens B's sweep");
+    let playbook: Playbook = PLAYBOOK.parse().expect("a playbook");
+    let fixture = fs::read(cloudflare_fixture("findings.json")).expect("the fixture");
+    let (expected, _) = parse_audit_findings(&fixture, &playbook).expect("findings");
+    // `assert!` rather than `assert_eq!`, so a failure prints no finding.
+    assert!(package.findings == expected, "the findings differ");
+    assert_eq!(package.manifest.sweeper, b_pubky);
+    assert_eq!(package.manifest.bounty, posted);
+
+    // B's pin of A's keys: A's one install, its device id and its key, in
+    // a 0600 file.
+    let pins_file = b.dirs.config().join("owner-keys.json");
+    assert_eq!(mode(&pins_file), 0o600);
+    assert_eq!(
+        json(&pins_file),
+        json!({
+            "schemaVersion": 1,
+            "owners": {
+                a_pubky.to_string(): [{
+                    "deviceId": json(&a.dirs.login_file())["deviceId"],
+                    "recipient": a_device.recipient().to_string(),
+                }],
+            },
+        })
+    );
+    // The sweep directory is stamped as submitted, and the snapshot of the
+    // fetch is gone, the record being final.
+    assert!(sweep_dir.join(".sweepky/submitted").is_file());
+    assert_gone(&snapshot_file);
+
+    // ----- P2b: a second run, with links planted in its audit/ -----
+
+    sweepky(&b, &["run", &posted.to_string()])
+        .await
+        .expect("B runs A's bounty again");
+    let run2_id = fs::read_dir(&sweeps)
+        .expect("sweeps/")
+        .map(|entry| {
+            entry
+                .expect("an entry")
+                .file_name()
+                .into_string()
+                .expect("UTF-8")
+        })
+        .find(|name| name != id)
+        .expect("a second sweep directory");
+    let run2: RecordId = run2_id.parse().expect("a record id");
+    let run2_audit = sweeps.join(&run2_id).join("audit");
+    fs::create_dir(&run2_audit).expect("audit/");
+    fs::copy(
+        cloudflare_fixture("findings.json"),
+        run2_audit.join("findings.json"),
+    )
+    .expect("copy");
+    // A hard link to B's login.json and a symbolic link to B's device key.
+    // The project and B's SWEEPKY_HOME are both under the system's temp
+    // directory, so on one filesystem, where a hard link can be made.
+    let b_config = b.dirs.config();
+    fs::hard_link(
+        b_config.join("login.json"),
+        run2_audit.join("planted-hard-link"),
+    )
+    .expect("a hard link");
+    symlink(b.dirs.device_key_file(), run2_audit.join("planted-symlink")).expect("a symlink");
+    let pins_before = fs::read(&pins_file).expect("the pins");
+    let run2_args = [
+        "submit",
+        "--run-dir",
+        &format!("sweeps/{run2_id}"),
+        "--playbook",
+        PLAYBOOK,
+    ];
+
+    // The walk stops at the first entry it refuses, in name order: the
+    // hard link, then, once that is gone, the symbolic link.
+    for (planted, what) in [
+        ("planted-hard-link", "hard links"),
+        ("planted-symlink", "a symbolic link"),
+    ] {
+        let error = sweepky(&b, &run2_args).await.expect_err("refused");
+        let message = format!("{error:#}");
+        assert!(message.contains(&format!("audit/{planted}")), "{message}");
+        assert!(message.contains(what), "{message}");
+        fs::remove_file(run2_audit.join(planted)).expect("remove the planted link");
+    }
+
+    // Nothing of run 2 reached B's storage, its record still says running,
+    // and B's pins are as they were.
+    let exists = testnet
+        .sdk()
+        .expect("client")
+        .public_storage()
+        .exists((&b_user, paths::sweep_package(run2).as_str()))
+        .await
+        .expect("the path is public");
+    assert!(!exists, "run 2's package was uploaded");
+    let record = get_capped(
+        &testnet,
+        &b_user,
+        &paths::sweep_record(run2),
+        MAX_RECORD_BYTES,
+    )
+    .await;
+    let record = Sweep::from_json(&record).expect("a sweep record");
+    assert_eq!(record.status.as_known(), Some(KnownSweepStatus::Running));
+    assert_eq!(fs::read(&pins_file).expect("the pins"), pins_before);
+
+    // ----- P2b: a key added under A's keys/ makes B's next submit warn -----
+
+    // A second key under A's keys/, written with A's own root key, standing
+    // in for an operator of A's homeserver or someone holding A's grant.
+    // Its identity is made for this run, and its secret is written nowhere.
+    let added_id = "added-by-the-test";
+    let added_key = DeviceIdentity::generate();
+    publish_as(
+        &testnet,
+        &a.dirs.config().join("identities/a.key"),
+        &format!("/pub/sweepky/keys/{added_id}.json"),
+        &json!({
+            "schemaVersion": 1,
+            "alg": "age-x25519",
+            "recipient": added_key.recipient().to_string(),
+            "label": "added by the test",
+            "createdAt": "2026-10-19T09:00:00Z",
+            "revokedAt": null,
+        }),
+    )
+    .await;
+    let a_recipient = a_device.recipient().to_string();
+    let added_recipient = added_key.recipient().to_string();
+
+    // Run 2, its planted links gone, now holds Cloudflare's output.
+    for name in CLOUDFLARE_FILES {
+        fs::copy(cloudflare_fixture(name), run2_audit.join(name)).expect("copy");
+    }
+
+    // Under --no-input, B's submit of run 2 fails on the new key. The
+    // warning is the error, which the binary prints on standard error: it
+    // names the new record by its device id and holds no key.
+    // `String::split_off` keeps what was said from `mark` on.
+    let mark = b_stderr.text().len();
+    let no_input_args = [&run2_args[..], &["--no-input"]].concat();
+    let error = sweepky(&b, &no_input_args)
+        .await
+        .expect_err("--no-input refuses a new key");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains(&format!("keys/{added_id}.json")),
+        "{message}"
+    );
+    assert!(message.contains("--no-input"), "{message}");
+    let shown = b_stderr.text().split_off(mark);
+    for recipient in [&a_recipient, &added_recipient] {
+        assert!(!message.contains(recipient.as_str()), "{message}");
+        assert!(!shown.contains(recipient.as_str()), "{shown}");
+    }
+    // Nothing was uploaded, the record still says running and the pin is
+    // as it was.
+    assert!(!package_exists(&testnet, &b_user, run2).await);
+    assert_eq!(
+        read_sweep(&testnet, &b_user, run2).await.status.as_known(),
+        Some(KnownSweepStatus::Running)
+    );
+    assert_eq!(fs::read(&pins_file).expect("the pins"), pins_before);
+
+    // The same submit answered yes: B is warned and asked once, and goes
+    // on. B's context is `mut`, so its standard input can be given the
+    // answer.
+    b.stdin = StdinReader::new(Cursor::new(b"y\n".to_vec()));
+    let mark = b_stderr.text().len();
+    sweepky(&b, &run2_args)
+        .await
+        .expect("B submits run 2 after a yes");
+    let shown = b_stderr.text().split_off(mark);
+    assert!(
+        shown.contains("warning: the bounty's owner has keys"),
+        "{shown}"
+    );
+    assert!(shown.contains(&format!("keys/{added_id}.json")), "{shown}");
+    assert_eq!(shown.matches("[y/N] ").count(), 1, "{shown}");
+    for recipient in [&a_recipient, &added_recipient] {
+        assert!(!shown.contains(recipient.as_str()), "{shown}");
+    }
+    let record = read_sweep(&testnet, &b_user, run2).await;
+    assert_eq!(record.status.as_known(), Some(KnownSweepStatus::Done));
+    assert!(package_exists(&testnet, &b_user, run2).await);
+
+    // B's pin, still 0600, now holds both of A's keys, in device-id order.
+    assert_eq!(mode(&pins_file), 0o600);
+    let a_device_id = json(&a.dirs.login_file())["deviceId"]
+        .as_str()
+        .expect("a device id")
+        .to_owned();
+    // The two recipients move into the pairs: this is their last use.
+    let mut a_keys = [
+        (a_device_id, a_recipient),
+        (added_id.to_owned(), added_recipient),
+    ];
+    a_keys.sort();
+    let a_keys: Vec<Value> = a_keys
+        .iter()
+        .map(|(id, recipient)| json!({ "deviceId": id, "recipient": recipient }))
+        .collect();
+    assert_eq!(
+        json(&pins_file),
+        json!({ "schemaVersion": 1, "owners": { a_pubky.to_string(): a_keys } })
+    );
+
+    // ----- P2b: two submits of two separate runs, at the same time -----
+
+    // Runs 3 and 4, each holding Cloudflare's output.
+    let run3 = cloudflare_sweep(&b, &posted, &sweeps).await;
+    let run4 = cloudflare_sweep(&b, &posted, &sweeps).await;
+    let (run3_dir, run4_dir) = (format!("sweeps/{run3}"), format!("sweeps/{run4}"));
+    let run3_args = ["submit", "--run-dir", &run3_dir, "--playbook", PLAYBOOK];
+    let run4_args = ["submit", "--run-dir", &run4_dir, "--playbook", PLAYBOOK];
+
+    // `tokio::join!` polls both submits in this one task until both are
+    // done, so each goes on while the other waits on the network or on the
+    // writers' lock. Both only borrow B's context (`&b`), and any number of
+    // shared borrows can be alive at once. Each takes the lock with its own
+    // open of `credential.lock`, so the two exclude each other as two
+    // processes would; that the lock serialises them is P2a's lock test.
+    let mark = b_stderr.text().len();
+    let (third, fourth) = tokio::join!(sweepky(&b, &run3_args), sweepky(&b, &run4_args));
+    third.expect("run 3 is submitted");
+    fourth.expect("run 4 is submitted");
+    // Neither asked a question: A's keys are as pinned.
+    let shown = b_stderr.text().split_off(mark);
+    assert!(!shown.contains("[y/N]"), "{shown}");
+    for run in [run3, run4] {
+        let record = read_sweep(&testnet, &b_user, run).await;
+        assert_eq!(record.status.as_known(), Some(KnownSweepStatus::Done));
+        assert!(package_exists(&testnet, &b_user, run).await);
+    }
 }
