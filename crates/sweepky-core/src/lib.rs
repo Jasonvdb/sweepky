@@ -93,7 +93,12 @@
 //!   re-fetches. The feed is only a hint from that homeserver, so the parse
 //!   is bounded: a body over [`MAX_FEED_BODY_BYTES`] is a
 //!   [`FeedError::TooLarge`], and a line over [`MAX_FEED_LINE_BYTES`] is
-//!   malformed.
+//!   malformed. (P2c) [`parse_event_stream`] reads one non-live
+//!   `/events-stream` answer, which `post --open` asks of the owner's
+//!   homeserver for its starting cursor, into a [`StreamPage`] of
+//!   [`StreamEvent`]s, each a [`FeedOp`], a [`PubkyUrl`] and the event's
+//!   [`EventCursor`], skipping and counting every malformed event, under the
+//!   same line cap and its own [`MAX_EVENT_STREAM_BODY_BYTES`].
 //! - Keys (P1b): [`DeviceIdentity`], this install's secret age key, which
 //!   can be generated, give its recipient, and be turned into and read back
 //!   from a [`SecretString`]; [`AgeRecipient`], a public `age1…` key read
@@ -264,7 +269,8 @@ pub use crypto::{
 };
 pub use error::{JsonCategory, RecordError};
 pub use feed::{
-    FeedError, FeedEvent, FeedOp, FeedPage, MAX_FEED_BODY_BYTES, MAX_FEED_LINE_BYTES, parse_feed,
+    FeedError, FeedEvent, FeedOp, FeedPage, MAX_EVENT_STREAM_BODY_BYTES, MAX_FEED_BODY_BYTES,
+    MAX_FEED_LINE_BYTES, StreamEvent, StreamPage, parse_event_stream, parse_feed,
 };
 pub use findings::{
     CloudflareField, Confidence, ConvertError, Finding, FindingStatus, Findings, FindingsSource,
