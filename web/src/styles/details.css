@@ -1,0 +1,141 @@
+/*
+ * The bounty and sweep pages (04, Views): targets, the sweeper timeline,
+ * credited sweepers and a sweep's fields. The open marker, trust badge,
+ * door and destructive mark come from board.css and base.css; this sheet
+ * lays them out. Rows wrap and pubkys break anywhere, so a 52-character key
+ * or a long SHA never pushes a 375 px page sideways.
+ */
+
+.details h1 {
+  margin: 0 0 0.75rem;
+}
+
+.details__meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.25rem 0.75rem;
+  margin: 0 0 1rem;
+  color: var(--muted-foreground);
+  font-size: 0.875rem;
+}
+
+.details__none {
+  margin: 0;
+  color: var(--muted-foreground);
+  font-size: 0.875rem;
+}
+
+.details__section {
+  margin-top: 2rem;
+}
+
+.details__section h2 {
+  margin: 0 0 0.75rem;
+  font-size: 1.25rem;
+}
+
+.details__absent {
+  max-width: 40rem;
+}
+
+/* A term above its value: one column, so long values wrap instead of
+   squeezing a second one. */
+.details__fields,
+.target__pin {
+  display: grid;
+  gap: 0.125rem;
+  margin: 0;
+  min-width: 0;
+}
+
+.details__fields dt,
+.target__pin dt {
+  margin-top: 0.5rem;
+  color: var(--muted-foreground);
+  font-size: 0.8125rem;
+}
+
+.details__fields dd,
+.target__pin dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+/* The owner's brief as plain text: their line breaks kept, nothing parsed. */
+.bounty-brief {
+  max-width: 48rem;
+  margin: 1rem 0 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.target-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 20rem), 1fr));
+  gap: 1rem;
+}
+
+.target {
+  display: grid;
+  gap: 0.75rem;
+  align-content: start;
+  min-width: 0;
+}
+
+.target__heading {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.target__link {
+  margin: 0;
+  font-size: 0.875rem;
+}
+
+.timeline,
+.target__sweeps,
+.credited {
+  display: grid;
+  gap: 0.625rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.timeline__item,
+.target-sweep,
+.credited__item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.25rem 0.625rem;
+  min-width: 0;
+  font-size: 0.875rem;
+}
+
+.timeline__item .pubky,
+.target-sweep .pubky {
+  flex-basis: 100%;
+}
+
+.timeline__finished {
+  color: var(--muted-foreground);
+}
+
+.sweep-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  font-weight: 600;
+}
+
+/* Struck: the word, beside base.css's destructive mark. */
+.sweep-status--aborted .sweep-status__label {
+  text-decoration: line-through;
+}
+
+.sweep-status--left .sweep-status__label,
+.sweep-status--unrecognised .sweep-status__label {
+  color: var(--muted-foreground);
+}

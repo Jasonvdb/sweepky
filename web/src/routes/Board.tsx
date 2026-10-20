@@ -7,7 +7,7 @@
 // circle selected, or the admin unreachable, worded and marked as the
 // Circle page marks an unreachable member.
 
-import { useEffect, useId, useState, type ReactNode } from 'react'
+import { useId, type ReactNode } from 'react'
 import { useBoard } from '../App.tsx'
 import { BountyLink } from '../components/BountyLink.tsx'
 import { CircleLink } from '../components/CircleLink.tsx'
@@ -16,6 +16,7 @@ import { IntroStrip } from '../components/IntroStrip.tsx'
 import { RecordTime } from '../components/RecordTime.tsx'
 import { Ticker } from '../components/Ticker.tsx'
 import { TrustBadge } from '../components/TrustBadge.tsx'
+import { useClock } from '../components/useClock.ts'
 import {
   boardStatus,
   floorPlan,
@@ -28,23 +29,6 @@ import {
   type SweepView,
 } from '../store/selectors.ts'
 import { bountyKey, sweepKey } from '../store/state.ts'
-
-/**
- * How often the board's clock moves on, so a sweep fades to "left" and
- * "today" rolls over without a new record. Not motion: nothing animates on
- * a tick, the views are only derived again.
- */
-const CLOCK_TICK_MS = 60_000
-
-/** The time the views are derived at, moving on every CLOCK_TICK_MS. */
-function useClock(): number {
-  const [now, setNow] = useState(Date.now)
-  useEffect(() => {
-    const timer = setInterval(() => setNow(Date.now()), CLOCK_TICK_MS)
-    return () => clearInterval(timer)
-  }, [])
-  return now
-}
 
 export function Board() {
   const now = useClock()
