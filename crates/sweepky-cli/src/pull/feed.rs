@@ -26,17 +26,28 @@
 //!    owner sees what the first discovered: its own cursor may start past
 //!    those events. The tag is kept only once every sweep the file lists is
 //!    settled, so a file with sweeps still to confirm is read whole again
-//!    next run. Then the poll state is written.
+//!    next run. While tags are sent, a file read whole whose tag is kept
+//!    now lowers each local cursor it gives a lower one for (step 2), stored
+//!    before the poll state. Then the poll state is written.
 //! 2. **Where each watched homeserver's feed starts** ([`Start`]): at the
 //!    local cursor; else at the lowest cursor the open bounties'
 //!    `discovered.json` give it; else at its head, found by
-//!    `events::find_head`, with a warning. A start that did not come from
-//!    the local file is stored there at once, so the next run starts from
-//!    it even if this one reads no page of that feed. There is one cursor
-//!    per owner and homeserver, not per bounty: a sweep record names its
-//!    bounty, so reading from the lowest start serves every open bounty on
-//!    that homeserver, and no sweep can name a bounty from before it
-//!    existed.
+//!    `events::find_head`, with a warning. A local cursor is lowered first
+//!    to a lower one a file of step 1 gives, as `post --open` lowers it for
+//!    a new bounty, so a lowering it never stored (it stopped after its
+//!    `discovered.json` PUT), or another install's newer open bounty, is
+//!    caught up with. Only once a file: the next run takes its 304. A file
+//!    read whole every run (no tag sent, or none kept while a listed sweep
+//!    waits) lowers nothing, as the files' cursors lag behind the local ones
+//!    (`pull::discovered` rewrites a file only when its sweeps change), and
+//!    lowering to the same one every run would read the same pages every
+//!    run. Lowering costs a re-read, which accepts nothing twice. A start
+//!    that did not come from the local file is stored there at once, so the
+//!    next run starts from it even if this one reads no page of that feed.
+//!    There is one cursor per owner and homeserver, not per bounty: a sweep
+//!    record names its bounty, so reading from the lowest start serves
+//!    every open bounty on that homeserver, and no sweep can name a bounty
+//!    from before it existed.
 //! 3. **Each feed, a batch at a time**: a page of up to [`FEED_PAGE_SIZE`]
 //!    events, at most [`MAX_FEED_PAGES_PER_RUN`] pages a run. A page with
 //!    more events than asked for is refused by the events seam; one with no
@@ -158,9 +169,9 @@ const CURSOR_NOT_FORWARD: &str = "the homeserver's cursor did not move past the 
 
 /// Why a feed stops when its cursor in the local file is no longer the one
 /// this run read from.
-const CURSOR_MOVED: &str = "its cursor in feed-cursors.json changed while pull read it, as \
-                            another pull or a post --open changes it; pull goes on from there \
-                            next time";
+const CURSOR_MOVED: &str = "its cursor in feed-cursors.json changed while pull read it, which no \
+                            sweepky command does while pull holds the pull lock; pull goes on \
+                            from there next time";
 
 /// What the watcher says when the poll state's file has no room for what a
 /// step of it read: the step is dropped, and nothing more is read.
@@ -295,10 +306,11 @@ where
         poll_state_full: false,
         found: FeedWatch::default(),
     };
-    // Read once, for both questions it answers: whether a kept tag may be
-    // sent (`read_discovered`), and where each feed starts (`starts`).
-    let local = FeedCursors::read(dirs, owner)?;
-    let listed = watcher.read_discovered(&local, watch_list).await?;
+    // Read once, for the questions it answers: whether a kept tag may be
+    // sent and which cursors a file read whole lowers (`read_discovered`),
+    // and where each feed starts (`starts`).
+    let mut local = FeedCursors::read(dirs, owner)?;
+    let listed = watcher.read_discovered(&mut local, watch_list).await?;
     // With no room for what the listings added, a feed's would have none
     // either, so no feed is read.
     if watcher.poll_state_full {
@@ -411,9 +423,13 @@ impl<F: EventsFeed, R: PublicRecords, H: ResolveHomeserver> Watcher<'_, '_, F, R
     /// stored here, before `starts` stores the cursors the file gave, and a
     /// 304 to a tag whose cursors were not stored would give no cursor at
     /// all (the module docs).
+    ///
+    /// While tags are sent, a file read whole whose tag is kept now lowers
+    /// each cursor of `local` it gives a lower one for, in `local` and in
+    /// the file, before the poll state keeps the tag (the module docs).
     async fn read_discovered(
         &mut self,
-        local: &FeedCursors,
+        local: &mut FeedCursors,
         watch_list: &[Pubky],
     ) -> anyhow::Result<FeedCursors> {
         let before = self.before_step();
@@ -421,6 +437,7 @@ impl<F: EventsFeed, R: PublicRecords, H: ResolveHomeserver> Watcher<'_, '_, F, R
             .iter()
             .all(|homeserver| local.get(homeserver).is_some());
         let mut lowest = FeedCursors::default();
+        let mut lowered = false;
         let mut budget = MAX_LISTED_SWEEPS_PER_RUN;
         let mut cut = false;
         // A copy of the ids, so that `self` is not borrowed by the loop
@@ -449,6 +466,11 @@ impl<F: EventsFeed, R: PublicRecords, H: ResolveHomeserver> Watcher<'_, '_, F, R
             match (listed, etag) {
                 (Listed::Settled, Some(etag)) => {
                     self.state.discovered_etags.insert(id, etag);
+                    // Here alone: the next run sends this tag and takes its
+                    // 304, so a file lowers a cursor once, not every run.
+                    if send_tags {
+                        lowered |= local.lower_kept_to(&discovered.cursors);
+                    }
                 }
                 // Read whole again next run, so the rest is confirmed then.
                 _ => {
@@ -462,6 +484,15 @@ impl<F: EventsFeed, R: PublicRecords, H: ResolveHomeserver> Watcher<'_, '_, F, R
                  {MAX_LISTED_SWEEPS_PER_RUN} sweeps new to this install; pull confirms that \
                  many this time and the rest next time"
             ));
+        }
+        // The cursors before the tags: the other way round, a run stopped
+        // in between would get a 304 next time, with no cursor to lower them
+        // to. The pull lock keeps every other writer of the file out, so
+        // `local` is what it holds but for these.
+        if lowered {
+            local
+                .write(self.dirs, self.owner)
+                .context("could not store where the events feeds start")?;
         }
         // Stored before any feed is read, as a batch is, so that a feed's
         // batch dropped for want of room goes back to a state that fits.
@@ -1716,6 +1747,90 @@ mod tests {
             records.asked().split_off(asked_before),
             [(owner, discovered)]
         );
+    }
+
+    #[tokio::test]
+    async fn a_discovered_json_read_whole_lowers_a_local_cursor_ahead_of_it_once() {
+        // A lowering `post --open` never stored: it stopped after its
+        // discovered.json PUT, so this install's cursor, left by the older
+        // open bounty, is past the newer one's start, and past a stranger's
+        // sweep of it.
+        let install = Install::new();
+        let (owner, home) = (install.owner, install.home);
+        install.store_cursor(home, 100);
+        let (older, newer) = (bounty(owner, 10), bounty(owner, 11));
+        let stranger = stranger_sweep(20);
+        let records = FakePublicRecords::default()
+            .with_record(
+                owner,
+                &paths::discovered(older.id),
+                &discovered_json(&[], &[(home, 100)]),
+            )
+            .with_record(
+                owner,
+                &paths::discovered(newer.id),
+                &discovered_json(&[], &[(home, 30)]),
+            );
+        let records = with_sweep(records, stranger, newer, "running");
+        let other = random_pubky();
+        let feed = FakeEventsFeed::of_events(vec![
+            (40, put(stranger)),
+            (120, format!("PUT pubky://{other}/pub/example.app/a.json")),
+        ]);
+        let resolver = FakeHomeservers::default();
+        let mut state = state_of(&[
+            (older, bounty_record(true, "open")),
+            (newer, bounty_record(true, "open")),
+        ]);
+
+        // Each file is read whole the first time, and settles: the newer
+        // one's cursor lowers the local one, stored before any page is read,
+        // and the stranger's sweep before it is found through the feed.
+        let watch = install.watch(&feed, &records, &resolver, &mut state).await;
+        assert!(watch.warnings.is_empty(), "{:?}", watch.warnings);
+        assert_eq!(watch.starts[&home], start(30, StartSource::Local));
+        assert_eq!(feed.asked(), [(EventCursor::new(30), 1000)]);
+        assert_eq!(watch.accepted, [of(newer, stranger)]);
+        assert_eq!(install.stored_cursor(home), Some(120));
+
+        // Their tags are kept and sent next run, and an unchanged file's 304
+        // gives no cursor: it does not lower the local one again.
+        assert!(state.discovered_etags.contains_key(&newer.id));
+        let watch = install.watch(&feed, &records, &resolver, &mut state).await;
+        assert_eq!(watch.starts[&home], start(120, StartSource::Local));
+        assert_eq!(install.stored_cursor(home), Some(120));
+    }
+
+    #[tokio::test]
+    async fn a_discovered_json_read_whole_every_run_never_lowers_a_local_cursor() {
+        // A file's cursors lag behind this install's by design: `pull`
+        // rewrites it only when its sweeps change. One whose listed sweep
+        // cannot be confirmed yet is read whole every run; were its cursor to
+        // lower the local one each time, the feed would read the same pages
+        // every run and never get past them.
+        let install = Install::new();
+        let (owner, home) = (install.owner, install.home);
+        install.store_cursor(home, 100);
+        let open = bounty(owner, 10);
+        let unreachable = stranger_sweep(20);
+        let records = FakePublicRecords::default().with_record(
+            owner,
+            &paths::discovered(open.id),
+            &discovered_json(&[unreachable], &[(home, 30)]),
+        );
+        let resolver =
+            FakeHomeservers::default().with_answers(unreachable.sweeper, &[FakeLookup::NoRecord]);
+        let feed = FakeEventsFeed::of_ids(&[40, 120]);
+        let mut state = one_open(open);
+
+        for expected in [100, 120] {
+            let watch = install.watch(&feed, &records, &resolver, &mut state).await;
+            assert!(
+                !state.discovered_etags.contains_key(&open.id),
+                "not settled, so read whole again next run"
+            );
+            assert_eq!(watch.starts[&home], start(expected, StartSource::Local));
+        }
     }
 
     #[tokio::test]

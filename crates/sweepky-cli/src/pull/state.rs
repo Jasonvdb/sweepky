@@ -56,20 +56,21 @@
 //!
 //! **Writing.** `write` reads the file again and replaces this owner's
 //! entry alone, so another owner's stays as the file has it now. That is
-//! a read, a change and a write, and nothing here locks:
+//! a read, a change and a write, and nothing here locks: every writer of
+//! either file holds the pull lock (`crate::lock::PullLock`) around its
+//! reads and writes, so no other write comes in between.
 //!
 //! - **`pull`** reads both files as it starts and writes them back after
-//!   each step, so it holds the pull lock (`crate::lock::PullLock`) from
-//!   its first read to its last write: two pulls of one install run one
-//!   after the other, and neither writes back a state that lacks the
-//!   other's steps.
+//!   each step, so it holds the pull lock from its first read to its last
+//!   write: two pulls of one install run one after the other, and neither
+//!   writes back a state that lacks the other's steps.
 //! - **`post --open`** lowers `feed-cursors.json`'s cursors for a new open
-//!   bounty under the writers' lock alone. It does not take the pull lock:
-//!   it would wait for a `pull` that runs for minutes, and `pull` takes the
-//!   writers' lock while it holds the pull lock, so the two could each
-//!   wait for the other. Its read and write take a moment, and
-//!   [`FeedCursors::advance`]'s compare-and-set keeps a cursor it lowered
-//!   while `pull` read a batch.
+//!   bounty under the pull lock too. It takes the pull lock before the
+//!   writers' lock, the order `pull` takes them in (`pull` takes the
+//!   writers' lock inside the pull lock for its one public write), so
+//!   neither command holds one while it waits for the other. It waits
+//!   while a `pull` runs, so a cursor it lowers is never written over by a
+//!   `pull` that read the file before ([`FeedCursors::advance`]).
 //! - **`logout`** reads and writes neither file.
 //!
 //! **What the poll state holds came from other people's records.** A
@@ -172,16 +173,16 @@ impl FeedCursors {
     /// Moves `owner`'s cursor for `homeserver` in the file from `from` on to
     /// `to`, as `pull` does once a batch of that feed is processed, and says
     /// whether it did: only while the file still holds `from` there, the
-    /// cursor this run started the batch from. A cursor another writer
-    /// stored meanwhile is left as the file has it: one `post --open`
-    /// lowered for a new bounty, so that its sweeps are not skipped. Two
-    /// pulls of one install never run at once (they hold the pull lock), so
-    /// against a second `pull` this is a second line of defence. Checking
-    /// that `to` is past `from` is the caller's (`pull::feed`).
+    /// cursor this run started the batch from. Checking that `to` is past
+    /// `from` is the caller's (`pull::feed`).
     ///
-    /// Nothing here locks, so `post --open` can still come between this
-    /// read and its write; the check narrows that to the moment of the
-    /// write, where a whole batch would be otherwise.
+    /// The caller holds the pull lock, as every writer of the file does,
+    /// `post --open` included when it lowers a cursor for a new bounty, so
+    /// nothing else writes the file between the batch's read of `from` and
+    /// this write: the pull lock is what makes the compare and the write one
+    /// step. The compare stays as a second line of defence: a cursor moved
+    /// by an earlier batch of the same run, written out of order, is left as
+    /// the file has it.
     pub(crate) fn advance(
         dirs: &Dirs,
         owner: Pubky,
@@ -211,6 +212,30 @@ impl FeedCursors {
             .entry(homeserver)
             .and_modify(|kept| *kept = (*kept).min(cursor))
             .or_insert(cursor);
+    }
+
+    /// Lowers each cursor kept here to the one `cursors` gives its
+    /// homeserver, when that one is lower, and says whether any was. A
+    /// homeserver with no cursor here gets none: unlike [`lower_to`], this
+    /// only ever moves a cursor back. The feed watcher lowers this install's
+    /// cursors with it to those of an open bounty's `discovered.json`
+    /// (`pull::feed`).
+    ///
+    /// [`lower_to`]: Self::lower_to
+    pub(crate) fn lower_kept_to(&mut self, cursors: &BTreeMap<Pubky, EventCursor>) -> bool {
+        let mut lowered = false;
+        for (homeserver, &cursor) in cursors {
+            // `get_mut` lends the kept cursor itself, so `*kept = …` changes
+            // it in place. The `if let … && …` (a let chain) runs the block
+            // only when one is kept and the new one is lower.
+            if let Some(kept) = self.cursors.get_mut(homeserver)
+                && cursor < *kept
+            {
+                *kept = cursor;
+                lowered = true;
+            }
+        }
+        lowered
     }
 }
 
@@ -568,18 +593,24 @@ fn write_entry<E: OwnerEntry>(dirs: &Dirs, owner: Pubky, entry: &E) -> anyhow::R
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::symlink;
     use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
 
     use serde_json::{Value, json};
     use sweepky_core::{Bounty, BountyRef, EventCursor, Pubky, Sweep, SweepRef};
+    use tokio::sync::oneshot;
+    use tokio::time::sleep;
 
     use super::{
         BountySummary, FeedCursors, OwnerEntry, PollState, SweepSummary, WouldPassCap, read_entry,
         write_entry,
     };
     use crate::Dirs;
+    use crate::lock::PullLock;
     use crate::private_fs::{ensure_private_dir, write_private_file};
     use crate::remote::ETag;
     use crate::test_support::{
@@ -756,6 +787,96 @@ mod tests {
         cursors.lower_to(watched, cursor(5));
         assert_eq!(cursors.get(&home), Some(cursor(90)));
         assert_eq!(cursors.get(&watched), Some(cursor(5)));
+    }
+
+    #[test]
+    fn lower_kept_to_lowers_only_the_cursors_kept_and_says_whether_it_did() {
+        let (home, watched, unwatched) = (random_pubky(), random_pubky(), random_pubky());
+        let mut cursors = FeedCursors::default();
+        cursors.set(home, cursor(100));
+        cursors.set(watched, cursor(40));
+        let given = BTreeMap::from([
+            // Lower: lowered.
+            (home, cursor(30)),
+            // Higher: kept.
+            (watched, cursor(90)),
+            // No cursor kept for it: none added.
+            (unwatched, cursor(1)),
+        ]);
+        assert!(cursors.lower_kept_to(&given));
+        assert_eq!(cursors.get(&home), Some(cursor(30)));
+        assert_eq!(cursors.get(&watched), Some(cursor(40)));
+        assert_eq!(cursors.get(&unwatched), None);
+        // Nothing lower left: nothing changes, and it says so.
+        let before = cursors.clone();
+        assert!(!cursors.lower_kept_to(&given));
+        assert_eq!(cursors, before);
+    }
+
+    // Every writer of feed-cursors.json holds the pull lock (module docs), so
+    // a `post --open` that lowers a cursor while a `pull` runs cannot come
+    // between the pull's read of a batch's cursor and its `advance`: it waits
+    // for the pull to let go, then lowers the cursor the pull left, and the
+    // lowered one is what the file keeps. Come in between, the lowering would
+    // be written over with the batch's cursor, and the new bounty's events
+    // before it skipped for good. Two opens of the lock in one process
+    // exclude each other as two processes do, and all three futures run in
+    // this one task (`tokio::join!`).
+    #[tokio::test]
+    async fn a_lowering_while_a_pull_runs_waits_for_its_advance_and_survives_it() {
+        let temp = private_temp();
+        let dirs = dirs_in(&temp);
+        let (owner, home) = (random_pubky(), random_pubky());
+        let mut start = FeedCursors::default();
+        start.set(home, cursor(5));
+        start.write(&dirs, owner).expect("written");
+        let mut pull = PullLock::open(&dirs).expect("opened");
+        let mut post = PullLock::open(&dirs).expect("opened");
+        let (read, has_read) = oneshot::channel::<()>();
+        let (finish, may_finish) = oneshot::channel::<()>();
+        let waited = AtomicBool::new(false);
+
+        let pulling = pull.hold(
+            || {},
+            async || {
+                // The batch's cursor, read as `pull::feed` reads it before
+                // it asks for the page.
+                let from = FeedCursors::read(&dirs, owner)?.get(&home);
+                read.send(()).expect("the lowering listens");
+                may_finish.await.expect("the test lets the batch finish");
+                let moved =
+                    FeedCursors::advance(&dirs, owner, home, from.expect("stored"), cursor(100))?;
+                assert!(moved, "the cursor moved while the pull held the lock");
+                Ok(())
+            },
+        );
+        let lowering = async {
+            has_read.await.expect("the pull read its cursor");
+            post.hold(
+                || waited.store(true, Ordering::SeqCst),
+                async || {
+                    // As `post --open` stores a new bounty's starting
+                    // cursor, 3, behind the one kept.
+                    let mut stored = FeedCursors::read(&dirs, owner)?;
+                    stored.lower_to(home, cursor(3));
+                    stored.write(&dirs, owner)
+                },
+            )
+            .await
+        };
+        let watching = async {
+            sleep(Duration::from_millis(300)).await;
+            assert!(waited.load(Ordering::SeqCst), "the lowering did not wait");
+            let stored = FeedCursors::read(&dirs, owner).expect("reads");
+            assert_eq!(stored.get(&home), Some(cursor(5)), "lowered meanwhile");
+            finish.send(()).expect("the pull waits");
+        };
+        let (pulled, lowered, ()) = tokio::join!(pulling, lowering, watching);
+        pulled.expect("advanced");
+        lowered.expect("lowered");
+
+        let stored = FeedCursors::read(&dirs, owner).expect("reads");
+        assert_eq!(stored.get(&home), Some(cursor(3)));
     }
 
     #[test]

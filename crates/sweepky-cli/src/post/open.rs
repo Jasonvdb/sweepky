@@ -14,9 +14,9 @@
 //!    cursor is at or before the bounty's creation and no sweep of it can
 //!    come before it. The search is paced for production's rate limit and
 //!    can take some seconds, so it runs outside the writers' lock;
-//! 3. under the writers' lock with a fresh session that is always signed
-//!    out (`session::with_writer_session`), after checking that `login.json`
-//!    still says what step 1 read:
+//! 3. under the pull lock, and inside it the writers' lock with a fresh
+//!    session that is always signed out (`session::with_writer_session`),
+//!    after checking that `login.json` still says what step 1 read:
 //!    1. PUT the bounty, `bounties/<id>.json`;
 //!    2. when the owner's homeserver is on the watch list, read its
 //!       `/events-stream` for the owner's latest event of exactly that
@@ -34,12 +34,18 @@
 //!       bounty's unread events are never skipped. Also when step 3.3 was
 //!       refused, so that `pull` can write the file later.
 //!
-//! **What the lock covers.** The sign-in, the two PUTs with the one stream
+//! **What the locks cover.** The sign-in, the two PUTs with the one stream
 //! read between them, the local cursor update and the sign-out; never the
 //! question or the search, which can wait on a person or on a rate limit.
-//! The local update is inside it because `pull::state` reads, changes and
-//! writes the file, and a writer that must not lose its update to a
-//! concurrent `pull` holds the lock around that.
+//! The pull lock is there for the local update: `pull` reads, changes and
+//! writes `feed-cursors.json` while it holds the pull lock, so every writer
+//! of the file holds it too (`pull::state`), or a cursor lowered here could
+//! be written over by a `pull` that read the file before. It is taken
+//! first, and the writers' lock inside it, the order `pull` takes them in,
+//! so neither command can hold one while it waits for the other. While a
+//! `pull` of this install runs, `post --open` waits for it, says so once on
+//! standard error, and past the lock's timeout gives up, before anything is
+//! posted, saying another pull is running.
 //!
 //! **Known gap.** An owner whose homeserver is not on the watch list gets
 //! no cursor for it, and `pull` does not watch it: 01's "a sweeper on a
@@ -63,6 +69,7 @@ use sweepky_core::{
 
 use super::{NOTHING_POSTED, publish};
 use crate::events::{EventsFeed, HomeserverEvents, SEARCH_PACE, find_head};
+use crate::lock::PullLock;
 use crate::own_storage::{OwnStorage, SessionStorage};
 use crate::pull::state::FeedCursors;
 use crate::pull::watched_homeservers;
@@ -76,6 +83,11 @@ use crate::{Context, Dirs, clock};
 /// for the login read first, so nothing is written for another.
 const LOGIN_CHANGED: &str = "this install's login changed while post was finding the starting \
      cursors, so nothing was posted; run post again";
+
+/// What `post --open` says on standard error while a `pull` of this install
+/// holds the pull lock, which it takes to store the starting cursors.
+const WAITING_FOR_PULL: &str = "waiting for a sweepky pull on this install to finish (it holds \
+     the pull lock, which post --open takes to store the bounty's starting cursors)";
 
 /// What `post --open` says on standard error before it searches: the
 /// search can take some seconds on a busy homeserver.
@@ -106,18 +118,36 @@ pub(super) async fn publish_signed_in(ctx: &Context, record: Vec<u8>) -> anyhow:
     let starting = StartingCursors::search(&feed, &watch_list, &login, SEARCH_PACE)
         .await
         .context(NOTHING_POSTED)?;
-    // From the clock, after the search, so the id stays close to the PUT.
-    let id = clock::new_record_id()?;
-    // `async move` moves `login`, `feed`, `record` and `starting` into the
-    // closure, which hands the last two on to `publish_open` by value.
-    with_writer_session(ctx, async move |signed| {
-        if signed.login() != &login {
-            bail!(LOGIN_CHANGED);
-        }
-        let storage = SessionStorage::new(signed);
-        publish_open(&storage, &feed, &ctx.dirs, &login, id, record, starting).await
-    })
-    .await
+    // The pull lock first, then the writers' lock inside it
+    // (`with_writer_session`): the order `pull` takes them in (the module
+    // docs).
+    let mut pull_lock = PullLock::open(&ctx.dirs).context(NOTHING_POSTED)?;
+    pull_lock
+        .hold(
+            // A courtesy, as for the writers' lock: if standard error cannot
+            // be written, `post` still waits and goes on.
+            || {
+                let _ = ctx.stderr.line(WAITING_FOR_PULL);
+            },
+            // `async move` moves `login`, `feed`, `record` and `starting`
+            // into this closure, and the inner one moves them on again, to
+            // hand the last two to `publish_open` by value.
+            async move || {
+                // From the clock once the pull lock is held, after the search
+                // and any wait for a pull, so that the id, the record's
+                // creation time, stays close to the PUT.
+                let id = clock::new_record_id()?;
+                with_writer_session(ctx, async move |signed| {
+                    if signed.login() != &login {
+                        bail!(LOGIN_CHANGED);
+                    }
+                    let storage = SessionStorage::new(signed);
+                    publish_open(&storage, &feed, &ctx.dirs, &login, id, record, starting).await
+                })
+                .await
+            },
+        )
+        .await
 }
 
 /// An open bounty's starting cursors as far as they are known before its
@@ -276,7 +306,9 @@ fn lower_stored_cursors(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::io;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     use anyhow::bail;
@@ -285,16 +317,19 @@ mod tests {
     use sweepky_core::paths::{self, SweepkyPath};
     use sweepky_core::{BountyRef, Discovered, EventCursor, Pubky, PubkyUrl, RecordId};
     use tempfile::TempDir;
+    use tokio::sync::oneshot;
+    use tokio::time::sleep;
 
-    use super::{StartingCursors, publish_open};
+    use super::{StartingCursors, WAITING_FOR_PULL, publish_open, publish_signed_in};
     use crate::Dirs;
+    use crate::lock::{PullLock, WritersLock};
     use crate::own_storage::OwnStorage;
     use crate::pull::state::FeedCursors;
-    use crate::remote::QUOTA_FULL;
-    use crate::state::LoginState;
+    use crate::remote::{QUOTA_FULL, pubky_of};
+    use crate::state::{LoginState, write_login_state};
     use crate::test_support::{
         FakeEventsFeed, FakeOwnStorage, FileSnapshot, PLANTED, StreamRequest, dirs_in, feed_page,
-        mode, private_temp, random_pubky, record_id, stream_event,
+        mode, offline_network, private_temp, random_pubky, record_id, stream_event, test_context,
     };
 
     /// No pause between the search's requests: the tests' pace.
@@ -584,5 +619,66 @@ mod tests {
         assert!(message.contains("do not post it again"), "{message}");
         assert_eq!(setup.storage.puts(), [setup.bounty_path()]);
         assert_eq!(FileSnapshot::of(&setup.dirs.feed_cursors_file()), None);
+    }
+
+    // `post --open` stores the bounty's starting cursors in feed-cursors.json,
+    // which `pull` rewrites while it holds the pull lock, so it takes the
+    // pull lock too, and before the writers' lock, the order `pull` takes
+    // them in: while a pull runs, it waits, says so once, holds neither lock
+    // and writes nothing. The running pull is the lock itself, opened as
+    // `pull` opens it, and all three futures run in this one task
+    // (`tokio::join!`), each going on while the others wait.
+    #[tokio::test]
+    async fn post_open_waits_for_a_running_pull_before_it_takes_the_writers_lock() {
+        let home = private_temp();
+        let (ctx, stderr) = test_context(offline_network(), &home, io::empty());
+        // Logged in on the one homeserver the network watches, so there is no
+        // head to search for before the locks.
+        let homeserver = pubky_of(ctx.network.settings().default_homeserver());
+        let login =
+            LoginState::identity("owner".parse().expect("a name"), random_pubky(), homeserver);
+        write_login_state(&ctx.dirs, &login).expect("written");
+        let mut pull = PullLock::open(&ctx.dirs).expect("opened");
+        let (release, released) = oneshot::channel::<()>();
+        let let_go = AtomicBool::new(false);
+
+        let pulling = pull.hold(
+            || {},
+            async || {
+                released.await.expect("the test lets go");
+                let_go.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        );
+        let posting = async {
+            let posted = publish_signed_in(&ctx, RECORD.to_vec()).await;
+            assert!(
+                let_go.load(Ordering::SeqCst),
+                "post --open went on while a pull held the pull lock"
+            );
+            posted
+        };
+        let watching = async {
+            sleep(Duration::from_millis(300)).await;
+            assert_eq!(stderr.text().matches(WAITING_FOR_PULL).count(), 1);
+            // The writers' lock is free meanwhile: taken at once, never
+            // waited for.
+            let mut writers = WritersLock::open(&ctx.dirs).expect("opened");
+            writers
+                .hold(
+                    || panic!("post --open held the writers' lock while it waited for the pull"),
+                    async || Ok(()),
+                )
+                .await
+                .expect("held");
+            assert_eq!(FileSnapshot::of(&ctx.dirs.feed_cursors_file()), None);
+            release.send(()).expect("the pull holds the lock");
+        };
+        let (pulled, posted, ()) = tokio::join!(pulling, posting, watching);
+        pulled.expect("held");
+        // Past both locks it signs in, which fails here: this install has no
+        // identity file to sign in with.
+        let error = posted.expect_err("cannot sign in");
+        assert!(format!("{error:#}").contains("cannot sign in"), "{error:#}");
     }
 }

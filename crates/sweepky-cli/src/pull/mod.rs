@@ -642,7 +642,7 @@ mod tests {
     };
     use crate::identity::IdentityName;
     use crate::installs::record_install_key;
-    use crate::lock::PullLock;
+    use crate::lock::{PullLock, WritersLock};
     use crate::own_storage::OwnStorage;
     use crate::passphrase::{NeedsPassphrase, Passphrase};
     use crate::session::NOT_LOGGED_IN;
@@ -988,11 +988,13 @@ mod tests {
     }
 
     // Two pulls of one install never run at once: the second waits for the
-    // first's pull lock, says so once, and starts only once the first lets
-    // go. The first is the lock itself, opened as `pull` opens it: a `flock`
-    // belongs to one open of the file, so two opens in one process exclude
-    // each other as two processes do. All three futures run in this one
-    // task (`tokio::join!`), each going on while the others wait.
+    // first's pull lock, says so once, holds no writers' lock while it waits
+    // (`pull` and `post --open` both take the pull lock first), and starts
+    // only once the first lets go. The first is the lock itself, opened as
+    // `pull` opens it: a `flock` belongs to one open of the file, so two
+    // opens in one process exclude each other as two processes do. All
+    // three futures run in this one task (`tokio::join!`), each going on
+    // while the others wait.
     #[tokio::test]
     async fn a_second_pull_waits_for_the_first_to_finish_and_says_so() {
         let home = private_temp();
@@ -1025,6 +1027,15 @@ mod tests {
             // pull's state.
             assert_eq!(stderr.text().matches(WAITING_FOR_PULL).count(), 1);
             assert!(!ctx.dirs.poll_state_file().exists());
+            // The writers' lock is free meanwhile: taken at once.
+            let mut writers = WritersLock::open(&ctx.dirs).expect("opened");
+            writers
+                .hold(
+                    || panic!("the pull held the writers' lock while it waited for the pull lock"),
+                    async || Ok(()),
+                )
+                .await
+                .expect("held");
             release.send(()).expect("the first holds the lock");
         };
         let (held, pulled, ()) = tokio::join!(holding, second, watching);

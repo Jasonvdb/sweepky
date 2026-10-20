@@ -12,18 +12,20 @@
 //! take no lock.
 //!
 //! **The pull lock** ([`PullLock`]) is the same kind of lock on a file of its
-//! own, `<config>/pull.lock`, which `pull` alone takes and holds for its whole
-//! run. `pull` reads its local state (`poll-state.json`, `feed-cursors.json`)
-//! as it starts, changes it in memory for minutes, and writes it back after
-//! each step, each write replacing this owner's whole entry. Two pulls at once
+//! own, `<config>/pull.lock`, which `pull` holds for its whole run, and
+//! `post --open` around its writes, as it stores cursors in a file `pull`
+//! rewrites (`pull::state`). `pull` reads its local state
+//! (`poll-state.json`, `feed-cursors.json`) as it starts, changes it in
+//! memory for minutes, and writes it back after each step, each write
+//! replacing this owner's whole entry. Two pulls at once
 //! would each write back what they read before the other's write: one could
 //! drop the strangers' sweeps the other accepted while the other's feed cursor
 //! had already moved past their events, so they would never be read again.
 //! Holding the writers' lock that long instead would keep `post`, `run`,
 //! `submit` and `done` waiting on every `pull`. `pull` takes the writers' lock
-//! inside the pull lock, for its one public write, and no command takes the
-//! pull lock while it holds the writers' lock, so the two never wait on each
-//! other.
+//! inside the pull lock, for its one public write, and so does `post --open`,
+//! for its writes; no command takes the pull lock while it holds the writers'
+//! lock, so no two commands each hold one while they wait for the other.
 //!
 //! **How.** An exclusive `flock` on the lock's file, `<config>/credential.lock`
 //! or `<config>/pull.lock`, through the `fd-lock` crate, which makes the
@@ -100,7 +102,8 @@ const MAX_RETRY_PAUSE: Duration = Duration::from_millis(500);
 /// What a command that gives up waiting for the writers' lock says holds it.
 const WRITERS_LOCK_HELD: &str = "another sweepky command still holds the writers' lock";
 
-/// What a `pull` that gives up waiting for the pull lock says holds it.
+/// What a command that gives up waiting for the pull lock, a `pull` or a
+/// `post --open`, says holds it.
 const PULL_LOCK_HELD: &str =
     "another sweepky pull on this install is still running and holds the pull lock";
 
@@ -154,7 +157,8 @@ impl WritersLock {
 }
 
 /// The pull lock file, open and ready to lock: `<config>/pull.lock`, which
-/// `pull` holds for its whole run (see the module docs).
+/// `pull` holds for its whole run and `post --open` around its writes (see
+/// the module docs).
 #[derive(Debug)]
 pub(crate) struct PullLock(LockFile);
 
@@ -166,8 +170,9 @@ impl PullLock {
     }
 
     /// Takes the lock and runs `work` while holding it, as
-    /// [`WritersLock::hold`] does: a `pull` that waits past [`WAIT_TIMEOUT`]
-    /// for another to finish gives up, saying another pull is running.
+    /// [`WritersLock::hold`] does: a command that waits past
+    /// [`WAIT_TIMEOUT`] for a pull to finish gives up, saying another pull
+    /// is running.
     pub(crate) async fn hold<T>(
         &mut self,
         on_wait: impl FnOnce(),
