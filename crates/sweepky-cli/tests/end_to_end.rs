@@ -1686,6 +1686,21 @@ async fn end_to_end() {
     // fetch is gone, the record being final.
     assert!(sweep_dir.join(".sweepky/submitted").is_file());
     assert_gone(&snapshot_file);
+    // And audit/ is out of the project, where a later agent session could
+    // read it, and under B's data directory, which the sandbox denies:
+    // directories 0700, files 0600. The report says where.
+    assert_gone(&audit);
+    let moved = b.dirs.data().join(format!("submitted/{id}/audit"));
+    assert_eq!(mode(&moved), 0o700);
+    assert_eq!(mode(moved.parent().expect("submitted/<id>")), 0o700);
+    for name in CLOUDFLARE_FILES {
+        assert_eq!(mode(&moved.join(name)), 0o600, "{name}");
+    }
+    assert!(
+        report.text().contains(&moved.display().to_string()),
+        "{}",
+        report.text()
+    );
 
     // ----- P2b: a second run, with links planted in its audit/ -----
 
@@ -1753,6 +1768,10 @@ async fn end_to_end() {
         .await
         .expect("the path is public");
     assert!(!exists, "run 2's package was uploaded");
+    // Refused before anything was final, so run 2's audit/ stays where
+    // it is, for the next try.
+    assert!(run2_audit.join("findings.json").is_file());
+    assert_gone(&b.dirs.data().join(format!("submitted/{run2_id}")));
     let record = get_capped(
         &testnet,
         &b_user,

@@ -72,11 +72,12 @@ const SWEEPS: &CStr = c"sweeps";
 /// stays well within that. A deeper tree is refused, and the copy removed,
 /// rather than copied in part. P2b's choice: a repository's tree is rarely
 /// a third as deep.
-const MAX_COPY_DEPTH: usize = 64;
+pub(crate) const MAX_COPY_DEPTH: usize = 64;
 
 /// How many characters of a name from the staged tree a message shows. The
-/// names are the repository's, so each is sanitised first.
-const MAX_NAME_CHARS: usize = 255;
+/// names are the repository's, so each is sanitised first. `submit` shows
+/// the names in a moved `audit/` the same way.
+pub(crate) const MAX_NAME_CHARS: usize = 255;
 
 /// How a copied file is made: write-only, new (`O_CREAT | O_EXCL`, which
 /// fails on anything already at the name, a link included, dangling or
@@ -350,8 +351,9 @@ fn names_in(dir: BorrowedFd<'_>, shown: &str) -> anyhow::Result<Vec<CString>> {
 /// it, through handles: a link is removed itself and never followed, and
 /// nothing deeper than [`MAX_COPY_DEPTH`] is looked into. A failed copy's
 /// last step, best effort, so it returns nothing: the copy's own error is
-/// the one to report.
-fn remove_tree_at(dir: BorrowedFd<'_>, name: &CStr, depth: usize) {
+/// the one to report. `submit` removes a project's `audit/` with it after
+/// copying it out, and then looks whether anything is left.
+pub(crate) fn remove_tree_at(dir: BorrowedFd<'_>, name: &CStr, depth: usize) {
     let Ok(seen) = rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) else {
         return;
     };

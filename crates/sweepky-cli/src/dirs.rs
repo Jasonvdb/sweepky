@@ -28,6 +28,7 @@
 //! | `git-home-<id>/` | git's `HOME` while one command (`post`, `run`) runs it: new, empty and 0700, removed when the command ends (`crate::git`) |
 //! | `staging/<id>/` | the sweep directory `run` builds before it moves it into the project's `sweeps/<id>/`: new and 0700, removed when `run` ends (`run::fetch`) |
 //! | `staging/.pull.<pid>.<nanos>.<n>.tmp/` | where `pull` writes one decrypted sweep, and a bounty's directory the first time, before it moves them into place: new and 0700, removed when the store ends (`crate::pull::store`) |
+//! | `submitted/<id>/audit/` | the plaintext `audit/` of sweep `id`, moved out of the `init` project by `submit` once the sweep's record says `done` or `aborted`, so no later agent session there reads it (`crate::submit::move_out`) |
 //! | `sweeps/<id>.json` | what `run` fetched for sweep `id`, which `submit` builds the manifest's commits from: written by `run`, removed once the sweep's record says `done` or `aborted` (`crate::sweep_state`) |
 //! | `feed-cursors.json` | per owner and watched homeserver, how far `pull` has read its `/events/` feed (`crate::pull`) |
 //! | `poll-state.json` | per owner, what `pull`'s roster polling learnt: the newest ids seen, bounty and sweep summaries with their `ETag`s, the strangers' sweeps accepted and the deletions confirmed (`crate::pull`) |
@@ -201,6 +202,14 @@ impl Dirs {
         self.data.join("staging")
     }
 
+    /// `data/submitted/<id>/`: where `submit` moves the `audit/` of sweep
+    /// `id` once its record is final, out of the agent's reach. A
+    /// [`RecordId`] is one plain path segment, as for
+    /// [`git_home_dir`](Self::git_home_dir).
+    pub(crate) fn submitted_dir(&self, id: &RecordId) -> PathBuf {
+        self.data.join("submitted").join(id.to_string())
+    }
+
     /// `data/sweeps/`: what `run` fetched for each sweep not yet finished,
     /// one file per sweep, out of reach of the agent.
     pub(crate) fn sweep_snapshots_dir(&self) -> PathBuf {
@@ -343,6 +352,10 @@ mod tests {
             Path::new("/x/share/git-home-0035G87EK4XFE")
         );
         assert_eq!(dirs.staging_dir(), Path::new("/x/share/staging"));
+        assert_eq!(
+            dirs.submitted_dir(&id),
+            Path::new("/x/share/submitted/0035G87EK4XFE")
+        );
         assert_eq!(
             dirs.sweep_snapshot_file(&id),
             Path::new("/x/share/sweeps/0035G87EK4XFE.json")
