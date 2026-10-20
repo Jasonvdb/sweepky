@@ -11,10 +11,20 @@
 // a board that silently shows nothing.
 //
 // Only the local testnet: `Pubky.testnet(TESTNET_HOST)` takes its pkarr
-// relay and homeserver from that one host, and the host is a constant, so no
-// setting can point the seed at a production relay.
+// relay and homeserver from that one host, the auth relay is built from the
+// same host, and the host is a constant, so no setting can point the seed at
+// a production relay.
+//
+// Each key signs up through a grant flow asking for `/pub/sweepky/:rw`, the
+// scope sweepky-cli itself asks for (03, "Two ways to log in"), and its own
+// Signer approves the request in-process. `Signer.signup` plus `signin` would
+// ask for root (`/:rw`) instead, which homeservers may refuse: they can allow
+// grants under `/pub/` only. A homeserver too old for grant auth (no
+// `/auth/grant/signup` route, or no HTTP relay on the testnet's port) fails the
+// flow; the seed then falls back to the legacy cookie signup with a new key and
+// says so on the console. Either way every write stays under `/pub/sweepky/`.
 
-import { Keypair, Pubky, PublicKey, type Session } from '@synonymdev/pubky'
+import { AuthFlowKind, Keypair, Pubky, PublicKey, type Session } from '@synonymdev/pubky'
 import { recordIdFromMicros, type RecordId } from '../src/records/ids.ts'
 import {
   parseBounty,
@@ -33,8 +43,14 @@ const TESTNET_HOST = 'localhost'
 /** The static testnet's homeserver (06, "Testnet"); `SWEEPKY_E2E_HOMESERVER` overrides it. */
 const DEFAULT_TESTNET_HOMESERVER = '8pinxxgqs41n4aididenw5apqp1urfmzdztr8jt4abrkdn435ewo'
 
-/** The app name the seed's sessions sign in as. */
-const CLIENT_ID = 'sweepky-board-e2e'
+/** The app name the seed's grants are issued to. */
+const CLIENT_ID = 'sweepky-e2e'
+
+/** The scope each grant asks for: sweepky-cli's own (03, "Two ways to log in"). */
+const SWEEPKY_CAPABILITIES = '/pub/sweepky/:rw'
+
+/** The static testnet's HTTP relay, which carries the grant approval (06, "Testnet"). */
+const TESTNET_AUTH_RELAY = `http://${TESTNET_HOST}:15412/inbox`
 
 /** A synthetic target: nothing in the board or this seed ever fetches it. */
 const SYNTHETIC_TARGET = {
@@ -69,17 +85,45 @@ export interface Cast {
 export async function signUpCast(): Promise<Cast> {
   const pubky = Pubky.testnet(TESTNET_HOST)
   const homeserver = PublicKey.from(testnetHomeserver())
-  const signUp = async (): Promise<Writer> => {
-    const signer = pubky.signer(Keypair.random())
-    await signer.signup(homeserver, null)
-    return writerOf(await signer.signin(CLIENT_ID))
-  }
+  const signUp = async (): Promise<Writer> => writerOf(await signUpSession(pubky, homeserver))
   // One after another: three signups are quick, and the testnet's logs stay
   // in an order a reader can follow.
   const owner = await signUp()
   const member = await signUp()
   const stranger = await signUp()
   return { owner, member, stranger }
+}
+
+/** A new key's writing session: a `/pub/sweepky/:rw` grant, else a legacy cookie session. */
+async function signUpSession(pubky: Pubky, homeserver: PublicKey): Promise<Session> {
+  try {
+    return await signUpWithGrant(pubky, homeserver)
+  } catch (error) {
+    console.warn(
+      `seed: grant signup failed (${error instanceof Error ? error.message : String(error)}); ` +
+        'falling back to the legacy cookie signup',
+    )
+    return pubky.signer(Keypair.random()).signupCookie(homeserver, null)
+  }
+}
+
+/**
+ * Starts a signup grant flow for a new key and approves it with that key's
+ * own Signer, as Ring would on a phone. The approval and the session both
+ * travel through the testnet relay, so the two promises run together.
+ */
+async function signUpWithGrant(pubky: Pubky, homeserver: PublicKey): Promise<Session> {
+  const flow = await pubky.startGrantAuthFlow(
+    SWEEPKY_CAPABILITIES,
+    AuthFlowKind.signup(homeserver, null),
+    { clientId: CLIENT_ID, relay: TESTNET_AUTH_RELAY },
+  )
+  const signer = pubky.signer(Keypair.random())
+  const [session] = await Promise.all([
+    flow.awaitApproval(),
+    signer.approveAuthRequest(flow.authorizationUrl),
+  ])
+  return session
 }
 
 function testnetHomeserver(): string {

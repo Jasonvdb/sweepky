@@ -51,14 +51,36 @@ interface Sent {
   readonly page: string
   readonly url: URL
   readonly method: string
-  readonly headers: Record<string, string>
+  /** The headers Chrome sent, or `null` for a request it never sent (see `wireHeaders`). */
+  readonly headers: Record<string, string> | null
 }
 
 /** The pages 04's layout rules cover, as layout.spec.ts checks them without data. */
 const LAYOUT_PAGES = ['/board', '/', '/circle'] as const
 
 function hasCredentials({ headers }: Sent): boolean {
-  return 'cookie' in headers || 'authorization' in headers
+  return headers !== null && ('cookie' in headers || 'authorization' in headers)
+}
+
+/** How long a request of a finished test gets to report the headers Chrome sent. */
+const WIRE_HEADERS_WAIT_MS = 5_000
+
+/**
+ * The headers Chrome put on the wire (`allHeaders` includes `cookie`, which
+ * `headers` leaves out), or `null` when it never reports them: a request
+ * answered from the memory cache, or cancelled by a navigation before it
+ * was sent, carried nothing, and `allHeaders` would wait for it forever.
+ */
+async function wireHeaders(request: Request): Promise<Record<string, string> | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const unreported = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), WIRE_HEADERS_WAIT_MS)
+  })
+  try {
+    return await Promise.race([request.allHeaders(), unreported])
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 test.describe('the board against a seeded testnet', { tag: '@testnet' }, () => {
@@ -94,14 +116,13 @@ test.describe('the board against a seeded testnet', { tag: '@testnet' }, () => {
   })
 
   test.afterEach(async () => {
-    // Before the page closes: `allHeaders` includes `cookie`, which
-    // `headers` leaves out, and needs the page that sent the request.
+    // Before the page closes: `allHeaders` needs the page that sent the request.
     const resolved = await Promise.all(
       watched.map(async ({ page, request }) => ({
         page,
         url: new URL(request.url()),
         method: request.method(),
-        headers: await request.allHeaders(),
+        headers: await wireHeaders(request),
       })),
     )
     sent.push(...resolved)
@@ -277,9 +298,12 @@ test.describe('the board against a seeded testnet', { tag: '@testnet' }, () => {
     // Chrome reports the planted cookie on the app's own requests, so the
     // checks below cannot pass because no cookie is ever reported.
     const own = sent.filter((request) => request.url.origin === appOrigin)
-    expect(own.some((request) => request.headers.cookie?.includes(PLANTED_COOKIE))).toBe(true)
+    expect(own.some((request) => request.headers?.cookie?.includes(PLANTED_COOKIE))).toBe(true)
 
-    const storage = sent.filter((request) => request.url.pathname.includes(STORAGE_PATH))
+    // Only reads Chrome sent count as seen, so this check cannot pass blind.
+    const storage = sent.filter(
+      (request) => request.headers !== null && request.url.pathname.includes(STORAGE_PATH),
+    )
     expect(storage.length, 'homeserver storage reads seen').toBeGreaterThan(0)
     expect(storage.filter(hasCredentials).map((request) => request.url.href)).toEqual([])
 
@@ -300,11 +324,17 @@ test.describe('the board against a seeded testnet', { tag: '@testnet' }, () => {
     expect(events).toEqual([])
 
     // Apart from the font, the landing page reaches only the relay and the
-    // homeserver storage its hero's store reads.
+    // homeserver its hero's store reads: that homeserver's storage, and its
+    // `/info`, which the SDK reads itself to learn the server's features
+    // (pubky 0.16.2 `client/http_targets/features.rs`, credentials omitted).
+    const homeservers = new Set(storage.map((request) => request.url.origin))
     const landingElsewhere = sent
       .filter((request) => request.page === '/' && request.url.origin !== appOrigin)
       .filter((request) => ![...FONT_ORIGINS, TESTNET_RELAY].includes(request.url.origin))
       .filter((request) => !request.url.pathname.includes(STORAGE_PATH))
+      .filter(
+        (request) => !(homeservers.has(request.url.origin) && request.url.pathname === '/info'),
+      )
       .map((request) => request.url.href)
     expect(landingElsewhere).toEqual([])
   })

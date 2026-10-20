@@ -82,3 +82,18 @@ CLI would write. The spec watches the board follow each change within one
 30-second poll, so a run takes a few minutes. The seed talks only to
 `localhost`. To use another testnet homeserver key, set
 `SWEEPKY_E2E_HOMESERVER`.
+
+Each key signs up through a grant flow that asks for `/pub/sweepky/:rw`, the
+same scope `sweepky login` asks for, and the key's own signer approves it in
+the test process through the testnet HTTP relay
+(`http://localhost:15412/inbox`). The SDK's plain `signup` and `signin` ask
+for root access (`/:rw`) instead, and a homeserver may refuse any grant
+outside `/pub/`. If the grant flow fails, for example on a homeserver too old
+to have grant auth or a testnet with no HTTP relay, the seed signs up a new
+key with the legacy cookie session and prints a `seed: grant signup failed`
+line. Either way it writes only under `/pub/sweepky/`.
+
+The local testnet must be a homeserver the pinned 0.16.2 SDK can talk to:
+`pubky-testnet` 0.16.2 on the fixed ports, as
+[06](../docs/plan/06-verification-and-limits.md) describes, or a compatible
+container on the same ports.
