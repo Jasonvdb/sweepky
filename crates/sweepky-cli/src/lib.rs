@@ -8,7 +8,7 @@
 //! from a local `EphemeralTestnet` instead ([`Network::injected`]), so the same
 //! code runs against a throwaway network with nothing reaching production.
 //!
-//! What is here so far (P2a, then P2b):
+//! What is here so far (P2a, then P2b, then P2c):
 //!
 //! - [`Cli`] and [`Command`], the arguments, parsed with clap. `--testnet`,
 //!   `--passphrase-file` and `--no-input` are global flags, so each goes
@@ -133,13 +133,19 @@
 //!   address included, the `ResolveHost` seam, over the system resolver,
 //!   and `HttpsRemote`, the `https://<repo>` remote that git's network
 //!   commands take, made only for a host whose every address is public.
-//! - `post <draft.json>` (`post`), for a bounty that is not `--open`: the
-//!   bounty draft, read with a cap and checked as strictly as a stranger's
-//!   record, its public text held to what the sanitiser prints unchanged;
-//!   every target checked against the target policy and pinned through the
-//!   context's target source; the bounty shown, sanitised, on standard
-//!   error, and published as `bounties/<id>.json` under the writers' lock
-//!   with a fresh session only once the owner says yes.
+//! - `post <draft.json> [--open]` (`post`): the bounty draft, read with a
+//!   cap and checked as strictly as a stranger's record, its public text
+//!   held to what the sanitiser prints unchanged; every target checked
+//!   against the target policy and pinned through the context's target
+//!   source; the bounty shown, sanitised, on standard error, and published
+//!   as `bounties/<id>.json` under the writers' lock with a fresh session
+//!   only once the owner says yes. With `--open` the record says `open:
+//!   true`, and `post` also writes `bounties/<id>.discovered.json` with the
+//!   bounty's starting cursors and no sweeps: each watched homeserver's
+//!   feed head, searched after the yes and before the PUT, and the owner's
+//!   own homeserver's event of the PUT, read from its stream right after
+//!   it. The same cursors go into `feed-cursors.json`, never raising a
+//!   lower one there.
 //! - `own_storage`, `OwnStorage`: the seam through which `post`, `run` and
 //!   `submit` write the signed-in user's own records and read them back,
 //!   with a fake for the unit tests that can refuse a chosen write.
@@ -186,6 +192,47 @@
 //!   a sweep, each target's pins and the commit checked out, kept where
 //!   the agent cannot write, which `submit` builds the manifest's
 //!   `targetShas` from and removes once the record is final.
+//! - `pull` (P2c): the logged-in owner and this install's device key, both
+//!   read before any network read; the roster poll of the owner's circle,
+//!   each key's homeserver looked up once a run and, on production, checked
+//!   against the host policy; the check of the owner's `keys/` for keys
+//!   this owner's installs did not create, where a check that cannot finish
+//!   is an alarm too; the watched homeservers' events feeds and each open
+//!   bounty's `discovered.json`, for strangers' sweeps of the owner's open
+//!   bounties; each new done sweep opened with the device key, checked and
+//!   stored owner-only in the data directory, strangers' in `untrusted/`;
+//!   each bounty's findings grouped into `groups.json` and `merged.json`,
+//!   the circle's content alone in the second; and last, under the writers'
+//!   lock with a fresh session, its one public write, each open bounty's
+//!   `discovered.json`, made only when its sweeps change. The report gives
+//!   each feed's start and where it came from, and each sweep's trust
+//!   label, status and place, a stranger's text sanitised, never a finding.
+//!   Between runs it keeps two files in the data directory, one entry per
+//!   owner: `feed-cursors.json`, each watched homeserver's feed cursor,
+//!   which `post --open` lowers to a new bounty's starting cursor; and
+//!   `poll-state.json`, what the roster poll and the feeds have seen. Both
+//!   are capped, owner-only and keep the fields a newer Sweepky adds.
+//! - `events` (P2c), the seam `post --open` and `pull` read a homeserver's
+//!   public events through, with no session: one page of its `/events/`
+//!   feed, capped and parsed by core, a page with more events than were
+//!   asked for refused; and the id of the owner's latest event of one file
+//!   from its non-live `/events-stream`, which must be a PUT of exactly that
+//!   file. The real one asks each homeserver by its key through the SDK's
+//!   HTTP client and `remote`'s unredirected `GET`, and the unit tests use a
+//!   fake. With it, `find_head`, the search for a watched homeserver's last
+//!   public event, an open bounty's starting cursor there: exponential, then
+//!   binary, with `limit=1`, bounded in its requests, never past cursor
+//!   2^62, paced for production's rate limit and stopped by a 429.
+//! - `done <bounty> [--credit <pubky>]… [--no-credit <pubky>]…` (P2c,
+//!   `done`): the URL and every pubky checked as text, a `--credit` naming
+//!   the bounty's owner refused in one line before any file is read; then
+//!   the credits proposed from the groups `pull` wrote, the sweepers of the
+//!   done sweeps in them and never the owner, each shown with its trust
+//!   label and the places it reported, sanitised; the flags applied; a
+//!   question unless they name every proposed sweeper; and, under the
+//!   writers' lock with a fresh session, the bounty read back, marked done
+//!   by core with the time and the credits, checked against the record cap
+//!   and written again with every field this build does not know kept.
 //!
 //! The rules that hold for everything here (see "Rust conventions" in
 //! `docs/plan/03-cli-and-skill.md`):
@@ -238,6 +285,10 @@ mod clock;
 // records are read and written through.
 mod device;
 mod dirs;
+// A homeserver's public events: one `/events/` page, the owner's latest
+// event of a file from `/events-stream`, and the search for where a feed
+// ends, which `post --open` starts an open bounty's discovery from.
+mod events;
 // The one way `post` and `run` run git: hardened, bounded and timed.
 mod git;
 // The identity name, secret file, details file and refusal rules of
@@ -245,6 +296,9 @@ mod git;
 mod identity;
 // The terminal sanitiser.
 mod display;
+// `done`: the credits proposed from `pull`'s groups, confirmed, and the
+// bounty rewritten as done under the writers' lock.
+mod done;
 mod init;
 // `installs.json`: the device ids this owner's own installs created.
 mod installs;
@@ -268,6 +322,12 @@ mod pins;
 // `post`: the bounty draft, checked and pinned into a bounty, shown, and
 // published once the owner says yes.
 mod post;
+// `pull`: the command, and its steps in order: the roster poll with its
+// homeserver lookups, the open-bounty feed watcher, the opens and the store
+// of each sweep, the triage, and the one public write, `discovered.json`.
+// The local state it keeps between runs is here too, whose feed cursors
+// `post --open` writes as well.
+mod pull;
 // Owner-only files and directories, which every secret and state file goes
 // through.
 mod private_fs;
@@ -479,7 +539,9 @@ pub fn run_without_context(cli: &Cli) -> Option<anyhow::Result<Report>> {
         | Command::Circle { .. }
         | Command::Post { .. }
         | Command::Run { .. }
-        | Command::Submit { .. } => None,
+        | Command::Submit { .. }
+        | Command::Pull
+        | Command::Done { .. } => None,
     }
 }
 
@@ -535,9 +597,9 @@ pub async fn run(cli: Cli, ctx: &Context) -> anyhow::Result<Report> {
         },
         // `match cli.command` moved only that field out of `cli`, so
         // `cli.no_input`, another field, can still be read here.
-        Command::Post { draft } => {
+        Command::Post { draft, open } => {
             let prompting = prompt::Prompting::from_no_input_flag(cli.no_input);
-            post::post(ctx, prompting, &draft).await
+            post::post(ctx, prompting, &draft, open).await
         }
         // `run::run` is the function `run` in the module `run`: a module
         // and a function live in different namespaces, so the two names
@@ -550,6 +612,16 @@ pub async fn run(cli: Cli, ctx: &Context) -> anyhow::Result<Report> {
         Command::Submit { run_dir, playbook } => {
             let prompting = prompt::Prompting::from_no_input_flag(cli.no_input);
             submit::submit(ctx, prompting, run_dir.as_deref(), playbook.as_deref()).await
+        }
+        // `pull` asks nothing, so it takes no `Prompting`.
+        Command::Pull => pull::pull(ctx).await,
+        Command::Done {
+            bounty,
+            credit,
+            no_credit,
+        } => {
+            let prompting = prompt::Prompting::from_no_input_flag(cli.no_input);
+            done::done(ctx, prompting, &bounty, &credit, &no_credit).await
         }
     }
 }
@@ -607,6 +679,7 @@ mod tests {
             &["circle", "remove", "pk"],
             &["circle", "show"],
             &["post", "draft.json"],
+            &["post", "--open", "draft.json"],
             &["run"],
             &[
                 "run",
@@ -623,6 +696,15 @@ mod tests {
                 "sweeps/0035G87EK4XFE",
                 "--playbook",
                 "cloudflare/security-audit@c1c8a8c",
+            ],
+            &["pull"],
+            &[
+                "done",
+                "pubky://owner/pub/sweepky/bounties/0035G87EK4XFE.json",
+                "--credit",
+                "b",
+                "--no-credit",
+                "c",
             ],
         ];
         for args in commands {

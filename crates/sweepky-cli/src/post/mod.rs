@@ -1,7 +1,7 @@
-//! `post <draft>`, for a bounty that is not `--open` (P2c adds that flag):
-//! the draft read and checked, every target pinned, the bounty shown to
-//! the owner, and, once they say yes, published as
-//! `/pub/sweepky/bounties/<id>.json`.
+//! `post <draft> [--open]`: the draft read and checked, every target
+//! pinned, the bounty shown to the owner, and, once they say yes, published
+//! as `/pub/sweepky/bounties/<id>.json`, closed to strangers' sweeps unless
+//! `--open`.
 //!
 //! - `draft`: the draft file an owner or their agent writes (title,
 //!   focus, brief, a suggested playbook and the targets, unpinned), read
@@ -9,7 +9,10 @@
 //! - [`prepare_bounty`]: checks every target against the target policy,
 //!   pins each one through the context's target source, and builds the
 //!   core `Bounty` that `post` publishes, with the warnings it shows
-//!   first.
+//!   first. `--open` changes the record's `open` field and nothing else.
+//! - `open`: what `post --open` does after the yes, in place of step 4
+//!   below: the starting cursors found, and the bounty published with its
+//!   discovered-sweeps file, `bounties/<id>.discovered.json`.
 //! - [`post`], the command, in this order:
 //!   1. read the draft, take `createdAt` from the clock, and pin every
 //!      target;
@@ -21,12 +24,16 @@
 //!   4. only then make the bounty's id from the clock and, under the
 //!      writers' lock with a fresh session that is always signed out
 //!      (`session::with_writer_session`), PUT the record through
-//!      [`OwnStorage`] ([`publish`]), and report its `pubky://` URL.
+//!      [`OwnStorage`] ([`publish`]), and report its `pubky://` URL. An
+//!      open bounty goes through `open` instead, which searches before it
+//!      takes the lock and writes its discovered-sweeps file after the
+//!      bounty.
 //!
 //! **Why the question comes before the lock.** The lock serialises every
 //! writing command on this install, and a person may take minutes to
 //! answer, so no other command waits on them and no session is open
-//! meanwhile. The lock covers the sign-in, the PUT and the sign-out alone.
+//! meanwhile. The lock covers the sign-in, the PUT and the sign-out alone
+//! (for `--open`, see `open` for the little more it covers).
 //!
 //! **Agent-written text is sanitised on its way to the terminal.** The
 //! draft's checks already refuse public text the sanitiser would change,
@@ -37,6 +44,7 @@
 //! makes a draft check first.
 
 pub(crate) mod draft;
+mod open;
 
 use std::path::Path;
 
@@ -72,18 +80,29 @@ const NOTHING_POSTED: &str = "nothing was posted";
 /// not `--open`.
 const CLOSED: &str = "closed: sweeps from outside your circle are not read";
 
-/// Runs `post <draft>`: reads the bounty draft at `draft`, pins its
-/// targets, shows the bounty and asks whether to publish it, and only on a
-/// yes writes `bounties/<id>.json` under the writers' lock with a fresh
-/// session. `prompting` is the global `--no-input`, under which the
-/// question fails, so nothing is posted. See the module docs for the
-/// order and why.
+/// The line the preview and the report both give for a bounty that is
+/// `--open`.
+const OPEN: &str = "open: sweeps from anyone are read and labelled by trust";
+
+/// [`OPEN`] or [`CLOSED`], as the bounty's `open` field says.
+fn reach(open: bool) -> &'static str {
+    if open { OPEN } else { CLOSED }
+}
+
+/// Runs `post <draft> [--open]`: reads the bounty draft at `draft`, pins
+/// its targets, shows the bounty and asks whether to publish it, and only
+/// on a yes writes `bounties/<id>.json` under the writers' lock with a
+/// fresh session; with `open`, the bounty takes anyone's sweeps, and the
+/// `open` module writes its discovered-sweeps file too. `prompting` is the
+/// global `--no-input`, under which the question fails, so nothing is
+/// posted or searched. See the module docs for the order and why.
 pub(crate) async fn post(
     ctx: &Context,
     prompting: Prompting,
     draft: &Path,
+    open: bool,
 ) -> anyhow::Result<Report> {
-    let prepared = pin_draft(ctx, draft).await?;
+    let prepared = pin_draft(ctx, draft, open).await?;
     let record = bounty_bytes(&prepared.bounty)?;
     ctx.stderr.write_flushed(&preview(&prepared)?)?;
     // `context` puts the words in front of `--no-input`'s error, so both
@@ -93,18 +112,24 @@ pub(crate) async fn post(
             "Not confirmed, so {NOTHING_POSTED}.\n"
         )));
     }
-    let posted = publish_signed_in(ctx, record).await?;
+    let posted = if open {
+        open::publish_signed_in(ctx, record).await?
+    } else {
+        publish_signed_in(ctx, record).await?
+    };
     // A `BountyRef` prints as its `pubky://` URL, the raw z-base32 owner
     // and the id, which need no sanitising. It ends its line, so it can be
     // copied whole.
     Ok(Report::new(format!(
-        "Posted the bounty, {CLOSED}:\n{posted}\n"
+        "Posted the bounty, {}:\n{posted}\n",
+        reach(open)
     )))
 }
 
 /// The draft at `path`, read and checked, its targets pinned through the
-/// context's target source into the bounty `post` publishes, posted now.
-async fn pin_draft(ctx: &Context, path: &Path) -> anyhow::Result<PreparedBounty> {
+/// context's target source into the bounty `post` publishes, posted now,
+/// and open to anyone's sweeps when `open`.
+async fn pin_draft(ctx: &Context, path: &Path, open: bool) -> anyhow::Result<PreparedBounty> {
     let draft = read_draft(path)?;
     let created_at = clock::now()?;
     // The runner is dropped when this function returns, which removes its
@@ -113,7 +138,7 @@ async fn pin_draft(ctx: &Context, path: &Path) -> anyhow::Result<PreparedBounty>
     // The SDK's HTTP client is the GitHub API a pull request target is
     // read through.
     let github = ctx.network.pubky().client();
-    prepare_bounty(draft, &ctx.targets, &git, github, created_at).await
+    prepare_bounty(draft, open, &ctx.targets, &git, github, created_at).await
 }
 
 /// `bounty` as it is published: compact JSON, refused when it would be
@@ -187,8 +212,9 @@ fn preview(prepared: &PreparedBounty) -> anyhow::Result<String> {
         .map(|warning| format!("warning: {warning}\n"))
         .collect();
     text.push_str(&format!(
-        "The bounty to post, {CLOSED}.\n  Title: {}\n  Focus: {}\n  Playbook: {}\n  \
+        "The bounty to post, {}.\n  Title: {}\n  Focus: {}\n  Playbook: {}\n  \
          Targets ({}):\n",
+        reach(bounty.open),
         sanitize(&bounty.title, MAX_TITLE_CHARS),
         sanitize(bounty.focus.as_str(), MAX_FOCUS_CHARS),
         shown_playbook(&bounty.playbook),
@@ -293,7 +319,8 @@ pub(crate) struct PreparedBounty {
 }
 
 /// Pins every target of `draft` through `source` and builds the bounty
-/// `post` publishes, posted at `created_at`.
+/// `post` publishes, posted at `created_at`, and open to anyone's sweeps
+/// when `open` (`--open`): that field alone differs.
 ///
 /// First every target goes through the source's policy, which needs no
 /// network, so a draft with one target the source refuses is refused
@@ -310,6 +337,7 @@ pub(crate) struct PreparedBounty {
 // have `async fn`s, so they cannot be `dyn` (see `TargetResolver`).
 pub(crate) async fn prepare_bounty(
     draft: BountyDraft,
+    open: bool,
     source: &impl TargetResolver,
     git: &impl RunGit,
     github: &impl GitHubApi,
@@ -329,10 +357,9 @@ pub(crate) async fn prepare_bounty(
     }
     // Read before `into_bounty`, which uses the draft up.
     let warnings = draft.warnings();
-    Ok(PreparedBounty {
-        bounty: draft.into_bounty(pinned, created_at),
-        warnings,
-    })
+    let mut bounty = draft.into_bounty(pinned, created_at);
+    bounty.open = open;
+    Ok(PreparedBounty { bounty, warnings })
 }
 
 /// `target` pinned through `source`: a repo or commit target's ref
@@ -384,8 +411,8 @@ mod tests {
 
     use super::draft::BountyDraft;
     use super::{
-        NOTHING_POSTED, PUBLISH_QUESTION, PreparedBounty, bounty_bytes, post, prepare_bounty,
-        preview, publish,
+        CLOSED, NOTHING_POSTED, OPEN, PUBLISH_QUESTION, PreparedBounty, bounty_bytes, post,
+        prepare_bounty, preview, publish,
     };
     use crate::Context;
     use crate::clock;
@@ -423,14 +450,16 @@ mod tests {
     }
 
     /// `draft` pinned through `source`, with `git`, and with a GitHub that
-    /// answers nothing, which the fixture source never asks.
+    /// answers nothing, which the fixture source never asks, into a bounty
+    /// open to anyone's sweeps when `open`.
     async fn prepare(
         draft: BountyDraft,
+        open: bool,
         source: &TargetSource,
         git: &impl crate::git::RunGit,
     ) -> anyhow::Result<PreparedBounty> {
         let github = FakeGitHub::answering(&[]);
-        let prepared = prepare_bounty(draft, source, git, &github, created_at()).await;
+        let prepared = prepare_bounty(draft, open, source, git, &github, created_at()).await;
         assert_eq!(github.asked(), Vec::<String>::new());
         prepared
     }
@@ -451,7 +480,7 @@ mod tests {
             { "kind": "pr", "repo": repo, "number": 1 },
         ]));
 
-        let prepared = prepare(draft, &source, &git).await.expect("pinned");
+        let prepared = prepare(draft, false, &source, &git).await.expect("pinned");
 
         assert_eq!(prepared.warnings, Vec::<String>::new());
         // `main` is M, the fixture's merge commit, for the repo and the
@@ -511,6 +540,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn open_changes_the_record_s_open_field_alone() {
+        let source = TargetSource::Fixture(fixture_targets());
+        let temp = private_temp();
+        let git = source
+            .git_runner(&dirs_in(&temp), &test_git_env())
+            .expect("a runner");
+        let repo = fixture_repo();
+        let targets = json!([
+            { "kind": "repo", "repo": repo, "ref": "main", "paths": ["src/auth/"] },
+            { "kind": "pr", "repo": repo, "number": 1 },
+        ]);
+        let closed = prepare(draft(targets.clone()), false, &source, &git)
+            .await
+            .expect("pinned");
+        let open = prepare(draft(targets), true, &source, &git)
+            .await
+            .expect("pinned");
+
+        // Read back as any Sweepky reads a bounty: open, and otherwise the
+        // record a closed post writes, field for field.
+        let written = bounty_bytes(&open.bounty).expect("within the cap");
+        assert!(Bounty::from_json(&written).expect("reads back").open);
+        let mut expected: Value =
+            serde_json::from_slice(&bounty_bytes(&closed.bounty).expect("within the cap"))
+                .expect("JSON");
+        assert_eq!(expected["open"], json!(false));
+        expected["open"] = json!(true);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&written).expect("JSON"),
+            expected
+        );
+        assert_eq!(open.warnings, closed.warnings);
+    }
+
+    #[tokio::test]
     async fn a_repository_that_is_not_anonymously_readable_builds_no_bounty() {
         // The fixture's name mapped to an empty directory: git cannot list
         // it, as it cannot list a private repository.
@@ -526,7 +590,9 @@ mod tests {
         let draft = draft(json!([{ "kind": "repo", "repo": fixture_repo(), "ref": "main" }]));
 
         // An `Err`, so there is no bounty to publish.
-        let error = prepare(draft, &source, &git).await.expect_err("refused");
+        let error = prepare(draft, false, &source, &git)
+            .await
+            .expect_err("refused");
         let message = format!("{error:#}");
         assert!(message.contains("targets[0]"), "{message}");
         assert!(message.contains(NOT_ANONYMOUSLY_READABLE), "{message}");
@@ -543,7 +609,9 @@ mod tests {
             { "kind": "commit", "repo": "example.invalid/sweepky/elsewhere", "ref": "main" },
         ]));
 
-        let error = prepare(draft, &source, &git).await.expect_err("refused");
+        let error = prepare(draft, false, &source, &git)
+            .await
+            .expect_err("refused");
         assert!(format!("{error:#}").contains("targets[1]"), "{error:#}");
         assert_eq!(git.argv(), Vec::<Vec<String>>::new());
     }
@@ -556,7 +624,7 @@ mod tests {
         let git = RecordingGit::succeeding(source.protocols(), listing.as_bytes());
         let draft = draft(json!([{ "kind": "repo", "repo": fixture_repo(), "ref": "HEAD" }]));
 
-        let prepared = prepare(draft, &source, &git).await.expect("pinned");
+        let prepared = prepare(draft, false, &source, &git).await.expect("pinned");
 
         let [warning] = prepared.warnings.as_slice() else {
             panic!("one warning: {:?}", prepared.warnings);
@@ -643,41 +711,97 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn anything_but_yes_posts_nothing_and_opens_no_session() {
-        // `n`, an empty line and the end of the input are each a no.
-        for answer in [&b"n\n"[..], b"\n", b""] {
-            let (home, ctx, _stderr) = post_context(answer);
-            let draft = draft_file(&home, &fixture_draft());
+    async fn anything_but_yes_posts_nothing_searches_nothing_and_opens_no_session() {
+        // `n`, an empty line and the end of the input are each a no, for a
+        // closed bounty and an open one alike.
+        for open in [false, true] {
+            for answer in [&b"n\n"[..], b"\n", b""] {
+                let (home, ctx, _stderr) = post_context(answer);
+                let draft = draft_file(&home, &fixture_draft());
 
-            let report = post(&ctx, Prompting::Allowed, &draft)
-                .await
-                .expect("a no is not an error");
+                let report = post(&ctx, Prompting::Allowed, &draft, open)
+                    .await
+                    .expect("a no is not an error");
 
-            // Had `post` signed in, it would have failed with
-            // NOT_LOGGED_IN: this context has no login.
-            assert!(report.text().contains(NOTHING_POSTED), "{}", report.text());
-            // The writers' lock file is made by the first command that
-            // takes the lock, so none was taken.
-            assert!(!ctx.dirs.credential_lock_file().exists());
+                // Had `post` signed in or searched a feed, it would have
+                // failed: this context has no login, and its network
+                // reaches nothing.
+                assert!(report.text().contains(NOTHING_POSTED), "{}", report.text());
+                // The writers' lock file is made by the first command that
+                // takes the lock, so none was taken; no cursor was stored.
+                assert!(!ctx.dirs.credential_lock_file().exists());
+                assert!(!ctx.dirs.feed_cursors_file().exists());
+            }
         }
     }
 
     #[tokio::test]
     async fn no_input_fails_instead_of_asking_and_posts_nothing() {
-        // A yes waits on standard input, and is never read.
+        for open in [false, true] {
+            // A yes waits on standard input, and is never read.
+            let (home, ctx, stderr) = post_context(b"y\n");
+            let draft = draft_file(&home, &fixture_draft());
+
+            let error = post(&ctx, Prompting::Forbidden, &draft, open)
+                .await
+                .expect_err("no question under --no-input");
+
+            let message = format!("{error:#}");
+            assert!(message.contains(NOTHING_POSTED), "{message}");
+            assert!(message.contains("--no-input"), "{message}");
+            assert!(!message.contains(NOT_LOGGED_IN), "{message}");
+            assert!(!stderr.text().contains("[y/N]"), "{}", stderr.text());
+            assert!(!ctx.dirs.credential_lock_file().exists());
+            assert!(!ctx.dirs.feed_cursors_file().exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn an_open_post_with_no_login_reads_it_after_the_yes_and_searches_nothing() {
         let (home, ctx, stderr) = post_context(b"y\n");
         let draft = draft_file(&home, &fixture_draft());
 
-        let error = post(&ctx, Prompting::Forbidden, &draft)
+        let error = post(&ctx, Prompting::Allowed, &draft, true)
             .await
-            .expect_err("no question under --no-input");
+            .expect_err("no login");
 
+        // NOT_LOGGED_IN, not a network error: had `post` searched the watch
+        // list's homeserver first, this context's network, which reaches
+        // nothing, would have failed it.
         let message = format!("{error:#}");
+        assert!(message.contains(NOT_LOGGED_IN), "{message}");
         assert!(message.contains(NOTHING_POSTED), "{message}");
-        assert!(message.contains("--no-input"), "{message}");
-        assert!(!message.contains(NOT_LOGGED_IN), "{message}");
-        assert!(!stderr.text().contains("[y/N]"), "{}", stderr.text());
+        // Asked and answered, then no search announced, no lock taken and
+        // no cursor stored.
+        let shown = stderr.text();
+        assert!(
+            shown.ends_with(&format!("{PUBLISH_QUESTION} [y/N] ")),
+            "{shown}"
+        );
         assert!(!ctx.dirs.credential_lock_file().exists());
+        assert!(!ctx.dirs.feed_cursors_file().exists());
+    }
+
+    #[tokio::test]
+    async fn the_preview_says_whether_the_bounty_is_open_before_the_question() {
+        for (open, reach) in [(false, CLOSED), (true, OPEN)] {
+            let (home, ctx, stderr) = post_context(b"n\n");
+            let draft = draft_file(&home, &fixture_draft());
+
+            post(&ctx, Prompting::Allowed, &draft, open)
+                .await
+                .expect("a no is not an error");
+
+            let shown = stderr.text();
+            assert!(
+                shown.contains(&format!("The bounty to post, {reach}.\n")),
+                "{shown}"
+            );
+            assert!(
+                shown.ends_with(&format!("{PUBLISH_QUESTION} [y/N] ")),
+                "{shown}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -688,7 +812,7 @@ mod tests {
         let (home, ctx, stderr) = post_context(b"n\n");
         let draft = draft_file(&home, &fixture_draft());
 
-        post(&ctx, Prompting::Allowed, &draft)
+        post(&ctx, Prompting::Allowed, &draft, false)
             .await
             .expect("a no is not an error");
 
@@ -725,26 +849,29 @@ mod tests {
 
     #[tokio::test]
     async fn a_bounty_over_the_record_cap_is_refused_before_the_question() {
-        let (home, ctx, stderr) = post_context(b"y\n");
         let draft = draft_near_the_cap();
         BountyDraft::parse(&draft).expect("the draft itself is within its caps");
-        let path = draft_file(&home, &draft);
+        for open in [false, true] {
+            let (home, ctx, stderr) = post_context(b"y\n");
+            let path = draft_file(&home, &draft);
 
-        let error = post(&ctx, Prompting::Allowed, &path)
-            .await
-            .expect_err("refused");
+            let error = post(&ctx, Prompting::Allowed, &path, open)
+                .await
+                .expect_err("refused");
 
-        // The cap's own message, not NOT_LOGGED_IN, which a sign-in after
-        // the yes on standard input would have given.
-        let message = format!("{error:#}");
-        assert!(
-            message.contains(&format!("over the {MAX_RECORD_BYTES} bytes")),
-            "{message}"
-        );
-        assert!(message.contains(NOTHING_POSTED), "{message}");
-        // Nothing shown, nothing asked and no lock taken.
-        assert_eq!(stderr.text(), "");
-        assert!(!ctx.dirs.credential_lock_file().exists());
+            // The cap's own message, not NOT_LOGGED_IN, which a sign-in or
+            // the login read after the yes on standard input would have
+            // given.
+            let message = format!("{error:#}");
+            assert!(
+                message.contains(&format!("over the {MAX_RECORD_BYTES} bytes")),
+                "{message}"
+            );
+            assert!(message.contains(NOTHING_POSTED), "{message}");
+            // Nothing shown, nothing asked and no lock taken.
+            assert_eq!(stderr.text(), "");
+            assert!(!ctx.dirs.credential_lock_file().exists());
+        }
     }
 
     #[test]

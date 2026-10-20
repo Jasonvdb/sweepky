@@ -6,15 +6,22 @@
 //! see it, and reads it back through its session only under the lock.
 //!
 //! - [`PublicRecords::get_record`] and [`PublicRecords::list`] are the two
-//!   methods an implementation writes: the bytes of one public file, at most
-//!   [`MAX_RECORD_BYTES`], or `None` when there is none (a 404); and the
-//!   Sweepky files one directory lists. [`PublicRecordReader`] is the real
-//!   one, through `remote::get_public` and `remote::list_dir`, which find
-//!   the owner's homeserver through pkarr, ask it anonymously, refuse an
-//!   answer that came through a redirect and cap every body before it is
-//!   buffered; a listing is read within [`ListLimits::DEFAULT`], at most
-//!   1000 entries in 11 pages, and refused whole past them or when a page
-//!   breaks the protocol. The unit tests use
+//!   methods an implementation writes for `run` and `submit`: the bytes of
+//!   one public file, at most [`MAX_RECORD_BYTES`], or `None` when there is
+//!   none (a 404); and the Sweepky files one directory lists. For `pull` it
+//!   writes three more:
+//!   [`list_newest_first`](PublicRecords::list_newest_first), a listing
+//!   newest first that stops at the newest record id already seen;
+//!   [`get_record_if_changed`](PublicRecords::get_record_if_changed), a
+//!   record read again only if it changed since its tag; and
+//!   [`get_package`](PublicRecords::get_package), a sweep's `.age`, at most
+//!   [`MAX_CIPHERTEXT_BYTES`](sweepky_core::MAX_CIPHERTEXT_BYTES).
+//!   [`PublicRecordReader`] is the real one, through `remote`'s helpers,
+//!   which find the owner's homeserver through pkarr, ask it anonymously,
+//!   refuse an answer that came through a redirect and cap every body
+//!   before it is buffered; a listing is read within
+//!   [`ListLimits::DEFAULT`], at most 1000 entries in 11 pages, and refused
+//!   whole past them or when a page breaks the protocol. The unit tests use
 //!   `test_support::FakePublicRecords`, which keeps files in memory.
 //! - [`get_bounty`](PublicRecords::get_bounty),
 //!   [`get_circle`](PublicRecords::get_circle) and
@@ -45,10 +52,13 @@ use sweepky_core::{
     Bounty, BountyRef, Circle, MAX_RECORD_BYTES, Pubky, RecordId, Sweep, SweepRef, Zeroizing,
 };
 
-use crate::remote::{ListLimits, Listing, get_public, list_dir, public_key_of};
+use crate::remote::{
+    self, Conditional, ETag, ListLimits, Listing, get_public, get_public_if_changed, list_dir,
+    list_dir_newest_first, public_key_of,
+};
 
 /// Anyone's public Sweepky records, read with no session: the seam between
-/// `run` and `submit` and everyone's homeservers.
+/// `run`, `submit` and `pull` and everyone's homeservers.
 ///
 /// A trait so that `run` can be tested without a network, as with
 /// `device::PublicKeys`. Its methods are `async fn`s, so it cannot be a
@@ -76,6 +86,37 @@ pub(crate) trait PublicRecords {
     /// `dir` is one of `sweepky_core::paths`' directories, which ends with
     /// `/`: an error names it.
     async fn list(&self, owner: Pubky, dir: &str) -> anyhow::Result<Listing>;
+
+    /// As [`list`](Self::list), but newest first, and stopping at `seen`,
+    /// the newest record id already seen in `dir`: the first file of a
+    /// record whose id is at or below it ends the listing, and is not in it
+    /// (`remote::ListOrder::NewestFirst`). `None` lists the whole
+    /// directory, newest first.
+    async fn list_newest_first(
+        &self,
+        owner: Pubky,
+        dir: &str,
+        seen: Option<RecordId>,
+    ) -> anyhow::Result<Listing>;
+
+    /// The file at `path` of `owner`'s public storage again, at most
+    /// [`MAX_RECORD_BYTES`], unless it is unchanged since `etag`, the tag
+    /// its last answer gave: [`Conditional::NotModified`] then, with no
+    /// body. [`Conditional::Absent`] when there is no such file. As for
+    /// [`get_record`](Self::get_record), `path` comes from
+    /// `sweepky_core::paths`.
+    async fn get_record_if_changed(
+        &self,
+        owner: Pubky,
+        path: &str,
+        etag: Option<&ETag>,
+    ) -> anyhow::Result<Conditional>;
+
+    /// The encrypted package of `sweep`, `sweeps/<id>.age` of its sweeper,
+    /// at most [`MAX_CIPHERTEXT_BYTES`](sweepky_core::MAX_CIPHERTEXT_BYTES),
+    /// or `None` when there is none. `pull::open` reads each sweep's
+    /// package through it, from the path it read the record from.
+    async fn get_package(&self, sweep: SweepRef) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>>;
 
     /// The bounty `bounty` points at, `bounties/<id>.json` of its owner, or
     /// `None` when there is none.
@@ -153,7 +194,7 @@ pub(crate) trait PublicRecords {
 /// The message for bytes at `path` of `owner` that are not a `kind`
 /// record: the path and the owner, which this build built and checked, and
 /// never the bytes. Core's `RecordError` follows it as the cause.
-fn not_a_record(kind: &str, path: &str, owner: Pubky) -> String {
+pub(crate) fn not_a_record(kind: &str, path: &str, owner: Pubky) -> String {
     format!("{path} of {owner} is not a {kind} record this build reads")
 }
 
@@ -188,18 +229,44 @@ impl PublicRecords for PublicRecordReader<'_> {
         let key = public_key_of(&owner)?;
         list_dir(self.client, &key, dir, ListLimits::DEFAULT).await
     }
+
+    async fn list_newest_first(
+        &self,
+        owner: Pubky,
+        dir: &str,
+        seen: Option<RecordId>,
+    ) -> anyhow::Result<Listing> {
+        let key = public_key_of(&owner)?;
+        list_dir_newest_first(self.client, &key, dir, ListLimits::DEFAULT, seen).await
+    }
+
+    async fn get_record_if_changed(
+        &self,
+        owner: Pubky,
+        path: &str,
+        etag: Option<&ETag>,
+    ) -> anyhow::Result<Conditional> {
+        let key = public_key_of(&owner)?;
+        get_public_if_changed(self.client, &key, path, etag).await
+    }
+
+    async fn get_package(&self, sweep: SweepRef) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
+        let key = public_key_of(&sweep.sweeper)?;
+        remote::get_package(self.client, &key, sweep.id).await
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
-    use sweepky_core::paths;
+    use sweepky_core::paths::{self, SweepkyPath};
     use sweepky_core::{BountyRef, MAX_RECORD_BYTES, Pubky, SweepRef};
 
     use super::PublicRecords;
+    use crate::remote::Conditional;
     use crate::test_support::{
         FakePublicRecords, PLANTED, bounty_id, bounty_json, circle_json, json_bytes, random_pubky,
-        record_id, sweep_json,
+        record_id, repo_target_json, sweep_json,
     };
 
     /// A running sweep of target t1 of `owner`'s synthetic bounty.
@@ -383,6 +450,161 @@ mod tests {
                 "{message}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_newest_first_listing_stops_at_the_newest_id_already_seen() {
+        let owner = random_pubky();
+        let records = FakePublicRecords::default()
+            .with_file(owner, &paths::bounty(record_id(1)), Vec::new())
+            .with_file(owner, &paths::bounty(record_id(2)), Vec::new())
+            .with_file(owner, &paths::bounty(record_id(3)), Vec::new())
+            .with_file(owner, &paths::discovered(record_id(3)), Vec::new());
+        let bounty = |n| SweepkyPath::Bounty(record_id(n));
+
+        // Newest first: a bounty's record sorts after its `.discovered.json`.
+        let all = records
+            .list_newest_first(owner, paths::BOUNTIES_DIR, None)
+            .await
+            .expect("listed");
+        assert_eq!(
+            all.entries,
+            [
+                bounty(3),
+                SweepkyPath::Discovered(record_id(3)),
+                bounty(2),
+                bounty(1)
+            ]
+        );
+        // Stopped at the newest id already seen, which is not listed again.
+        let since_1 = records
+            .list_newest_first(owner, paths::BOUNTIES_DIR, Some(record_id(1)))
+            .await
+            .expect("listed");
+        assert_eq!(
+            since_1.entries,
+            [bounty(3), SweepkyPath::Discovered(record_id(3)), bounty(2)]
+        );
+        let since_3 = records
+            .list_newest_first(owner, paths::BOUNTIES_DIR, Some(record_id(3)))
+            .await
+            .expect("listed");
+        assert!(since_3.entries.is_empty());
+        // The oldest-first listing is as it was.
+        let oldest_first = records
+            .list(owner, paths::BOUNTIES_DIR)
+            .await
+            .expect("listed");
+        assert_eq!(
+            oldest_first.entries,
+            [
+                bounty(1),
+                bounty(2),
+                SweepkyPath::Discovered(record_id(3)),
+                bounty(3)
+            ]
+        );
+        assert_eq!(
+            records.asked(),
+            vec![(owner, paths::BOUNTIES_DIR.to_owned()); 4]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_conditional_get_is_answered_by_the_content_hash() {
+        let owner = random_pubky();
+        let path = paths::bounty(bounty_id());
+        let first = bounty_json(json!([]));
+        let records = FakePublicRecords::default().with_record(owner, &path, &first);
+
+        // Without a tag, the record and the tag to send next time.
+        let Conditional::Changed {
+            body,
+            etag: Some(tag),
+        } = records
+            .get_record_if_changed(owner, &path, None)
+            .await
+            .expect("read")
+        else {
+            panic!("a first read is a change, with a tag");
+        };
+        assert_eq!(body.as_slice(), json_bytes(&first));
+        // The tag sent back while the bytes are the same: unchanged.
+        let again = records
+            .get_record_if_changed(owner, &path, Some(&tag))
+            .await
+            .expect("read");
+        assert!(matches!(again, Conditional::NotModified));
+
+        // Once the bytes change, the old tag no longer matches.
+        let second = bounty_json(json!([repo_target_json("t1")]));
+        let records = records.with_record(owner, &path, &second);
+        let Conditional::Changed {
+            body,
+            etag: Some(new_tag),
+        } = records
+            .get_record_if_changed(owner, &path, Some(&tag))
+            .await
+            .expect("read")
+        else {
+            panic!("changed bytes are a change, with a tag");
+        };
+        assert_eq!(body.as_slice(), json_bytes(&second));
+        assert_ne!(new_tag, tag);
+
+        // A record that is not there is absent.
+        let missing = paths::bounty(record_id(9));
+        let gone = records
+            .get_record_if_changed(owner, &missing, Some(&tag))
+            .await
+            .expect("read");
+        assert!(matches!(gone, Conditional::Absent));
+
+        // Every request is recorded.
+        assert_eq!(
+            records.asked(),
+            [
+                (owner, path.clone()),
+                (owner, path.clone()),
+                (owner, path),
+                (owner, missing),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_package_is_read_from_the_sweeper_s_age_file() {
+        let sweeper = random_pubky();
+        let package_path = paths::sweep_package(record_id(3));
+        let records = FakePublicRecords::default()
+            .with_file(sweeper, &package_path, b"sealed bytes".to_vec())
+            .with_file(sweeper, &paths::sweep_record(record_id(4)), Vec::new());
+
+        let package = records
+            .get_package(SweepRef {
+                sweeper,
+                id: record_id(3),
+            })
+            .await
+            .expect("read")
+            .expect("there");
+        assert_eq!(package.as_slice(), b"sealed bytes");
+        // A sweep with a record and no package has none.
+        let unsubmitted = records
+            .get_package(SweepRef {
+                sweeper,
+                id: record_id(4),
+            })
+            .await
+            .expect("a 404 is no error");
+        assert!(unsubmitted.is_none());
+        assert_eq!(
+            records.asked(),
+            [
+                (sweeper, package_path),
+                (sweeper, paths::sweep_package(record_id(4))),
+            ]
+        );
     }
 
     /// `err` says which kind of record it could not read, and quotes none of

@@ -12,6 +12,7 @@
 //! | File | What |
 //! |---|---|
 //! | `credential.lock` | the writers' lock |
+//! | `pull.lock` | the pull lock: one `pull` at a time on this install |
 //! | `login.json` | which login this install uses |
 //! | `installs.json` | the device ids this owner's own installs created |
 //! | `owner-keys.json` | per bounty owner, the keys `submit` last encrypted a sweep to, pinned (`crate::pins`) |
@@ -25,12 +26,20 @@
 //! |---|---|
 //! | `git-home-<id>/` | git's `HOME` while one command (`post`, `run`) runs it: new, empty and 0700, removed when the command ends (`crate::git`) |
 //! | `staging/<id>/` | the sweep directory `run` builds before it moves it into the project's `sweeps/<id>/`: new and 0700, removed when `run` ends (`run::fetch`) |
+//! | `staging/.pull.<pid>.<nanos>.<n>.tmp/` | where `pull` writes one decrypted sweep, and a bounty's directory the first time, before it moves them into place: new and 0700, removed when the store ends (`crate::pull::store`) |
 //! | `sweeps/<id>.json` | what `run` fetched for sweep `id`, which `submit` builds the manifest's commits from: written by `run`, removed once the sweep's record says `done` or `aborted` (`crate::sweep_state`) |
+//! | `feed-cursors.json` | per owner and watched homeserver, how far `pull` has read its `/events/` feed (`crate::pull`) |
+//! | `poll-state.json` | per owner, what `pull`'s roster polling learnt: the newest ids seen, bounty and sweep summaries with their `ETag`s, the strangers' sweeps accepted and the deletions confirmed (`crate::pull`) |
+//! | `<id>/` | what `pull` decrypted of the owner's bounty `id`: `owner.json`, the owner check; each trusted sweep in `<sweeper z32>-<sweep id>/`, and each untrusted one in `untrusted/<sweeper z32>-<sweep id>/`, holding the package's files and `.sweepky/findings.json`, a compact copy of its findings (`crate::pull::store`) |
 //!
-//! The data directory's other subtrees (P2c) come later. Every file here
-//! is written with [`crate::private_fs`]: directories 0700, files 0600;
-//! the one exception is what git checks out under `staging/<id>/`, which
-//! that 0700 directory keeps from other users.
+//! A bounty's id is 13 characters of `0-9` and upper-case `A-Z`, and no
+//! other name here is, in either case: each is shorter or has a `-` or a
+//! `.` in it. So a pulled bounty's directory never takes another entry's
+//! name, even on a file system that ignores case. Every directory here is
+//! made 0700 and every file 0600, with [`crate::private_fs`] or, for what
+//! `pull` stores, through directory handles (`crate::pull::store`); the one
+//! exception is what git checks out under `staging/<id>/`, which that 0700
+//! directory keeps from other users.
 //!
 //! **`XDG_CONFIG_HOME` and `XDG_DATA_HOME` are ignored, on purpose.** The
 //! sandbox template `init` writes into a sweeper project denies reads of
@@ -122,6 +131,12 @@ impl Dirs {
         self.config.join("credential.lock")
     }
 
+    /// `config/pull.lock`, the file the pull lock is taken on, so that one
+    /// `pull` at a time reads and writes its local state (`crate::lock`).
+    pub(crate) fn pull_lock_file(&self) -> PathBuf {
+        self.config.join("pull.lock")
+    }
+
     /// `config/login.json`: which login this install uses.
     pub fn login_file(&self) -> PathBuf {
         self.config.join("login.json")
@@ -190,6 +205,36 @@ impl Dirs {
     /// [`git_home_dir`](Self::git_home_dir).
     pub(crate) fn sweep_snapshot_file(&self, id: &RecordId) -> PathBuf {
         self.sweep_snapshots_dir().join(format!("{id}.json"))
+    }
+}
+
+/// The data directory's files that `pull` keeps (`crate::pull`).
+impl Dirs {
+    /// `data/feed-cursors.json`: per owner and watched homeserver, how far
+    /// `pull` has read that homeserver's `/events/` feed.
+    pub(crate) fn feed_cursors_file(&self) -> PathBuf {
+        self.data.join("feed-cursors.json")
+    }
+
+    /// `data/poll-state.json`: per owner, what `pull`'s roster polling
+    /// learnt, which its next run starts from.
+    pub(crate) fn poll_state_file(&self) -> PathBuf {
+        self.data.join("poll-state.json")
+    }
+
+    /// `data/<id>/`: what `pull` decrypted of the owner's bounty `id`, 03's
+    /// `~/.local/share/sweepky/<bounty>/`. A [`RecordId`] is 13 characters
+    /// of `0-9` and upper-case `A-Z`, so the name is one plain path segment
+    /// and never that of another entry here, none of which is 13 such
+    /// characters, in either case (the module docs).
+    pub(crate) fn pulled_bounty_dir(&self, id: &RecordId) -> PathBuf {
+        self.data.join(id.to_string())
+    }
+
+    /// `data/<id>/untrusted/`: the strangers' sweeps of bounty `id`, kept
+    /// apart from the merged report (02, "Sweeper safety").
+    pub(crate) fn pulled_untrusted_dir(&self, id: &RecordId) -> PathBuf {
+        self.pulled_bounty_dir(id).join("untrusted")
     }
 }
 
@@ -267,6 +312,7 @@ mod tests {
             dirs.credential_lock_file(),
             Path::new("/x/config/credential.lock")
         );
+        assert_eq!(dirs.pull_lock_file(), Path::new("/x/config/pull.lock"));
         assert_eq!(dirs.login_file(), Path::new("/x/config/login.json"));
         assert_eq!(dirs.installs_file(), Path::new("/x/config/installs.json"));
         assert_eq!(dirs.device_key_file(), Path::new("/x/config/device.key"));
@@ -292,6 +338,22 @@ mod tests {
         assert_eq!(
             dirs.sweep_snapshot_file(&id),
             Path::new("/x/share/sweeps/0035G87EK4XFE.json")
+        );
+        assert_eq!(
+            dirs.feed_cursors_file(),
+            Path::new("/x/share/feed-cursors.json")
+        );
+        assert_eq!(
+            dirs.poll_state_file(),
+            Path::new("/x/share/poll-state.json")
+        );
+        assert_eq!(
+            dirs.pulled_bounty_dir(&id),
+            Path::new("/x/share/0035G87EK4XFE")
+        );
+        assert_eq!(
+            dirs.pulled_untrusted_dir(&id),
+            Path::new("/x/share/0035G87EK4XFE/untrusted")
         );
     }
 }

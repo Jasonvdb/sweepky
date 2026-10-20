@@ -6,17 +6,26 @@
 //! what it writes to standard error, the [`GitEnv`] the tests run git with
 //! and the inert fixture repository they run it against, a
 //! [`FakeResolver`] in place of DNS and the [`checked_remote`] made
-//! through it, a [`RecordingGit`] in place of git, a [`FakeGitHub`] in
+//! through it, a [`FakeHomeservers`] in place of pkarr's homeserver
+//! records, a [`RecordingGit`] in place of git, a [`FakeGitHub`] in
 //! place of GitHub's API, the fixture source over
 //! that repository ([`fixture_targets`]) and the SHAs `fixtures/README.md`
 //! records for it, a [`FakeKeyStore`] in place of a homeserver's `keys/`, a
 //! [`FakeOwnStorage`] in place of the signed-in user's own storage, a
 //! [`FakePublicRecords`] in place of everyone's public storage and its
-//! listings, and the synthetic bounty, circle and sweep records the tests
+//! listings, a [`FakeEventsFeed`] in place of a homeserver's events feed and
+//! stream, which keeps every request, with [`feed_page`] and
+//! [`events_page`], an honest feed's page as a homeserver writes it, and
+//! [`stream_event`], one event of a
+//! stream answer, a [`LocalHttp`] server on the loopback address for the
+//! requests Sweepky sends itself, and the synthetic bounty, circle and
+//! sweep records the tests
 //! put there, with the snapshot `run` keeps of a sweep's fetch, the
 //! passphrase the tests wrap secret files with and a byte search to check
-//! a wrapped file shows none of its secret, and a compile-time check that a
-//! secret type implements none of the traits that would print or copy it.
+//! a wrapped file shows none of its secret, a compile-time check that a
+//! secret type implements none of the traits that would print or copy it,
+//! and [`stored_findings`], what `pull` stored of a sweep's findings, read
+//! back.
 //!
 //! Compiled only for `cargo test` (`#[cfg(test)]` on its `mod` line in
 //! `lib.rs`), so nothing here reaches the binary, and like any test code it
@@ -24,6 +33,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, Permissions};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{self, BufRead, ErrorKind, Write};
 use std::net::IpAddr;
 // `MetadataExt` adds `.mode()` and `.ino()` to `Metadata`; `PermissionsExt`
@@ -35,18 +45,22 @@ use std::sync::{Arc, Mutex};
 use pubky::errors::RequestError;
 use pubky::{Keypair, PubkyHttpClient, PublicKey, StatusCode};
 use serde_json::{Value, json};
-use sweepky_core::paths::SweepkyPath;
+use sweepky_core::paths::{self, SweepkyPath};
 use sweepky_core::{
-    Bounty, BountyRef, DeviceId, GitSha, KnownTarget, Pubky, RecordId, RepoName, SweepRef,
-    TargetId, Timestamp, Zeroizing,
+    Bounty, BountyRef, DeviceId, EventCursor, Findings, GitSha, KnownTarget, MAX_PACKAGE_BYTES,
+    Pubky, RecordId, RepoName, SweepRef, TargetId, Timestamp, Zeroizing,
 };
 use tempfile::TempDir;
+use tokio::net::{TcpListener, TcpStream};
 
 use crate::device::{KeyIds, KeyStore, PublicKeys};
+use crate::events::EventsFeed;
 use crate::git::{AllowedProtocols, GitCommand, GitFailed, RunGit, git_argv};
 use crate::own_storage::OwnStorage;
+use crate::pull::resolve::{ResolveHomeserver, Unreachable};
+use crate::pull::store::{Placement, StoredCopy, read_stored_findings, stored_sweep_dir};
 use crate::records::PublicRecords;
-use crate::remote::{Listing, ListingError};
+use crate::remote::{Conditional, ETag, ListOrder, Listing, ListingError};
 use crate::sweep_state::SweepSnapshot;
 use crate::targets::TargetSource;
 use crate::targets::fixture::FixtureTargets;
@@ -368,6 +382,8 @@ pub(crate) struct FakeKeyStore {
     listed_only: Mutex<BTreeSet<DeviceId>>,
     /// Ids whose public read fails, as a request to a homeserver can.
     failing_reads: Mutex<BTreeSet<DeviceId>>,
+    /// Whether the listing fails, as a request to a homeserver can.
+    failing_listings: Mutex<bool>,
     calls: Mutex<Vec<KeyStoreCall>>,
     refuse_puts_with: Option<StatusCode>,
 }
@@ -421,6 +437,12 @@ impl FakeKeyStore {
         self.failing_reads.lock().expect("lock").insert(id.clone());
     }
 
+    /// Fails every listing of `keys/` with [`FAKE_READ_FAILURE`], as a
+    /// request to a homeserver can fail. Not logged either.
+    pub(crate) fn fail_listings(&self) {
+        *self.failing_listings.lock().expect("lock") = true;
+    }
+
     fn log(&self, call: KeyStoreCall) {
         self.calls.lock().expect("lock").push(call);
     }
@@ -429,6 +451,9 @@ impl FakeKeyStore {
 impl PublicKeys for FakeKeyStore {
     async fn list_key_ids(&self, owner: &PublicKey) -> anyhow::Result<KeyIds> {
         self.log(KeyStoreCall::ListKeyIds(owner.clone()));
+        if *self.failing_listings.lock().expect("lock") {
+            anyhow::bail!(FAKE_READ_FAILURE);
+        }
         let records = self.records.lock().expect("lock");
         let listed_only = self.listed_only.lock().expect("lock");
         // Collected into a set first, so the ids come out in order, once.
@@ -602,17 +627,22 @@ impl OwnStorage for FakeOwnStorage {
 
 /// A [`PublicRecords`] in memory, in place of everyone's homeservers: files
 /// by owner and path, the directories whose listing it refuses, and every
-/// read and listing it was asked for, in order (a listing by its directory,
-/// which ends with `/`). It hands a file back whole, whatever its size, and
-/// lists a directory whole, in path order: the caps and the listing limits
-/// are the real reader's business, and the record parsers check the cap
-/// again themselves. The `Mutex` is there for the same reason as in
-/// [`FakeKeyStore`].
+/// request it was asked, in order: a read by its path, a listing by its
+/// directory, which ends with `/`. It hands a file back whole, whatever its
+/// size, and lists a directory whole, in path order or the reverse, newest
+/// first, where it stops as the real listing does
+/// ([`ListOrder::stops_at`]): the caps and the listing limits are the real
+/// reader's business, and the record parsers check the cap again
+/// themselves. A conditional read compares the tag sent with a hash of the
+/// file's bytes, as a homeserver compares its content hash. The `Mutex` is
+/// there for the same reason as in [`FakeKeyStore`].
 #[derive(Default)]
 pub(crate) struct FakePublicRecords {
     files: BTreeMap<(Pubky, String), Vec<u8>>,
     broken_listings: BTreeSet<(Pubky, String)>,
     asked: Mutex<Vec<(Pubky, String)>>,
+    /// Every conditional read, with the tag it sent.
+    conditional: Mutex<Vec<(Pubky, String, Option<ETag>)>>,
 }
 
 impl FakePublicRecords {
@@ -622,6 +652,19 @@ impl FakePublicRecords {
     pub(crate) fn with_file(mut self, owner: Pubky, path: &str, bytes: Vec<u8>) -> Self {
         self.files.insert((owner, path.to_owned()), bytes);
         self
+    }
+
+    /// The same fake, with nothing at `path` of `owner`'s storage any more,
+    /// as after its owner deleted it.
+    pub(crate) fn without_file(mut self, owner: Pubky, path: &str) -> Self {
+        self.files.remove(&(owner, path.to_owned()));
+        self
+    }
+
+    /// The owner, the path and the tag sent of every conditional read so
+    /// far, in order. Each is in [`asked`](Self::asked) too.
+    pub(crate) fn conditional_asked(&self) -> Vec<(Pubky, String, Option<ETag>)> {
+        self.conditional.lock().expect("lock").clone()
     }
 
     /// The same fake, holding `record` as JSON at `path` of `owner`'s
@@ -638,28 +681,23 @@ impl FakePublicRecords {
         self
     }
 
-    /// The owner and path of every read and listing so far, in order.
+    /// The owner and path of every request so far, in order.
     pub(crate) fn asked(&self) -> Vec<(Pubky, String)> {
         self.asked.lock().expect("lock").clone()
     }
-}
 
-impl PublicRecords for FakePublicRecords {
-    async fn get_record(
-        &self,
-        owner: Pubky,
-        path: &str,
-    ) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
+    /// The file at `path` of `owner`'s storage, if any, with the request
+    /// kept in [`asked`](Self::asked).
+    fn file(&self, owner: Pubky, path: &str) -> Option<&Vec<u8>> {
         let key = (owner, path.to_owned());
-        let found = self
-            .files
-            .get(&key)
-            .map(|bytes| Zeroizing::new(bytes.clone()));
+        let found = self.files.get(&key);
         self.asked.lock().expect("lock").push(key);
-        Ok(found)
+        found
     }
 
-    async fn list(&self, owner: Pubky, dir: &str) -> anyhow::Result<Listing> {
+    /// The listing of `dir` of `owner`'s storage in `order`, with the
+    /// request kept in [`asked`](Self::asked).
+    fn listing(&self, owner: Pubky, dir: &str, order: ListOrder) -> anyhow::Result<Listing> {
         let key = (owner, dir.to_owned());
         let broken = self.broken_listings.contains(&key);
         self.asked.lock().expect("lock").push(key);
@@ -669,17 +707,425 @@ impl PublicRecords for FakePublicRecords {
         }
         // The Sweepky files in `dir`, as the real listing keeps them: the
         // map's order is the paths' byte order, a homeserver's order too.
-        let entries = self
+        let in_dir = self
             .files
             .keys()
             .filter(|(file_owner, path)| *file_owner == owner && path.starts_with(dir))
-            .filter_map(|(_, path)| SweepkyPath::parse(path))
-            .collect();
+            .filter_map(|(_, path)| SweepkyPath::parse(path));
+        let entries = match order {
+            ListOrder::OldestFirst => in_dir.collect(),
+            ListOrder::NewestFirst { .. } => in_dir
+                .rev()
+                .take_while(|entry| !order.stops_at(entry))
+                .collect(),
+        };
         Ok(Listing {
             entries,
             skipped: 0,
         })
     }
+}
+
+/// The tag [`FakePublicRecords`] gives a file: a hash of its bytes, quoted
+/// as a homeserver quotes its content hash, so it changes when they do.
+/// std's `DefaultHasher` is enough for a fake; it is no content hash to
+/// rely on.
+fn content_tag(bytes: &[u8]) -> ETag {
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    ETag::parse(format!("\"{:016x}\"", hasher.finish()).as_bytes()).expect("a usable tag")
+}
+
+impl PublicRecords for FakePublicRecords {
+    async fn get_record(
+        &self,
+        owner: Pubky,
+        path: &str,
+    ) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
+        Ok(self
+            .file(owner, path)
+            .map(|bytes| Zeroizing::new(bytes.clone())))
+    }
+
+    async fn list(&self, owner: Pubky, dir: &str) -> anyhow::Result<Listing> {
+        self.listing(owner, dir, ListOrder::OldestFirst)
+    }
+
+    async fn list_newest_first(
+        &self,
+        owner: Pubky,
+        dir: &str,
+        seen: Option<RecordId>,
+    ) -> anyhow::Result<Listing> {
+        self.listing(owner, dir, ListOrder::NewestFirst { seen })
+    }
+
+    async fn get_record_if_changed(
+        &self,
+        owner: Pubky,
+        path: &str,
+        etag: Option<&ETag>,
+    ) -> anyhow::Result<Conditional> {
+        self.conditional
+            .lock()
+            .expect("lock")
+            .push((owner, path.to_owned(), etag.cloned()));
+        let Some(bytes) = self.file(owner, path) else {
+            return Ok(Conditional::Absent);
+        };
+        let now = content_tag(bytes);
+        if etag == Some(&now) {
+            return Ok(Conditional::NotModified);
+        }
+        Ok(Conditional::Changed {
+            body: Zeroizing::new(bytes.clone()),
+            etag: Some(now),
+        })
+    }
+
+    async fn get_package(&self, sweep: SweepRef) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
+        Ok(self
+            .file(sweep.sweeper, &paths::sweep_package(sweep.id))
+            .map(|bytes| Zeroizing::new(bytes.clone())))
+    }
+}
+
+/// What a [`FakeEventsFeed`] answers a page request with: the body for the
+/// cursor and the limit asked, or an error. `Box<dyn Fn ..>` is "any
+/// function of this shape", chosen by each test, closures that capture
+/// their own data included.
+type FeedAnswer = Box<dyn Fn(EventCursor, u16) -> anyhow::Result<Vec<u8>>>;
+
+/// What a [`FakeEventsFeed`] answers a stream request with: the body for
+/// the homeserver, the owner and the path asked, or an error.
+type StreamAnswer = Box<dyn Fn(Pubky, Pubky, &SweepkyPath) -> anyhow::Result<Vec<u8>>>;
+
+/// One stream request a [`FakeEventsFeed`] was sent: the homeserver asked,
+/// and the owner and the path of the file whose latest event it asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StreamRequest {
+    pub(crate) homeserver: Pubky,
+    pub(crate) owner: Pubky,
+    pub(crate) path: SweepkyPath,
+}
+
+/// An [`EventsFeed`] in memory, in place of a homeserver's `/events/` and
+/// `/events-stream`: each page is what its function answers for the cursor
+/// and the limit asked, whatever the homeserver, and each stream answer
+/// what its other function answers for the request. It keeps every page
+/// request, with its homeserver, and every stream request, in order. The
+/// parse and the checks are `EventsFeed`'s provided methods', so they run
+/// on these bodies as on a homeserver's; the caps are the real reader's.
+/// The `Mutex`es are there for the same reason as in [`FakeKeyStore`].
+pub(crate) struct FakeEventsFeed {
+    pages: FeedAnswer,
+    stream: StreamAnswer,
+    asked: Mutex<Vec<(Pubky, EventCursor, u16)>>,
+    streams_asked: Mutex<Vec<StreamRequest>>,
+}
+
+impl FakeEventsFeed {
+    /// A feed whose pages `answer` gives, and whose stream answer is empty.
+    // `'static`: the boxed function may outlive this call, so whatever it
+    // captures must be owned (`move`d in), not borrowed.
+    pub(crate) fn answering(
+        answer: impl Fn(EventCursor, u16) -> anyhow::Result<Vec<u8>> + 'static,
+    ) -> Self {
+        Self {
+            pages: Box::new(answer),
+            stream: Box::new(|_, _, _| Ok(Vec::new())),
+            asked: Mutex::new(Vec::new()),
+            streams_asked: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// An honest feed of public events with the ids `ids`, in increasing
+    /// order: each page as [`feed_page`] writes it.
+    pub(crate) fn of_ids(ids: &[u64]) -> Self {
+        let ids = ids.to_vec();
+        Self::answering(move |cursor, limit| Ok(feed_page(&ids, cursor, limit)))
+    }
+
+    /// An honest feed of `events`, each an id and its line, in increasing
+    /// order of id: each page as [`events_page`] writes it.
+    pub(crate) fn of_events(events: Vec<(u64, String)>) -> Self {
+        Self::answering(move |cursor, limit| Ok(events_page(&events, cursor, limit)))
+    }
+
+    /// The same fake, answering every stream request with `body`.
+    pub(crate) fn with_stream(self, body: &[u8]) -> Self {
+        let body = body.to_vec();
+        self.with_stream_answer(move |_, _, _| Ok(body.clone()))
+    }
+
+    /// The same fake, answering each stream request with what `answer`
+    /// gives for its homeserver, owner and path.
+    pub(crate) fn with_stream_answer(
+        mut self,
+        answer: impl Fn(Pubky, Pubky, &SweepkyPath) -> anyhow::Result<Vec<u8>> + 'static,
+    ) -> Self {
+        self.stream = Box::new(answer);
+        self
+    }
+
+    /// The cursor and the limit of every page request so far, in order.
+    pub(crate) fn asked(&self) -> Vec<(EventCursor, u16)> {
+        self.asked
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|&(_, cursor, limit)| (cursor, limit))
+            .collect()
+    }
+
+    /// Every homeserver a page was asked of so far, once each.
+    pub(crate) fn homeservers_asked(&self) -> BTreeSet<Pubky> {
+        self.asked
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|&(homeserver, _, _)| homeserver)
+            .collect()
+    }
+
+    /// Every stream request so far, in order.
+    pub(crate) fn streams_asked(&self) -> Vec<StreamRequest> {
+        self.streams_asked.lock().expect("lock").clone()
+    }
+}
+
+impl EventsFeed for FakeEventsFeed {
+    async fn feed_body(
+        &self,
+        homeserver: Pubky,
+        cursor: EventCursor,
+        limit: u16,
+    ) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+        self.asked
+            .lock()
+            .expect("lock")
+            .push((homeserver, cursor, limit));
+        (self.pages)(cursor, limit).map(Zeroizing::new)
+    }
+
+    async fn stream_body(
+        &self,
+        homeserver: Pubky,
+        owner: Pubky,
+        path: &SweepkyPath,
+    ) -> anyhow::Result<Zeroizing<Vec<u8>>> {
+        self.streams_asked
+            .lock()
+            .expect("lock")
+            .push(StreamRequest {
+                homeserver,
+                owner,
+                path: path.clone(),
+            });
+        (self.stream)(homeserver, owner, path).map(Zeroizing::new)
+    }
+}
+
+/// One event of an `/events-stream` answer, as pubky-homeserver 0.16.2
+/// writes it: its type, the file's URL, its cursor and, for a PUT, a
+/// content hash, then a blank line.
+pub(crate) fn stream_event(op: &str, url: &str, cursor: u64) -> String {
+    let hash = if op == "PUT" {
+        "data: content_hash: r0NJufX5oaagQE3qNtzJSZvLJcmtwRK3zJqTyuQfMmI=\n"
+    } else {
+        ""
+    };
+    format!("event: {op}\ndata: {url}\ndata: cursor: {cursor}\n{hash}\n")
+}
+
+/// One page of an honest feed of public events with the ids `ids`, in
+/// increasing order, as [`events_page`] writes it: a `PUT` of a file of
+/// another app for each.
+pub(crate) fn feed_page(ids: &[u64], cursor: EventCursor, limit: u16) -> Vec<u8> {
+    let user = Pubky::from_bytes([7; 32]);
+    // Only the events the page holds get a line written, so a long feed
+    // costs each page no more than its own lines.
+    let after: Vec<(u64, String)> = ids
+        .iter()
+        .filter(|&&id| id > cursor.id())
+        .take(usize::from(limit))
+        .map(|&id| (id, format!("PUT pubky://{user}/pub/example.app/{id}.json")))
+        .collect();
+    events_page(&after, cursor, limit)
+}
+
+/// One page of an honest feed of `events`, each an id and its line (`PUT
+/// pubky://…` or `DEL pubky://…`), in increasing order of id, as
+/// `format_events_feed` in pubky-homeserver 0.16.2 writes it: the lines of
+/// the first `limit` events after `cursor`, then `cursor: <the last one's
+/// id>`, joined with `\n`; the empty body when no event comes after
+/// `cursor`.
+pub(crate) fn events_page(events: &[(u64, String)], cursor: EventCursor, limit: u16) -> Vec<u8> {
+    let after: Vec<&(u64, String)> = events
+        .iter()
+        .filter(|(id, _)| *id > cursor.id())
+        .take(usize::from(limit))
+        .collect();
+    let Some((last, _)) = after.last() else {
+        return Vec::new();
+    };
+    let mut lines: Vec<&str> = after.iter().map(|(_, line)| line.as_str()).collect();
+    let cursor_line = format!("cursor: {last}");
+    lines.push(&cursor_line);
+    lines.join("\n").into_bytes()
+}
+
+/// What a [`LocalHttp`] server answers a path with.
+pub(crate) enum Canned {
+    /// These bytes, as they go on the wire: the status line, the headers, a
+    /// blank line and the body ([`canned`] writes them). The connection
+    /// closes after them.
+    Bytes(Vec<u8>),
+    /// A 200 with no length, whose body is zero bytes sent until the client
+    /// hangs up or [`ENDLESS_LIMIT`] bytes have gone out: a server that
+    /// streams forever.
+    Endless,
+}
+
+/// The most a [`Canned::Endless`] body sends, so that a client that never
+/// stops reading still ends the test: 64 MiB, twice the largest cap
+/// Sweepky reads with.
+const ENDLESS_LIMIT: usize = 64 * 1024 * 1024;
+
+/// An HTTP/1.1 answer of `status` (such as `"302 Found"`), `headers` and
+/// `body`, with a `content-length` of the body's.
+pub(crate) fn canned(status: &str, headers: &[(&str, &str)], body: &[u8]) -> Canned {
+    let header_lines: String = headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect();
+    let head = format!(
+        "HTTP/1.1 {status}\r\n{header_lines}content-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    );
+    let mut bytes = head.into_bytes();
+    bytes.extend_from_slice(body);
+    Canned::Bytes(bytes)
+}
+
+/// An HTTP/1.1 server on the loopback address, for the tests of the
+/// requests Sweepky sends itself where a fake would skip the code under
+/// test: what reqwest does with a redirect, a 304 or a body over a cap. It
+/// answers each request with the [`Canned`] answer for its path (the query
+/// is ignored), any other path with a 404, and keeps the head of every
+/// request it read, in order. Dropping it stops it.
+pub(crate) struct LocalHttp {
+    base: url::Url,
+    heads: Arc<Mutex<Vec<String>>>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl LocalHttp {
+    /// A server on a free port of 127.0.0.1, answering `routes`: each a
+    /// path and its answer.
+    pub(crate) async fn start(routes: Vec<(&'static str, Canned)>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a free loopback port");
+        let address = listener.local_addr().expect("its address");
+        let base = url::Url::parse(&format!("http://{address}/")).expect("a URL");
+        // `Arc` because every connection's task reads the routes and writes
+        // the heads, and each task must own what it uses.
+        let routes: Arc<BTreeMap<&'static str, Canned>> = Arc::new(routes.into_iter().collect());
+        let heads = Arc::new(Mutex::new(Vec::new()));
+        let server = tokio::spawn({
+            let heads = Arc::clone(&heads);
+            async move {
+                // A task per connection, so a client that keeps one open
+                // does not hold up the next.
+                while let Ok((stream, _)) = listener.accept().await {
+                    tokio::spawn(answer(stream, Arc::clone(&routes), Arc::clone(&heads)));
+                }
+            }
+        });
+        Self {
+            base,
+            heads,
+            server,
+        }
+    }
+
+    /// The URL of `path` on this server.
+    pub(crate) fn url(&self, path: &str) -> url::Url {
+        self.base.join(path).expect("a URL")
+    }
+
+    /// The head of every request so far, its request line and headers, as
+    /// it arrived, in order.
+    pub(crate) fn heads(&self) -> Vec<String> {
+        self.heads.lock().expect("lock").clone()
+    }
+}
+
+impl Drop for LocalHttp {
+    // Stops accepting; each connection's task ends once its answer is out.
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
+/// Reads one request's head from `stream`, keeps it in `heads`, and writes
+/// the answer `routes` has for its path.
+async fn answer(
+    mut stream: TcpStream,
+    routes: Arc<BTreeMap<&'static str, Canned>>,
+    heads: Arc<Mutex<Vec<String>>>,
+) {
+    // `AsyncReadExt` and `AsyncWriteExt` add `.read`, `.write_all` and
+    // `.shutdown` to the socket. Imported here, not for the whole module,
+    // where tokio's `write` would clash with `std::io::Write`'s on
+    // `SharedBuffer`.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // A GET has no body, so its head is the whole request. 16 KiB is far
+    // more than reqwest sends.
+    let mut head = Vec::new();
+    let mut buf = [0_u8; 1024];
+    while !head.windows(4).any(|end| end == b"\r\n\r\n") && head.len() < 16 * 1024 {
+        match stream.read(&mut buf).await {
+            Ok(0) | Err(_) => return,
+            Ok(read) => head.extend_from_slice(&buf[..read]),
+        }
+    }
+    let head = String::from_utf8_lossy(&head).into_owned();
+    // `GET /path?query HTTP/1.1`: the path, without its query.
+    let path = head
+        .split(' ')
+        .nth(1)
+        .and_then(|target| target.split('?').next())
+        .unwrap_or_default()
+        .to_owned();
+    heads.lock().expect("lock").push(head);
+    // A write fails once the client has hung up, which is how an endless
+    // body ends, so the results are dropped.
+    match routes.get(path.as_str()) {
+        Some(Canned::Bytes(bytes)) => {
+            let _ = stream.write_all(bytes).await;
+        }
+        Some(Canned::Endless) => {
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n")
+                .await;
+            let zeros = [0_u8; 64 * 1024];
+            let mut sent = 0;
+            while sent < ENDLESS_LIMIT && stream.write_all(&zeros).await.is_ok() {
+                sent += zeros.len();
+            }
+        }
+        None => {
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
+                .await;
+        }
+    }
+    let _ = stream.shutdown().await;
 }
 
 /// A word the tests plant in a stranger's text, where serde_json's own
@@ -762,6 +1208,47 @@ pub(crate) fn sweep_json(bounty: BountyRef, targets: &[&str], status: &str) -> V
     })
 }
 
+/// [`sweep_json`] as `submit` leaves it: done, with its `finishedAt`.
+pub(crate) fn done_record(bounty: BountyRef, targets: &[&str]) -> Value {
+    let mut record = sweep_json(bounty, targets, "done");
+    record["finishedAt"] = json!("2026-10-19T10:00:00Z");
+    record
+}
+
+/// A sweep package as `submit` builds one, of `sweeper`'s sweep of
+/// `bounty` at `shas` (target id to commit), its targets the keys of
+/// `shas`, with [`PLANTED`] in its one finding and its one attachment, so
+/// a test can check that nothing printed holds sealed content.
+pub(crate) fn package_json(sweeper: Pubky, bounty: BountyRef, shas: Value) -> Value {
+    let targets: Vec<&String> = shas.as_object().expect("an object").keys().collect();
+    json!({
+        "schemaVersion": 1,
+        "manifest": {
+            "sweeper": sweeper.to_string(),
+            "bounty": bounty.to_string(),
+            "targets": targets,
+            "targetShas": shas,
+            "playbook": "careful-review",
+            "startedAt": "2026-10-19T09:00:00Z",
+            "finishedAt": "2026-10-19T10:00:00Z",
+        },
+        "findings": {
+            "schemaVersion": 1,
+            "playbook": "careful-review",
+            "findings": [{
+                "id": "session-expiry-off-by-one",
+                "title": PLANTED,
+                "severity": null,
+                "confidence": null,
+                "status": "needs_validation",
+                "locations": [{ "file": "src/auth/session.rs", "line": 88 }],
+                "description": PLANTED,
+            }],
+        },
+        "attachments": { "REPORT.md": PLANTED },
+    })
+}
+
 /// A SHA no synthetic target pins, for a revision rewritten after a fetch.
 pub(crate) const UNPINNED_SHA: &str = "4444444444444444444444444444444444444444";
 
@@ -820,6 +1307,31 @@ pub(crate) fn circle_json(admin: Pubky, members: &[Pubky]) -> Value {
     })
 }
 
+/// The compact copy `pull` stored of the findings of `sweep` of `bounty`,
+/// read back within the package's cap: the side it was stored on, as its
+/// directory shows, and the findings, or `None` when it was not stored.
+pub(crate) fn stored_findings(
+    dirs: &Dirs,
+    bounty: BountyRef,
+    sweep: SweepRef,
+) -> anyhow::Result<Option<(Placement, Findings)>> {
+    let Some(dir) = stored_sweep_dir(dirs, bounty, sweep)? else {
+        return Ok(None);
+    };
+    let placement = if dir.starts_with(dirs.pulled_untrusted_dir(&bounty.id)) {
+        Placement::Untrusted
+    } else {
+        Placement::Trusted
+    };
+    Ok(
+        match read_stored_findings(dirs, bounty, sweep, MAX_PACKAGE_BYTES)? {
+            None => None,
+            Some(StoredCopy::Read { findings, .. }) => Some((placement, findings)),
+            Some(StoredCopy::OverCap { len }) => panic!("a copy over the cap, of {len} bytes"),
+        },
+    )
+}
+
 /// What a [`FakeResolver`] that fails gives as its error: words that a
 /// test checks never reach a message.
 pub(crate) const FAKE_LOOKUP_TEXT: &str = "fake resolver: SERVFAIL for lookup-marker.example";
@@ -868,6 +1380,71 @@ impl ResolveHost for FakeResolver {
         self.answer
             .clone()
             .ok_or_else(|| anyhow::anyhow!(FAKE_LOOKUP_TEXT))
+    }
+}
+
+/// The homeserver every key is at in a [`FakeHomeservers`] that was given
+/// no answers for it.
+pub(crate) const FAKE_HOMESERVER: Pubky = Pubky::from_bytes([9; 32]);
+
+/// How a [`FakeHomeservers`] answers one lookup of a key.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum FakeLookup {
+    /// The key's pkarr record names this homeserver.
+    At(Pubky),
+    /// The key has no pkarr record, or one that names no homeserver.
+    NoRecord,
+    /// The lookup fails.
+    Fails,
+}
+
+/// A [`ResolveHomeserver`] in place of pkarr: each key's lookups are
+/// answered in the order a test gave, the last one again for every lookup
+/// after it, and a key given no answers is at [`FAKE_HOMESERVER`]. It keeps
+/// every key it was asked for, in order. The `Mutex` is there for the same
+/// reason as in [`FakeKeyStore`].
+#[derive(Default)]
+pub(crate) struct FakeHomeservers {
+    answers: BTreeMap<Pubky, Vec<FakeLookup>>,
+    asked: Mutex<Vec<Pubky>>,
+}
+
+impl FakeHomeservers {
+    /// The same fake, answering the lookups of `user` with `answers`, in
+    /// order.
+    pub(crate) fn with_answers(mut self, user: Pubky, answers: &[FakeLookup]) -> Self {
+        self.answers.insert(user, answers.to_vec());
+        self
+    }
+
+    /// Every key looked up so far, in order.
+    pub(crate) fn asked(&self) -> Vec<Pubky> {
+        self.asked.lock().expect("lock").clone()
+    }
+
+    /// How many times `user` was looked up so far.
+    pub(crate) fn times_asked(&self, user: Pubky) -> usize {
+        self.asked().iter().filter(|&&asked| asked == user).count()
+    }
+}
+
+impl ResolveHomeserver for FakeHomeservers {
+    async fn homeserver_of(&self, user: Pubky) -> Result<Pubky, Unreachable> {
+        let earlier = self.times_asked(user);
+        self.asked.lock().expect("lock").push(user);
+        let answer = match self.answers.get(&user) {
+            None => FakeLookup::At(FAKE_HOMESERVER),
+            // The answer for this lookup, or the last one once they run out.
+            Some(answers) => *answers
+                .get(earlier)
+                .or(answers.last())
+                .expect("at least one answer"),
+        };
+        match answer {
+            FakeLookup::At(homeserver) => Ok(homeserver),
+            FakeLookup::NoRecord => Err(Unreachable::NoHomeserver),
+            FakeLookup::Fails => Err(Unreachable::LookupFailed),
+        }
     }
 }
 

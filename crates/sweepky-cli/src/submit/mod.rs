@@ -867,7 +867,7 @@ mod command_tests {
     use sweepky_core::paths;
     use sweepky_core::{
         AttachmentPath, BountyRef, DeviceId, DeviceIdentity, KnownSweepStatus, Playbook, Pubky,
-        Sweep, SweepRef, Zeroizing, open_package, parse_audit_findings,
+        RecordId, Sweep, SweepRef, Zeroizing, open_package, parse_audit_findings,
     };
     use tempfile::TempDir;
 
@@ -885,7 +885,9 @@ mod command_tests {
     use crate::pins::{OwnerKey, pin_owner_keys, read_pins};
     use crate::prompt::Prompting;
     use crate::records::PublicRecords;
-    use crate::remote::{Listing, PACKAGE_TOO_LARGE, QUOTA_FULL, RATE_LIMITED, UPLOAD_QUOTA_FULL};
+    use crate::remote::{
+        Conditional, ETag, Listing, PACKAGE_TOO_LARGE, QUOTA_FULL, RATE_LIMITED, UPLOAD_QUOTA_FULL,
+    };
     use crate::sweep_state::NO_SNAPSHOT;
     use crate::test_support::{
         FakeKeyStore, FakeOwnStorage, FakePublicRecords, SYNTHETIC_HEAD, SYNTHETIC_SHA, bounty_id,
@@ -933,6 +935,30 @@ mod command_tests {
 
         async fn list(&self, owner: Pubky, dir: &str) -> anyhow::Result<Listing> {
             self.others.list(owner, dir).await
+        }
+
+        // `submit` calls none of the three below; the trait asks for them,
+        // and like `list` they answer from everyone else's storage.
+        async fn list_newest_first(
+            &self,
+            owner: Pubky,
+            dir: &str,
+            seen: Option<RecordId>,
+        ) -> anyhow::Result<Listing> {
+            self.others.list_newest_first(owner, dir, seen).await
+        }
+
+        async fn get_record_if_changed(
+            &self,
+            owner: Pubky,
+            path: &str,
+            etag: Option<&ETag>,
+        ) -> anyhow::Result<Conditional> {
+            self.others.get_record_if_changed(owner, path, etag).await
+        }
+
+        async fn get_package(&self, sweep: SweepRef) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
+            self.others.get_package(sweep).await
         }
     }
 

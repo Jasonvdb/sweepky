@@ -9,11 +9,14 @@
 //!    `installs.json` the device ids this owner's installs here created,
 //!    each with the key that install published.
 //! 2. `keys/` is listed through public storage, paged and capped
-//!    (`remote::list_dir`); a name that is not a `keys/<deviceId>.json` is
-//!    skipped and counted, never fatal.
-//! 3. Each listed record is read, capped at `MAX_RECORD_BYTES`, and parsed
-//!    with core's `DeviceKey::from_json`. A record that is gone or does not
-//!    parse is named by its device id with the reason, and not listed.
+//!    (`remote::list_dir` with `ListLimits::DEFAULT`); a name that is not a
+//!    `keys/<deviceId>.json` is skipped and counted, never fatal. A listing
+//!    past those limits is refused whole.
+//! 3. Each listed record is read, one after another, capped at
+//!    `MAX_RECORD_BYTES`, and within [`KEY_RECORDS_BUDGET_BYTES`] for all of
+//!    them together, then parsed with core's `DeviceKey::from_json`. A
+//!    record that is gone, does not parse or cannot be read is named by its
+//!    device id with the reason, and not listed.
 //! 4. Each unrevoked record goes through `DeviceKey::encryption_recipient`,
 //!    the one way from a record to a key a sweep could be encrypted to. One
 //!    that fails is marked unusable, with a warning naming its device id and
@@ -34,7 +37,21 @@
 //! string a record holds (`label`, `alg`, the times) goes through
 //! `display::sanitize` on the way. [`key_alarms`] is the same steps with
 //! only the alarms kept, which `login` runs after it has published or
-//! reused this install's key.
+//! reused this install's key, and `pull` on every run.
+//!
+//! **The check either finishes or fails, typed.** [`key_alarms`] gives the
+//! alarms only once it has read every listed record within those bounds;
+//! otherwise it fails with a [`KeyCheckError`]: the listing past its
+//! limits, the records past the budget, the listing failing, or a record
+//! under a known id that could not be read, which could hold any key. (A
+//! record under an unknown id that could not be read is that id's alarm,
+//! as 02 has it: only a revoked record settles it.) So a check that could
+//! not finish never reads as "no alarms", and the caller has to say so:
+//! `login` as a warning, `pull` as an alarm. `keys list` reads through the
+//! same [`list_keys`], so the two never disagree; it fails in the same way
+//! past the listing limits or the budget, and shows a record it could not
+//! read as a warning beside the rest, which is what `login`'s warning
+//! points at.
 //!
 //! **`keys revoke <deviceId>`** ([`revoke`]) checks the id, then, under the
 //! writers' lock with a session of its own that is always signed out
@@ -46,10 +63,13 @@
 //! read-modify-write ([`revoke_if_published`]).
 
 use std::collections::BTreeSet;
+use std::fmt;
 
 use anyhow::{Context as _, bail};
 use pubky::PublicKey;
-use sweepky_core::{AgeRecipient, DeviceId, DeviceKey, DeviceKeyError, KeyAlg, Pubky, RecordTime};
+use sweepky_core::{
+    AgeRecipient, DeviceId, DeviceKey, DeviceKeyError, KeyAlg, MAX_RECORD_BYTES, Pubky, RecordTime,
+};
 
 use crate::clock;
 use crate::device::{
@@ -59,10 +79,149 @@ use crate::display::{MAX_LABEL_CHARS, sanitize};
 use crate::installs::{
     Install, read_installs, replaced_key_alarm, unknown_key_alarm, unknown_key_ids,
 };
-use crate::remote::{pubky_of, public_key_of, write_error};
+use crate::remote::{ListLimits, ListingError, pubky_of, public_key_of, write_error};
 use crate::session::{NOT_LOGGED_IN, with_writer_session};
 use crate::state::read_login_state;
 use crate::{Context, Report};
+
+// ---------------------------------------------------------------------------
+// The bounds of one check of `keys/`, and how it fails.
+
+/// The most bytes one check of `keys/` reads, all its records together: 8
+/// MiB, P2c's choice.
+///
+/// A device key record is a few hundred bytes, and one holding a
+/// post-quantum key would still be a few KiB, so a full listing of real
+/// records takes a small part of it. `keys/` is the owner's own directory,
+/// written by their installs or by whoever holds their grant or runs their
+/// homeserver, so records anywhere near the budget are themselves a sign
+/// that someone wrote there. Each record keeps its own cap,
+/// `MAX_RECORD_BYTES` (1 MiB), which is the record format's.
+const KEY_RECORDS_BUDGET_BYTES: usize = 8 * MIB;
+
+/// One mebibyte.
+const MIB: usize = 1024 * 1024;
+
+/// What one check of `keys/` may still read, out of
+/// [`KEY_RECORDS_BUDGET_BYTES`].
+struct ReadBudget {
+    left: usize,
+}
+
+impl ReadBudget {
+    /// The whole budget, for a new check.
+    fn new() -> Self {
+        Self {
+            left: KEY_RECORDS_BUDGET_BYTES,
+        }
+    }
+
+    /// Lets the next read go ahead only while a record at the most a read
+    /// returns, `MAX_RECORD_BYTES`, would still fit. So the reads together
+    /// never pass the budget, however large each record turns out to be.
+    fn check_room_for_a_record(&self) -> Result<(), KeyCheckError> {
+        if self.left < MAX_RECORD_BYTES {
+            return Err(KeyCheckError::OverBudget);
+        }
+        Ok(())
+    }
+
+    /// Takes `bytes` off what is left. `saturating_sub` stops at zero
+    /// rather than wrapping round, so a reader that broke its cap leaves no
+    /// room for another read instead of a huge amount.
+    fn spend(&mut self, bytes: usize) {
+        self.left = self.left.saturating_sub(bytes);
+    }
+}
+
+/// Why a check of an owner's `keys/` could not finish: [`key_alarms`], and
+/// the [`list_keys`] behind `keys list`, which reads with the same bounds.
+///
+/// It is not "no alarms", so a caller that gets one has to say that the
+/// check failed: `login` prints it as a warning and `pull` as an alarm.
+/// Its own text is fixed, with numbers and a device id at most (a
+/// [`DeviceId`] holds only `A-Z`, `a-z`, `0-9`, `-` and `_`). A listing or
+/// a read that failed keeps the reader's error as its cause, which for
+/// [`PublicKeyReader`] is `remote`'s: fixed text and an HTTP status, never
+/// the server's words or a record's.
+#[derive(Debug)]
+pub(crate) enum KeyCheckError {
+    /// The listing has more entries than [`ListLimits::DEFAULT`] reads, so
+    /// no record was read.
+    TooManyKeys,
+    /// What was read left less of [`KEY_RECORDS_BUDGET_BYTES`] than one more
+    /// record may hold, so the check stopped before the rest.
+    OverBudget,
+    /// The listing failed otherwise: a request that failed, an answer other
+    /// than 2xx or 404, a line that breaks the protocol.
+    Listing(anyhow::Error),
+    /// A record under a known id could not be read: a request that failed,
+    /// or a body over `MAX_RECORD_BYTES`. It could hold any key, so the
+    /// check cannot say whether it should alarm. Under an unknown id, a
+    /// failed read is that id's alarm instead.
+    Read {
+        /// The record's device id.
+        id: DeviceId,
+        /// Why, from the reader.
+        cause: anyhow::Error,
+    },
+}
+
+impl KeyCheckError {
+    /// A failed listing of `keys/`, sorted by why it failed.
+    fn from_listing_error(error: anyhow::Error) -> Self {
+        // `downcast_ref` finds a value of the named type in the error, under
+        // the context `list_dir` wraps round it: here the parser's own
+        // `ListingError`, the typed reason for a refused listing.
+        match error.downcast_ref::<ListingError>() {
+            Some(ListingError::TooManyEntries | ListingError::TooManyPages) => Self::TooManyKeys,
+            _ => Self::Listing(error),
+        }
+    }
+}
+
+impl fmt::Display for KeyCheckError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The cause is not written here: `source` below hands it on, and
+        // `anyhow`'s `{:#}` prints it after this text.
+        match self {
+            Self::TooManyKeys => write!(
+                f,
+                "keys/ lists more than the {} entries one check reads, so none of its records \
+                 was checked",
+                ListLimits::DEFAULT.max_entries
+            ),
+            Self::OverBudget => write!(
+                f,
+                "the records under keys/ are more than one check reads: it reads up to {} MiB, \
+                 and starts on a record only while {} MiB, the most one may hold, is left (a read \
+                 that failed counts as that much), so it stopped before the rest; a device key \
+                 record is a few hundred bytes",
+                KEY_RECORDS_BUDGET_BYTES / MIB,
+                MAX_RECORD_BYTES / MIB
+            ),
+            Self::Listing(_) => f.write_str("keys/ could not be listed"),
+            Self::Read { id, .. } => write!(
+                f,
+                "keys/{id}.json could not be read, so the check cannot tell which key it holds"
+            ),
+        }
+    }
+}
+
+/// Makes it an error type, so `?` turns it into an `anyhow::Error`, and
+/// hands on the cause of a failed listing or read as its `source`, which is
+/// how an error chain is linked.
+impl std::error::Error for KeyCheckError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            // `as_ref` lends the `anyhow::Error` out as the plain
+            // `dyn Error` it wraps.
+            Self::Listing(cause) | Self::Read { cause, .. } => Some(cause.as_ref()),
+            Self::TooManyKeys | Self::OverBudget => None,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Reading one record.
@@ -71,10 +230,33 @@ use crate::{Context, Report};
 enum RecordRead {
     /// The record, parsed.
     Parsed(DeviceKey),
-    /// Not readable as a device key record, and why, in fixed text: gone
-    /// (404) by the time it was read, a failed request, a body over the cap,
-    /// or a parse error, none of which quotes the homeserver.
-    Unreadable(String),
+    /// Not readable as a device key record, and why.
+    Unreadable(Unreadable),
+}
+
+/// Why a listed `keys/<id>.json` is not shown.
+#[derive(Debug)]
+enum Unreadable {
+    /// It was read, but is no device key record this build reads: gone
+    /// (404) by the time it was read, or a parse error, in fixed text that
+    /// quotes none of it. No sweeper running this build encrypts to it
+    /// either.
+    NotARecord(String),
+    /// The read failed: a request that failed, or a body over the cap. What
+    /// the record holds is unknown, so a sweeper might still encrypt to it:
+    /// `keys list` warns, and the check fails ([`KeyCheckError::Read`]).
+    ReadFailed(anyhow::Error),
+}
+
+impl fmt::Display for Unreadable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotARecord(reason) => f.write_str(reason),
+            // `remote`'s errors are fixed text and a status, never the
+            // server's own words. `{:#}` prints the whole chain on one line.
+            Self::ReadFailed(error) => write!(f, "{error:#}"),
+        }
+    }
 }
 
 impl RecordRead {
@@ -90,28 +272,48 @@ impl RecordRead {
     }
 }
 
-/// Reads and parses `owner`'s `keys/<id>.json`.
+/// Reads and parses `owner`'s `keys/<id>.json`, taking what it read off
+/// `budget`.
 ///
-/// Never an error: a record that cannot be read comes back as a
-/// [`RecordRead`] too, so one bad record never stops a listing or an alarm.
-async fn read_record(keys: &impl PublicKeys, owner: &PublicKey, id: &DeviceId) -> RecordRead {
-    match keys.get_key(owner, id).await {
-        // `&bytes` lends the `Zeroizing<Vec<u8>>` out as the `&[u8]`
-        // `from_json` takes, through `Deref`, without a copy.
-        Ok(Some(bytes)) => match DeviceKey::from_json(&bytes) {
-            Ok(record) => RecordRead::Parsed(record),
-            // core's `RecordError` names the kind of fault and where it is,
-            // never the input.
-            Err(error) => RecordRead::Unreadable(format!(
-                "it is not a device key record this build reads ({error})"
-            )),
-        },
+/// Only the budget makes it an error ([`KeyCheckError::OverBudget`],
+/// before anything is asked for): a record that cannot be read comes back
+/// as a [`RecordRead`] too, so the caller decides what that means.
+async fn read_record(
+    keys: &impl PublicKeys,
+    owner: &PublicKey,
+    id: &DeviceId,
+    budget: &mut ReadBudget,
+) -> Result<RecordRead, KeyCheckError> {
+    budget.check_room_for_a_record()?;
+    let read = match keys.get_key(owner, id).await {
+        Ok(Some(bytes)) => {
+            budget.spend(bytes.len());
+            // `&bytes` lends the `Zeroizing<Vec<u8>>` out as the `&[u8]`
+            // `from_json` takes, through `Deref`, without a copy.
+            match DeviceKey::from_json(&bytes) {
+                Ok(record) => RecordRead::Parsed(record),
+                // core's `RecordError` names the kind of fault and where it
+                // is, never the input.
+                Err(error) => RecordRead::Unreadable(Unreadable::NotARecord(format!(
+                    "it is not a device key record this build reads ({error})"
+                ))),
+            }
+        }
         // Listed, but deleted before it was read.
-        Ok(None) => RecordRead::Unreadable("it was listed, but is gone now".to_owned()),
-        // `remote`'s errors are fixed text and a status, never the server's
-        // own words. `{:#}` prints the whole chain on one line.
-        Err(error) => RecordRead::Unreadable(format!("{error:#}")),
-    }
+        Ok(None) => RecordRead::Unreadable(Unreadable::NotARecord(
+            "it was listed, but is gone now".to_owned(),
+        )),
+        Err(error) => {
+            // A failed read may have taken a whole record's worth before it
+            // stopped (a body with no length is refused only at the chunk
+            // that crosses the cap), so it counts as one. Otherwise a server
+            // could make every read fail just past the cap and never touch
+            // the budget.
+            budget.spend(MAX_RECORD_BYTES);
+            RecordRead::Unreadable(Unreadable::ReadFailed(error))
+        }
+    };
+    Ok(read)
 }
 
 /// An alarm of 02 ("Who can read a sweep") about one `keys/<id>.json`:
@@ -152,15 +354,37 @@ impl KeyAlarm {
 /// install's.
 ///
 /// `login` runs this once it has published or reused this install's key,
-/// so that key is listed, known and recorded with its key; P2c's `pull` is
-/// meant to run it too.
+/// so that key is listed, known and recorded with its key; P2c's `pull`
+/// runs it too.
+///
+/// The alarms come back only when every listed record was read; otherwise
+/// the check fails with a [`KeyCheckError`] (see the module docs), and a
+/// record under a known id that could not be read fails it too, though
+/// `keys list` shows that one as a warning. A record under an unknown id
+/// that could not be read is its alarm, as 02 has it: only a revoked
+/// record settles that alarm, and a failed read shows none.
 pub(crate) async fn key_alarms(
     keys: &impl PublicKeys,
     owner: &PublicKey,
     installs: &[Install],
     this_install: Option<&DeviceId>,
-) -> anyhow::Result<Vec<KeyAlarm>> {
-    Ok(list_keys(keys, owner, installs, this_install).await?.alarms)
+) -> Result<Vec<KeyAlarm>, KeyCheckError> {
+    // Taking the listing apart moves these two fields out of it; `..`
+    // drops the rest.
+    let KeyListing {
+        alarms, unreadable, ..
+    } = list_keys(keys, owner, installs, this_install).await?;
+    for key in unreadable {
+        // A `let` chain: the pattern must match and the `&&` hold too. An
+        // id with an `Unknown` alarm raised it already, whatever its record
+        // holds, so its failed read leaves nothing undecided.
+        if let Unreadable::ReadFailed(cause) = key.why
+            && !alarms.contains(&KeyAlarm::Unknown(key.id.clone()))
+        {
+            return Err(KeyCheckError::Read { id: key.id, cause });
+        }
+    }
+    Ok(alarms)
 }
 
 // ---------------------------------------------------------------------------
@@ -177,7 +401,8 @@ struct KeyListing {
     owner: Pubky,
     /// The records that parsed, in the order they were listed.
     keys: Vec<ListedKey>,
-    /// The listed ids whose record was gone or did not parse.
+    /// The listed ids whose record was gone, did not parse or could not be
+    /// read.
     unreadable: Vec<UnreadableKey>,
     /// How many listing entries were not a `keys/<deviceId>.json`.
     skipped_names: usize,
@@ -399,8 +624,8 @@ impl ListedKey {
 struct UnreadableKey {
     /// The device id, from the listing.
     id: DeviceId,
-    /// Why, in fixed text.
-    reason: String,
+    /// Why.
+    why: Unreadable,
 }
 
 impl UnreadableKey {
@@ -408,7 +633,7 @@ impl UnreadableKey {
     fn warning(&self) -> String {
         format!(
             "warning: keys/{}.json is not listed: {}.\n",
-            self.id, self.reason
+            self.id, self.why
         )
     }
 }
@@ -506,15 +731,29 @@ fn created_ids(installs: &[Install], this_install: Option<&DeviceId>) -> Vec<Dev
 ///
 /// `installs` are this owner's installs here, from `installs.json`, each
 /// with the key it published when that is recorded, and `this_install` the
-/// id `login.json` records as this install's. Only the listing itself can
-/// fail; one record that cannot be read is a warning in the listing.
+/// id `login.json` records as this install's.
+///
+/// It fails, with a [`KeyCheckError`], when the listing fails or is past
+/// [`ListLimits::DEFAULT`], and when the records pass
+/// [`KEY_RECORDS_BUDGET_BYTES`]. One record that cannot be read is a
+/// warning in the listing, which [`key_alarms`] turns into a failure.
 async fn list_keys(
     keys: &impl PublicKeys,
     owner: &PublicKey,
     installs: &[Install],
     this_install: Option<&DeviceId>,
-) -> anyhow::Result<KeyListing> {
-    let listed = keys.list_key_ids(owner).await?;
+) -> Result<KeyListing, KeyCheckError> {
+    let listed = keys
+        .list_key_ids(owner)
+        .await
+        .map_err(KeyCheckError::from_listing_error)?;
+    // `PublicKeyReader` lists with `ListLimits::DEFAULT`, which refuses a
+    // longer listing already. Counting again here holds any `PublicKeys`
+    // to the same bound, and comes before anything that grows with the
+    // listing, such as the search for unknown ids.
+    if listed.ids.len().saturating_add(listed.skipped) > ListLimits::DEFAULT.max_entries {
+        return Err(KeyCheckError::TooManyKeys);
+    }
     let unknown = unknown_key_ids(&created_ids(installs, this_install), &listed.ids);
     let mut listing = KeyListing {
         owner: pubky_of(owner),
@@ -526,6 +765,7 @@ async fn list_keys(
     // A homeserver could list one name twice; it is read and shown once.
     // `insert` returns `false` for a value the set holds already.
     let mut seen = BTreeSet::new();
+    let mut budget = ReadBudget::new();
     // `listed.ids` is moved into the loop: each `id` is owned, so it can
     // move into the entry without a clone.
     for id in listed.ids {
@@ -533,7 +773,9 @@ async fn list_keys(
             continue;
         }
         let is_unknown = unknown.contains(&id);
-        let read = read_record(keys, owner, &id).await;
+        // One read at a time, each awaited before the next is sent: the
+        // budget is checked before every one.
+        let read = read_record(keys, owner, &id, &mut budget).await?;
         if is_unknown && !read.settles_the_alarm() {
             listing.alarms.push(KeyAlarm::Unknown(id.clone()));
         }
@@ -545,8 +787,8 @@ async fn list_keys(
                 listing.alarms.extend(key.replaced_alarm());
                 listing.keys.push(key);
             }
-            RecordRead::Unreadable(reason) => {
-                listing.unreadable.push(UnreadableKey { id, reason });
+            RecordRead::Unreadable(why) => {
+                listing.unreadable.push(UnreadableKey { id, why });
             }
         }
     }
@@ -700,17 +942,18 @@ mod tests {
     use serde_json::{Value, json};
     use sweepky_core::paths;
     use sweepky_core::{
-        AgeRecipient, DeviceId, DeviceIdentity, DeviceKeyError, RecordTime, Zeroizing,
+        AgeRecipient, DeviceId, DeviceIdentity, DeviceKeyError, MAX_RECORD_BYTES, RecordTime,
+        Zeroizing,
     };
 
     use super::{
-        KeyAlarm, KeyCheck, KeyListing, Revocation, key_alarms, list_keys, revoke_key,
-        revoke_report,
+        KEY_RECORDS_BUDGET_BYTES, KeyAlarm, KeyCheck, KeyCheckError, KeyListing, Revocation,
+        key_alarms, list_keys, revoke_key, revoke_report,
     };
     use crate::device::{KeyIds, PublicKeys, device_key_bytes, device_key_record};
     use crate::installs::Install;
     use crate::remote::{ListLimits, ListingError, ListingParser};
-    use crate::test_support::{FakeKeyStore, KeyStoreCall};
+    use crate::test_support::{FAKE_READ_FAILURE, FAKE_SERVER_TEXT, FakeKeyStore, KeyStoreCall};
 
     fn id(text: &str) -> DeviceId {
         text.parse().expect("a valid device id")
@@ -865,7 +1108,7 @@ mod tests {
             assert!(!text.contains(&key.to_string()), "{text}");
         }
 
-        // The check `login` runs (and P2c's `pull` will) raises the same
+        // The check `login` and `pull` run raises the same
         // alarms from the same reads: every listed record, the known ones
         // too.
         let before = keys.calls().len();
@@ -1154,6 +1397,288 @@ mod tests {
         // Never the recipient's text, in either spelling.
         assert!(!text.contains(&recipient), "{text}");
         assert!(!text.contains(&recipient.to_uppercase()), "{text}");
+    }
+
+    /// A failure of the check as a caller prints it: its own text, then
+    /// each cause after it, as `anyhow`'s `{:#}` prints a chain.
+    fn shown(failure: KeyCheckError) -> String {
+        format!("{:#}", anyhow::Error::new(failure))
+    }
+
+    /// Asserts that `text`, a failure as a caller prints it, quotes none of
+    /// `quoted` (records' labels and keys, listing lines) and none of the
+    /// fake homeserver's own words.
+    fn assert_quotes_none(text: &str, quoted: &[&str]) {
+        for part in quoted.iter().chain(&[FAKE_SERVER_TEXT]) {
+            assert!(!text.contains(part), "{part:?} quoted in: {text}");
+        }
+    }
+
+    /// A record as this CLI publishes one, for `recipient`, under `label`,
+    /// padded with trailing spaces (which JSON allows) to exactly `len`
+    /// bytes.
+    fn padded_record(recipient: &AgeRecipient, label: &str, len: usize) -> Vec<u8> {
+        let mut value = record_of(recipient);
+        value["label"] = json!(label);
+        let mut padded = bytes(&value);
+        padded.resize(len, b' ');
+        padded
+    }
+
+    #[tokio::test]
+    async fn records_past_the_budget_fail_the_check_after_reading_no_more_than_it() {
+        // A device key record is a few hundred bytes, so records at the
+        // per-record cap, one more than the budget holds, are someone
+        // filling keys/. Each carries a label and a key the failure must
+        // not quote.
+        const LABEL: &str = "synthetic-label-text";
+        let keys = FakeKeyStore::default();
+        let owner = owner();
+        let recipient = new_key();
+        let fit = KEY_RECORDS_BUDGET_BYTES / MAX_RECORD_BYTES;
+        let ids: Vec<DeviceId> = (0..=fit).map(|n| id(&format!("filler-{n}"))).collect();
+        for filler in &ids {
+            keys.set_record(filler, padded_record(&recipient, LABEL, MAX_RECORD_BYTES));
+        }
+
+        let failure = key_alarms(&keys, &owner, &[], None)
+            .await
+            .expect_err("over the budget");
+        assert!(matches!(failure, KeyCheckError::OverBudget), "{failure:?}");
+        // No more than the budget was read: the records asked for add up
+        // to at most it, and the last one, which would pass it, was never
+        // asked for.
+        let calls = keys.calls();
+        let read: usize = calls
+            .iter()
+            .filter_map(|call| match call {
+                KeyStoreCall::GetKey(asked) => keys.record(asked).map(|bytes| bytes.len()),
+                _ => None,
+            })
+            .sum();
+        assert!(read <= KEY_RECORDS_BUDGET_BYTES, "{read} bytes read");
+        let last = ids.last().expect("ids");
+        assert!(
+            !calls.contains(&KeyStoreCall::GetKey(last.clone())),
+            "{calls:?}"
+        );
+        // Fixed text, which quotes no record.
+        let text = shown(failure);
+        assert_eq!(
+            text,
+            "the records under keys/ are more than one check reads: it reads up to 8 MiB, and \
+             starts on a record only while 1 MiB, the most one may hold, is left (a read that \
+             failed counts as that much), so it stopped before the rest; a device key record is \
+             a few hundred bytes"
+        );
+        assert_quotes_none(&text, &[LABEL, &recipient.to_string()]);
+
+        // `keys list` reads with the same bounds, and fails the same way.
+        let listed = list_keys(&keys, &owner, &[], None)
+            .await
+            .expect_err("the same bounds");
+        assert!(matches!(listed, KeyCheckError::OverBudget), "{listed:?}");
+
+        // One record fewer is the budget exactly, which is not past it:
+        // every record is read and checked.
+        keys.remove_record(last);
+        let alarms = key_alarms(&keys, &owner, &[], None)
+            .await
+            .expect("within the budget");
+        assert_eq!(alarms.len(), fit);
+    }
+
+    /// A `keys/` whose listing is refused with this error, which
+    /// `list_key_ids` hands on in the context `remote::list_dir` adds to
+    /// it, as `PublicKeyReader` does.
+    struct RefusedListing(ListingError);
+
+    impl PublicKeys for RefusedListing {
+        async fn list_key_ids(&self, owner: &PublicKey) -> anyhow::Result<KeyIds> {
+            Err(anyhow::Error::new(self.0).context(format!(
+                "could not list {} of {}",
+                paths::KEYS_DIR,
+                owner.z32()
+            )))
+        }
+
+        async fn get_key(
+            &self,
+            _owner: &PublicKey,
+            _id: &DeviceId,
+        ) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
+            anyhow::bail!("a refused listing names no record to read")
+        }
+    }
+
+    /// What the real parser refuses a `keys/` listing with one entry past
+    /// [`ListLimits::DEFAULT`], read in full pages as `list_dir` reads it.
+    fn refusal_past_the_default(owner: &PublicKey) -> ListingError {
+        let dir = PubkyResource::new(owner.clone(), paths::KEYS_DIR).expect("a directory");
+        let mut parser = ListingParser::new(&dir, ListLimits::DEFAULT);
+        let z32 = owner.z32();
+        let page_size = usize::from(ListLimits::DEFAULT.page_size);
+        // The bound only stops a parser that never refuses from looping.
+        for page in 0..=ListLimits::DEFAULT.max_pages {
+            let lines: String = (page * page_size..(page + 1) * page_size)
+                .map(|n| format!("pubky://{z32}/pub/sweepky/keys/k{n}.json\n"))
+                .collect();
+            if let Err(refusal) = parser.page(lines.as_bytes()) {
+                return refusal;
+            }
+        }
+        panic!("the parser read more than ListLimits::DEFAULT allows");
+    }
+
+    #[tokio::test]
+    async fn a_listing_past_the_default_limits_is_a_typed_failure_not_alarms() {
+        let limit = ListLimits::DEFAULT.max_entries;
+        let owner = owner();
+        // Ids none of this owner's installs created, listed with no record
+        // behind them: on its own, each is an alarm.
+        let keys = FakeKeyStore::default();
+        for n in 0..limit {
+            keys.list_without_record(&id(&format!("k{n}")));
+        }
+        let alarms = key_alarms(&keys, &owner, &[], None)
+            .await
+            .expect("at the limit, the check runs");
+        assert_eq!(alarms.len(), limit);
+
+        // One past it is a failure, before any record is read, rather than
+        // a thousand alarms; `keys list` refuses it the same way.
+        keys.list_without_record(&id("one-more"));
+        let before = keys.calls().len();
+        let failure = key_alarms(&keys, &owner, &[], None)
+            .await
+            .expect_err("past the limit");
+        assert!(matches!(failure, KeyCheckError::TooManyKeys), "{failure:?}");
+        assert_eq!(
+            keys.calls()[before..],
+            [KeyStoreCall::ListKeyIds(owner.clone())]
+        );
+        let listed = list_keys(&keys, &owner, &[], None)
+            .await
+            .expect_err("the same bounds");
+        assert!(matches!(listed, KeyCheckError::TooManyKeys), "{listed:?}");
+        let text = shown(failure);
+        assert_eq!(
+            text,
+            "keys/ lists more than the 1000 entries one check reads, so none of its records was \
+             checked"
+        );
+        assert_quotes_none(&text, &["k1000", "one-more"]);
+
+        // The real listing refuses the entry past the limit itself, and
+        // that refusal, as `list_dir` hands it on, is the same failure.
+        let refusal = refusal_past_the_default(&owner);
+        assert_eq!(refusal, ListingError::TooManyEntries);
+        let failure = key_alarms(&RefusedListing(refusal), &owner, &[], None)
+            .await
+            .expect_err("refused");
+        assert!(matches!(failure, KeyCheckError::TooManyKeys), "{failure:?}");
+        assert_quotes_none(&shown(failure), &["pubky://", "k1000"]);
+
+        // Any other refusal of the listing is a failure too, with
+        // `remote`'s fixed reason as its cause.
+        let failure = key_alarms(&RefusedListing(ListingError::NotUtf8), &owner, &[], None)
+            .await
+            .expect_err("refused");
+        assert!(matches!(failure, KeyCheckError::Listing(_)), "{failure:?}");
+        assert_eq!(
+            shown(failure),
+            format!(
+                "keys/ could not be listed: could not list /pub/sweepky/keys/ of {}: a line of the \
+                 listing is not UTF-8",
+                owner.z32()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_record_that_cannot_be_read_fails_the_check() {
+        // A known id whose read fails: no alarm could say whether its
+        // record still holds that install's key, so the check fails rather
+        // than come back with none. `keys list`, from the same reads, shows
+        // the rest with a warning, as P2a had it.
+        let keys = FakeKeyStore::default();
+        let owner = owner();
+        let own = id("own-install");
+        let sibling = id("sibling");
+        let [own_key, sibling_key] = [new_key(), new_key()];
+        keys.set_record(&own, bytes(&record_of(&own_key)));
+        keys.set_record(&sibling, bytes(&record_of(&sibling_key)));
+        keys.fail_reads_of(&sibling);
+        let installs = [
+            install(&own, Some(&own_key)),
+            install(&sibling, Some(&sibling_key)),
+        ];
+
+        let failure = key_alarms(&keys, &owner, &installs, Some(&own))
+            .await
+            .expect_err("a read failed");
+        assert!(
+            matches!(&failure, KeyCheckError::Read { id, .. } if *id == sibling),
+            "{failure:?}"
+        );
+        // The device id and `remote`'s fixed words for the failed request,
+        // and no record.
+        let text = shown(failure);
+        assert_eq!(
+            text,
+            format!(
+                "keys/sibling.json could not be read, so the check cannot tell which key it \
+                 holds: {FAKE_READ_FAILURE}"
+            )
+        );
+        assert_quotes_none(&text, &[&own_key.to_string(), &sibling_key.to_string()]);
+
+        let listing = list_keys(&keys, &owner, &installs, Some(&own))
+            .await
+            .expect("keys list lists the rest");
+        assert!(listing.alarms.is_empty(), "{:?}", listing.alarms);
+        let rendered = listing.render();
+        for part in [
+            "keys/own-install.json: this install; in use",
+            "warning: keys/sibling.json is not listed",
+        ] {
+            assert!(rendered.contains(part), "{part:?} missing from: {rendered}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_record_under_an_unknown_id_that_cannot_be_read_still_alarms() {
+        // 02: "a record under an unknown id that it cannot read still
+        // alarms". Only a revoked record settles that alarm, and a failed
+        // read shows none, so the check finishes with the alarm rather than
+        // failing, and `login` raises it rather than a warning.
+        let keys = FakeKeyStore::default();
+        let owner = owner();
+        let own = id("own-install");
+        let own_key = new_key();
+        keys.set_record(&own, bytes(&record_of(&own_key)));
+        let stranger = id("stranger");
+        let mut revoked = record_of(&new_key());
+        revoked["revokedAt"] = json!(NOW);
+        keys.set_record(&stranger, bytes(&revoked));
+        keys.fail_reads_of(&stranger);
+        let installs = [install(&own, Some(&own_key))];
+
+        let alarms = key_alarms(&keys, &owner, &installs, Some(&own))
+            .await
+            .expect("the unknown id's alarm settles the check");
+        assert_eq!(alarms, [KeyAlarm::Unknown(stranger.clone())]);
+        let listing = list_keys(&keys, &owner, &installs, Some(&own))
+            .await
+            .expect("keys list lists it");
+        assert_eq!(listing.alarms, alarms);
+        assert!(
+            listing
+                .render()
+                .contains("warning: keys/stranger.json is not listed"),
+            "{}",
+            listing.render()
+        );
     }
 
     /// The time `revoke_key` is handed as "now" in these tests.

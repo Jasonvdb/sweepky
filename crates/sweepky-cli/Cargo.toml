@@ -25,7 +25,10 @@ path = "src/main.rs"
 [dependencies]
 # Records, ids, paths and encryption, with no network or file I/O.
 sweepky-core = { path = "../sweepky-core" }
-# The Pubky SDK. The workspace entry turns on its `json` feature.
+# The Pubky SDK. The workspace entry turns on its `json` feature. `pull`'s
+# host policy reads pkarr records through its `pkarr` re-export (and
+# simple-dns through pkarr's `dns`), so neither needs a line of its own: each
+# stays the release this pubky brings in, as Cargo.lock holds it.
 pubky = { workspace = true }
 # Argument parsing. `derive` adds `#[derive(Parser)]`; clap's default features
 # stay on. Never `env`: only main.rs reads environment variables, with

@@ -83,7 +83,7 @@ const MAX_NAME_CHARS: usize = 255;
 /// not), never through a link (`O_NOFOLLOW`, belt and braces), never this
 /// process's terminal, and not handed to any program this one starts.
 /// `union` is the `const` form of `|`, so this can be a constant.
-const NEW_FILE_FLAGS: OFlags = OFlags::WRONLY
+pub(crate) const NEW_FILE_FLAGS: OFlags = OFlags::WRONLY
     .union(OFlags::CREATE)
     .union(OFlags::EXCL)
     .union(OFlags::NOFOLLOW)
@@ -134,7 +134,7 @@ pub(super) fn already_there(shown: &str) -> String {
 /// The directory at `path`, opened. Its path is the user's own (the
 /// project's, or the data directory's), so the parts above it are taken as
 /// they are; `O_NOFOLLOW` still refuses a link at its last part.
-fn open_dir_path(path: &Path) -> anyhow::Result<OwnedFd> {
+pub(crate) fn open_dir_path(path: &Path) -> anyhow::Result<OwnedFd> {
     rustix::fs::open(path, DIR_FLAGS, Mode::empty())
         .with_context(|| format!("could not open {}", path.display()))
 }
@@ -231,7 +231,7 @@ fn changed(shown: &str) -> String {
 /// `staging` copied to `name` in `sweeps`, shown as `shown`, through the
 /// handles alone (see the module docs). A copy that fails is removed again,
 /// best effort, so no part of a sweep is left for `submit` to find.
-fn copy_sweep(
+pub(crate) fn copy_sweep(
     staging: BorrowedFd<'_>,
     name: &CStr,
     sweeps: BorrowedFd<'_>,
