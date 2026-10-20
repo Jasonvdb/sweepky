@@ -22,8 +22,10 @@
 //! sweep records the tests
 //! put there, with the snapshot `run` keeps of a sweep's fetch, the
 //! passphrase the tests wrap secret files with and a byte search to check
-//! a wrapped file shows none of its secret, and a compile-time check that a
-//! secret type implements none of the traits that would print or copy it.
+//! a wrapped file shows none of its secret, a compile-time check that a
+//! secret type implements none of the traits that would print or copy it,
+//! and [`stored_findings`], what `pull` stored of a sweep's findings, read
+//! back.
 //!
 //! Compiled only for `cargo test` (`#[cfg(test)]` on its `mod` line in
 //! `lib.rs`), so nothing here reaches the binary, and like any test code it
@@ -45,8 +47,8 @@ use pubky::{Keypair, PubkyHttpClient, PublicKey, StatusCode};
 use serde_json::{Value, json};
 use sweepky_core::paths::{self, SweepkyPath};
 use sweepky_core::{
-    Bounty, BountyRef, DeviceId, EventCursor, GitSha, KnownTarget, Pubky, RecordId, RepoName,
-    SweepRef, TargetId, Timestamp, Zeroizing,
+    Bounty, BountyRef, DeviceId, EventCursor, Findings, GitSha, KnownTarget, MAX_PACKAGE_BYTES,
+    Pubky, RecordId, RepoName, SweepRef, TargetId, Timestamp, Zeroizing,
 };
 use tempfile::TempDir;
 use tokio::net::{TcpListener, TcpStream};
@@ -56,6 +58,7 @@ use crate::events::EventsFeed;
 use crate::git::{AllowedProtocols, GitCommand, GitFailed, RunGit, git_argv};
 use crate::own_storage::OwnStorage;
 use crate::pull::resolve::{ResolveHomeserver, Unreachable};
+use crate::pull::store::{Placement, StoredCopy, read_stored_findings};
 use crate::records::PublicRecords;
 use crate::remote::{Conditional, ETag, ListOrder, Listing, ListingError};
 use crate::sweep_state::SweepSnapshot;
@@ -1250,6 +1253,27 @@ pub(crate) fn circle_json(admin: Pubky, members: &[Pubky]) -> Value {
         "admin": admin.to_string(),
         "members": members,
     })
+}
+
+/// The compact copy `pull` stored of the findings of `sweep` of `bounty`,
+/// read back within the package's cap: the side it was stored on and the
+/// findings, or `None` when it was not stored.
+pub(crate) fn stored_findings(
+    dirs: &Dirs,
+    bounty: BountyRef,
+    sweep: SweepRef,
+) -> anyhow::Result<Option<(Placement, Findings)>> {
+    Ok(
+        match read_stored_findings(dirs, bounty, sweep, MAX_PACKAGE_BYTES)? {
+            None => None,
+            Some(StoredCopy::Read {
+                placement,
+                findings,
+                ..
+            }) => Some((placement, findings)),
+            Some(StoredCopy::OverCap { len }) => panic!("a copy over the cap, of {len} bytes"),
+        },
+    )
 }
 
 /// What a [`FakeResolver`] that fails gives as its error: words that a

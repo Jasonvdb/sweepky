@@ -10,6 +10,7 @@
 //! | `<bounty id>/untrusted/<sweeper z32>-<sweep id>/` | an untrusted one |
 //! | `…/<sweep>/<path>` | each file the package split into: `findings.json`, pretty-printed, and every attachment at its own path |
 //! | `…/<sweep>/.sweepky/findings.json` | the compact copy of the findings, which regrouping reads ([`read_stored_findings`]) |
+//! | `<bounty id>/groups.json`, `<bounty id>/merged.json` | the bounty's triage, written by `pull::triage` |
 //! | `staging/.pull.<pid>.<nanos>.<n>.tmp/` | one store's staging, removed when the store ends |
 //!
 //! A sweeper's z-base32 key is 52 lower-case characters and a sweep id 13 of
@@ -174,27 +175,41 @@ impl fmt::Debug for CompactFindings {
     }
 }
 
-/// What [`compact_with_cap`] says when serde_json fails other than at the
-/// cap, which these types never make it do.
-const COMPACT_FAILED: &str = "could not write the sweep's findings as compact JSON";
-
 /// [`CompactFindings::of`] with the cap as a parameter, so a test can check
 /// the edge with findings of any size.
+fn compact_with_cap(findings: &Findings, cap: usize) -> anyhow::Result<CompactFindings> {
+    let Some(bytes) = compact_json(findings, cap)? else {
+        bail!(
+            "the sweep's findings come to more than the {cap} bytes pull keeps of a sweep's \
+             findings written compactly, so the sweep was not stored"
+        );
+    };
+    Ok(CompactFindings(bytes))
+}
+
+/// What [`compact_json`] says when serde_json fails other than at the cap,
+/// which the types `pull` writes never make it do.
+const COMPACT_FAILED: &str = "could not write compact JSON for pull's own files";
+
+/// `value` as compact JSON in a `Zeroizing` buffer of exactly its length, or
+/// `None` when that would be more than `cap` bytes. The compact copy of a
+/// sweep's findings is written with it, and so are `pull::triage`'s files.
 ///
 /// Two passes, so the buffer is allocated once at its exact length: the first
 /// counts the bytes and keeps none, stopping at the cap; the second writes
 /// them. A `Vec` that grew while the JSON was written would copy it into a
 /// bigger allocation each time and free the old one unwiped.
-fn compact_with_cap(findings: &Findings, cap: usize) -> anyhow::Result<CompactFindings> {
+// Generic over `T`, any type serde can write: `&T` is only borrowed, twice.
+pub(crate) fn compact_json<T: Serialize>(
+    value: &T,
+    cap: usize,
+) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>> {
     let mut counter = CappedWriter::new(io::sink(), cap);
     // serde_json's error is dropped (`map_err(|_| …)`): its message could
     // quote a value. The counter says whether it was the cap.
-    let counted = serde_json::to_writer(&mut counter, findings);
+    let counted = serde_json::to_writer(&mut counter, value);
     if counter.over_cap {
-        bail!(
-            "the sweep's findings come to more than the {cap} bytes pull keeps of a sweep's \
-             findings written compactly, so the sweep was not stored"
-        );
+        return Ok(None);
     }
     counted.map_err(|_| anyhow!(COMPACT_FAILED))?;
     let len = counter.written;
@@ -202,9 +217,9 @@ fn compact_with_cap(findings: &Findings, cap: usize) -> anyhow::Result<CompactFi
     // `&mut *bytes` lends the `Vec` inside the `Zeroizing`; `&mut Vec<u8>`
     // is an `io::Write`. The cap of exactly `len` keeps the `Vec` from ever
     // growing past the capacity it was given.
-    serde_json::to_writer(CappedWriter::new(&mut *bytes, len), findings)
+    serde_json::to_writer(CappedWriter::new(&mut *bytes, len), value)
         .map_err(|_| anyhow!(COMPACT_FAILED))?;
-    Ok(CompactFindings(bytes))
+    Ok(Some(bytes))
 }
 
 /// An `io::Write` that passes at most `cap` bytes on to `inner`, and counts
@@ -309,28 +324,70 @@ pub(crate) fn store_sweep(
     }
 }
 
+/// The owner's bounty `bounty`'s directory, `<data>/<bounty id>/`, once it
+/// is seen to be a real directory whose owner check names `bounty`'s owner;
+/// `None` when nothing is there, as before any sweep of it is stored. A
+/// link there, or another owner's directory, is refused.
+pub(crate) fn stored_bounty_dir(dirs: &Dirs, bounty: BountyRef) -> anyhow::Result<Option<PathBuf>> {
+    let dir = dirs.pulled_bounty_dir(&bounty.id);
+    if !is_real_dir(&dir)? {
+        return Ok(None);
+    }
+    check_owner(dirs, bounty)?;
+    Ok(Some(dir))
+}
+
+/// What [`read_stored_findings`] found of a stored sweep's compact copy of
+/// its findings.
+// `Debug` is derived: `Findings`' own `Debug` prints counts only.
+#[derive(Debug)]
+pub(crate) enum StoredCopy {
+    /// Read back: the side the sweep was stored on, its findings, and the
+    /// copy's length in bytes.
+    Read {
+        placement: Placement,
+        findings: Findings,
+        len: usize,
+    },
+    /// Longer than the cap the caller gave, by its length in bytes: nothing
+    /// of it was read.
+    OverCap { len: u64 },
+}
+
 /// The compact copy of the findings of `sweep` of the owner's bounty
-/// `bounty`, read back with the side it was stored on, or `None` when it
-/// was not stored.
+/// `bounty`, read back if it is at most `cap` bytes long (never more than
+/// `MAX_PACKAGE_BYTES`), or `None` when it was not stored.
 ///
-/// Through `private_fs::read_private_file` with `MAX_PACKAGE_BYTES` as the
-/// cap, the size checked before a byte is read; each directory on the way is
+/// Its length is looked at first, without following a link, so a copy over
+/// the cap is [`StoredCopy::OverCap`] and not a byte of it is read; then it
+/// is read through `private_fs::read_private_file` with the same cap, which
+/// checks the size again before it reads. Each directory on the way is
 /// looked at first and refused when it is a link. A bounty directory of
 /// another owner's is refused. The parse's error quotes nothing of the file.
 pub(crate) fn read_stored_findings(
     dirs: &Dirs,
     bounty: BountyRef,
     sweep: SweepRef,
-) -> anyhow::Result<Option<(Placement, Findings)>> {
-    if !is_real_dir(&dirs.pulled_bounty_dir(&bounty.id))? {
+    cap: usize,
+) -> anyhow::Result<Option<StoredCopy>> {
+    if stored_bounty_dir(dirs, bounty)?.is_none() {
         return Ok(None);
     }
-    check_owner(dirs, bounty)?;
+    let cap = cap.min(MAX_PACKAGE_BYTES);
     for placement in [Placement::Trusted, Placement::Untrusted] {
         let Some(path) = copy_path(dirs, bounty, sweep, placement)? else {
             continue;
         };
-        let Some(bytes) = read_private_file(&path, MAX_PACKAGE_BYTES)? else {
+        let Some(seen) = lstat(&path)? else {
+            continue;
+        };
+        // `try_from` turns the cap into the `u64` a file's length is; a
+        // `usize` fits one on every platform Rust supports, so the fallback
+        // never applies.
+        if seen.len() > u64::try_from(cap).unwrap_or(u64::MAX) {
+            return Ok(Some(StoredCopy::OverCap { len: seen.len() }));
+        }
+        let Some(bytes) = read_private_file(&path, cap)? else {
             continue;
         };
         // `RecordError::from` keeps only the kind of fault and where it is,
@@ -338,7 +395,11 @@ pub(crate) fn read_stored_findings(
         let findings = serde_json::from_slice(&bytes)
             .map_err(RecordError::from)
             .with_context(|| format!("{} is not valid", path.display()))?;
-        return Ok(Some((placement, findings)));
+        return Ok(Some(StoredCopy::Read {
+            placement,
+            findings,
+            len: bytes.len(),
+        }));
     }
     Ok(None)
 }
@@ -908,15 +969,15 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        CompactFindings, Placement, Stored, check_paths, compact_with_cap, read_stored_findings,
-        store_sweep, sweep_dir_name,
+        CompactFindings, Placement, Stored, StoredCopy, check_paths, compact_with_cap,
+        read_stored_findings, store_sweep, sweep_dir_name,
     };
     use crate::Dirs;
     use crate::private_fs::ensure_private_dir;
     use crate::submit::walk::{MAX_DEPTH, MAX_ENTRIES};
     use crate::test_support::{
         PLANTED, SYNTHETIC_SHA, bounty_id, dirs_in, json_bytes, mode, private_temp, random_pubky,
-        record_id,
+        record_id, stored_findings,
     };
 
     /// What a tree holds, by path relative to its root, links not
@@ -1165,7 +1226,7 @@ mod tests {
         );
         assert_eq!(mode(&fixture.untrusted_dir()), 0o700);
         let side = |sweep| {
-            read_stored_findings(&fixture.dirs, fixture.bounty, sweep)
+            stored_findings(&fixture.dirs, fixture.bounty, sweep)
                 .expect("read")
                 .map(|(placement, _)| placement)
         };
@@ -1410,37 +1471,55 @@ mod tests {
             .expect("stored");
 
         assert_eq!(
-            read_stored_findings(&fixture.dirs, fixture.bounty, sweep).expect("read"),
+            stored_findings(&fixture.dirs, fixture.bounty, sweep).expect("read"),
             Some((Placement::Trusted, findings.clone()))
         );
         // A sweep never stored has none.
         assert_eq!(
-            read_stored_findings(&fixture.dirs, fixture.bounty, new_sweep()).expect("read"),
+            stored_findings(&fixture.dirs, fixture.bounty, new_sweep()).expect("read"),
             None
         );
 
-        // At its cap a copy is made; one byte under, it is refused.
+        // Read back with the caller's cap: at the copy's length it is read,
+        // and the length comes back; one byte under, nothing is read.
         let len = compact.as_bytes().len();
+        let at_len = read_stored_findings(&fixture.dirs, fixture.bounty, sweep, len);
+        assert!(
+            matches!(at_len, Ok(Some(StoredCopy::Read { len: read, .. })) if read == len),
+            "{at_len:?}"
+        );
+        let under = read_stored_findings(&fixture.dirs, fixture.bounty, sweep, len - 1);
+        let expected = u64::try_from(len).expect("fits");
+        assert!(
+            matches!(under, Ok(Some(StoredCopy::OverCap { len })) if len == expected),
+            "{under:?}"
+        );
+
+        // At its cap a copy is made; one byte under, it is refused.
         assert!(compact_with_cap(&findings, len).is_ok());
         let error = compact_with_cap(&findings, len - 1).expect_err("over the cap");
         let message = format!("{error:#}");
         assert!(message.contains("more than"), "{message}");
         assert_quotes_none(&message, &[]);
 
-        // A copy on disk over the cap is refused before it is read.
+        // A copy on disk over the package's cap is never read, whatever cap
+        // the caller asks for.
         let copy = fixture
             .bounty_dir()
             .join(sweep_dir_name(sweep))
             .join(".sweepky/findings.json");
+        let too_long = u64::try_from(MAX_PACKAGE_BYTES + 1).expect("fits");
         File::options()
             .write(true)
             .open(&copy)
             .expect("open")
-            .set_len(u64::try_from(MAX_PACKAGE_BYTES + 1).expect("fits"))
+            .set_len(too_long)
             .expect("set_len");
-        let error =
-            read_stored_findings(&fixture.dirs, fixture.bounty, sweep).expect_err("over the cap");
-        assert!(format!("{error:#}").contains("larger than"), "{error:#}");
+        let over = read_stored_findings(&fixture.dirs, fixture.bounty, sweep, usize::MAX);
+        assert!(
+            matches!(over, Ok(Some(StoredCopy::OverCap { len })) if len == too_long),
+            "{over:?}"
+        );
     }
 
     #[test]
@@ -1464,7 +1543,8 @@ mod tests {
 
         assert!(format!("{error:#}").contains("another owner"), "{error:#}");
         assert_eq!(tree(&fixture.bounty_dir()), before);
-        let error = read_stored_findings(&fixture.dirs, other, sweep).expect_err("refused");
+        let error = read_stored_findings(&fixture.dirs, other, sweep, MAX_PACKAGE_BYTES)
+            .expect_err("refused");
         assert!(format!("{error:#}").contains("another owner"), "{error:#}");
     }
 }

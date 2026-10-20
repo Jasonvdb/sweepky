@@ -667,11 +667,12 @@ mod tests {
     use crate::passphrase::{NeedsPassphrase, Passphrase};
     use crate::pull::resolve::Homeservers;
     use crate::pull::state::{BountySummary, PollState, SweepSummary};
-    use crate::pull::store::{Placement, Stored, read_stored_findings};
+    use crate::pull::store::{Placement, Stored};
     use crate::test_support::{
         FAKE_HOMESERVER, FakeHomeservers, FakeLookup, FakePublicRecords, PLANTED, SYNTHETIC_HEAD,
         SYNTHETIC_SHA, TEST_PASSPHRASE, bounty_json, circle_json, dirs_in, json_bytes,
-        pr_target_json, private_temp, random_pubky, record_id, repo_target_json, sweep_json,
+        pr_target_json, private_temp, random_pubky, record_id, repo_target_json, stored_findings,
+        sweep_json,
     };
 
     /// What the warning about a sweep sealed to other keys only says.
@@ -827,7 +828,7 @@ mod tests {
 
         /// Where `sweep` of the bounty is stored, or `None` when it is not.
         fn stored(&self, sweep: SweepRef) -> Option<Placement> {
-            read_stored_findings(&self.dirs, self.bounty, sweep)
+            stored_findings(&self.dirs, self.bounty, sweep)
                 .expect("readable")
                 .map(|(placement, _)| placement)
         }
@@ -935,7 +936,7 @@ mod tests {
                 .iter()
                 .all(|done| done.bounty == fx.bounty && matches!(done.stored, Stored::Written(_)))
         );
-        let (placement, findings) = read_stored_findings(&fx.dirs, fx.bounty, trusted)
+        let (placement, findings) = stored_findings(&fx.dirs, fx.bounty, trusted)
             .expect("readable")
             .expect("stored");
         assert_eq!(placement, Placement::Trusted);
