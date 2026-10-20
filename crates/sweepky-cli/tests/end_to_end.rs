@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use clap::Parser;
+use pubky::errors::RequestError;
 use pubky::{Capabilities, ClientId, Keypair, Method, PubkySigner, PublicKey};
 use pubky_testnet::EphemeralTestnet;
 use serde_json::{Value, json};
@@ -1304,6 +1305,11 @@ async fn end_to_end() {
     assert!(text.contains("The grant expires at "), "{text}");
     assert!(text.contains("two years from your approval"), "{text}");
     assert_eq!(mode(&a.dirs.grant_token_file()), 0o600);
+    // The token A saved at login, copied now for the check after A1's
+    // `logout` that it no longer restores. It is the grant's secret, so it
+    // stays in a buffer that wipes itself when dropped, and no assertion
+    // ever quotes it.
+    let a_saved_token = Zeroizing::new(fs::read(a.dirs.grant_token_file()).expect("readable"));
     let login = json(&a.dirs.login_file());
     assert_eq!(login["kind"], "ring");
     assert_eq!(login["pubky"], a_user.z32());
@@ -2439,6 +2445,113 @@ async fn end_to_end() {
         })
     );
 
-    // The key the test injected under A's keys/ stays unrevoked: P2d's
-    // concurrent `keys revoke` step, after these steps, revokes it.
+    // ----- P2d: two writers at once on A1's one saved Ring token -----
+
+    // `circle add` of a synthetic member, a key made here and used nowhere
+    // else, and `keys revoke` of the key the test injected under A's keys/,
+    // at the same time on A1. Each restores a session from the one
+    // grant.token, and each restore mints a fresh bearer that cuts off the
+    // one before it, so both succeed only because the writers' lock runs
+    // them one at a time. They come after every check P2c landed, so they
+    // change no group, credit or label asserted above.
+    let member = Keypair::random().public_key();
+    let member_z32 = member.z32();
+    let added_path = format!("/pub/sweepky/keys/{added_id}.json");
+    let injected = read_json(&testnet, &a_user, &added_path).await;
+    // The argument arrays are `let` bindings because `tokio::join!` polls
+    // the futures after its own statement has begun, and a temporary array
+    // borrowed by a future would be dropped too soon (E0716).
+    let add_args = ["circle", "add", &member_z32];
+    let revoke_args = ["keys", "revoke", added_id];
+    let (circle_add, keys_revoke) = tokio::join!(sweepky(&a, &add_args), sweepky(&a, &revoke_args));
+    let report = circle_add.expect("circle add on the shared token");
+    assert!(
+        report.text().contains(&format!("Added {member_z32}")),
+        "{}",
+        report.text()
+    );
+    let report = keys_revoke.expect("keys revoke on the shared token");
+    assert!(
+        report
+            .text()
+            .contains(&format!("Revoked keys/{added_id}.json")),
+        "{}",
+        report.text()
+    );
+
+    // Anyone reading A's circle sees the new member, and the injected key
+    // revoked with every other field as it was.
+    let roster = get_capped(
+        &testnet,
+        &a_user,
+        "/pub/sweepky/circle.json",
+        MAX_RECORD_BYTES,
+    )
+    .await;
+    let circle = Circle::from_json(&roster).expect("a circle record");
+    let added: Pubky = member_z32.parse().expect("a pubky");
+    assert!(
+        circle.members.iter().any(|entry| entry.pubky == added),
+        "the new member is not in A's circle"
+    );
+    let revoked = read_json(&testnet, &a_user, &added_path).await;
+    let revoked_at = revoked["revokedAt"].as_str().expect("revokedAt is set");
+    let mut expected = injected;
+    expected["revokedAt"] = json!(revoked_at);
+    assert_eq!(revoked, expected);
+
+    // ----- P2d: A1 logs out, and the token saved at login is dead -----
+
+    // `logout` restores the saved grant, revokes A1's key with it, signs
+    // the grant out and deletes A1's login files. The two lock files stay:
+    // a deleted lock would let the next two writers in at once.
+    // `login` is A1's login.json as read after its Ring login.
+    let a1_device_id = login["deviceId"].as_str().expect("a device id");
+    let report = sweepky(&a, &["logout"]).await.expect("A1 logs out");
+    let text = report.text();
+    assert!(
+        text.contains(&format!("Revoked keys/{a1_device_id}.json")),
+        "{text}"
+    );
+    assert!(
+        text.contains("Revoked this install's Pubky Ring grant"),
+        "{text}"
+    );
+    let own = get_capped(&testnet, &a_user, &key_path, MAX_RECORD_BYTES).await;
+    let own = DeviceKey::from_json(&own).expect("a device key record");
+    assert!(own.revoked_at.is_some(), "logout revoked A1's key");
+    for gone in [
+        a.dirs.grant_token_file(),
+        a.dirs.device_key_file(),
+        a.dirs.login_file(),
+    ] {
+        assert_gone(&gone);
+    }
+    // `pull.lock`'s path helper is private to the crate, so the test joins
+    // the name itself.
+    for lock in [
+        a.dirs.credential_lock_file(),
+        a.dirs.config().join("pull.lock"),
+    ] {
+        assert_eq!(mode(&lock), 0o600, "{} is gone", lock.display());
+    }
+
+    // Done when: restoring the token A saved at login now gets 401. The
+    // token is lent to `restore_session` as a `&str` view of the wiping
+    // buffer, never copied into a plain `String`. `let … else` keeps only
+    // the error: a session that restored would end the test, and is never
+    // printed.
+    let saved = std::str::from_utf8(&a_saved_token).expect("the token is ASCII");
+    let Err(error) = testnet.sdk().expect("client").restore_session(saved).await else {
+        panic!("the token A saved at login still restores after logout");
+    };
+    // `matches!` with a guard checks the variant and the status together;
+    // the message is fixed, so a failure prints nothing of the error.
+    assert!(
+        matches!(
+            error,
+            pubky::Error::Request(RequestError::Server { status, .. }) if status.as_u16() == 401
+        ),
+        "restoring the saved token did not get 401"
+    );
 }
