@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Sweepky</title>
+    <!--
+      Inter Tight from Google Fonts: apart from the app's own files, the one
+      request that does not come from the board's store. The board loads it
+      itself because a parent page's font does not carry into an iframe.
+      `crossorigin` makes the stylesheet a CORS request without credentials,
+      so no Google cookie rides along, and the preconnects match it so the
+      browser reuses those connections.
+    -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" crossorigin />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@400..700&display=swap"
+      crossorigin
+    />
+    <style>
+      body {
+        font-family:
+          'Inter Tight',
+          system-ui,
+          -apple-system,
+          'Segoe UI',
+          Roboto,
+          sans-serif;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

@@ -153,8 +153,10 @@ jobs:
           cache: pnpm
           cache-dependency-path: web/pnpm-lock.yaml
       # --frozen-lockfile fails if the lockfile does not match package.json
-      # instead of rewriting it. Keep this step even while web/ has no
-      # dependencies: it creates the pnpm store that setup-node's post step
-      # saves, and a missing store fails the job.
+      # instead of rewriting it.
       - run: pnpm --dir web install --frozen-lockfile
+      # `tsc -b` typechecks the app, the tests and vite.config.ts, then Vite
+      # bundles the app. The build also fails if VITE_PUBKY_TESTNET is set,
+      # so nothing here may set it.
+      - run: pnpm --dir web build
       - run: pnpm --dir web test

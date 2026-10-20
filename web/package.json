@@ -2,9 +2,29 @@
   "name": "sweepky-web",
   "version": "0.0.0",
   "private": true,
-  "description": "Placeholder for the Sweepky landing page and board; the real Vite scaffold lands in P4 (docs/plan/phases/P4-board.md).",
+  "description": "The Sweepky landing page and read-only board (docs/plan/04-board.md).",
+  "type": "module",
   "packageManager": "pnpm@10.33.0",
   "scripts": {
-    "test": "node -e \"console.log('web/: placeholder until P4, no tests yet')\""
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@synonymdev/pubky": "0.16.2",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "react-router": "8.4.0",
+    "zustand": "5.0.15"
+  },
+  "devDependencies": {
+    "@types/node": "24.19.2",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.2",
+    "typescript": "7.0.2",
+    "vite": "8.3.4",
+    "vitest": "5.0.5"
   }
 }
