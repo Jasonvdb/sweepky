@@ -8,6 +8,9 @@
 //! `logout` deletes the identity it runs on), and P2b to P2d add their steps
 //! for A, B and C after these, without reordering them. Each identity has a
 //! `SWEEPKY_HOME`, and so a `Context`, of its own, as on separate machines.
+//! A and A's second install log in through the default Pubky Ring flow, the
+//! test playing both the browser and Ring with a keypair it holds for A;
+//! the throwaway, B and C use `--identity`.
 //!
 //! It needs Postgres for the testnet's homeserver, through
 //! `TEST_PUBKY_CONNECTION_STRING`. `#[pubky_testnet::test]` drops the test
@@ -17,12 +20,13 @@
 
 use std::fs;
 use std::io::{self, BufRead, Cursor, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, symlink};
+use std::os::unix::fs::{MetadataExt, symlink};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use clap::Parser;
-use pubky::{ClientId, Keypair, Method, PublicKey};
+use pubky::{Capabilities, ClientId, Keypair, Method, PubkySigner, PublicKey};
 use pubky_testnet::EphemeralTestnet;
 use serde_json::{Value, json};
 use sweepky_cli::{
@@ -37,6 +41,8 @@ use sweepky_core::{
     RecordId, RepoName, RepoPath, SecretString, Sweep, SweepRef, Zeroizing, open_package,
     parse_audit_findings, parse_feed,
 };
+use tokio::net::TcpStream;
+use tokio::sync::mpsc::{self, UnboundedReceiver};
 use url::Url;
 
 /// What the context writes to standard error, kept where the test can read
@@ -149,15 +155,11 @@ async fn list_keys(testnet: &EphemeralTestnet, user: &PublicKey) -> Vec<String> 
         .collect()
 }
 
-/// Signs in as the identity whose Sweepky key file is `key_file`, with its
-/// root key, writes `record` at `path`, and signs out: what another install
-/// of the same identity, an operator of its homeserver or anyone holding its
-/// credentials can do behind this install's back.
-async fn publish_as(testnet: &EphemeralTestnet, key_file: &Path, path: &str, record: &Value) {
-    let signer = testnet
-        .sdk()
-        .expect("client")
-        .signer(Keypair::from_secret(&identity_seed(key_file)));
+/// Signs in with `signer`'s root key, writes `record` at `path`, and signs
+/// out: what another install of the same identity, an operator of its
+/// homeserver or anyone holding its credentials can do behind this
+/// install's back.
+async fn publish_as(signer: &PubkySigner, path: &str, record: &Value) {
     let session = signer
         .signin(ClientId::new(CLIENT_ID).expect("a valid client id"))
         .await
@@ -198,38 +200,6 @@ fn identity_seed(key_file: &Path) -> Zeroizing<[u8; 32]> {
         *byte = u8::from_str_radix(digits, 16).expect("hex digits");
     }
     seed
-}
-
-/// Copies the Sweepky identity file `key_file` into `identities`, another
-/// install's `identities/`, as an owner on `--identity` carries the
-/// identity to a second machine: test setup for A's second install, not an
-/// import path, since `login` still refuses recovery files and raw keys.
-///
-/// The directory, and any parent missing, is made 0700 and the copy is
-/// created 0600, so the secret is never readable by anyone else, not even
-/// for a moment: a `chmod` after the write would leave such a moment. The
-/// bytes stay in a buffer that wipes itself.
-fn copy_identity_file(key_file: &Path, identities: &Path) {
-    // `DirBuilderExt` and `OpenOptionsExt` are Unix extension traits: in
-    // scope, they add `mode`, the permission bits to create with, which the
-    // umask can only narrow.
-    fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(identities)
-        .expect("identities/");
-    let secret = Zeroizing::new(fs::read(key_file).expect("readable"));
-    let copy = identities.join(key_file.file_name().expect("a file name"));
-    // `create_new` refuses anything already at the name, a link included,
-    // rather than writing through it.
-    fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(copy)
-        .expect("a new file")
-        .write_all(&secret)
-        .expect("written");
 }
 
 /// The synthetic name the fixture source serves `fixtures/target-repo.git`
@@ -312,10 +282,199 @@ fn context(
         // Targets from the fixture repository, so nothing reaches a real
         // repository host.
         targets: fixture_targets(),
-        // Never a real browser. No install logs in through Ring yet.
+        // Never a real browser. A's installs, which log in through Ring,
+        // swap this for `Browser::Notify` with [`notify_browser`].
         browser: Browser::None,
     };
     (ctx, stderr)
+}
+
+/// Makes `ctx`'s `login` hand the Pubky Ring sign-in page's URL to the
+/// returned receiver instead of opening a browser, so the test can play the
+/// browser and Ring itself. One receiver per context: each login sends its
+/// page's URL down its own install's channel.
+fn notify_browser(ctx: &mut Context) -> UnboundedReceiver<Url> {
+    let (urls, received) = mpsc::unbounded_channel();
+    ctx.browser = Browser::Notify(urls);
+    received
+}
+
+/// The most bytes [`loopback_get`] reads of one answer. The sign-in page,
+/// with its QR code as an SVG, is well under this.
+const MAX_LOOPBACK_ANSWER: u64 = 1024 * 1024;
+
+/// How long [`loopback_get`] waits for one answer, and [`RingPage::open`]
+/// for the page's URL.
+const LOOPBACK_WAIT: Duration = Duration::from_secs(10);
+
+/// A plain `GET` of `url` on the loopback address, as a browser would send
+/// it, over a raw `TcpStream`: the answer's status code and its body, read
+/// to at most [`MAX_LOOPBACK_ANSWER`] bytes within [`LOOPBACK_WAIT`].
+///
+/// The library's own copy is in its crate-private `test_support`, which an
+/// integration test cannot reach. A raw request rather than the SDK's
+/// client, because that client resolves names through pkarr and sends what
+/// it likes; this sends exactly the `Host` the server checks. It refuses
+/// any URL but `http://127.0.0.1:<port>/...`, so the test cannot send it
+/// anywhere else by mistake.
+async fn loopback_get(url: &Url) -> (u16, String) {
+    // Imported here only: tokio's `AsyncWriteExt` has a `write` of its own,
+    // which at the top of the file would clash with `std::io::Write`'s in
+    // `SharedBuffer`.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    assert_eq!(url.scheme(), "http", "not a loopback URL");
+    assert_eq!(url.host_str(), Some("127.0.0.1"), "not a loopback URL");
+    assert_eq!(url.query(), None, "the sign-in page takes no query");
+    let port = url.port().expect("the loopback URL names its port");
+    let exchange = async {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await?;
+        let request = format!(
+            "GET {} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n",
+            url.path()
+        );
+        stream.write_all(request.as_bytes()).await?;
+        let mut raw = Vec::new();
+        // `take` caps the read: past the cap it reads as the end of input,
+        // so a server that never stops talking cannot fill the test's
+        // memory.
+        stream
+            .take(MAX_LOOPBACK_ANSWER)
+            .read_to_end(&mut raw)
+            .await?;
+        // The `::<_, io::Error>` tells `?` above which error type this
+        // block returns, which it cannot infer on its own.
+        Ok::<_, io::Error>(raw)
+    };
+    let raw = tokio::time::timeout(LOOPBACK_WAIT, exchange)
+        .await
+        .expect("the loopback server answers in time")
+        .expect("the loopback server answers");
+    let text = String::from_utf8(raw).expect("a UTF-8 answer");
+    let (head, body) = text.split_once("\r\n\r\n").expect("a head and a body");
+    let status = head
+        .split(' ')
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .expect("a status line");
+    (status, body.to_owned())
+}
+
+/// The Pubky Ring sign-in page as the test, playing the browser, sees it:
+/// fetched from the URL `login` handed to `Browser::Notify`, with the
+/// authorization link and the status URL read off it.
+///
+/// The URL and the link are secrets of the flow (the link carries the
+/// relay channel's secret), so the test asserts on them without printing
+/// them: no `Debug`, and no assertion message that quotes either.
+struct RingPage {
+    /// The page's URL, a secret path on `127.0.0.1`.
+    url: Url,
+    /// The page's HTML.
+    html: String,
+    /// The `pubkyauth://` link, un-escaped from the page's `auth-link`.
+    link: String,
+    /// The status URL: the page's `data-status` joined to the page's URL,
+    /// as the page's script resolves it.
+    status_url: Url,
+}
+
+impl RingPage {
+    /// Waits for the page's URL on `urls`, fetches the page and reads the
+    /// link and the status URL off it.
+    async fn open(urls: &mut UnboundedReceiver<Url>) -> Self {
+        let url = tokio::time::timeout(LOOPBACK_WAIT, urls.recv())
+            .await
+            .expect("login hands over the page URL in time")
+            .expect("login hands over the page URL");
+        let (status, html) = loopback_get(&url).await;
+        assert_eq!(status, 200, "the page answers");
+        let link = html_unescape(between(&html, r#"<code id="auth-link">"#, "</code>"));
+        let status_path = html_unescape(between(&html, r#"data-status=""#, r#"""#));
+        // `join` resolves the path against the page's URL, as a browser
+        // resolves a `fetch` of it, so a path that left 127.0.0.1 would show
+        // here as another host, which `loopback_get` refuses.
+        let status_url = url.join(&status_path).expect("a status URL");
+        Self {
+            url,
+            html,
+            link,
+            status_url,
+        }
+    }
+
+    /// The value of the query parameter `name` in the link, if it has one.
+    fn link_query(&self, name: &str) -> Option<String> {
+        Url::parse(&self.link)
+            .expect("the link is a URL")
+            .query_pairs()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.into_owned())
+    }
+
+    /// The status word the page's status URL answers with now.
+    async fn status(&self) -> String {
+        let (code, word) = loopback_get(&self.status_url).await;
+        assert_eq!(code, 200, "{word}");
+        word
+    }
+
+    /// Asks the status about every 100 ms until it is no longer `waiting`,
+    /// and returns that final word; fails after 30 s.
+    async fn final_status(&self) -> String {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while tokio::time::Instant::now() < deadline {
+            let word = self.status().await;
+            if word != "waiting" {
+                return word;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("the status stayed `waiting` for 30 s");
+    }
+}
+
+/// The text of `html` between the first `start` and the next `end` after it.
+/// The lifetime `'a` says the slice returned borrows from `html`, not from
+/// the markers.
+fn between<'a>(html: &'a str, start: &str, end: &str) -> &'a str {
+    let (_, rest) = html.split_once(start).expect("the start marker");
+    let (inside, _) = rest.split_once(end).expect("the end marker");
+    inside
+}
+
+/// The page's HTML escapes undone (the five the page escapes), with
+/// `&amp;` last so that an escaped entity is not unescaped twice.
+fn html_unescape(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
+}
+
+/// Runs `sweepky login` on `ctx` with no `--identity`, so through Pubky
+/// Ring, while the test plays the browser and Ring: it opens the page from
+/// `urls`, approves the link in full with `signer` (`approve_auth`, Ring's
+/// approve button) and sees the status flip to `approved`.
+async fn ring_login(
+    ctx: &Context,
+    urls: &mut UnboundedReceiver<Url>,
+    signer: &PubkySigner,
+) -> Report {
+    // `tokio::join!` polls the login and the stand-in in this one task, so
+    // the login can wait on the relay while the stand-in fetches the page
+    // and approves. `Box::pin` keeps the stand-in's future on the heap, as
+    // [`sweepky`] does for the login's, so the test's stack stays small.
+    let (logged_in, ()) = tokio::join!(
+        sweepky(ctx, &["login"]),
+        Box::pin(async {
+            let page = RingPage::open(urls).await;
+            signer.approve_auth(&page.link).await.expect("approves");
+            assert_eq!(page.final_status().await, "approved");
+        })
+    );
+    logged_in.expect("the Ring login")
 }
 
 /// The playbook B's sweeps name: the pinned Cloudflare skill.
@@ -544,6 +703,30 @@ async fn package_exists(testnet: &EphemeralTestnet, user: &PublicKey, id: Record
 /// where `login` must not sign up, it proves that no signup was sent.
 const TRIPWIRE_TOKEN: &str = "not-a-signup-code";
 
+/// What a Ring login says when Ring approved less than Sweepky asked for:
+/// the library's `ring::flow::NARROWED_GRANT`, written out here because the
+/// module is private to the crate, and because this is the text the user
+/// reads.
+const NARROWED_GRANT: &str = "Pubky Ring approved less than Sweepky asked for: Sweepky needs \
+     write on /pub/sweepky/, so it signed out again and saved nothing; approve the full request \
+     in Ring, or log in with `sweepky login --identity <name>` instead";
+
+/// A Pubky recovery file for a fresh random keypair, made by the SDK at run
+/// time, so no recovery file or secret is ever committed. Its passphrase is
+/// synthetic too, and the keypair is used nowhere else.
+///
+/// `create_recovery_file` is on the crate's clippy ban list, because
+/// Sweepky never keeps a secret in that format. A test that needs a real
+/// one to refuse may call it, and `expect` (rather than `allow`) fails the
+/// lint run if the ban ever stops applying here.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a synthetic recovery file is the input login's refusal is tested on"
+)]
+fn synthetic_recovery_file() -> Vec<u8> {
+    pubky::recovery_file::create_recovery_file(&Keypair::random(), "synthetic passphrase")
+}
+
 // `multi_thread`: tokio's runtime with worker threads, the kind
 // `#[tokio::main]` builds for the binary, rather than `#[tokio::test]`'s
 // default of one thread, so the two `submit`s P2b runs at once run as they
@@ -690,8 +873,9 @@ async fn end_to_end() {
         [format!("pubky://{pubky}/pub/sweepky/keys/{device_id}.json")]
     );
 
-    // The key file alone, as P2c's second install copies it: login rebuilds
-    // the details from the key and the pkarr record, without a signup.
+    // The key file alone, as an owner copies it to a second machine: login
+    // rebuilds the details from the key and the pkarr record, without a
+    // signup.
     fs::remove_file(&details_file).expect("remove the details");
     sweepky(
         &ctx,
@@ -749,11 +933,17 @@ async fn end_to_end() {
     // tells. `keys list` raises the alarm and no longer shows the key in
     // use, without printing either key. The original record then goes back,
     // so the steps below find this install's key as login published it.
+    // The test signs with the throwaway's root key, read from its identity
+    // file, as `login --identity` would.
+    let throwaway = testnet
+        .sdk()
+        .expect("client")
+        .signer(Keypair::from_secret(&identity_seed(&key_file)));
     let original: Value = serde_json::from_slice(&record).expect("JSON");
     let intruder = DeviceIdentity::generate();
     let mut rewritten = original.clone();
     rewritten["recipient"] = json!(intruder.recipient().to_string());
-    publish_as(&testnet, &key_file, &path, &rewritten).await;
+    publish_as(&throwaway, &path, &rewritten).await;
     let report = sweepky(&ctx, &["keys", "list"]).await.expect("keys list");
     let text = report.text();
     assert!(
@@ -767,7 +957,7 @@ async fn end_to_end() {
     for recipient in [intruder.recipient(), device.recipient()] {
         assert!(!text.contains(&recipient.to_string()), "{text}");
     }
-    publish_as(&testnet, &key_file, &path, &original).await;
+    publish_as(&throwaway, &path, &original).await;
     let report = sweepky(&ctx, &["keys", "list"]).await.expect("keys list");
     assert!(report.text().contains(&own_line), "{}", report.text());
 
@@ -786,7 +976,7 @@ async fn end_to_end() {
         "revokedAt": null,
         "addedLater": { "kept": true },
     });
-    publish_as(&testnet, &key_file, &other_path, &other_record).await;
+    publish_as(&throwaway, &other_path, &other_record).await;
 
     // Logging in again keeps this install's key and id, and the report
     // raises the alarm for the new id, with the fix.
@@ -999,21 +1189,143 @@ async fn end_to_end() {
 
     // A, the owner, and B, a member of A's circle, each with a SWEEPKY_HOME
     // of their own. A answers yes to the one question `post` asks; B is
-    // asked nothing. `mut`: P2c gives A's standard input a second answer.
+    // asked nothing. `mut`: P2c gives A's standard input a second answer,
+    // and A's login hands its sign-in page to the test.
     let a_home = tempfile::tempdir().expect("temp dir");
     let (mut a, a_stderr) = context(&testnet, a_home.path(), Cursor::new(b"y\n".to_vec()));
+    let mut a_urls = notify_browser(&mut a);
     let b_home = tempfile::tempdir().expect("temp dir");
     // `mut`: B's working directory becomes its project before `run`.
     let (mut b, b_stderr) = context(&testnet, b_home.path(), io::empty());
-    sweepky(&a, &["login", "--identity", "a"])
+
+    // ----- P2d: a recovery file passed to `login` is refused -----
+
+    // A Pubky recovery file, the format Ring exports, made by the SDK at run
+    // time for a fresh keypair, in a directory of its own that deletes
+    // itself. `login --identity <its path>` refuses it by what it is, before
+    // anything is written: A's config directory is not even made.
+    let recovery_dir = tempfile::tempdir().expect("temp dir");
+    let recovery_file = recovery_dir.path().join("synthetic.pkarr");
+    fs::write(&recovery_file, synthetic_recovery_file()).expect("written");
+    let error = sweepky(
+        &a,
+        &[
+            "login",
+            "--identity",
+            recovery_file.to_str().expect("a UTF-8 path"),
+        ],
+    )
+    .await
+    .expect_err("a recovery file is refused");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("this is a Pubky recovery file, and Sweepky never imports one"),
+        "{message}"
+    );
+    assert_gone(a.dirs.config());
+
+    // ----- P2d: A logs in through Pubky Ring -----
+
+    // A's keypair, made for this run, stands in for the one in A's Pubky
+    // Ring: the test holds it as Ring does, signs A up on the testnet's
+    // homeserver as Ring would, and approves A's logins with it. The test
+    // also signs with it where an operator or another install of A writes
+    // behind A's installs' backs.
+    let a_keypair = Keypair::random();
+    let a_user = a_keypair.public_key();
+    let a_signer = testnet.sdk().expect("client").signer(a_keypair);
+    a_signer
+        .signup(&homeserver, None)
         .await
-        .expect("A logs in");
+        .expect("A signs up");
+
+    // A's first `login`, with no flag, is the default Ring flow. The test,
+    // as A's browser, fetches the sign-in page: its QR code and link are
+    // there, and the status URL the page's script reads answers `waiting`.
+    // Another path on the server gets 404. The link asks through the
+    // testnet's relay, a local one, for exactly Sweepky's capability. As a
+    // Ring that narrows the request, the test approves it read-only, and
+    // the login is refused with the narrowed-grant message: the page says
+    // `refused`, and nothing of the login is saved.
+    let relay = testnet.http_relay().local_url();
+    let read_only = Capabilities::builder()
+        .read("/pub/sweepky/")
+        .expect("a scope")
+        .finish();
+    let (narrowed, ()) = tokio::join!(
+        sweepky(&a, &["login"]),
+        Box::pin(async {
+            let page = RingPage::open(&mut a_urls).await;
+            assert!(page.html.contains("<svg"), "no QR code on the page");
+            assert!(page.link.starts_with("pubkyauth://"), "no link on the page");
+            assert_eq!(page.status().await, "waiting");
+
+            let mut wrong = page.url.clone();
+            wrong.set_path(&format!("{}x", page.url.path()));
+            assert_eq!(loopback_get(&wrong).await.0, 404, "a wrong path");
+
+            let link_relay = Url::parse(&page.link_query("relay").expect("a relay"))
+                .expect("the relay is a URL");
+            assert!(
+                matches!(link_relay.host_str(), Some("localhost" | "127.0.0.1")),
+                "{link_relay}"
+            );
+            assert_eq!(
+                (link_relay.host_str(), link_relay.port_or_known_default()),
+                (relay.host_str(), relay.port_or_known_default())
+            );
+            assert_eq!(page.link_query("caps").as_deref(), Some("/pub/sweepky/:rw"));
+
+            a_signer
+                .approve_auth_with_capabilities(&page.link, &read_only)
+                .await
+                .expect("approves read-only");
+            assert_eq!(page.final_status().await, "refused");
+        })
+    );
+    let error = narrowed.expect_err("a read-only approval is refused");
+    assert_eq!(format!("{error:#}"), NARROWED_GRANT);
+    for gone in [a.dirs.login_file(), a.dirs.grant_token_file()] {
+        assert_gone(&gone);
+    }
+
+    // A's second `login`, approved in full (`approve_auth`): the page flips
+    // to `approved` and the login succeeds. The report shows the grant's
+    // expiry, two years out. The grant token is a 0600 file, login.json
+    // records a Ring login as A, and the grant's first write is A's
+    // `keys/<deviceId>.json`, which anyone can read, holding device.key's
+    // key.
+    let report = ring_login(&a, &mut a_urls, &a_signer).await;
+    let text = report.text();
+    assert!(
+        text.contains(&format!("Logged in through Pubky Ring as {}", a_user.z32())),
+        "{text}"
+    );
+    assert!(text.contains("The grant expires at "), "{text}");
+    assert!(text.contains("two years from your approval"), "{text}");
+    assert_eq!(mode(&a.dirs.grant_token_file()), 0o600);
+    let login = json(&a.dirs.login_file());
+    assert_eq!(login["kind"], "ring");
+    assert_eq!(login["pubky"], a_user.z32());
+    let a_pubky = logged_in(&a);
+    let key_path = format!(
+        "/pub/sweepky/keys/{}.json",
+        login["deviceId"].as_str().expect("a device id")
+    );
+    let record = get_capped(&testnet, &a_user, &key_path, MAX_RECORD_BYTES).await;
+    let key = DeviceKey::from_json(&record).expect("a device key record");
+    assert_eq!(key.revoked_at, None);
+    // `assert!` rather than `assert_eq!`, so a failure prints neither key.
+    assert!(
+        key.encryption_recipient().expect("usable") == device_identity(&a.dirs).recipient(),
+        "A's key record does not hold device.key's key"
+    );
+
+    // B stays on `--identity`.
     sweepky(&b, &["login", "--identity", "b"])
         .await
         .expect("B logs in");
-    let a_pubky = logged_in(&a);
     let b_pubky = logged_in(&b);
-    let a_user = PublicKey::try_from_z32(&a_pubky.to_string()).expect("a key");
 
     // A's circle, with B in it, as anyone reads it.
     sweepky(&a, &["circle", "create", "A's circle"])
@@ -1253,8 +1565,7 @@ async fn end_to_end() {
     .expect("JSON");
     let mut rewritten = as_posted.clone();
     rewritten["targets"][0]["rev"] = json!(f2.as_str());
-    let a_key_file = a.dirs.config().join("identities/a.key");
-    publish_as(&testnet, &a_key_file, &paths::bounty(posted.id), &rewritten).await;
+    publish_as(&a_signer, &paths::bounty(posted.id), &rewritten).await;
     let error = sweepky(&b, &submit_args)
         .await
         .expect_err("the bounty changed since the run");
@@ -1274,7 +1585,7 @@ async fn end_to_end() {
     assert_eq!(mode(&snapshot_file), 0o600);
 
     // A puts the bounty back as posted, and B's submit goes through.
-    publish_as(&testnet, &a_key_file, &paths::bounty(posted.id), &as_posted).await;
+    publish_as(&a_signer, &paths::bounty(posted.id), &as_posted).await;
     let report = sweepky(&b, &submit_args)
         .await
         .expect("B submits the sweep");
@@ -1433,8 +1744,7 @@ async fn end_to_end() {
     let added_id = "added-by-the-test";
     let added_key = DeviceIdentity::generate();
     publish_as(
-        &testnet,
-        &a.dirs.config().join("identities/a.key"),
+        &a_signer,
         &format!("/pub/sweepky/keys/{added_id}.json"),
         &json!({
             "schemaVersion": 1,
@@ -1905,29 +2215,16 @@ async fn end_to_end() {
 
     // ----- P2c: A's second install, A2 -----
 
-    // A2, a SWEEPKY_HOME of A's own, as on a second machine. Until P2d moves
-    // A to the Ring flow, the test makes it by copying A's Sweepky identity
-    // file there, and `login --identity a` reuses it. The key file alone:
-    // login rebuilds the details from it and A's pkarr record, with no
-    // signup, which the tripwire token proves. It publishes A2's own device
-    // key under the id A2's login.json records: unrevoked, holding A2's
-    // key.
+    // A2, a SWEEPKY_HOME of A's own, as on a second machine, logs in
+    // through Pubky Ring like A's first install: a second approval with A's
+    // signer, so a second grant, and no identity file anywhere. It publishes
+    // A2's own device key under the id A2's login.json records: unrevoked,
+    // holding A2's key.
     let a2_home = tempfile::tempdir().expect("temp dir");
-    let (a2, _) = context(&testnet, a2_home.path(), io::empty());
-    let a2_identities = a2.dirs.identities_dir();
-    copy_identity_file(&a_key_file, &a2_identities);
-    assert_eq!(mode(a2.dirs.config()), 0o700);
-    assert_eq!(mode(&a2_identities), 0o700);
-    assert_eq!(mode(&a2_identities.join("a.key")), 0o600);
-    let report = sweepky(
-        &a2,
-        &["login", "--identity", "a", "--signup-token", TRIPWIRE_TOKEN],
-    )
-    .await
-    .expect("A2 logs in");
-    let text = report.text();
-    assert!(!text.contains("Signed up"), "{text}");
-    assert!(text.contains("still unspent"), "{text}");
+    let (mut a2, _) = context(&testnet, a2_home.path(), io::empty());
+    let mut a2_urls = notify_browser(&mut a2);
+    ring_login(&a2, &mut a2_urls, &a_signer).await;
+    assert_eq!(json(&a2.dirs.login_file())["kind"], "ring");
     assert_eq!(logged_in(&a2), a_pubky);
     let a2_device_id = json(&a2.dirs.login_file())["deviceId"]
         .as_str()
@@ -2061,7 +2358,7 @@ async fn end_to_end() {
     newer["addedLater"] = json!({ "kept": true });
     newer["playbook"]["addedLater"] = json!("kept");
     newer["targets"][0]["addedLater"] = json!("kept");
-    publish_as(&testnet, &a_key_file, &bounty_path, &newer).await;
+    publish_as(&a_signer, &bounty_path, &newer).await;
 
     // `done --credit <A>` is refused with its one line, before anything is
     // shown or asked, and the bounty anyone reads is as it was.
