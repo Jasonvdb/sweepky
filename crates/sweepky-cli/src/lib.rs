@@ -8,7 +8,7 @@
 //! from a local `EphemeralTestnet` instead ([`Network::injected`]), so the same
 //! code runs against a throwaway network with nothing reaching production.
 //!
-//! What is here so far (P2a, then P2b, then P2c):
+//! What is here so far (P2a, then P2b, P2c and P2d):
 //!
 //! - [`Cli`] and [`Command`], the arguments, parsed with clap. `--testnet`,
 //!   `--passphrase-file` and `--no-input` are global flags, so each goes
@@ -233,6 +233,13 @@
 //!   writers' lock with a fresh session, the bounty read back, marked done
 //!   by core with the time and the credits, checked against the record cap
 //!   and written again with every field this build does not know kept.
+//! - `ring` (P2d), the local half of the Pubky Ring login so far: the check
+//!   that an approved grant can write under `/pub/sweepky/`, the notice
+//!   within 30 days of the grant's expiry and once it has passed, and
+//!   `grant.token`, the owner-only file that holds the grant token the SDK
+//!   exports, optionally passphrase-wrapped, read back within a cap and
+//!   refused in fixed text when it is not a token. `login.json` records a
+//!   Ring login as the kind `ring`, with the grant's expiry.
 //!
 //! The rules that hold for everything here (see "Rust conventions" in
 //! `docs/plan/03-cli-and-skill.md`):
@@ -333,6 +340,20 @@ mod pull;
 mod private_fs;
 // Standard input, and the one yes-or-no question a command asks on it.
 mod prompt;
+// The Pubky Ring login: the check that a grant can write every Sweepky
+// record, the expiry notice, and `grant.token`, the grant token's file.
+// The Ring login flow, a later P2d step, is the first caller outside the
+// tests; until then the compiler would warn that nothing here is used.
+// `expect` (not `allow`) warns as soon as that stops being true, so the
+// step that first calls in removes it.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the Ring login flow, a later P2d step, is the first caller"
+    )
+)]
+mod ring;
 // `PublicRecords`: anyone's public bounty, circle and sweep records, read
 // with a cap and parsed by core, and bounded listings of their bounties and
 // sweeps, with a fake for the unit tests.

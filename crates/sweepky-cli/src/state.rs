@@ -3,10 +3,14 @@
 //!
 //! - [`LoginState`], `login.json`: which login this install uses. For a
 //!   dedicated identity, `{"schemaVersion":1,"kind":"identity","name":…,
-//!   "pubky":"<z32>","homeserver":"<z32>","deviceId":"<id>"}` plus any
-//!   fields a newer Sweepky added; `deviceId` appears once this install's
-//!   device key is published. It holds no secret, and no secret may ever be
-//!   added to it: the secret lives in its own file.
+//!   "pubky":"<z32>","homeserver":"<z32>","deviceId":"<id>"}`; for a Pubky
+//!   Ring login, `{"schemaVersion":1,"kind":"ring","pubky":"<z32>",
+//!   "homeserver":"<z32>","grantExpiresAt":<unix seconds>,
+//!   "deviceId":"<id>"}`, with no name. Either way plus any fields a newer
+//!   Sweepky added; `deviceId` appears once this install's device key is
+//!   published. It holds no secret, and no secret may ever be added to it:
+//!   the secret lives in its own file (`identities/<name>.key`, or
+//!   `grant.token` for Ring, `crate::ring::token`).
 //! - A dedicated identity's two files, `identities/<name>.key` (the secret,
 //!   wrapped with a passphrase when `login` was given `--passphrase-file`)
 //!   and `identities/<name>.json` (its public details), read together by
@@ -49,11 +53,14 @@ const MAX_LOGIN_FILE_BYTES: usize = 64 * 1024;
 #[serde(transparent)]
 pub(crate) struct LoginKind(String);
 
-/// The kinds of login this build knows. P2d adds the Pubky Ring login.
+/// The kinds of login this build knows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KnownLoginKind {
     /// A dedicated identity, `login --identity <name>`.
     Identity,
+    /// The pubky the user already has in Pubky Ring, signed in through a
+    /// grant Ring approved: `login` without `--identity` (P2d).
+    Ring,
 }
 
 impl KnownLoginKind {
@@ -61,6 +68,7 @@ impl KnownLoginKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::Identity => "identity",
+            Self::Ring => "ring",
         }
     }
 }
@@ -71,6 +79,7 @@ impl LoginKind {
     pub(crate) fn as_known(&self) -> Option<KnownLoginKind> {
         match self.0.as_str() {
             "identity" => Some(KnownLoginKind::Identity),
+            "ring" => Some(KnownLoginKind::Ring),
             _ => None,
         }
     }
@@ -84,8 +93,8 @@ impl From<KnownLoginKind> for LoginKind {
 
 /// `login.json`: which login this install uses.
 ///
-/// Holds public values only (a name, two public keys, a device id), so
-/// deriving `Debug` prints nothing secret.
+/// Holds public values only (a name, two public keys, a device id, when a
+/// grant expires), so deriving `Debug` prints nothing secret.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 // The Rust fields are snake_case; the JSON keys camelCase, as in records.
 #[serde(rename_all = "camelCase")]
@@ -95,8 +104,8 @@ pub(crate) struct LoginState {
     /// What kind of login this is.
     pub(crate) kind: LoginKind,
     /// The identity's name, for a dedicated identity. `Option` with
-    /// `default` and `skip_serializing_if`, because the Ring login (P2d) has
-    /// no name: a missing key reads as `None`, and `None` is not written.
+    /// `default` and `skip_serializing_if`, because the Ring login has no
+    /// name: a missing key reads as `None`, and `None` is not written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) name: Option<IdentityName>,
     /// The pubky this install is logged in as, raw z-base32.
@@ -109,6 +118,15 @@ pub(crate) struct LoginState {
     /// written, so a login whose key write was refused records none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) device_id: Option<DeviceId>,
+    /// When the grant a Ring login holds expires, in seconds since the Unix
+    /// epoch: the grant's own `exp`, which the homeserver reports with the
+    /// session. A number, not RFC 3339 text, so a later run compares it
+    /// with the clock without parsing a date; it is shown with
+    /// `crate::ring::expiry_text`. Public, as the rest of the file is. A
+    /// dedicated identity has no grant, so it has `None`, which is not
+    /// written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) grant_expires_at: Option<u64>,
     /// Fields a newer Sweepky wrote, kept for the rewrite.
     #[serde(flatten)]
     pub(crate) extra: UnknownFields,
@@ -125,6 +143,34 @@ impl LoginState {
             pubky,
             homeserver,
             device_id: None,
+            grant_expires_at: None,
+            extra: UnknownFields::new(),
+        }
+    }
+
+    /// The state of a Pubky Ring login as `pubky` on `homeserver`, whose
+    /// grant expires at `grant_expires_at` (Unix seconds), before its device
+    /// key is recorded. The grant token itself is not here: it is a secret,
+    /// and lives in `grant.token` (`crate::ring::token`).
+    // The Ring login flow, a later P2d step, is the first caller; until then
+    // only the tests build one. `expect` (not `allow`) warns once that is
+    // no longer true, so the attribute cannot outlive its reason.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the Ring login flow, a later P2d step, is the first caller"
+        )
+    )]
+    pub(crate) fn ring(pubky: Pubky, homeserver: Pubky, grant_expires_at: u64) -> Self {
+        Self {
+            schema_version: SchemaVersion::CURRENT,
+            kind: KnownLoginKind::Ring.into(),
+            name: None,
+            pubky,
+            homeserver,
+            device_id: None,
+            grant_expires_at: Some(grant_expires_at),
             extra: UnknownFields::new(),
         }
     }
@@ -292,11 +338,13 @@ mod tests {
     use std::fs;
 
     use serde_json::json;
+    use sweepky_core::DeviceId;
 
     use super::{
         KnownLoginKind, LoginState, StoredIdentity, create_identity, read_identity,
         read_login_state, write_identity_meta, write_login_state,
     };
+    use crate::Dirs;
     use crate::identity::{IdentityMeta, IdentityName, IdentitySecret, Refusal};
     use crate::test_support::{dirs_in, mode, private_temp, random_pubky};
 
@@ -318,7 +366,7 @@ mod tests {
         // A field and a kind from a newer Sweepky: the file still reads, the
         // kind is not one this build knows, and the field survives a rewrite.
         let mut newer = serde_json::to_value(&state).expect("serializes");
-        newer["kind"] = json!("ring");
+        newer["kind"] = json!("hardware-key");
         newer["deviceLabel"] = json!("laptop");
         fs::write(dirs.login_file(), serde_json::to_vec(&newer).expect("json")).expect("write");
         let read = read_login_state(&dirs).expect("reads").expect("present");
@@ -327,6 +375,66 @@ mod tests {
         let raw: serde_json::Value =
             serde_json::from_slice(&fs::read(dirs.login_file()).expect("read")).expect("json");
         assert_eq!(raw["deviceLabel"], json!("laptop"));
+    }
+
+    #[test]
+    fn ring_login_state_round_trips_with_its_expiry_and_no_name() {
+        let temp = private_temp();
+        let dirs = dirs_in(&temp);
+        let (pubky, homeserver) = (random_pubky(), random_pubky());
+        // 2028-10-19T00:00:00Z, two years after a login on 2026-10-20.
+        let expires_at = 1_855_526_400;
+        let mut state = LoginState::ring(pubky, homeserver, expires_at);
+        write_login_state(&dirs, &state).expect("writes");
+        assert_eq!(mode(&dirs.login_file()), 0o600);
+
+        // On disk: kind `ring`, the expiry as a number of seconds, and no
+        // `name` (a Ring login has none) and no `deviceId` yet.
+        let raw = raw_login_json(&dirs);
+        assert_eq!(raw["kind"], json!("ring"));
+        assert_eq!(raw["grantExpiresAt"], json!(expires_at));
+        assert_eq!(raw["pubky"], serde_json::to_value(pubky).expect("json"));
+        assert_eq!(
+            raw["homeserver"],
+            serde_json::to_value(homeserver).expect("json")
+        );
+        assert!(raw.get("name").is_none(), "{raw}");
+        assert!(raw.get("deviceId").is_none(), "{raw}");
+        let read = read_login_state(&dirs).expect("reads").expect("present");
+        assert_eq!(read, state);
+        assert_eq!(read.kind.as_known(), Some(KnownLoginKind::Ring));
+
+        // The shared tail sets the device id; it is written from then on.
+        let device_id: DeviceId = "0035G87EK4XFE".parse().expect("valid");
+        state.device_id = Some(device_id.clone());
+        write_login_state(&dirs, &state).expect("rewrites");
+        assert_eq!(raw_login_json(&dirs)["deviceId"], json!(device_id.as_str()));
+
+        // A field from a newer Sweepky survives a rewrite of a Ring login.
+        let mut newer = raw_login_json(&dirs);
+        newer["grantLabel"] = json!("laptop");
+        fs::write(dirs.login_file(), serde_json::to_vec(&newer).expect("json")).expect("write");
+        let read = read_login_state(&dirs).expect("reads").expect("present");
+        assert_eq!(read.grant_expires_at, Some(expires_at));
+        write_login_state(&dirs, &read).expect("rewrites");
+        assert_eq!(raw_login_json(&dirs)["grantLabel"], json!("laptop"));
+    }
+
+    #[test]
+    fn identity_login_state_has_no_grant_expiry() {
+        let temp = private_temp();
+        let dirs = dirs_in(&temp);
+        let name: IdentityName = "throwaway".parse().expect("valid");
+        let state = LoginState::identity(name, random_pubky(), random_pubky());
+        write_login_state(&dirs, &state).expect("writes");
+        let raw = raw_login_json(&dirs);
+        assert!(raw.get("grantExpiresAt").is_none(), "{raw}");
+        assert_eq!(state.grant_expires_at, None);
+    }
+
+    /// `login.json` as JSON, read straight from the disk.
+    fn raw_login_json(dirs: &Dirs) -> serde_json::Value {
+        serde_json::from_slice(&fs::read(dirs.login_file()).expect("read")).expect("json")
     }
 
     #[test]
