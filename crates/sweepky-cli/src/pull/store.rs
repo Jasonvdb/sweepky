@@ -337,18 +337,45 @@ pub(crate) fn stored_bounty_dir(dirs: &Dirs, bounty: BountyRef) -> anyhow::Resul
     Ok(Some(dir))
 }
 
+/// Where `sweep` of the owner's bounty `bounty` is stored, on whichever
+/// side its first store put it, or `None` when it is not stored: what
+/// `pull`'s report shows of a sweep an earlier run stored. As for
+/// [`read_stored_findings`], the bounty directory's owner check must name
+/// `bounty`'s owner, and each directory on the way is looked at without
+/// following a link and refused when it is one.
+pub(crate) fn stored_sweep_dir(
+    dirs: &Dirs,
+    bounty: BountyRef,
+    sweep: SweepRef,
+) -> anyhow::Result<Option<PathBuf>> {
+    if stored_bounty_dir(dirs, bounty)?.is_none() {
+        return Ok(None);
+    }
+    for placement in [Placement::Trusted, Placement::Untrusted] {
+        // `lstat` does not follow a link in a path's last part, but does in
+        // every part before it, so `untrusted/` is looked at on its own
+        // first, as `stored_bounty_dir` has looked at the bounty's.
+        if placement == Placement::Untrusted
+            && !is_real_dir(&dirs.pulled_untrusted_dir(&bounty.id))?
+        {
+            continue;
+        }
+        let dir = sweep_path(dirs, bounty, sweep, placement);
+        if is_real_dir(&dir)? {
+            return Ok(Some(dir));
+        }
+    }
+    Ok(None)
+}
+
 /// What [`read_stored_findings`] found of a stored sweep's compact copy of
 /// its findings.
 // `Debug` is derived: `Findings`' own `Debug` prints counts only.
 #[derive(Debug)]
 pub(crate) enum StoredCopy {
-    /// Read back: the side the sweep was stored on, its findings, and the
-    /// copy's length in bytes.
-    Read {
-        placement: Placement,
-        findings: Findings,
-        len: usize,
-    },
+    /// Read back: its findings, and the copy's length in bytes. Which side
+    /// the sweep was stored on is [`stored_sweep_dir`]'s to say.
+    Read { findings: Findings, len: usize },
     /// Longer than the cap the caller gave, by its length in bytes: nothing
     /// of it was read.
     OverCap { len: u64 },
@@ -396,7 +423,6 @@ pub(crate) fn read_stored_findings(
             .map_err(RecordError::from)
             .with_context(|| format!("{} is not valid", path.display()))?;
         return Ok(Some(StoredCopy::Read {
-            placement,
             findings,
             len: bytes.len(),
         }));

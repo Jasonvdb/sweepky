@@ -164,7 +164,7 @@ pub(crate) fn create_device_key(
 
 /// Reads this install's identity back from `device.key`, or `None` when
 /// there is no such file. `login` reads it when it reuses this install's
-/// key; `pull` will, to open sweeps. A wrapped file is unwrapped with
+/// key, and `pull` to open sweeps. A wrapped file is unwrapped with
 /// `passphrase`, and without one is an error that says how to give it.
 pub(crate) fn read_device_key(
     dirs: &Dirs,

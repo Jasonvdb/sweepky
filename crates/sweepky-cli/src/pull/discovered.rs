@@ -439,6 +439,44 @@ async fn write_due(
     Ok(())
 }
 
+/// A [`WriteUnderLock`] in place of the writers' lock and a session, for
+/// this module's tests and the command's (`pub(super)`: the `pull` module
+/// and its other children may use it): it counts the sessions it opened and
+/// closed, and writes through its `FakeOwnStorage` what the real one writes
+/// through the session's. `cfg(test)`, so it never reaches the binary.
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct FakeSession {
+    pub(super) storage: crate::test_support::FakeOwnStorage,
+    // `Cell` lets a method that takes `&self`, as the trait's does, change a
+    // `Copy` value; a single-threaded test needs no `Mutex`.
+    opened: std::cell::Cell<usize>,
+    closed: std::cell::Cell<usize>,
+}
+
+#[cfg(test)]
+impl FakeSession {
+    /// The sessions opened and closed so far.
+    pub(super) fn sessions(&self) -> (usize, usize) {
+        (self.opened.get(), self.closed.get())
+    }
+}
+
+#[cfg(test)]
+impl WriteUnderLock for FakeSession {
+    async fn write(
+        &self,
+        due: &[RecordId],
+        changes: &Changes,
+        published: &mut Published,
+    ) -> anyhow::Result<()> {
+        self.opened.set(self.opened.get() + 1);
+        let result = write_due(&self.storage, due, changes, published).await;
+        self.closed.set(self.closed.get() + 1);
+        result
+    }
+}
+
 /// `found`, the bytes at `path` of `owner`'s storage, as a discovered-sweeps
 /// file, or `None` when there is none. Core's `from_json` refuses more than
 /// `MAX_RECORD_BYTES` and a newer `schemaVersion` before it parses, and its
@@ -458,7 +496,6 @@ fn parse(
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
     use std::io;
 
     use pubky::StatusCode;
@@ -471,8 +508,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        Changes, LOGIN_CHANGED, LockedSession, Published, WriteUnderLock, publish_discovered,
-        write_due,
+        FakeSession, LOGIN_CHANGED, LockedSession, Published, WriteUnderLock, publish_discovered,
     };
     use crate::own_storage::OwnStorage;
     use crate::pull::feed::{BountySweep, FeedWatch, Start, StartSource};
@@ -481,8 +517,8 @@ mod tests {
     use crate::remote::QUOTA_FULL;
     use crate::state::read_login_state;
     use crate::test_support::{
-        FakeOwnStorage, FakePublicRecords, FileSnapshot, PLANTED, bounty_json, dirs_in, json_bytes,
-        private_temp, random_pubky, record_id, repo_target_json, test_context,
+        FakePublicRecords, FileSnapshot, PLANTED, bounty_json, dirs_in, json_bytes, private_temp,
+        random_pubky, record_id, repo_target_json, test_context,
     };
     use crate::{Dirs, Network};
 
@@ -588,39 +624,6 @@ mod tests {
             )
             .await
             .expect("the local files read")
-        }
-    }
-
-    /// A [`WriteUnderLock`] in place of the writers' lock and a session: it
-    /// counts the sessions it opened and closed, and writes through its
-    /// [`FakeOwnStorage`] what the real one writes through the session's.
-    #[derive(Default)]
-    struct FakeSession {
-        storage: FakeOwnStorage,
-        // `Cell` lets a method that takes `&self`, as the trait's does,
-        // change a `Copy` value; a single-threaded test needs no `Mutex`.
-        opened: Cell<usize>,
-        closed: Cell<usize>,
-    }
-
-    impl FakeSession {
-        /// The sessions opened and closed so far.
-        fn sessions(&self) -> (usize, usize) {
-            (self.opened.get(), self.closed.get())
-        }
-    }
-
-    impl WriteUnderLock for FakeSession {
-        async fn write(
-            &self,
-            due: &[RecordId],
-            changes: &Changes,
-            published: &mut Published,
-        ) -> anyhow::Result<()> {
-            self.opened.set(self.opened.get() + 1);
-            let result = write_due(&self.storage, due, changes, published).await;
-            self.closed.set(self.closed.get() + 1);
-            result
         }
     }
 

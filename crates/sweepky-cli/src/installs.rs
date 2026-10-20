@@ -25,12 +25,15 @@
 //! ([`record_install_key`]).
 //!
 //! **The list is local.** It knows the ids that installs sharing this
-//! config directory made, not the ones another machine made. P2c's second
-//! install of the same owner will therefore see the first install's key as
-//! unknown, and alarm on it, until the two lists are joined.
+//! config directory made, not the ones another machine made, and P2c
+//! decided not to join the lists across machines. So a second install of
+//! the same owner sees the first install's key as unknown, and alarms on
+//! it, and the first the second's, as [`unknown_key_alarm`]'s text says;
+//! `keys list` on the other machine shows the owner whether the key is that
+//! install's own.
 //!
-//! [`unknown_key_ids`] is the comparison `login` and `keys list` make (and
-//! P2c's `pull` will), and [`unknown_key_alarm`] the alarm they raise for
+//! [`unknown_key_ids`] is the comparison `login`, `keys list` and `pull`
+//! make, and [`unknown_key_alarm`] the alarm they raise for
 //! each id it finds; [`replaced_key_alarm`] is the alarm for a known id
 //! whose record names another key.
 

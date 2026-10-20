@@ -65,7 +65,8 @@ use super::{NOTHING_POSTED, publish};
 use crate::events::{EventsFeed, HomeserverEvents, SEARCH_PACE, find_head};
 use crate::own_storage::{OwnStorage, SessionStorage};
 use crate::pull::state::FeedCursors;
-use crate::remote::{pubky_of, write_error};
+use crate::pull::watched_homeservers;
+use crate::remote::write_error;
 use crate::session::{NOT_LOGGED_IN, with_writer_session};
 use crate::state::{LoginState, read_login_state};
 use crate::{Context, Dirs, clock};
@@ -117,16 +118,6 @@ pub(super) async fn publish_signed_in(ctx: &Context, record: Vec<u8>) -> anyhow:
         publish_open(&storage, &feed, &ctx.dirs, &login, id, record, starting).await
     })
     .await
-}
-
-/// The watch list of the context's network, as core's keys.
-fn watched_homeservers(ctx: &Context) -> Vec<Pubky> {
-    ctx.network
-        .settings()
-        .watch_list()
-        .iter()
-        .map(pubky_of)
-        .collect()
 }
 
 /// An open bounty's starting cursors as far as they are known before its

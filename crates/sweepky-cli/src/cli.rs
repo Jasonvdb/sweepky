@@ -242,6 +242,21 @@ pub enum Command {
         #[arg(long, value_name = "NAME")]
         playbook: Option<String>,
     },
+
+    /// Read what is new about your bounties and open the sweeps you can:
+    /// poll your circle's records, check keys/ for device keys your installs
+    /// did not create, watch the watched homeservers' events feeds for
+    /// strangers' sweeps of your open bounties, decrypt each new done sweep
+    /// into the data directory (strangers' into untrusted/), group each
+    /// bounty's findings by location into groups.json and merged.json, and
+    /// add the strangers' sweeps it found to each open bounty's
+    /// /pub/sweepky/bounties/ID.discovered.json. Prints where each feed was
+    /// read from, and each sweep's trust label, status and where it was
+    /// stored; never a finding.
+    //
+    // No arguments: everything it needs is the login, the device key and
+    // the state files of this install, and the network settings.
+    Pull,
 }
 
 /// The `circle` commands.
@@ -504,6 +519,18 @@ mod tests {
         ));
         // No positional argument.
         assert!(Cli::try_parse_from(["sweepky", "submit", "sweeps/0035G87EK4XFE"]).is_err());
+    }
+
+    #[test]
+    fn pull_takes_no_argument() {
+        let cli = Cli::try_parse_from(["sweepky", "pull"]).expect("parses");
+        assert!(matches!(cli.command, Command::Pull), "{cli:?}");
+        // Global flags still go before or after it.
+        let cli = Cli::try_parse_from(["sweepky", "pull", "--testnet"]).expect("parses");
+        assert!(cli.testnet && matches!(cli.command, Command::Pull));
+        // Nothing else: no positional argument and no flag of its own.
+        assert!(Cli::try_parse_from(["sweepky", "pull", "bounty"]).is_err());
+        assert!(Cli::try_parse_from(["sweepky", "pull", "--open"]).is_err());
     }
 
     #[test]

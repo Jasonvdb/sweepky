@@ -58,11 +58,11 @@
 //! more this run, with one warning, and their sweeps wait for the next; so
 //! does a sweep the store failed to write.
 //!
-//! **Secrets and sealed content.** This install's key is read only when a
-//! sweep is waiting, with the context's passphrase (a wrapped key without
-//! one is `passphrase::NeedsPassphrase`), is only ever lent to
-//! `open_package`, and is dropped as soon as the run's opens are done.
-//! Nothing decrypted is printed or logged: a package is consumed by its
+//! **Secrets and sealed content.** This install's key is read by the
+//! command, once and before any network read (`pull::ThisInstall`), and
+//! lent to [`open_sweeps`], which only ever lends it on to `open_package`;
+//! the command drops it as soon as the run's opens are done. Nothing
+//! decrypted is printed or logged: a package is consumed by its
 //! split and its files by the store. Warnings name keys, URLs and paths
 //! core built, numbers, and core's and `remote`'s fixed text, never a byte
 //! of a record or a package.
@@ -74,7 +74,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use anyhow::{anyhow, bail};
+use anyhow::anyhow;
 use sweepky_core::{
     BindingError, Bounty, BountyRef, Circle, DecryptError, DeviceIdentity, GitSha,
     KnownSweepStatus, MAX_CIPHERTEXT_BYTES, OpenError, PackageFiles, Pubky, RecordError, Sweep,
@@ -86,8 +86,6 @@ use super::roster::{Fetched, Stop, fetch};
 use super::state::{PollState, SweepSummary};
 use super::store::{CompactFindings, Placement, Stored, check_paths, store_sweep};
 use crate::Dirs;
-use crate::device::read_device_key;
-use crate::passphrase::Passphrase;
 use crate::records::PublicRecords;
 use crate::remote::BodyTooLarge;
 
@@ -126,36 +124,32 @@ pub(crate) struct OpenedSweep {
     pub(crate) stored: Stored,
 }
 
-/// Opens the sweeps `owner`'s poll state `state` says are waiting, reading
-/// through `records` once each sweeper's homeserver resolves through
-/// `homeservers`, and stores them in `dirs`' data directory: see the module
-/// docs. Marks each one stored as `pulled` and each one refused for good as
-/// `refused` in `state`; writing `state` back is the caller's.
+/// Opens the sweeps `owner`'s poll state `state` says are waiting with
+/// `identity`, this install's key, reading through `records` once each
+/// sweeper's homeserver resolves through `homeservers`, and stores them in
+/// `dirs`' data directory: see the module docs. Marks each one stored as
+/// `pulled` and each one refused for good as `refused` in `state`; writing
+/// `state` back is the caller's.
 ///
 /// Every fault of a sweep, a sweeper or a bounty is a warning in the
-/// [`Opened`]. The errors are this install's own: its device key missing,
-/// unreadable, or wrapped and `passphrase` not given.
+/// [`Opened`], so nothing here is an error.
+// `identity` is borrowed (`&`), never owned: the caller read it and decides
+// when it is dropped, which wipes it.
 pub(crate) async fn open_sweeps<R: PublicRecords, H: ResolveHomeserver>(
     records: &R,
     homeservers: &mut Homeservers<'_, H>,
     dirs: &Dirs,
-    passphrase: Option<&Passphrase>,
+    identity: &DeviceIdentity,
     owner: Pubky,
     roster: &Circle,
     state: &mut PollState,
-) -> anyhow::Result<Opened> {
+) -> Opened {
     let waiting = waiting_sweeps(state, owner, roster);
-    if waiting.is_empty() {
-        return Ok(Opened::default());
-    }
-    let Some(identity) = read_device_key(dirs, passphrase)? else {
-        bail!("this install has no device key, so pull cannot open sweeps: run `sweepky login`");
-    };
     let mut opener = Opener {
         records,
         homeservers,
         dirs,
-        identity: &identity,
+        identity,
         roster,
         state,
         given_up: BTreeSet::new(),
@@ -164,13 +158,7 @@ pub(crate) async fn open_sweeps<R: PublicRecords, H: ResolveHomeserver>(
     for (bounty, sweeps) in waiting {
         opener.open_bounty(bounty, sweeps).await;
     }
-    // The opener is not used once `found` is moved out of it, so its borrow
-    // of the key ends here, and `drop` wipes the key at once
-    // (`DeviceIdentity` wipes itself when dropped) rather than whenever the
-    // function's locals go.
-    let found = opener.found;
-    drop(identity);
-    Ok(found)
+    opener.found
 }
 
 /// The sweeps waiting to be opened, by the owner's bounty they are of: see
@@ -663,14 +651,12 @@ mod tests {
 
     use super::{MAX_OPENS_PER_BOUNTY, MAX_OPENS_PER_SWEEPER, Opened, fair_order, open_sweeps};
     use crate::Dirs;
-    use crate::device::{create_device_key, remove_device_key};
-    use crate::passphrase::{NeedsPassphrase, Passphrase};
     use crate::pull::resolve::Homeservers;
     use crate::pull::state::{BountySummary, PollState, SweepSummary};
     use crate::pull::store::{Placement, Stored};
     use crate::test_support::{
         FAKE_HOMESERVER, FakeHomeservers, FakeLookup, FakePublicRecords, PLANTED, SYNTHETIC_HEAD,
-        SYNTHETIC_SHA, TEST_PASSPHRASE, bounty_json, circle_json, dirs_in, json_bytes,
+        SYNTHETIC_SHA, bounty_json, circle_json, dirs_in, done_record, json_bytes, package_json,
         pr_target_json, private_temp, random_pubky, record_id, repo_target_json, stored_findings,
         sweep_json,
     };
@@ -687,7 +673,7 @@ mod tests {
         _home: TempDir,
         dirs: Dirs,
         owner: Pubky,
-        /// This install's key, as `device.key` holds it.
+        /// This install's key, as the command lends it to the opens.
         key: DeviceIdentity,
         bounty: BountyRef,
         /// The roster's members besides the owner, its admin.
@@ -698,19 +684,12 @@ mod tests {
     }
 
     impl Fixture {
-        /// A bounty of `targets`, and a device key written plain.
+        /// A bounty of `targets`, and a fresh device key.
         fn new(targets: Value) -> Self {
-            Self::with_key_wrapped_by(targets, None)
-        }
-
-        /// As [`new`](Self::new), the device key wrapped with `passphrase`
-        /// when there is one.
-        fn with_key_wrapped_by(targets: Value, passphrase: Option<&Passphrase>) -> Self {
             let home = private_temp();
             let dirs = dirs_in(&home);
             let owner = random_pubky();
             let key = DeviceIdentity::generate();
-            create_device_key(&dirs, &key, passphrase).expect("written");
             let bounty = BountyRef {
                 owner,
                 id: record_id(1),
@@ -804,21 +783,16 @@ mod tests {
             Circle::from_json(&json_bytes(&record)).expect("a circle")
         }
 
-        /// One run's opens, with no passphrase.
+        /// One run's opens, with a fresh cache of homeservers, as each run
+        /// starts with.
         async fn open(&mut self) -> Opened {
-            self.open_with(None).await.expect("opened")
-        }
-
-        /// One run's opens, with `passphrase`, and a fresh cache of
-        /// homeservers, as each run starts with.
-        async fn open_with(&mut self, passphrase: Option<&Passphrase>) -> anyhow::Result<Opened> {
             let roster = self.roster();
             let mut homeservers = Homeservers::new(&self.resolver);
             open_sweeps(
                 &self.records,
                 &mut homeservers,
                 &self.dirs,
-                passphrase,
+                &self.key,
                 self.owner,
                 &roster,
                 &mut self.state,
@@ -841,38 +815,6 @@ mod tests {
         }
     }
 
-    /// A sweep package as `submit` builds one, of `sweeper`'s sweep of
-    /// `bounty` at `shas`, its targets the keys of `shas`.
-    fn package_json(sweeper: Pubky, bounty: BountyRef, shas: Value) -> Value {
-        let targets: Vec<&String> = shas.as_object().expect("an object").keys().collect();
-        json!({
-            "schemaVersion": 1,
-            "manifest": {
-                "sweeper": sweeper.to_string(),
-                "bounty": bounty.to_string(),
-                "targets": targets,
-                "targetShas": shas,
-                "playbook": "careful-review",
-                "startedAt": "2026-10-19T09:00:00Z",
-                "finishedAt": "2026-10-19T10:00:00Z",
-            },
-            "findings": {
-                "schemaVersion": 1,
-                "playbook": "careful-review",
-                "findings": [{
-                    "id": "session-expiry-off-by-one",
-                    "title": PLANTED,
-                    "severity": null,
-                    "confidence": null,
-                    "status": "needs_validation",
-                    "locations": [{ "file": "src/auth/session.rs", "line": 88 }],
-                    "description": PLANTED,
-                }],
-            },
-            "attachments": { "REPORT.md": PLANTED },
-        })
-    }
-
     /// `sweeper`'s sweep with record id `n`: ids order as `n` does.
     fn sweep_of(sweeper: Pubky, n: u64) -> SweepRef {
         SweepRef {
@@ -884,13 +826,6 @@ mod tests {
     /// The sweeps `opened` stored, in the order stored.
     fn stored_sweeps(opened: &Opened) -> Vec<SweepRef> {
         opened.stored.iter().map(|done| done.sweep).collect()
-    }
-
-    /// A sweep record of `targets` of `bounty` as `submit` leaves it: done.
-    fn done_record(bounty: BountyRef, targets: &[&str]) -> Value {
-        let mut record = sweep_json(bounty, targets, "done");
-        record["finishedAt"] = json!("2026-10-19T10:00:00Z");
-        record
     }
 
     /// The one warning that names `sweep`.
@@ -1205,7 +1140,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_done_sweeps_are_opened_and_with_none_the_key_is_not_read() {
+    async fn only_done_sweeps_are_opened() {
         let mut fx = Fixture::new(json!([repo_target_json("t1")]));
         let member = random_pubky();
         fx.members.push(member);
@@ -1217,8 +1152,6 @@ mod tests {
             fx.summarise(sweep, &record);
             sweeps.push(sweep);
         }
-        // Nothing to open, so no key is needed.
-        remove_device_key(&fx.dirs).expect("removed");
 
         let opened = fx.open().await;
         assert!(opened.stored.is_empty() && opened.warnings.is_empty());
@@ -1227,25 +1160,6 @@ mod tests {
             let summary = &fx.state.sweeps[&sweep];
             assert!(!summary.pulled && !summary.refused);
         }
-    }
-
-    #[tokio::test]
-    async fn a_wrapped_device_key_needs_the_passphrase() {
-        let passphrase = Passphrase::for_tests(TEST_PASSPHRASE);
-        let mut fx =
-            Fixture::with_key_wrapped_by(json!([repo_target_json("t1")]), Some(&passphrase));
-        let member = random_pubky();
-        fx.members.push(member);
-        let sweep = fx.submit(member, 10);
-
-        let err = fx.open_with(None).await.expect_err("needs the passphrase");
-        assert!(err.is::<NeedsPassphrase>(), "{err:#}");
-        assert!(fx.records.asked().is_empty(), "{:?}", fx.records.asked());
-        assert_eq!(fx.stored(sweep), None);
-
-        let opened = fx.open_with(Some(&passphrase)).await.expect("opened");
-        assert_eq!(opened.stored.len(), 1);
-        assert_eq!(fx.stored(sweep), Some(Placement::Trusted));
     }
 
     #[tokio::test]

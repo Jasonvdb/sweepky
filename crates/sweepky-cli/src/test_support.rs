@@ -58,7 +58,7 @@ use crate::events::EventsFeed;
 use crate::git::{AllowedProtocols, GitCommand, GitFailed, RunGit, git_argv};
 use crate::own_storage::OwnStorage;
 use crate::pull::resolve::{ResolveHomeserver, Unreachable};
-use crate::pull::store::{Placement, StoredCopy, read_stored_findings};
+use crate::pull::store::{Placement, StoredCopy, read_stored_findings, stored_sweep_dir};
 use crate::records::PublicRecords;
 use crate::remote::{Conditional, ETag, ListOrder, Listing, ListingError};
 use crate::sweep_state::SweepSnapshot;
@@ -382,6 +382,8 @@ pub(crate) struct FakeKeyStore {
     listed_only: Mutex<BTreeSet<DeviceId>>,
     /// Ids whose public read fails, as a request to a homeserver can.
     failing_reads: Mutex<BTreeSet<DeviceId>>,
+    /// Whether the listing fails, as a request to a homeserver can.
+    failing_listings: Mutex<bool>,
     calls: Mutex<Vec<KeyStoreCall>>,
     refuse_puts_with: Option<StatusCode>,
 }
@@ -435,6 +437,12 @@ impl FakeKeyStore {
         self.failing_reads.lock().expect("lock").insert(id.clone());
     }
 
+    /// Fails every listing of `keys/` with [`FAKE_READ_FAILURE`], as a
+    /// request to a homeserver can fail. Not logged either.
+    pub(crate) fn fail_listings(&self) {
+        *self.failing_listings.lock().expect("lock") = true;
+    }
+
     fn log(&self, call: KeyStoreCall) {
         self.calls.lock().expect("lock").push(call);
     }
@@ -443,6 +451,9 @@ impl FakeKeyStore {
 impl PublicKeys for FakeKeyStore {
     async fn list_key_ids(&self, owner: &PublicKey) -> anyhow::Result<KeyIds> {
         self.log(KeyStoreCall::ListKeyIds(owner.clone()));
+        if *self.failing_listings.lock().expect("lock") {
+            anyhow::bail!(FAKE_READ_FAILURE);
+        }
         let records = self.records.lock().expect("lock");
         let listed_only = self.listed_only.lock().expect("lock");
         // Collected into a set first, so the ids come out in order, once.
@@ -1197,6 +1208,47 @@ pub(crate) fn sweep_json(bounty: BountyRef, targets: &[&str], status: &str) -> V
     })
 }
 
+/// [`sweep_json`] as `submit` leaves it: done, with its `finishedAt`.
+pub(crate) fn done_record(bounty: BountyRef, targets: &[&str]) -> Value {
+    let mut record = sweep_json(bounty, targets, "done");
+    record["finishedAt"] = json!("2026-10-19T10:00:00Z");
+    record
+}
+
+/// A sweep package as `submit` builds one, of `sweeper`'s sweep of
+/// `bounty` at `shas` (target id to commit), its targets the keys of
+/// `shas`, with [`PLANTED`] in its one finding and its one attachment, so
+/// a test can check that nothing printed holds sealed content.
+pub(crate) fn package_json(sweeper: Pubky, bounty: BountyRef, shas: Value) -> Value {
+    let targets: Vec<&String> = shas.as_object().expect("an object").keys().collect();
+    json!({
+        "schemaVersion": 1,
+        "manifest": {
+            "sweeper": sweeper.to_string(),
+            "bounty": bounty.to_string(),
+            "targets": targets,
+            "targetShas": shas,
+            "playbook": "careful-review",
+            "startedAt": "2026-10-19T09:00:00Z",
+            "finishedAt": "2026-10-19T10:00:00Z",
+        },
+        "findings": {
+            "schemaVersion": 1,
+            "playbook": "careful-review",
+            "findings": [{
+                "id": "session-expiry-off-by-one",
+                "title": PLANTED,
+                "severity": null,
+                "confidence": null,
+                "status": "needs_validation",
+                "locations": [{ "file": "src/auth/session.rs", "line": 88 }],
+                "description": PLANTED,
+            }],
+        },
+        "attachments": { "REPORT.md": PLANTED },
+    })
+}
+
 /// A SHA no synthetic target pins, for a revision rewritten after a fetch.
 pub(crate) const UNPINNED_SHA: &str = "4444444444444444444444444444444444444444";
 
@@ -1256,21 +1308,25 @@ pub(crate) fn circle_json(admin: Pubky, members: &[Pubky]) -> Value {
 }
 
 /// The compact copy `pull` stored of the findings of `sweep` of `bounty`,
-/// read back within the package's cap: the side it was stored on and the
-/// findings, or `None` when it was not stored.
+/// read back within the package's cap: the side it was stored on, as its
+/// directory shows, and the findings, or `None` when it was not stored.
 pub(crate) fn stored_findings(
     dirs: &Dirs,
     bounty: BountyRef,
     sweep: SweepRef,
 ) -> anyhow::Result<Option<(Placement, Findings)>> {
+    let Some(dir) = stored_sweep_dir(dirs, bounty, sweep)? else {
+        return Ok(None);
+    };
+    let placement = if dir.starts_with(dirs.pulled_untrusted_dir(&bounty.id)) {
+        Placement::Untrusted
+    } else {
+        Placement::Trusted
+    };
     Ok(
         match read_stored_findings(dirs, bounty, sweep, MAX_PACKAGE_BYTES)? {
             None => None,
-            Some(StoredCopy::Read {
-                placement,
-                findings,
-                ..
-            }) => Some((placement, findings)),
+            Some(StoredCopy::Read { findings, .. }) => Some((placement, findings)),
             Some(StoredCopy::OverCap { len }) => panic!("a copy over the cap, of {len} bytes"),
         },
     )

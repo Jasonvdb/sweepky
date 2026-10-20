@@ -1108,7 +1108,7 @@ mod tests {
             assert!(!text.contains(&key.to_string()), "{text}");
         }
 
-        // The check `login` runs (and P2c's `pull` will) raises the same
+        // The check `login` and `pull` run raises the same
         // alarms from the same reads: every listed record, the known ones
         // too.
         let before = keys.calls().len();

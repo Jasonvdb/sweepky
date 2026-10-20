@@ -192,14 +192,26 @@
 //!   a sweep, each target's pins and the commit checked out, kept where
 //!   the agent cannot write, which `submit` builds the manifest's
 //!   `targetShas` from and removes once the record is final.
-//! - `pull` (P2c), so far only the local state it keeps between runs in the
-//!   data directory, one entry per owner: `feed-cursors.json`, each watched
-//!   homeserver's feed cursor, set after a batch or lowered to a bounty's
-//!   starting cursor, as `post --open` does; and `poll-state.json`, the
-//!   roster poll's newest ids seen, bounty and sweep summaries with their
-//!   `ETag`s, the `ETag` of each own `discovered.json`, the strangers'
-//!   sweeps accepted and the deletions confirmed. Both are capped,
-//!   owner-only and keep the fields a newer Sweepky adds.
+//! - `pull` (P2c): the logged-in owner and this install's device key, both
+//!   read before any network read; the roster poll of the owner's circle,
+//!   each key's homeserver looked up once a run and, on production, checked
+//!   against the host policy; the check of the owner's `keys/` for keys
+//!   this owner's installs did not create, where a check that cannot finish
+//!   is an alarm too; the watched homeservers' events feeds and each open
+//!   bounty's `discovered.json`, for strangers' sweeps of the owner's open
+//!   bounties; each new done sweep opened with the device key, checked and
+//!   stored owner-only in the data directory, strangers' in `untrusted/`;
+//!   each bounty's findings grouped into `groups.json` and `merged.json`,
+//!   the circle's content alone in the second; and last, under the writers'
+//!   lock with a fresh session, its one public write, each open bounty's
+//!   `discovered.json`, made only when its sweeps change. The report gives
+//!   each feed's start and where it came from, and each sweep's trust
+//!   label, status and place, a stranger's text sanitised, never a finding.
+//!   Between runs it keeps two files in the data directory, one entry per
+//!   owner: `feed-cursors.json`, each watched homeserver's feed cursor,
+//!   which `post --open` lowers to a new bounty's starting cursor; and
+//!   `poll-state.json`, what the roster poll and the feeds have seen. Both
+//!   are capped, owner-only and keep the fields a newer Sweepky adds.
 //! - `events` (P2c), the seam `post --open` and `pull` read a homeserver's
 //!   public events through, with no session: one page of its `/events/`
 //!   feed, capped and parsed by core, a page with more events than were
@@ -297,19 +309,11 @@ mod pins;
 // `post`: the bounty draft, checked and pinned into a bounty, shown, and
 // published once the owner says yes.
 mod post;
-// `pull`: so far the local state it keeps between runs, whose feed cursors
-// `post --open` already writes, the roster polling with its homeserver
-// lookups, and the open-bounty feed watcher. The command comes in a later
-// step, so outside the tests most of the module is unused yet and the
-// compiler would warn of dead code. `expect` (not `allow`) silences that
-// only while it is true: the step that wires the command in must remove it.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the pull command, the module's main user, comes in a later step"
-    )
-)]
+// `pull`: the command, and its steps in order: the roster poll with its
+// homeserver lookups, the open-bounty feed watcher, the opens and the store
+// of each sweep, the triage, and the one public write, `discovered.json`.
+// The local state it keeps between runs is here too, whose feed cursors
+// `post --open` writes as well.
 mod pull;
 // Owner-only files and directories, which every secret and state file goes
 // through.
@@ -522,7 +526,8 @@ pub fn run_without_context(cli: &Cli) -> Option<anyhow::Result<Report>> {
         | Command::Circle { .. }
         | Command::Post { .. }
         | Command::Run { .. }
-        | Command::Submit { .. } => None,
+        | Command::Submit { .. }
+        | Command::Pull => None,
     }
 }
 
@@ -594,6 +599,8 @@ pub async fn run(cli: Cli, ctx: &Context) -> anyhow::Result<Report> {
             let prompting = prompt::Prompting::from_no_input_flag(cli.no_input);
             submit::submit(ctx, prompting, run_dir.as_deref(), playbook.as_deref()).await
         }
+        // `pull` asks nothing, so it takes no `Prompting`.
+        Command::Pull => pull::pull(ctx).await,
     }
 }
 
@@ -668,6 +675,7 @@ mod tests {
                 "--playbook",
                 "cloudflare/security-audit@c1c8a8c",
             ],
+            &["pull"],
         ];
         for args in commands {
             // With and without `--no-input`, which changes nothing here: the
