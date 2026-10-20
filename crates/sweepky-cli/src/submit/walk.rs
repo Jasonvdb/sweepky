@@ -74,11 +74,11 @@ pub(super) const MAX_FILE_BYTES: usize = 8 * 1024 * 1024;
 /// every entry, not only files, bounds the work a directory of a million
 /// empty directories could cause. `target/` and each skipped `scratch/`
 /// count as one entry, their contents as none. P2b's choice.
-pub(super) const MAX_ENTRIES: usize = 4096;
+pub(crate) const MAX_ENTRIES: usize = 4096;
 
 /// The most directories deep the walk goes below the sweep directory:
 /// `audit/` is 1 deep, `audit/notes/` 2. P2b's choice.
-pub(super) const MAX_DEPTH: usize = 32;
+pub(crate) const MAX_DEPTH: usize = 32;
 
 /// How many characters of a path in the sweep directory a message shows:
 /// as many as core's `AttachmentPath` allows.

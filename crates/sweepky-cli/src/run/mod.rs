@@ -91,7 +91,9 @@
 mod fetch;
 mod marker;
 mod pick;
-mod place;
+// `pub(crate)`: `pull` stores a sweep with the same handle calls, and
+// falls back on the same copy.
+pub(crate) mod place;
 mod scope_file;
 mod select;
 mod strip;

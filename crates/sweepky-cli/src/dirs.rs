@@ -25,18 +25,20 @@
 //! |---|---|
 //! | `git-home-<id>/` | git's `HOME` while one command (`post`, `run`) runs it: new, empty and 0700, removed when the command ends (`crate::git`) |
 //! | `staging/<id>/` | the sweep directory `run` builds before it moves it into the project's `sweeps/<id>/`: new and 0700, removed when `run` ends (`run::fetch`) |
+//! | `staging/.pull.<pid>.<nanos>.<n>.tmp/` | where `pull` writes one decrypted sweep, and a bounty's directory the first time, before it moves them into place: new and 0700, removed when the store ends (`crate::pull::store`) |
 //! | `sweeps/<id>.json` | what `run` fetched for sweep `id`, which `submit` builds the manifest's commits from: written by `run`, removed once the sweep's record says `done` or `aborted` (`crate::sweep_state`) |
 //! | `feed-cursors.json` | per owner and watched homeserver, how far `pull` has read its `/events/` feed (`crate::pull`) |
 //! | `poll-state.json` | per owner, what `pull`'s roster polling learnt: the newest ids seen, bounty and sweep summaries with their `ETag`s, the strangers' sweeps accepted and the deletions confirmed (`crate::pull`) |
-//! | `<id>/` | what `pull` decrypted of the owner's bounty `id`, with `untrusted/` for the strangers' sweeps |
+//! | `<id>/` | what `pull` decrypted of the owner's bounty `id`: `owner.json`, the owner check; each trusted sweep in `<sweeper z32>-<sweep id>/`, and each untrusted one in `untrusted/<sweeper z32>-<sweep id>/`, holding the package's files and `.sweepky/findings.json`, a compact copy of its findings (`crate::pull::store`) |
 //!
 //! A bounty's id is 13 characters of `0-9` and upper-case `A-Z`, and no
 //! other name here is, in either case: each is shorter or has a `-` or a
 //! `.` in it. So a pulled bounty's directory never takes another entry's
-//! name, even on a file system that ignores case. Every file here is
-//! written with [`crate::private_fs`]: directories 0700, files 0600;
-//! the one exception is what git checks out under `staging/<id>/`, which
-//! that 0700 directory keeps from other users.
+//! name, even on a file system that ignores case. Every directory here is
+//! made 0700 and every file 0600, with [`crate::private_fs`] or, for what
+//! `pull` stores, through directory handles (`crate::pull::store`); the one
+//! exception is what git checks out under `staging/<id>/`, which that 0700
+//! directory keeps from other users.
 //!
 //! **`XDG_CONFIG_HOME` and `XDG_DATA_HOME` are ignored, on purpose.** The
 //! sandbox template `init` writes into a sweeper project denies reads of
@@ -200,17 +202,6 @@ impl Dirs {
 }
 
 /// The data directory's files that `pull` keeps (`crate::pull`).
-// Nothing outside the tests calls these yet, so outside them the compiler
-// would warn that they are never used. `expect` (not `allow`) silences that
-// only while it is true, for every method in this block: the step that
-// wires the `pull` command in must remove it.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the pull command, their first caller, comes in a later step"
-    )
-)]
 impl Dirs {
     /// `data/feed-cursors.json`: per owner and watched homeserver, how far
     /// `pull` has read that homeserver's `/events/` feed.
