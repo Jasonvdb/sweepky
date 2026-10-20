@@ -20,6 +20,9 @@
 //!   token (`crate::session`): [`refuse_expired_grant`] before any request,
 //!   [`check_restored_session`] on what the homeserver restored, and
 //!   [`restore_error`], the restore's own errors in fixed text.
+//! - [`revoke_grant`], how `logout` ends a grant and proves it ended:
+//!   restore, the work that needs the live session, sign-out, then a second
+//!   restore that must get a 401 ([`GrantRevocation`]).
 //! - [`token`], `grant.token`, the owner-only file that holds the token.
 //! - [`page`], the sign-in page the loopback server serves, with the
 //!   authorization URL's QR code as an inline SVG, a copy button and a live
@@ -275,6 +278,89 @@ pub(crate) fn restore_error(error: &pubky::Error) -> anyhow::Error {
     } else {
         request_error(error).context("could not restore this install's Pubky Ring session")
     }
+}
+
+/// `login.json`'s `grantExpiresAt` when it is at or before `now` (both Unix
+/// seconds), so the grant has expired; `None` while it has not. A login
+/// that records no expiry is not known to have expired, so that is `None`
+/// too, and the homeserver decides.
+pub(crate) fn expired_grant_at(login: &LoginState, now: u64) -> Option<u64> {
+    // `filter` keeps the value only when the closure says `true`, so a
+    // missing expiry and a future one both come out as `None`.
+    login.grant_expires_at.filter(|&expires_at| {
+        matches!(
+            expiry_notice(now, expires_at),
+            Some(ExpiryNotice::Expired { .. })
+        )
+    })
+}
+
+/// What one restore of the saved grant token gave, for [`revoke_grant`].
+///
+/// Generic over the session type `S`, so the tests can stand a fake in for
+/// the real `crate::session::WriterSession`.
+pub(crate) enum Restored<S> {
+    /// The homeserver took the token: a live session.
+    Live(S),
+    /// The homeserver answered 401: it no longer takes this grant, because
+    /// it was revoked (in Ring, or by an earlier sign-out) or has expired.
+    Refused,
+}
+
+/// How [`revoke_grant`] ended.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum GrantRevocation<T> {
+    /// Signed out, and the restore after the sign-out got a 401: the grant
+    /// is revoked for certain. `T` is what the live-session work gave.
+    Revoked(T),
+    /// The first restore got a 401 already, so there was no session to do
+    /// anything with: the grant was revoked or had expired before.
+    AlreadyRevoked,
+    /// The sign-out failed, or the restore after it was anything but a 401
+    /// (a session, or an error that says nothing about the grant). The grant
+    /// may still be live, so the token must be kept for another try.
+    NotConfirmed,
+}
+
+/// Ends the grant behind the saved token, and proves it is ended:
+///
+/// 1. `restore` a session from the token; a 401 is
+///    [`GrantRevocation::AlreadyRevoked`] at once, any other error is
+///    returned;
+/// 2. `with_live`, the work that needs the live session (for `logout`, the
+///    revoke of this install's device key), which borrows it;
+/// 3. `sign_out`, which takes the session by value and revokes the grant;
+/// 4. `restore` again, which must now get a 401
+///    ([`GrantRevocation::Revoked`]); anything else is
+///    [`GrantRevocation::NotConfirmed`].
+///
+/// When step 2 fails, its error comes back and the session is dropped, *not*
+/// signed out: a grant revoked first would lock this install out of the
+/// device key it could not yet revoke. The closures are the seams, as in
+/// `logout::retire`, so the tests run every ending without a homeserver.
+/// `restore` is an `AsyncFn` (callable more than once, through a shared
+/// borrow) because it runs twice; the others run once.
+pub(crate) async fn revoke_grant<S, T>(
+    restore: impl AsyncFn() -> anyhow::Result<Restored<S>>,
+    with_live: impl AsyncFnOnce(&S) -> anyhow::Result<T>,
+    sign_out: impl AsyncFnOnce(S) -> anyhow::Result<()>,
+) -> anyhow::Result<GrantRevocation<T>> {
+    let session = match restore().await? {
+        Restored::Live(session) => session,
+        Restored::Refused => return Ok(GrantRevocation::AlreadyRevoked),
+    };
+    // `?` returns here with `session` still owned by this function, so it
+    // is dropped on the way out, never signed out.
+    let done = with_live(&session).await?;
+    if sign_out(session).await.is_err() {
+        return Ok(GrantRevocation::NotConfirmed);
+    }
+    Ok(match restore().await {
+        Ok(Restored::Refused) => GrantRevocation::Revoked(done),
+        // A session that still restores is dropped unused when the match
+        // ends; an error proves nothing either way.
+        Ok(Restored::Live(_)) | Err(_) => GrantRevocation::NotConfirmed,
+    })
 }
 
 /// `expires_at`, Unix seconds, as `login` and the notices show it: RFC 3339

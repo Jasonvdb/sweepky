@@ -35,12 +35,14 @@
 //! mid-write (02, "Device keys"). Restoring only under the writers' lock
 //! makes that impossible on one install.
 //!
-//! `logout` runs the same steps itself, under [`with_writers_lock`] with
-//! [`sign_in`] and [`WriterSession::sign_out`], because it deletes the
-//! credential and this install's files after the sign-out and before the
-//! lock is released, which a body of [`with_writer_session`] cannot do. Its
-//! sign-out is explicit, so it signs out a Ring session too: revoking the
-//! grant is what logging out means.
+//! `logout` runs the same steps itself, under [`with_writers_lock`],
+//! because it deletes the credential and this install's files after the
+//! sign-out and before the lock is released, which a body of
+//! [`with_writer_session`] cannot do. For an identity it uses [`sign_in`]
+//! and [`WriterSession::sign_out`]; for a Ring login [`restore_saved_grant`],
+//! which tells a 401 apart, and [`WriterSession::sign_out_checked`], whose
+//! failure it must see: revoking the grant is what logging out means, and
+//! it deletes the token only once a restore proves the grant is gone.
 //!
 //! **Never `{:?}` a session, a signer or a token.** `PubkySession`'s `Debug`
 //! prints its credential's, a signer holds the identity's keypair, and the
@@ -56,16 +58,18 @@
 //! per command, however many sessions the command opens (`run` opens two).
 
 use anyhow::{Context as _, bail};
-use pubky::PubkySession;
+use pubky::{PubkySession, StatusCode};
 
 use crate::clock;
 use crate::identity::IdentitySecret;
 use crate::lock::WritersLock;
 use crate::network::client_id;
 use crate::passphrase::Passphrase;
-use crate::remote::{pubky_of, request_error};
+use crate::remote::{pubky_of, request_error, status_of};
 use crate::ring::token::read_grant_token;
-use crate::ring::{check_restored_session, refuse_expired_grant, restore_error};
+use crate::ring::{
+    GRANT_NOT_ACCEPTED, Restored, check_restored_session, refuse_expired_grant, restore_error,
+};
 use crate::state::{KnownLoginKind, LoginState, StoredIdentity, read_identity, read_login_state};
 use crate::{Context, Dirs};
 
@@ -155,6 +159,19 @@ impl WriterSession {
     /// through [`with_writer_session`], which calls [`WriterSession::end`].
     pub(crate) async fn sign_out(self, ctx: &Context) {
         sign_out(ctx, self.session).await;
+    }
+
+    /// Signs the session out and says whether that worked, in fixed text
+    /// (`remote::request_error`) when it did not. For a Ring `logout`, which
+    /// must not delete the token after a sign-out that may not have revoked
+    /// the grant. The session the SDK hands back with its error is dropped.
+    pub(crate) async fn sign_out_checked(self) -> anyhow::Result<()> {
+        self.session
+            .signout()
+            .await
+            // The closure's pattern `(error, _session)` takes the pair apart
+            // and drops the session.
+            .map_err(|(error, _session)| request_error(&error))
     }
 
     /// Ends the session the way an ordinary command must (step 4 of the
@@ -255,7 +272,27 @@ async fn sign_in_identity(ctx: &Context, login: LoginState) -> anyhow::Result<Wr
 }
 
 /// Step 2 for a Pubky Ring login: everything that can be refused locally
-/// first, then the one restore request, then the checks of what came back.
+/// first, then the one restore request, then the checks of what came back
+/// ([`restore_saved_grant`]). A 401 is [`GRANT_NOT_ACCEPTED`], as
+/// [`restore_error`] words a 403.
+async fn restore_ring(ctx: &Context, login: LoginState) -> anyhow::Result<WriterSession> {
+    // The clock first: the SDK reads it during the restore with a function
+    // that panics on a clock set before 1970, which this refuses in words.
+    let now = clock::now_unix_seconds()?;
+    refuse_expired_grant(&login, now)?;
+    match restore_saved_grant(ctx, login).await? {
+        Restored::Live(signed) => Ok(signed),
+        Restored::Refused => bail!(GRANT_NOT_ACCEPTED),
+    }
+}
+
+/// Reads `grant.token`, restores a session from it and checks what the
+/// homeserver restored, telling a 401 apart ([`Restored::Refused`]) from
+/// every other error, which is fixed text ([`restore_error`]). `logout`
+/// needs that 401: it is how a revoked grant shows.
+///
+/// The caller must have read the clock with `clock::now_unix_seconds` first
+/// (see [`restore_ring`]) and must hold the writers' lock.
 ///
 /// The token lives in a `GrantToken` (a `SecretString` inside), borrowed as
 /// a `&str` only for the `restore_session` call, and wiped when `token` is
@@ -263,11 +300,10 @@ async fn sign_in_identity(ctx: &Context, login: LoginState) -> anyhow::Result<Wr
 /// check is dropped, not signed out: it may be the user's real grant behind
 /// a stale `login.json`, and revoking it is `logout`'s decision, not an
 /// ordinary command's.
-async fn restore_ring(ctx: &Context, login: LoginState) -> anyhow::Result<WriterSession> {
-    // The clock first: the SDK reads it during the restore with a function
-    // that panics on a clock set before 1970, which this refuses in words.
-    let now = clock::now_unix_seconds()?;
-    refuse_expired_grant(&login, now)?;
+pub(crate) async fn restore_saved_grant(
+    ctx: &Context,
+    login: LoginState,
+) -> anyhow::Result<Restored<WriterSession>> {
     let Some(token) = read_grant_token(&ctx.dirs, ctx.passphrase.as_ref())? else {
         bail!(
             "{} records a Pubky Ring login, but {} is missing, so there is no grant to restore; \
@@ -276,12 +312,19 @@ async fn restore_ring(ctx: &Context, login: LoginState) -> anyhow::Result<Writer
             ctx.dirs.grant_token_file().display()
         );
     };
-    let session = ctx
+    let session = match ctx
         .network
         .pubky()
         .restore_session(token.expose_secret())
         .await
-        .map_err(|error| restore_error(&error))?;
+    {
+        Ok(session) => session,
+        // A match guard: this arm takes only an error whose status is 401.
+        Err(error) if status_of(&error) == Some(StatusCode::UNAUTHORIZED) => {
+            return Ok(Restored::Refused);
+        }
+        Err(error) => return Err(restore_error(&error)),
+    };
     // `as_grant` is `None` for a cookie session; `read_grant_token` only
     // takes a grant token, so this is a second check. The view borrows
     // `session`, and `session_info` hands back an owned copy, so the borrow
@@ -296,11 +339,11 @@ async fn restore_ring(ctx: &Context, login: LoginState) -> anyhow::Result<Writer
         info.client_id.as_str(),
         &info.capabilities,
     )?;
-    Ok(WriterSession {
+    Ok(Restored::Live(WriterSession {
         session,
         login,
         kind: KnownLoginKind::Ring,
-    })
+    }))
 }
 
 /// The secret of the identity `login` names, checked to be the key of the
@@ -344,10 +387,6 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
-    use anyhow::bail;
-    use pubky_testnet::EphemeralTestnet;
-    use tempfile::TempDir;
-
     use super::{read_identity_secret, read_logged_in, with_writer_session};
     use crate::identity::{IdentityMeta, IdentityName, IdentitySecret};
     use crate::passphrase::{NeedsPassphrase, Passphrase};
@@ -355,10 +394,12 @@ mod tests {
     use crate::ring::{ExpiryNotice, GRANT_NOT_ACCEPTED};
     use crate::state::{LoginState, create_identity, read_login_state, write_login_state};
     use crate::test_support::{
-        PLANTED, RingPage, RingStandIn, SharedBuffer, TEST_PASSPHRASE, dirs_in, offline_network,
-        private_temp, random_pubky, ring_context, ring_network, ring_testnet, test_context,
+        PLANTED, TEST_PASSPHRASE, dirs_in, offline_network, private_temp, random_pubky, ring_login,
+        ring_testnet, test_context,
     };
     use crate::{CLIENT_ID, Context, Network, clock};
+    use anyhow::bail;
+    use pubky_testnet::EphemeralTestnet;
 
     #[test]
     fn wrapped_identity_signs_in_only_with_its_passphrase() {
@@ -478,23 +519,6 @@ mod tests {
 
     /// What every expiry notice says, soon or expired.
     const EXPIRY_LINE: &str = "Pubky Ring grant";
-
-    /// A Ring login on `testnet` in a fresh install under `home`, approved
-    /// by a new [`RingStandIn`], returned with the install's context, its
-    /// standard error and the stand-in.
-    async fn ring_login(
-        testnet: &EphemeralTestnet,
-        home: &TempDir,
-    ) -> (Context, SharedBuffer, RingStandIn) {
-        let (ctx, stderr, mut urls) = ring_context(ring_network(testnet), home, io::empty());
-        let ring = RingStandIn::sign_up(testnet).await;
-        let (logged_in, ()) = tokio::join!(crate::login::login(&ctx, None, None, None), async {
-            let page = RingPage::open(&mut urls).await;
-            ring.approve(&page).await;
-        });
-        logged_in.expect("logs in through the stand-in");
-        (ctx, stderr, ring)
-    }
 
     /// Rewrites `login.json`'s `grantExpiresAt` to `now + offset` seconds
     /// (`offset` may be negative), keeping every other field.

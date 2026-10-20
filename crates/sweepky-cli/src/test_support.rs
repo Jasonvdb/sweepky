@@ -1844,6 +1844,12 @@ impl RingStandIn {
         self.root.public_key()
     }
 
+    /// The identity's root session, which writes anywhere in its storage,
+    /// as the user's own Ring or another install could.
+    pub(crate) fn root(&self) -> &PubkySession {
+        &self.root
+    }
+
     /// Approves `page`'s link in full, as Ring's approve button does.
     pub(crate) async fn approve(&self, page: &RingPage) {
         self.signer
@@ -1873,4 +1879,21 @@ impl RingStandIn {
             .filter(|grant| grant.client_id == client_id)
             .collect()
     }
+}
+
+/// A Ring login on `testnet` in a fresh install under `home`, approved by a
+/// new [`RingStandIn`], returned with the install's context, its standard
+/// error and the stand-in.
+pub(crate) async fn ring_login(
+    testnet: &EphemeralTestnet,
+    home: &TempDir,
+) -> (Context, SharedBuffer, RingStandIn) {
+    let (ctx, stderr, mut urls) = ring_context(ring_network(testnet), home, io::empty());
+    let ring = RingStandIn::sign_up(testnet).await;
+    let (logged_in, ()) = tokio::join!(crate::login::login(&ctx, None, None, None), async {
+        let page = RingPage::open(&mut urls).await;
+        ring.approve(&page).await;
+    });
+    logged_in.expect("logs in through the stand-in");
+    (ctx, stderr, ring)
 }
