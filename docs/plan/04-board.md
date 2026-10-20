@@ -47,7 +47,7 @@ Taken:
 
 - **Tokens**, under pubky-app's names: `--background` `oklch(0.118 0.014 284.115)` and `--card` `oklch(0.232 0.006 285.946)` (the same values Vibes uses), `--foreground` `oklch(1 0 0)`, `--card-foreground` `oklch(0.951 0.011 286.195)`, `--muted-foreground` `#89898f`, `--secondary` `#303034`, `--border` `oklch(0.311 0.007 285.98)`, `--brand` `oklch(0.928 0.23 123.978)`, `--destructive` `oklch(0.628 0.258 29.234)`, `--radius` `0.625rem`.
 - **Type:** Inter Tight throughout, monospace for commands and pubkys; layouts work from 375 px wide.
-- **Buttons:** pills. Primary is solid `--brand` with `--background` text; default is `--brand` at 16 % fill with a brand border and brand text; secondary is `--secondary`.
+- **Buttons:** pills. Primary is solid `--brand` with `--background` text; default is `--brand` at 16 % fill with a brand border and brand text; secondary is `--secondary` with `--foreground` text (pubky-app's `--secondary-foreground` is not taken).
 - **Section pattern:** a small uppercase eyebrow in `--brand` with wide tracking ("The problem"), a large heading with one word in `--brand`, a one-line subtitle in `--muted-foreground`, then a grid of cards (`--card` at 80 % opacity, medium radius, 24 px padding, a small shadow).
 - **Landing structure:** hero (heading, subtitle, actions and footer on the left, a visual on the right), the problem, how it works, a final call to action.
 
@@ -55,11 +55,11 @@ Not taken:
 
 - Next.js, Tailwind, the shadcn components, the service worker and the analytics consent banner. The app stays a Vite SPA with hand-written CSS.
 - Pubky's and Synonym's logos, mascot illustrations, videos and the Synonym/Tether footer. Sweepky has its own mark and art, and says "Built on Pubky" as a text link. Using their marks would suggest an endorsement nobody has given.
-- Motion that ignores `prefers-reduced-motion`. The pinned `globals.css` has no reduced-motion rule for its animated landing background; Sweepky's pulses, ticker and landing motion all stop under `reduce`.
+- Motion that ignores `prefers-reduced-motion`. The pinned `globals.css` stops only its own landing animations under `reduce` (`.landing-swirl-background__graphic` and `.landing-scroll-cue__icon`); Sweepky stops all of its own motion, pulses, ticker and landing motion included, with one global rule under `reduce`.
 
 ## Visual direction
 
-A counter-surveillance sweep, not brooms. pubky-app's dark tokens with exactly one accent, `--brand` (Pubky's lime), read as a detector's phosphor glow. It marks detectors, swept rooms, primary buttons and eyebrows, and nothing else. `--destructive` red appears only on `aborted` sweeps and "unreachable" members. There is no red/blue palette: red already means "failed", a second hue would compete with the one signal that matters (something is being swept), and Vibes frames the board beside apps that all use the Pubky palette. State is carried by shape, fill, brightness and motion, always with a text label, so nothing depends on colour alone. Lime on the background and background-coloured text on lime both clear WCAG AA by a wide margin.
+A counter-surveillance sweep, not brooms. pubky-app's dark tokens with exactly one accent, `--brand` (Pubky's lime), read as a detector's phosphor glow. It marks detectors, swept rooms, primary buttons and eyebrows, and nothing else. `--destructive` red appears only on `aborted` sweeps and "unreachable" members, as a mark beside a label in `--foreground`, because red text on a card falls below 4.5:1. There is no red/blue palette: red already means "failed", a second hue would compete with the one signal that matters (something is being swept), and Vibes frames the board beside apps that all use the Pubky palette. State is carried by shape, fill, brightness and motion, always with a text label, so nothing depends on colour alone. Lime on the background and background-coloured text on lime both clear WCAG AA by a wide margin.
 
 Bounties are rooms on a floor plan; a sweep in progress is a detector pulsing in its room; a completed sweep leaves the room marked swept; a done bounty is a room with the lights off and the credited sweepers' marks on the door. Trust badges: `circle` is a solid brand mark, `known N` a brand outline with the count, `unknown` a hollow muted outline that a credit fills in. Motion is slow and idle-driven; the ticker scrolls only on real events.
 
