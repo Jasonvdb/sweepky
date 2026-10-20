@@ -25,11 +25,18 @@
 //    - *new*: `bounties/`, then `sweeps/`, listed newest first down to the
 //      watermark, and the records listed above it read oldest first, at most
 //      MAX_NEW_BOUNTIES_PER_MEMBER and MAX_NEW_SWEEPS_PER_MEMBER a pass. What
-//      a cap leaves unread stays above the watermark for the next pass.
+//      a cap leaves unread stays above the watermark for the next pass;
+//    - *discovered*: the `discovered.json` of its bounties open to
+//      strangers that discovered.ts says are due.
 //
 //    A read that fails ends that key's pass, as in `pull`: its reads all go
 //    to one homeserver, which would likely fail the rest too. The failure
 //    is noted on the key, so the next pass looks it up again.
+// 4. **Strangers' sweeps** that the held discovered lists name, each from
+//    its sweeper's own storage, within discovered.ts's caps, MAX_IN_FLIGHT
+//    sweepers at a time. A sweeper whose read fails, or whose homeserver
+//    cannot be resolved, is read no further this pass; the bounty and its
+//    owner are untouched by it.
 //
 // **When a lookup is due.** Before a key's first one; an hour after the
 // last; on the next pass after a failed read of its storage or a lookup
@@ -45,7 +52,8 @@
 // `/pub/sweepky/` (net/transport.ts), with `cache: 'no-cache'`: the browser
 // asks the homeserver each time, sending the validators of its cached copy,
 // so an unchanged record costs a 304 and a heuristic cache never answers
-// with a stale listing or record. Nothing here reads a feed.
+// with a stale listing or record. Nothing here reads a feed: strangers'
+// sweeps come only from the owners' discovered.json.
 
 import { listDirNewestFirst } from '../net/listing.ts'
 import type { ListedDir, RecordAnswer, Transport } from '../net/transport.ts'
@@ -53,12 +61,16 @@ import type { RecordId } from '../records/ids.ts'
 import { asKnownBountyStatus, asKnownSweepStatus } from '../records/parse.ts'
 import { BOUNTIES_DIR, SWEEPS_DIR } from '../records/paths.ts'
 import type { Pubky } from '../records/pubky.ts'
+import type { SweepRef } from '../records/urls.ts'
 import type { BoardAction } from './actions.ts'
+import { discoveredDue, strangersSweepsDue } from './discovered.ts'
 import {
+  bountyKey,
   memberState,
   rosterKeys,
   type BoardState,
   type MemberState,
+  type RecordKey,
   type RereadKind,
 } from './state.ts'
 
@@ -101,22 +113,25 @@ export interface PollDeps {
 
 /**
  * What one pass keeps while it runs: the keys looked up during it, so none
- * is looked up twice in a pass, and those whose read failed, which are read
- * no further this pass.
+ * is looked up twice in a pass; those whose read failed, which are read no
+ * further this pass; and the bounties it read, whose discovered.json is due
+ * if they are done (discovered.ts).
  */
 interface Pass extends PollDeps {
   readonly lookedUp: Set<Pubky>
   readonly failed: Set<Pubky>
+  readonly bountiesRead: Set<RecordKey>
 }
 
 /** One pass over the selected circle: see the module comment. Resolves when the pass is over. */
 export async function pollOnce(deps: PollDeps): Promise<void> {
   const admin = deps.getState().admin
   if (admin === null) return
-  const pass: Pass = { ...deps, lookedUp: new Set(), failed: new Set() }
+  const pass: Pass = { ...deps, lookedUp: new Set(), failed: new Set(), bountiesRead: new Set() }
   if (!(await isReachable(pass, admin))) return
   await readCircle(pass, admin)
   await forEachLimited(rosterKeys(deps.getState()), MAX_IN_FLIGHT, (key) => pollKey(pass, key))
+  await readStrangersSweeps(pass)
 }
 
 async function readCircle(pass: Pass, admin: Pubky): Promise<void> {
@@ -126,14 +141,18 @@ async function readCircle(pass: Pass, admin: Pubky): Promise<void> {
   if (isFailure(answer)) pass.failed.add(admin)
 }
 
-/** One roster key's share of the pass: again, then new bounties, then new sweeps. */
+/**
+ * One roster key's share of the pass: again, then new bounties, new sweeps,
+ * and its discovered files.
+ */
 async function pollKey(pass: Pass, key: Pubky): Promise<void> {
   if (pass.failed.has(key) || !(await isReachable(pass, key))) return
   // Each step says whether the key's reads went well; the first that did
   // not ends the key's pass, as `?` does in roster.rs.
   if (!(await rereadKey(pass, key))) return
   if (!(await readNew(pass, key, BOUNTIES_DIR))) return
-  await readNew(pass, key, SWEEPS_DIR)
+  if (!(await readNew(pass, key, SWEEPS_DIR))) return
+  await readDiscovered(pass, key)
 }
 
 /**
@@ -301,6 +320,43 @@ async function readNew(pass: Pass, key: Pubky, dir: ListedDir): Promise<boolean>
   return true
 }
 
+// Discovered: open bounties' strangers' sweeps
+
+/** Reads the discovered.json of `owner`'s bounties that is due; `false` when a read failed. */
+async function readDiscovered(pass: Pass, owner: Pubky): Promise<boolean> {
+  for (const bounty of discoveredDue(pass.getState(), owner, pass.bountiesRead)) {
+    if (pass.signal.aborted) return false
+    const answer = await pass.transport.getRecord(
+      owner,
+      { kind: 'discovered', id: bounty.id },
+      { cache: 'no-cache' },
+    )
+    pass.dispatch({ type: 'discoveredRead', bounty, answer, at: pass.now() })
+    if (isFailure(answer)) return false
+  }
+  return true
+}
+
+/**
+ * Reads the strangers' sweeps that are due, each sweeper's one after
+ * another; a sweeper's first failed read ends that sweeper's share.
+ */
+async function readStrangersSweeps(pass: Pass): Promise<void> {
+  const turn = Math.floor(pass.now() / POLL_INTERVAL_MS)
+  const bySweeper = new Map<Pubky, SweepRef[]>()
+  for (const ref of strangersSweepsDue(pass.getState(), turn)) {
+    const refs = bySweeper.get(ref.sweeper) ?? []
+    refs.push(ref)
+    bySweeper.set(ref.sweeper, refs)
+  }
+  await forEachLimited([...bySweeper.values()], MAX_IN_FLIGHT, async (refs) => {
+    for (const ref of refs) {
+      if (pass.signal.aborted) return
+      if (isFailure(await readSweep(pass, ref.sweeper, ref.id))) return
+    }
+  })
+}
+
 // Reads
 
 async function readBounty(pass: Pass, owner: Pubky, id: RecordId): Promise<RecordAnswer> {
@@ -310,6 +366,7 @@ async function readBounty(pass: Pass, owner: Pubky, id: RecordId): Promise<Recor
     { cache: 'no-cache' },
   )
   pass.dispatch({ type: 'bountyRead', ref: { owner, id }, answer, at: pass.now() })
+  pass.bountiesRead.add(bountyKey({ owner, id }))
   return answer
 }
 
