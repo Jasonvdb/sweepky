@@ -19,6 +19,9 @@
 //! - [`page`], the sign-in page the loopback server serves, with the
 //!   authorization URL's QR code as an inline SVG, a copy button and a live
 //!   status, and the QR code `login` prints in the terminal as its fallback.
+//! - [`loopback`], that server: one flow's page and status on `127.0.0.1`
+//!   at a random port and secret path, under a strict CSP, with bounded
+//!   connections, reads and lifetime.
 //!
 //! The checks are pure: they take the capabilities and the times as
 //! arguments, so they are tested without a network or a clock.
@@ -30,6 +33,7 @@ use sweepky_core::RecordTime;
 
 use crate::network::SWEEPKY_CAPABILITY;
 
+pub(crate) mod loopback;
 pub(crate) mod page;
 pub(crate) mod token;
 

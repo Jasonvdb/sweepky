@@ -671,7 +671,7 @@ fn decode_hex_pairs(pairs: &[[u8; 2]; SECRET_BYTES], secret: &mut [u8; SECRET_BY
 /// effort, not a proof. The digits for 10 to 15 sit 39 places after the
 /// ones `b'0' + nibble` gives (`b'a'` is 97, `b'9' + 1` is 58), so the mask
 /// adds 39 exactly when `nibble` is over 9.
-fn hex_digit(nibble: u8) -> u8 {
+pub(crate) fn hex_digit(nibble: u8) -> u8 {
     // `9 - nibble`, wrapping: 0 to 9 for a decimal digit, 250 to 255 (top
     // bit set) for 10 to 15. The top bit, spread to all eight, is the mask.
     let over_nine = (9_u8.wrapping_sub(nibble) >> 7) & 1;

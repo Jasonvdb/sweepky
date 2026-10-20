@@ -38,12 +38,15 @@ clap = { workspace = true, features = ["derive"] }
 # The async runtime: `rt-multi-thread` for `#[tokio::main]`'s default runtime,
 # `macros` for `#[tokio::main]` itself, `time` for timeouts, `process` and
 # `io-util` for the git runner's child processes and its bounded reads of
-# their output, and `net` for `lookup_host`, through which the host policy
-# resolves a target's host. pubky already turns all of them on in this build
-# (it asks for tokio's `full` on every target but wasm; `cargo tree -e
-# features -i tokio`), so naming them adds no code; it keeps this crate
-# building if pubky ever stops.
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "process", "io-util", "net"] }
+# their output, `net` for `lookup_host`, through which the host policy
+# resolves a target's host, and for the `TcpListener` of the Ring sign-in
+# page's loopback server, and `sync` for the `watch` channel through which
+# the Ring login tells that server the flow's status (`rt-multi-thread`
+# includes `rt`, which has the server's `JoinSet`). pubky already turns all
+# of them on in this build (it asks for tokio's `full` on every target but
+# wasm; `cargo tree -e features -i tokio`), so naming them adds no code; it
+# keeps this crate building if pubky ever stops.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "process", "io-util", "net", "sync"] }
 anyhow = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
