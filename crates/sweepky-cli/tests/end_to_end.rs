@@ -17,7 +17,7 @@
 
 use std::fs;
 use std::io::{self, BufRead, Cursor, Write};
-use std::os::unix::fs::{MetadataExt, symlink};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -198,6 +198,38 @@ fn identity_seed(key_file: &Path) -> Zeroizing<[u8; 32]> {
         *byte = u8::from_str_radix(digits, 16).expect("hex digits");
     }
     seed
+}
+
+/// Copies the Sweepky identity file `key_file` into `identities`, another
+/// install's `identities/`, as an owner on `--identity` carries the
+/// identity to a second machine: test setup for A's second install, not an
+/// import path, since `login` still refuses recovery files and raw keys.
+///
+/// The directory, and any parent missing, is made 0700 and the copy is
+/// created 0600, so the secret is never readable by anyone else, not even
+/// for a moment: a `chmod` after the write would leave such a moment. The
+/// bytes stay in a buffer that wipes itself.
+fn copy_identity_file(key_file: &Path, identities: &Path) {
+    // `DirBuilderExt` and `OpenOptionsExt` are Unix extension traits: in
+    // scope, they add `mode`, the permission bits to create with, which the
+    // umask can only narrow.
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(identities)
+        .expect("identities/");
+    let secret = Zeroizing::new(fs::read(key_file).expect("readable"));
+    let copy = identities.join(key_file.file_name().expect("a file name"));
+    // `create_new` refuses anything already at the name, a link included,
+    // rather than writing through it.
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(copy)
+        .expect("a new file")
+        .write_all(&secret)
+        .expect("written");
 }
 
 /// The synthetic name the fixture source serves `fixtures/target-repo.git`
@@ -393,6 +425,12 @@ async fn cloudflare_sweep(ctx: &Context, bounty: &BountyRef, sweeps: &Path) -> R
 async fn read_sweep(testnet: &EphemeralTestnet, user: &PublicKey, id: RecordId) -> Sweep {
     let record = get_capped(testnet, user, &paths::sweep_record(id), MAX_RECORD_BYTES).await;
     Sweep::from_json(&record).expect("a sweep record")
+}
+
+/// `user`'s record at `path` as JSON, read anonymously within the record
+/// cap.
+async fn read_json(testnet: &EphemeralTestnet, user: &PublicKey, path: &str) -> Value {
+    serde_json::from_slice(&get_capped(testnet, user, path, MAX_RECORD_BYTES).await).expect("JSON")
 }
 
 /// `owner`'s `bounties/<id>.discovered.json`, read anonymously within the
@@ -1862,4 +1900,246 @@ async fn end_to_end() {
             url: PubkyUrl::sweepky(a_pubky, &SweepkyPath::Discovered(open.id)),
         }]
     );
+
+    // ----- P2c: A's second install, A2 -----
+
+    // A2, a SWEEPKY_HOME of A's own, as on a second machine. Until P2d moves
+    // A to the Ring flow, the test makes it by copying A's Sweepky identity
+    // file there, and `login --identity a` reuses it. The key file alone:
+    // login rebuilds the details from it and A's pkarr record, with no
+    // signup, which the tripwire token proves. It publishes A2's own device
+    // key under the id A2's login.json records: unrevoked, holding A2's
+    // key.
+    let a2_home = tempfile::tempdir().expect("temp dir");
+    let (a2, _) = context(&testnet, a2_home.path(), io::empty());
+    let a2_identities = a2.dirs.identities_dir();
+    copy_identity_file(&a_key_file, &a2_identities);
+    assert_eq!(mode(a2.dirs.config()), 0o700);
+    assert_eq!(mode(&a2_identities), 0o700);
+    assert_eq!(mode(&a2_identities.join("a.key")), 0o600);
+    let report = sweepky(
+        &a2,
+        &["login", "--identity", "a", "--signup-token", TRIPWIRE_TOKEN],
+    )
+    .await
+    .expect("A2 logs in");
+    let text = report.text();
+    assert!(!text.contains("Signed up"), "{text}");
+    assert!(text.contains("still unspent"), "{text}");
+    assert_eq!(logged_in(&a2), a_pubky);
+    let a2_device_id = json(&a2.dirs.login_file())["deviceId"]
+        .as_str()
+        .expect("a device id")
+        .to_owned();
+    assert_ne!(
+        json(&a.dirs.login_file())["deviceId"],
+        a2_device_id.as_str()
+    );
+    let a2_device = device_identity(&a2.dirs);
+    let a2_record = get_capped(
+        &testnet,
+        &a_user,
+        &format!("/pub/sweepky/keys/{a2_device_id}.json"),
+        MAX_RECORD_BYTES,
+    )
+    .await;
+    let a2_key = DeviceKey::from_json(&a2_record).expect("a device key record");
+    assert_eq!(a2_key.revoked_at, None);
+    // `assert!` rather than `assert_eq!`, so a failure prints neither key.
+    assert!(
+        a2_key.encryption_recipient().expect("usable") == a2_device.recipient(),
+        "A2's key record does not hold A2's key"
+    );
+
+    // ----- P2c: A2 pulls, and can open none of the earlier sweeps -----
+
+    // A2 has no feed cursor of its own, so it reads the testnet's feed from
+    // the cursor the open bounty's discovered.json gives, the one A1's first
+    // pull wrote there. C's events are before it and C is outside the
+    // roster, so A2 reaches C's sweep through discovered.json's list alone.
+    // Every sweep so far was sealed before A2's key was published: A2
+    // refuses B's and C's sweeps of the open bounty for good as not
+    // encrypted to its key, and stores no sweep of either bounty.
+    let report = sweepky(&a2, &["pull"]).await.expect("A2 pulls");
+    let text = report.text();
+    let from_discovered = format!(
+        "Events feeds:\n  {watched}: read from cursor {persisted}, from the open bounties' \
+         discovered.json\n"
+    );
+    assert!(text.contains(&from_discovered), "{text}");
+    for (sweep, label) in [(b_open, "circle"), (c_sweep, "unknown")] {
+        for expected in [
+            format!("  {sweep}: {label}; done; not stored: refused for good\n"),
+            format!(
+                "warning: pull skipped {sweep} for good: not encrypted to this install's key \
+                 (sealed before this install's key was published, or to another install)\n"
+            ),
+        ] {
+            assert!(text.contains(&expected), "{expected}\nnot in\n{text}");
+        }
+    }
+    for bounty in [posted, open] {
+        assert_gone(&a2.dirs.data().join(bounty.id.to_string()));
+    }
+    // installs.json is each install's own, so A2 alarms on A1's key too;
+    // the test asserts the injected key's alarm alone.
+    assert!(
+        text.contains(&format!(
+            "alarm: keys/{added_id}.json is a device key that this owner's installs here did \
+             not create."
+        )),
+        "{text}"
+    );
+
+    // ----- P2c: B's third sweep of the open bounty, after A2's login -----
+
+    // B's submit finds A2's key, new since B pinned A's keys, warns of it
+    // by its device id alone, asks once and goes on after the yes, sealing
+    // the sweep to A2's key with A's others.
+    let third = SweepRef {
+        sweeper: b_pubky,
+        id: cloudflare_sweep(&b, &open, &sweeps).await,
+    };
+    b.stdin = StdinReader::new(Cursor::new(b"y\n".to_vec()));
+    let mark = b_stderr.text().len();
+    let third_dir = format!("sweeps/{}", third.id);
+    sweepky(
+        &b,
+        &["submit", "--run-dir", &third_dir, "--playbook", PLAYBOOK],
+    )
+    .await
+    .expect("B submits the third sweep after a yes");
+    let shown = b_stderr.text().split_off(mark);
+    assert!(
+        shown.contains("warning: the bounty's owner has keys"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains(&format!("keys/{a2_device_id}.json")),
+        "{shown}"
+    );
+    assert_eq!(shown.matches("[y/N] ").count(), 1, "{shown}");
+    assert!(
+        !shown.contains(&a2_device.recipient().to_string()),
+        "B was shown A2's key"
+    );
+
+    // A2's next pull opens the third sweep with A2's key, the second
+    // install of A decrypting it, and stores it among the trusted, B being
+    // in A's circle, byte for byte as B's agent left it.
+    let report = sweepky(&a2, &["pull"]).await.expect("A2 pulls again");
+    let text = report.text();
+    let third_stored = a2
+        .dirs
+        .data()
+        .join(open.id.to_string())
+        .join(format!("{b_pubky}-{}", third.id));
+    let expected = format!(
+        "  {third}: circle; done; stored now in {}\n",
+        third_stored.display()
+    );
+    assert!(text.contains(&expected), "{expected}\nnot in\n{text}");
+    assert!(
+        fs::read(third_stored.join("REPORT.md")).expect("stored")
+            == fs::read(cloudflare_fixture("REPORT.md")).expect("the fixture"),
+        "A2's REPORT.md differs from the fixture"
+    );
+
+    // ----- P2c: A marks the open bounty done, on A1 -----
+
+    // Both `done` steps run on A's first install, A1, whose groups, from
+    // its last pull, hold B's and C's sweeps. A2 could not open C's sweep,
+    // so A2's groups would propose B alone.
+
+    // A newer client of A's, stood in for by A's root key, has written
+    // fields this build does not know into the bounty: at the top, in its
+    // playbook and in a target. `done` keeps every one.
+    let bounty_path = paths::bounty(open.id);
+    let mut newer = read_json(&testnet, &a_user, &bounty_path).await;
+    newer["addedLater"] = json!({ "kept": true });
+    newer["playbook"]["addedLater"] = json!("kept");
+    newer["targets"][0]["addedLater"] = json!("kept");
+    publish_as(&testnet, &a_key_file, &bounty_path, &newer).await;
+
+    // `done --credit <A>` is refused with its one line, before anything is
+    // shown or asked, and the bounty anyone reads is as it was.
+    let mark = a_stderr.text().len();
+    let error = sweepky(
+        &a,
+        &["done", &open.to_string(), "--credit", &a_pubky.to_string()],
+    )
+    .await
+    .expect_err("done refuses to credit the owner");
+    assert_eq!(
+        format!("{error:#}"),
+        "--credit names the bounty's owner, who is never credited on their own bounty"
+    );
+    assert_eq!(a_stderr.text().split_off(mark), "", "done showed nothing");
+    assert_eq!(read_json(&testnet, &a_user, &bounty_path).await, newer);
+
+    // `done` with A's yes: it proposes B and C, each labelled as A1's last
+    // pull labelled them, asks once, and credits both.
+    a.stdin = StdinReader::new(Cursor::new(b"y\n".to_vec()));
+    let mark = a_stderr.text().len();
+    let report = sweepky(&a, &["done", &open.to_string()])
+        .await
+        .expect("A marks the bounty done");
+    let shown = a_stderr.text().split_off(mark);
+    assert!(!shown.contains("warning: "), "{shown}");
+    for expected in [
+        format!("  {b_pubky}: circle; "),
+        format!("  {c_pubky}: unknown; "),
+        format!("Credits to write (2):\n  {b_pubky} (proposed)\n  {c_pubky} (proposed)\n"),
+    ] {
+        assert!(shown.contains(&expected), "{expected}\nnot in\n{shown}");
+    }
+    assert_eq!(shown.matches("[y/N] ").count(), 1, "{shown}");
+    let expected = format!(
+        "Marked the bounty done, crediting 2 sweepers:\n{open}\n  {b_pubky}\n  {c_pubky}\n"
+    );
+    assert!(report.text().contains(&expected), "{}", report.text());
+
+    // The bounty anyone reads is done at the doneAt `done` wrote, crediting
+    // exactly B and C, and every other field is as it was, the unknown ones
+    // included.
+    let marked = read_json(&testnet, &a_user, &bounty_path).await;
+    let done_at = marked["doneAt"].as_str().expect("doneAt is set").to_owned();
+    let mut expected = newer;
+    expected["status"] = json!("done");
+    expected["doneAt"] = json!(done_at);
+    expected["credits"] = json!([b_pubky.to_string(), c_pubky.to_string()]);
+    assert_eq!(marked, expected);
+
+    // ----- P2c: A1 pulls once the bounty is done -----
+
+    // The done bounty credits C, so A1's next pull labels C known: 1
+    // credit across 1 owner, A, in its report and in groups.json; C is
+    // still outside the circle, so C's sweep stays untrusted.
+    let report = sweepky(&a, &["pull"]).await.expect("A pulls after done");
+    let text = report.text();
+    let expected = format!(
+        "  {c_sweep}: known: 1 credit across 1 owner; done; stored in {}\n",
+        c_stored.display()
+    );
+    assert!(text.contains(&expected), "{expected}\nnot in\n{text}");
+    let regrouped = json(&bounty_dir.join("groups.json"));
+    let c_entry = regrouped["sweeps"]
+        .as_array()
+        .expect("sweeps")
+        .iter()
+        .find(|entry| entry["sweep"] == c_sweep.to_string())
+        .expect("C's sweep is grouped");
+    assert_eq!(
+        *c_entry,
+        json!({
+            "sweep": c_sweep.to_string(),
+            "label": "known",
+            "bounties": 1,
+            "owners": 1,
+            "trusted": false,
+        })
+    );
+
+    // The key the test injected under A's keys/ stays unrevoked: P2d's
+    // concurrent `keys revoke` step, after these steps, revokes it.
 }
