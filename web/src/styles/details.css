@@ -1,0 +1,270 @@
+/*
+ * The bounty and sweep pages (04, Views): targets, the sweeper timeline,
+ * credited sweepers and a sweep's fields. The open marker, trust badge,
+ * door and destructive mark come from board.css and base.css; this sheet
+ * lays them out. Rows wrap and pubkys break anywhere, so a 52-character key
+ * or a long SHA never pushes a 375 px page sideways.
+ */
+
+.details h1 {
+  margin: 0 0 0.75rem;
+}
+
+.details__meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.25rem 0.75rem;
+  margin: 0 0 1rem;
+  color: var(--muted-foreground);
+  font-size: 0.875rem;
+}
+
+.details__none {
+  margin: 0;
+  color: var(--muted-foreground);
+  font-size: 0.875rem;
+}
+
+.details__section {
+  margin-top: 2rem;
+}
+
+.details__section h2 {
+  margin: 0 0 0.75rem;
+  font-size: 1.25rem;
+}
+
+.details__absent {
+  max-width: 40rem;
+}
+
+/* A term above its value: one column, so long values wrap instead of
+   squeezing a second one. */
+.details__fields,
+.target__pin {
+  display: grid;
+  gap: 0.125rem;
+  margin: 0;
+  min-width: 0;
+}
+
+.details__fields dt,
+.target__pin dt {
+  margin-top: 0.5rem;
+  color: var(--muted-foreground);
+  font-size: 0.8125rem;
+}
+
+.details__fields dd,
+.target__pin dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+/* The owner's brief as plain text: their line breaks kept, nothing parsed. */
+.bounty-brief {
+  max-width: 48rem;
+  margin: 1rem 0 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.target-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 20rem), 1fr));
+  gap: 1rem;
+}
+
+.target {
+  display: grid;
+  gap: 0.75rem;
+  align-content: start;
+  min-width: 0;
+}
+
+.target__heading {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.target__link {
+  margin: 0;
+  font-size: 0.875rem;
+}
+
+.timeline,
+.target__sweeps,
+.credited {
+  display: grid;
+  gap: 0.625rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.timeline__item,
+.target-sweep,
+.credited__item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.25rem 0.625rem;
+  min-width: 0;
+  font-size: 0.875rem;
+}
+
+.timeline__item .pubky,
+.target-sweep .pubky {
+  flex-basis: 100%;
+}
+
+.timeline__finished {
+  color: var(--muted-foreground);
+}
+
+.sweep-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  font-weight: 600;
+}
+
+/* Struck: the word, beside base.css's destructive mark. */
+.sweep-status--aborted .sweep-status__label {
+  text-decoration: line-through;
+}
+
+.sweep-status--left .sweep-status__label,
+.sweep-status--unrecognised .sweep-status__label {
+  color: var(--muted-foreground);
+}
+
+/*
+ * The Circle page (04, "Visual direction"): a ring of members whose
+ * brightness is their recent activity. Brightness is a --foreground node,
+ * never the colour of text, so every label keeps its contrast; the accent
+ * stays off this page. At 375 px the dial is not drawn and the cards are a
+ * one-column list.
+ */
+
+.member-ring {
+  display: grid;
+  gap: 2rem;
+  margin-top: 1.5rem;
+}
+
+.member-ring__dial {
+  display: none;
+}
+
+.member-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 18rem), 1fr));
+  gap: 1rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+/* Wide enough for the dial beside the cards. */
+@media (min-width: 64rem) {
+  .member-ring {
+    grid-template-columns: 20rem 1fr;
+    align-items: start;
+  }
+
+  .member-ring__dial {
+    --ring-radius: 9rem;
+    display: block;
+    position: sticky;
+    top: 1.5rem;
+    aspect-ratio: 1;
+    border: 1px solid var(--border);
+    border-radius: 50%;
+  }
+}
+
+/* Each node its share of a turn round the dial, from twelve o'clock. */
+.member-ring__node {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 0.875rem;
+  height: 0.875rem;
+  margin: -0.4375rem;
+  border-radius: 50%;
+  transform: rotate(calc(var(--turn) * 1turn)) translateY(calc(-1 * var(--ring-radius)));
+}
+
+.member-ring__node--bright,
+.member--bright .member__glow {
+  background: var(--foreground);
+  box-shadow: 0 0 0.5rem color-mix(in srgb, var(--foreground) 60%, transparent);
+}
+
+.member-ring__node--lit,
+.member--lit .member__glow {
+  background: color-mix(in srgb, var(--foreground) 65%, transparent);
+}
+
+.member-ring__node--dim,
+.member--dim .member__glow {
+  background: color-mix(in srgb, var(--foreground) 30%, transparent);
+}
+
+/* Dark: an outline with nothing lit inside. */
+.member-ring__node--dark,
+.member--dark .member__glow {
+  border: 1px solid var(--muted-foreground);
+}
+
+.member {
+  display: grid;
+  gap: 0.5rem;
+  align-content: start;
+  font-size: 0.875rem;
+}
+
+.member__name {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem 0.5rem;
+  min-width: 0;
+  margin: 0;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.member__glow {
+  flex: none;
+  width: 0.75rem;
+  height: 0.75rem;
+  border-radius: 50%;
+}
+
+.member__role,
+.member__muted {
+  color: var(--muted-foreground);
+}
+
+.member__role {
+  font-weight: 400;
+}
+
+.member > .pubky {
+  margin: 0;
+}
+
+.member__reach {
+  display: grid;
+  gap: 0.25rem;
+}
+
+/* "Unreachable": base.css's destructive mark beside the word. */
+.member__reach--inline {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.375rem;
+}

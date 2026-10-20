@@ -1,0 +1,53 @@
+/*
+ * Pill buttons after pubky-app's Button (src/components/atoms/Button/Button.tsx
+ * at ef6ad207e680169b1b01a6fb92695ffc646583b2): its `brand` variant is
+ * Sweepky's primary, its `default` the default, its `secondary` the secondary,
+ * here with --foreground text.
+ */
+.button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  min-height: 2.5rem;
+  padding: 0.5rem 1rem;
+  border: 1px solid transparent;
+  border-radius: 9999px;
+  box-shadow: var(--shadow-xs);
+  font: inherit;
+  font-size: 0.875rem;
+  font-weight: 600;
+  line-height: 1.25;
+  text-decoration: none;
+  cursor: pointer;
+  transition:
+    background-color 150ms ease,
+    border-color 150ms ease;
+}
+
+.button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.button--primary {
+  border-color: var(--brand);
+  background: var(--brand);
+  color: var(--background);
+}
+
+.button--default {
+  border-color: var(--brand);
+  background: color-mix(in srgb, var(--brand) 16%, transparent);
+  color: var(--brand);
+}
+
+.button--default:hover {
+  background: color-mix(in srgb, var(--brand) 30%, transparent);
+}
+
+.button--secondary {
+  border-color: var(--secondary);
+  background: var(--secondary);
+  color: var(--foreground);
+}

@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+  <!--
+    Sweepky's link-preview cover (04, Page rules): its own mark and a floor
+    plan on pubky-app's dark tokens, as sRGB hex because an image is drawn
+    outside the page's CSS: background #05050a, card #1f1f24, border #2e2e33,
+    muted foreground #89898f, brand #c8ff03. No Pubky or Synonym marks. Art,
+    not data: the board itself never draws a sample room. An XML comment may
+    not hold a double hyphen, so the command that renders og-cover.png is in
+    the metadata element below.
+  -->
+  <metadata>
+    og-cover.png is this file rendered at 1200x630 with the installed Chrome, from web/public/:
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --headless --hide-scrollbars --screenshot="$PWD/og-cover.png" --window-size=1200,630 "file://$PWD/og-cover.svg"
+  </metadata>
+  <rect width="1200" height="630" fill="#05050a"/>
+
+  <!-- The mark and the name. -->
+  <g transform="translate(72 72) scale(2)">
+    <circle cx="16" cy="16" r="13" fill="none" stroke="#c8ff03" stroke-width="2.5"/>
+    <path d="M16 16 L16 5 A11 11 0 0 1 25.5 10.5 Z" fill="#c8ff03"/>
+    <circle cx="16" cy="16" r="2.5" fill="#c8ff03"/>
+  </g>
+  <text x="152" y="122" fill="#ffffff" font-family="'Inter Tight', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="44" font-weight="700">Sweepky</text>
+
+  <text font-family="'Inter Tight', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="64" font-weight="700" fill="#ffffff">
+    <tspan x="72" y="300">Your spare tokens,</tspan>
+    <tspan x="72" y="378"><tspan fill="#c8ff03">sweeping</tspan> for bugs.</tspan>
+  </text>
+  <text x="72" y="470" fill="#89898f" font-family="'Inter Tight', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif" font-size="28">Findings are encrypted to the bounty's owner.</text>
+
+  <!-- The floor plan: four rooms with door gaps in their walls. -->
+  <g fill="#1f1f24" stroke="#2e2e33" stroke-width="4">
+    <rect x="700" y="96" width="200" height="200" rx="8"/>
+    <rect x="928" y="96" width="200" height="200" rx="8"/>
+    <rect x="700" y="324" width="200" height="200" rx="8"/>
+    <rect x="928" y="324" width="200" height="200" rx="8"/>
+  </g>
+  <g fill="#05050a">
+    <rect x="896" y="170" width="8" height="52"/>
+    <rect x="776" y="292" width="52" height="8"/>
+    <rect x="1004" y="320" width="52" height="8"/>
+  </g>
+
+  <!-- A lit room with a detector sweeping it. -->
+  <rect x="700" y="96" width="200" height="200" rx="8" fill="none" stroke="#c8ff03" stroke-width="4"/>
+  <g transform="translate(800 196)">
+    <circle r="62" fill="none" stroke="#c8ff03" stroke-opacity="0.25" stroke-width="3"/>
+    <circle r="40" fill="none" stroke="#c8ff03" stroke-opacity="0.5" stroke-width="3"/>
+    <path d="M0 0 L0 -62 A62 62 0 0 1 53.7 -31 Z" fill="#c8ff03" fill-opacity="0.35"/>
+    <circle r="8" fill="#c8ff03"/>
+  </g>
+
+  <!-- A swept room: an outlined mark on the floor. -->
+  <rect x="928" y="96" width="200" height="200" rx="8" fill="none" stroke="#c8ff03" stroke-opacity="0.55" stroke-width="4"/>
+  <path d="M990 198 L1016 224 L1068 170" fill="none" stroke="#c8ff03" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- A done room, lights off, with credited marks on its door. -->
+  <rect x="928" y="324" width="200" height="200" rx="8" fill="#05050a" stroke="#2e2e33" stroke-width="4"/>
+  <g fill="#89898f">
+    <circle cx="1008" cy="350" r="7"/>
+    <circle cx="1030" cy="350" r="7"/>
+    <circle cx="1052" cy="350" r="7"/>
+  </g>
+
+  <!-- A room still waiting for a sweeper: a hollow outline. -->
+  <circle cx="800" cy="424" r="18" fill="none" stroke="#89898f" stroke-width="3" stroke-dasharray="6 6"/>
+</svg>

@@ -25,7 +25,7 @@ Three identities run side by side, each with its own `SWEEPKY_HOME`; below, `as 
 6. As stranger, in another `init` project: `sweepky run <bounty-url>`, then a synthetic `audit/` whose one finding points at the same file and scope as one real finding under a different id, then `sweepky submit`.
 7. `sweepky pull` as owner; show the groups (the shared location lists both reporters), the `untrusted/` directory holding the stranger's content, and the updated `discovered.json`.
 8. `sweepky done` as owner: the proposal is {sweeper, stranger}; accept.
-9. `pnpm --dir web dev` with `VITE_PUBKY_TESTNET=1`; print the landing and board URLs.
+9. `pnpm --dir web dev` with `VITE_PUBKY_TESTNET=1` and `VITE_SWEEPKY_CIRCLE=<owner pubky>`, so `/` and `/board` show the owner's circle with no `?circle=` in the address; print the landing and board URLs.
 
 ## Done when
 

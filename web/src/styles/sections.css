@@ -1,0 +1,61 @@
+/*
+ * The landing section pattern after pubky-app's landing sections
+ * (src/components/templates/Public/Landing/ at
+ * ef6ad207e680169b1b01a6fb92695ffc646583b2): an uppercase eyebrow in --brand,
+ * a large heading with one word in --brand, a one-line muted subtitle, then a
+ * grid of cards.
+ */
+.section {
+  padding-block: clamp(2.5rem, 8vw, 6rem);
+  scroll-margin-top: 3rem;
+}
+
+.section__header {
+  display: grid;
+  gap: 1.25rem;
+  max-width: 47.5rem;
+  margin-bottom: 2.5rem;
+}
+
+.section__eyebrow {
+  margin: 0;
+  color: var(--brand);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.section__heading {
+  margin: 0;
+  font-size: clamp(2.25rem, 1.5rem + 3.5vw, 3.75rem);
+  font-weight: 700;
+  line-height: 1.1;
+}
+
+.accent {
+  color: var(--brand);
+}
+
+.section__subtitle {
+  margin: 0;
+  color: var(--muted-foreground);
+  font-size: clamp(1rem, 0.9rem + 0.5vw, 1.25rem);
+}
+
+/* As many 16rem columns as fit, one column at 375 px. `min(100%, …)` keeps a
+   column from overflowing a viewport narrower than 16rem. */
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 16rem), 1fr));
+  gap: 1rem;
+}
+
+.card {
+  min-width: 0;
+  padding: 1.5rem;
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--card) 80%, transparent);
+  box-shadow: var(--shadow-sm);
+  color: var(--card-foreground);
+}

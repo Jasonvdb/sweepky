@@ -7,6 +7,10 @@ node_modules/
 dist/
 .vite/
 
+# Playwright's output (web/e2e)
+web/test-results/
+web/playwright-report/
+
 # Local secrets and state (never commit)
 .env
 .env.local
