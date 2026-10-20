@@ -152,16 +152,6 @@ impl LoginState {
     /// grant expires at `grant_expires_at` (Unix seconds), before its device
     /// key is recorded. The grant token itself is not here: it is a secret,
     /// and lives in `grant.token` (`crate::ring::token`).
-    // The Ring login flow, a later P2d step, is the first caller; until then
-    // only the tests build one. `expect` (not `allow`) warns once that is
-    // no longer true, so the attribute cannot outlive its reason.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the Ring login flow, a later P2d step, is the first caller"
-        )
-    )]
     pub(crate) fn ring(pubky: Pubky, homeserver: Pubky, grant_expires_at: u64) -> Self {
         Self {
             schema_version: SchemaVersion::CURRENT,

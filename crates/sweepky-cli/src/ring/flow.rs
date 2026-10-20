@@ -264,43 +264,27 @@ mod tests {
 
     use pubky::Capabilities;
     use pubky_testnet::EphemeralTestnet;
-    use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+    use tokio::sync::mpsc::UnboundedReceiver;
     use url::Url;
 
     use super::{LOGIN_TIMEOUT, NARROWED_GRANT, duration_text, sign_in_with_ring};
+    use crate::Context;
     use crate::network::{CLIENT_ID, SWEEPKY_CAPABILITY};
     use crate::ring::page::terminal_qr;
     use crate::test_support::{
-        RingPage, RingStandIn, SharedBuffer, loopback_get, private_temp, test_context,
+        RingPage, RingStandIn, SharedBuffer, loopback_get, private_temp, ring_context,
+        ring_network, ring_testnet,
     };
-    use crate::{Browser, Context, Network};
 
     /// Two years in seconds, the grant lifetime the SDK fixes.
     const TWO_YEARS: u64 = 2 * 365 * 86_400;
 
-    async fn testnet() -> EphemeralTestnet {
-        EphemeralTestnet::builder()
-            .with_http_relay()
-            .build()
-            .await
-            .expect("testnet starts")
-    }
-
-    /// A context on `testnet` whose browser hands the page's URL to the
-    /// returned receiver, as a test playing Ring needs.
-    fn ring_context(
+    /// A [`ring_context`] on `testnet`, with nothing on standard input.
+    fn ring_context_on(
         testnet: &EphemeralTestnet,
         home: &tempfile::TempDir,
     ) -> (Context, SharedBuffer, UnboundedReceiver<Url>) {
-        let network = Network::injected(
-            testnet.sdk().expect("client"),
-            format!("{}inbox", testnet.http_relay().local_url()),
-            testnet.homeserver_app().public_key(),
-        );
-        let (mut ctx, stderr) = test_context(network, home, io::empty());
-        let (urls, received) = unbounded_channel();
-        ctx.browser = Browser::Notify(urls);
-        (ctx, stderr, received)
+        ring_context(ring_network(testnet), home, io::empty())
     }
 
     /// The value of the query parameter `name` in `link`, if it has one.
@@ -323,9 +307,9 @@ mod tests {
     #[tokio::test]
     #[pubky_testnet::test]
     async fn an_approval_in_ring_flips_the_page_and_signs_in_the_approver() {
-        let testnet = testnet().await;
+        let testnet = ring_testnet().await;
         let home = private_temp();
-        let (ctx, stderr, mut urls) = ring_context(&testnet, &home);
+        let (ctx, stderr, mut urls) = ring_context_on(&testnet, &home);
         let ring = RingStandIn::sign_up(&testnet).await;
         let relay = testnet.http_relay().local_url();
 
@@ -404,9 +388,9 @@ mod tests {
     #[tokio::test]
     #[pubky_testnet::test]
     async fn a_read_only_approval_is_refused_and_its_grant_revoked() {
-        let testnet = testnet().await;
+        let testnet = ring_testnet().await;
         let home = private_temp();
-        let (ctx, _stderr, mut urls) = ring_context(&testnet, &home);
+        let (ctx, _stderr, mut urls) = ring_context_on(&testnet, &home);
         let ring = RingStandIn::sign_up(&testnet).await;
         let read_only = Capabilities::builder()
             .read("/pub/sweepky/")
@@ -432,9 +416,9 @@ mod tests {
     #[tokio::test]
     #[pubky_testnet::test]
     async fn no_approval_in_time_expires_the_flow() {
-        let testnet = testnet().await;
+        let testnet = ring_testnet().await;
         let home = private_temp();
-        let (ctx, _stderr, mut urls) = ring_context(&testnet, &home);
+        let (ctx, _stderr, mut urls) = ring_context_on(&testnet, &home);
 
         let (signed_in, page) =
             tokio::join!(sign_in_with_ring(&ctx, Duration::from_secs(3)), async {

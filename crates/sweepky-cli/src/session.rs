@@ -52,8 +52,8 @@ const WAITING_FOR_LOCK: &str =
 /// What a command that needs a login says when this install has none:
 /// every writing command here, and `keys list`, which needs to know whose
 /// `keys/` to read.
-pub(crate) const NOT_LOGGED_IN: &str =
-    "this install is not logged in; run `sweepky login --identity <name>` first";
+pub(crate) const NOT_LOGGED_IN: &str = "this install is not logged in; run `sweepky login` \
+     (through Pubky Ring) or `sweepky login --identity <name>` (a dedicated identity) first";
 
 /// Takes the writers' lock, runs `work` while holding it, then releases it.
 ///

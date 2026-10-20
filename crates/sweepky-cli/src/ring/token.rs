@@ -186,6 +186,16 @@ pub(crate) fn write_grant_token(
 /// is a [`NeedsPassphrase`](crate::passphrase::NeedsPassphrase) error that
 /// says how to give it. A file that is not a token is a [`MalformedToken`]
 /// error naming the file and none of its content.
+// Read back only by the commands that restore the grant, a later P2d step;
+// `expect` (not `allow`) warns once they call in, so the attribute goes
+// with them.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "restoring the session from the token, a later P2d step, is the first caller"
+    )
+)]
 pub(crate) fn read_grant_token(
     dirs: &Dirs,
     passphrase: Option<&Passphrase>,

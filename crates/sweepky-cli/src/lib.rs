@@ -233,7 +233,7 @@
 //!   writers' lock with a fresh session, the bounty read back, marked done
 //!   by core with the time and the credits, checked against the record cap
 //!   and written again with every field this build does not know kept.
-//! - `ring` (P2d), the local half of the Pubky Ring login so far: the check
+//! - `ring` (P2d), the Pubky Ring login: the check
 //!   that an approved grant can write under `/pub/sweepky/`, the notice
 //!   within 30 days of the grant's expiry and once it has passed, and
 //!   `grant.token`, the owner-only file that holds the grant token the SDK
@@ -246,7 +246,9 @@
 //!   serves it; and the approval flow: the SDK's grant flow on this
 //!   network's own relay, the page opened in the browser beside the
 //!   terminal fallback, a bounded wait, and an approval that cannot write
-//!   `/pub/sweepky/` signed out again and refused.
+//!   `/pub/sweepky/` signed out again and refused; and `login` without
+//!   `--identity`, which runs them and then, under the writers' lock, saves
+//!   the token and runs `login`'s shared tail with the grant's session.
 //!
 //! The rules that hold for everything here (see "Rust conventions" in
 //! `docs/plan/03-cli-and-skill.md`):
@@ -353,18 +355,8 @@ mod prompt;
 // The Pubky Ring login: the check that a grant can write every Sweepky
 // record, the expiry notice, `grant.token`, the grant token's file, the
 // sign-in page with its QR codes, its loopback server and the approval
-// flow that runs them.
-// The `login` command, a later P2d step, is the first caller outside the
-// tests; until then the compiler would warn that nothing here is used.
-// `expect` (not `allow`) warns as soon as that stops being true, so the
-// step that first calls in removes it.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the login command, a later P2d step, is the first caller"
-    )
-)]
+// flow that runs them, and `login` without `--identity`, which puts them
+// together.
 mod ring;
 // `PublicRecords`: anyone's public bounty, circle and sweep records, read
 // with a cap and parsed by core, and bounded listings of their bounties and

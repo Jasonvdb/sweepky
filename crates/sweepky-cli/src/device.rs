@@ -128,6 +128,31 @@ pub(crate) fn device_key_bytes(record: &DeviceKey) -> anyhow::Result<Vec<u8>> {
     serde_json::to_vec(record).context("could not write the device key record")
 }
 
+/// Refuses when anything is at `device.key`, for a login about to make this
+/// install's first device key: whatever is there, `login.json` does not
+/// record it, and Sweepky never replaces a device key, because it may be
+/// the only key that opens the sweeps encrypted to it.
+///
+/// [`create_device_key`] checks this just before it writes, and the Pubky
+/// Ring login checks it before it asks Ring for anything, so a key file
+/// left behind stops that login before the human scans a code. Only the
+/// path is looked at, never the content, so a wrapped file is refused the
+/// same way without the passphrase.
+pub(crate) fn refuse_unrecorded_device_key(dirs: &Dirs) -> anyhow::Result<()> {
+    let path = dirs.device_key_file();
+    // `lstat` does not follow a link, so a link at the path, even one
+    // pointing nowhere, counts as something there.
+    if lstat(&path)?.is_some() {
+        bail!(
+            "{} already holds a device key that login.json does not record; Sweepky never \
+             replaces a device key, because it may be the only key that opens the sweeps \
+             encrypted to it. Move the file somewhere safe and run `sweepky login` again",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 /// Writes `identity` to `device.key` (0600, in the 0700 config directory),
 /// unless something is already there; wrapped with `passphrase` when there
 /// is one.
@@ -142,17 +167,8 @@ pub(crate) fn create_device_key(
     identity: &DeviceIdentity,
     passphrase: Option<&Passphrase>,
 ) -> anyhow::Result<()> {
+    refuse_unrecorded_device_key(dirs)?;
     let path = dirs.device_key_file();
-    // `lstat` does not follow a link, so a link at the path, even one
-    // pointing nowhere, counts as something there.
-    if lstat(&path)?.is_some() {
-        bail!(
-            "{} already holds a device key that login.json does not record; Sweepky never \
-             replaces a device key, because it may be the only key that opens the sweeps \
-             encrypted to it. Move the file somewhere safe and run `sweepky login` again",
-            path.display()
-        );
-    }
     ensure_private_dir(dirs.config())?;
     // `to_secret_string` hands out the identity's text in a `SecretString`,
     // which is wiped when it is dropped at the end of this function;

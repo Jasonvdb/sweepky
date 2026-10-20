@@ -1701,6 +1701,41 @@ pub(crate) async fn loopback_get(url: &Url) -> io::Result<(u16, String)> {
     Ok((status, body.to_owned()))
 }
 
+/// A testnet for the Ring login's tests: an `EphemeralTestnet` with its
+/// HTTP relay, which the grant flow posts the approval through.
+pub(crate) async fn ring_testnet() -> EphemeralTestnet {
+    EphemeralTestnet::builder()
+        .with_http_relay()
+        .build()
+        .await
+        .expect("testnet starts")
+}
+
+/// The [`Network`] of a [`ring_testnet`]: its client, its relay's inbox
+/// and its homeserver as the default.
+pub(crate) fn ring_network(testnet: &EphemeralTestnet) -> Network {
+    Network::injected(
+        testnet.sdk().expect("client"),
+        format!("{}inbox", testnet.http_relay().local_url()),
+        testnet.homeserver_app().public_key(),
+    )
+}
+
+/// A [`test_context`] on `network` whose browser hands the sign-in page's
+/// URL to the returned receiver ([`Browser::Notify`]), as a test playing
+/// Ring needs, and as one checking that no flow started does: its
+/// receiver then has nothing.
+pub(crate) fn ring_context(
+    network: Network,
+    home: &TempDir,
+    stdin: impl BufRead + Send + 'static,
+) -> (Context, SharedBuffer, UnboundedReceiver<Url>) {
+    let (mut ctx, stderr) = test_context(network, home, stdin);
+    let (urls, received) = tokio::sync::mpsc::unbounded_channel();
+    ctx.browser = Browser::Notify(urls);
+    (ctx, stderr, received)
+}
+
 /// The Pubky Ring sign-in page as a test playing Ring sees it: fetched from
 /// the URL `login` handed to [`Browser::Notify`], with the authorization
 /// link and the status URL read off it.

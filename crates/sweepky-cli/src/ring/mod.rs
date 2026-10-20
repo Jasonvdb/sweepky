@@ -3,7 +3,7 @@
 //! and this install keeps the grant token the SDK exports, from which every
 //! later command restores its session.
 //!
-//! What is here so far, all of it the local half of that login:
+//! What is here so far:
 //!
 //! - [`grants_sweepky_write`], the check after approval. A future Ring may
 //!   approve less than Sweepky asked for (`/pub/sweepky/:rw`); a grant that
@@ -26,6 +26,9 @@
 //!   own relay, the page, the terminal fallback and the browser, a bounded
 //!   wait, and the refusal (signed out again) of an approval that cannot
 //!   write `/pub/sweepky/`.
+//! - [`login`], `sweepky login` without `--identity`, which puts them
+//!   together: the checks before the flow, the approval, and under the
+//!   writers' lock the token, P2a's shared tail and `login.json`.
 //!
 //! The checks are pure: they take the capabilities and the times as
 //! arguments, so they are tested without a network or a clock.
@@ -38,6 +41,7 @@ use sweepky_core::RecordTime;
 use crate::network::SWEEPKY_CAPABILITY;
 
 pub(crate) mod flow;
+pub(crate) mod login;
 pub(crate) mod loopback;
 pub(crate) mod page;
 pub(crate) mod token;
@@ -123,6 +127,18 @@ pub(crate) enum ExpiryNotice {
 // Denies plain `+`, `-` and `*` on integers inside this function, which
 // could overflow, so a later edit cannot slip one in.
 #[deny(clippy::arithmetic_side_effects)]
+// The commands that restore the grant show the notice, a later P2d step;
+// until then nothing outside the tests calls this. `expect` (not `allow`)
+// warns once that stops being true, so the attribute cannot outlive its
+// reason. What only this uses (the notice type, the 30 days) is covered by
+// it too.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the expiry warning on later runs, a later P2d step, is the first caller"
+    )
+)]
 pub(crate) fn expiry_notice(now: u64, expires_at: u64) -> Option<ExpiryNotice> {
     // `checked_sub` is `None` when `now` is past `expires_at`. A plain `-`
     // would overflow there: a panic in a debug build, and in a release
