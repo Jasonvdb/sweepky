@@ -48,7 +48,7 @@ use std::process::ExitCode;
 use anyhow::Context as _;
 use clap::Parser;
 use sweepky_cli::{
-    Cli, Context, Dirs, GitEnv, Network, Passphrase, Report, StderrWriter, StdinReader,
+    Browser, Cli, Context, Dirs, GitEnv, Network, Passphrase, Report, StderrWriter, StdinReader,
     TargetSource, run, run_without_context, select_kind,
 };
 
@@ -126,6 +126,8 @@ async fn execute(cli: Cli) -> anyhow::Result<Report> {
         // Real repositories, over https alone. The binary never builds the
         // fixture source, the one that allows git's `file` transport.
         targets: TargetSource::Real,
+        // The Ring sign-in page opens in the user's default browser.
+        browser: Browser::System,
     };
     run(cli, &ctx).await
 }

@@ -66,7 +66,7 @@ use crate::targets::TargetSource;
 use crate::targets::fixture::FixtureTargets;
 use crate::targets::github::GitHubApi;
 use crate::targets::host::{HttpsRemote, ResolveHost};
-use crate::{Context, Dirs, GitEnv, Network, StderrWriter, StdinReader};
+use crate::{Browser, Context, Dirs, GitEnv, Network, StderrWriter, StdinReader};
 
 /// A fresh private directory to work in, created 0700 (`tempfile` passes
 /// `permissions` to the `mkdir` itself; its default would follow the
@@ -174,6 +174,8 @@ pub(crate) fn test_context(
         passphrase: None,
         git_env: test_git_env(),
         targets: TargetSource::Fixture(FixtureTargets::new([])),
+        // No test opens a real browser.
+        browser: Browser::None,
     };
     (ctx, stderr)
 }

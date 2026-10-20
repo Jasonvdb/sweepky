@@ -26,7 +26,7 @@ use pubky::{ClientId, Keypair, Method, PublicKey};
 use pubky_testnet::EphemeralTestnet;
 use serde_json::{Value, json};
 use sweepky_cli::{
-    CLIENT_ID, Cli, Context, Dirs, FixtureTargets, GitEnv, Network, Report, StderrWriter,
+    Browser, CLIENT_ID, Cli, Context, Dirs, FixtureTargets, GitEnv, Network, Report, StderrWriter,
     StdinReader, TargetSource, run,
 };
 use sweepky_core::paths::{self, SweepkyPath};
@@ -312,6 +312,8 @@ fn context(
         // Targets from the fixture repository, so nothing reaches a real
         // repository host.
         targets: fixture_targets(),
+        // Never a real browser. No install logs in through Ring yet.
+        browser: Browser::None,
     };
     (ctx, stderr)
 }

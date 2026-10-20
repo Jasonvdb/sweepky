@@ -286,6 +286,9 @@
     )
 )]
 
+// How `login` opens the Ring sign-in page: the system opener in the
+// binary, nothing or a channel to the test in the tests.
+mod browser;
 // `circle create|add|remove|show`: the roster in `circle.json`.
 mod circle;
 mod cli;
@@ -402,6 +405,7 @@ use std::sync::{Mutex, PoisonError};
 
 use anyhow::bail;
 
+pub use browser::Browser;
 pub use cli::{CircleCommand, Cli, Command, KeysCommand};
 pub use dirs::Dirs;
 pub use git::GitEnv;
@@ -464,6 +468,11 @@ pub struct Context {
     /// [`TargetSource::Real`] in the binary, the fixture repository in the
     /// tests.
     pub targets: TargetSource,
+    /// How `login` opens its Pubky Ring sign-in page: [`Browser::System`]
+    /// in the binary, [`Browser::None`] in most tests, and
+    /// [`Browser::Notify`] in a test that plays Ring and needs the page's
+    /// URL.
+    pub browser: Browser,
 }
 
 /// Where a command writes the lines it says along the way, rather than in
