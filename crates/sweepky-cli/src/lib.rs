@@ -242,7 +242,11 @@
 //!   Ring login as the kind `ring`, with the grant's expiry. And the sign-in
 //!   page, one HTML string with the QR code as an inline SVG, a copy button
 //!   and a live status, made to run under a strict nonce CSP, plus the QR
-//!   code the terminal prints as the fallback.
+//!   code the terminal prints as the fallback; the loopback server that
+//!   serves it; and the approval flow: the SDK's grant flow on this
+//!   network's own relay, the page opened in the browser beside the
+//!   terminal fallback, a bounded wait, and an approval that cannot write
+//!   `/pub/sweepky/` signed out again and refused.
 //!
 //! The rules that hold for everything here (see "Rust conventions" in
 //! `docs/plan/03-cli-and-skill.md`):
@@ -347,9 +351,10 @@ mod private_fs;
 // Standard input, and the one yes-or-no question a command asks on it.
 mod prompt;
 // The Pubky Ring login: the check that a grant can write every Sweepky
-// record, the expiry notice, `grant.token`, the grant token's file, and the
-// sign-in page with its QR codes.
-// The Ring login flow, a later P2d step, is the first caller outside the
+// record, the expiry notice, `grant.token`, the grant token's file, the
+// sign-in page with its QR codes, its loopback server and the approval
+// flow that runs them.
+// The `login` command, a later P2d step, is the first caller outside the
 // tests; until then the compiler would warn that nothing here is used.
 // `expect` (not `allow`) warns as soon as that stops being true, so the
 // step that first calls in removes it.
@@ -357,7 +362,7 @@ mod prompt;
     not(test),
     expect(
         dead_code,
-        reason = "the Ring login flow, a later P2d step, is the first caller"
+        reason = "the login command, a later P2d step, is the first caller"
     )
 )]
 mod ring;

@@ -24,8 +24,10 @@
 //! passphrase the tests wrap secret files with and a byte search to check
 //! a wrapped file shows none of its secret, a compile-time check that a
 //! secret type implements none of the traits that would print or copy it,
-//! and [`stored_findings`], what `pull` stored of a sweep's findings, read
-//! back.
+//! [`stored_findings`], what `pull` stored of a sweep's findings, read
+//! back, and for the Ring login a [`RingStandIn`] that approves in-process
+//! as Pubky Ring would, the [`RingPage`] it reads the link off, and
+//! [`loopback_get`], the raw, capped GET it fetches the page with.
 //!
 //! Compiled only for `cargo test` (`#[cfg(test)]` on its `mod` line in
 //! `lib.rs`), so nothing here reaches the binary, and like any test code it
@@ -41,9 +43,14 @@ use std::net::IpAddr;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use pubky::errors::RequestError;
-use pubky::{Keypair, PubkyHttpClient, PublicKey, StatusCode};
+use pubky::{
+    Capabilities, ClientId, GrantInfo, GrantManager, Keypair, PubkyHttpClient, PubkySession,
+    PubkySigner, PublicKey, StatusCode,
+};
+use pubky_testnet::EphemeralTestnet;
 use serde_json::{Value, json};
 use sweepky_core::paths::{self, SweepkyPath};
 use sweepky_core::{
@@ -52,6 +59,8 @@ use sweepky_core::{
 };
 use tempfile::TempDir;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc::UnboundedReceiver;
+use url::Url;
 
 use crate::device::{KeyIds, KeyStore, PublicKeys};
 use crate::events::EventsFeed;
@@ -1641,3 +1650,192 @@ macro_rules! assert_not_impl_any {
 // `crate::test_support::assert_not_impl_any` for test modules anywhere in the
 // crate.
 pub(crate) use assert_not_impl_any;
+
+/// The most bytes [`loopback_get`] reads of one answer. The sign-in page,
+/// with its QR code as an SVG, is well under this.
+const MAX_LOOPBACK_ANSWER: u64 = 1024 * 1024;
+
+/// How long [`loopback_get`] waits for one answer.
+const LOOPBACK_WAIT: Duration = Duration::from_secs(10);
+
+/// A plain `GET` of `url` on the loopback address, as a browser would send
+/// it, over a raw `TcpStream`: the answer's status code and its body, read
+/// to at most [`MAX_LOOPBACK_ANSWER`] bytes within [`LOOPBACK_WAIT`].
+///
+/// `Err` when nothing answers (the server has stopped). It refuses any URL
+/// that is not `http://127.0.0.1:<port>/...`, so a test cannot send it
+/// anywhere else by mistake.
+pub(crate) async fn loopback_get(url: &Url) -> io::Result<(u16, String)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    assert_eq!(url.scheme(), "http", "{url}");
+    assert_eq!(url.host_str(), Some("127.0.0.1"), "{url}");
+    let port = url.port().expect("the loopback URL names its port");
+    let target = match url.query() {
+        Some(query) => format!("{}?{query}", url.path()),
+        None => url.path().to_owned(),
+    };
+    let exchange = async {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).await?;
+        let request =
+            format!("GET {target} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+        stream.write_all(request.as_bytes()).await?;
+        let mut raw = Vec::new();
+        // `take` caps the read: past the cap it reads as the end of input.
+        stream
+            .take(MAX_LOOPBACK_ANSWER)
+            .read_to_end(&mut raw)
+            .await?;
+        Ok::<_, io::Error>(raw)
+    };
+    let raw = tokio::time::timeout(LOOPBACK_WAIT, exchange)
+        .await
+        .map_err(|_| io::Error::from(ErrorKind::TimedOut))??;
+    let text = String::from_utf8(raw).expect("a UTF-8 answer");
+    let (head, body) = text.split_once("\r\n\r\n").expect("a head and a body");
+    let status = head
+        .split(' ')
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .expect("a status line");
+    Ok((status, body.to_owned()))
+}
+
+/// The Pubky Ring sign-in page as a test playing Ring sees it: fetched from
+/// the URL `login` handed to [`Browser::Notify`], with the authorization
+/// link and the status URL read off it.
+pub(crate) struct RingPage {
+    /// The page's URL, a secret path on `127.0.0.1`.
+    pub(crate) url: Url,
+    /// The page's HTML.
+    pub(crate) html: String,
+    /// The `pubkyauth://` link, un-escaped from the page's `auth-link`.
+    pub(crate) link: String,
+    /// The status URL: the page's `data-status` joined to the page's URL,
+    /// as the page's script resolves it.
+    pub(crate) status_url: Url,
+}
+
+impl RingPage {
+    /// Waits for the page URL on `urls`, fetches the page and reads the
+    /// link and the status URL off it.
+    pub(crate) async fn open(urls: &mut UnboundedReceiver<Url>) -> Self {
+        let url = tokio::time::timeout(LOOPBACK_WAIT, urls.recv())
+            .await
+            .expect("login hands over the page URL in time")
+            .expect("login hands over the page URL");
+        let (status, html) = loopback_get(&url).await.expect("the page answers");
+        assert_eq!(status, 200, "{html}");
+        let link = html_unescape(between(&html, r#"<code id="auth-link">"#, "</code>"));
+        let status_path = html_unescape(between(&html, r#"data-status=""#, r#"""#));
+        let status_url = url.join(&status_path).expect("a status URL");
+        Self {
+            url,
+            html,
+            link,
+            status_url,
+        }
+    }
+
+    /// The status word the page's status URL answers with now.
+    pub(crate) async fn status(&self) -> String {
+        let (code, word) = loopback_get(&self.status_url)
+            .await
+            .expect("the status answers");
+        assert_eq!(code, 200, "{word}");
+        word
+    }
+
+    /// Asks the status about every 100 ms until it is no longer `waiting`,
+    /// and returns that final word.
+    pub(crate) async fn final_status(&self) -> String {
+        for _ in 0..300 {
+            let word = self.status().await;
+            if word != "waiting" {
+                return word;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("the status stayed `waiting` for 30 s");
+    }
+}
+
+/// The text of `html` between the first `start` and the next `end` after it.
+fn between<'a>(html: &'a str, start: &str, end: &str) -> &'a str {
+    let (_, rest) = html.split_once(start).expect("the start marker");
+    let (inside, _) = rest.split_once(end).expect("the end marker");
+    inside
+}
+
+/// The page's HTML escapes undone (`ring::page::html_escape`'s five), with
+/// `&amp;` last so that an escaped entity is not unescaped twice.
+fn html_unescape(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&")
+}
+
+/// An in-process stand-in for Pubky Ring: a keypair signed up on a testnet
+/// homeserver, which approves a sign-in link as Ring would
+/// (`PubkySigner::approve_auth`), and a root session of its own, which
+/// lists the identity's grants the way Ring's grant list does.
+///
+/// No `Debug`: it holds a signer and a session.
+pub(crate) struct RingStandIn {
+    signer: PubkySigner,
+    root: PubkySession,
+}
+
+impl RingStandIn {
+    /// A fresh identity signed up on `testnet`'s homeserver, signed in with
+    /// its root key under the client id `ring-stand-in`.
+    pub(crate) async fn sign_up(testnet: &EphemeralTestnet) -> Self {
+        let signer = testnet.sdk().expect("client").signer(Keypair::random());
+        signer
+            .signup(&testnet.homeserver_app().public_key(), None)
+            .await
+            .expect("signs up");
+        let root = signer
+            .signin(ClientId::new("ring-stand-in").expect("a client id"))
+            .await
+            .expect("signs in");
+        Self { signer, root }
+    }
+
+    /// The identity's public key.
+    pub(crate) fn public_key(&self) -> PublicKey {
+        self.root.public_key()
+    }
+
+    /// Approves `page`'s link in full, as Ring's approve button does.
+    pub(crate) async fn approve(&self, page: &RingPage) {
+        self.signer
+            .approve_auth(&page.link)
+            .await
+            .expect("approves");
+    }
+
+    /// Approves `page`'s link with `capabilities` only, as a Ring that
+    /// narrows a request would.
+    pub(crate) async fn approve_with(&self, page: &RingPage, capabilities: &Capabilities) {
+        self.signer
+            .approve_auth_with_capabilities(&page.link, capabilities)
+            .await
+            .expect("approves");
+    }
+
+    /// The identity's active grants made for `client_id`, from the
+    /// homeserver's grant list (`GrantManager::list`, which needs this root
+    /// session).
+    pub(crate) async fn active_grants_for(&self, client_id: &str) -> Vec<GrantInfo> {
+        GrantManager::new(&self.root)
+            .list()
+            .await
+            .expect("lists the grants")
+            .into_iter()
+            .filter(|grant| grant.client_id == client_id)
+            .collect()
+    }
+}

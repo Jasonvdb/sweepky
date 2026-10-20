@@ -58,13 +58,6 @@ impl Browser {
     ///
     /// The URL is a secret (its path guards the page), so it goes to the
     /// opener and the channel only, never into a message.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the Ring login flow, a later P2d step, is the first caller"
-        )
-    )]
     pub(crate) async fn open(&self, url: &Url, stderr: &StderrWriter) -> anyhow::Result<bool> {
         match self {
             Self::System => launch(opener_command(url), OPENER_WAIT, stderr).await,

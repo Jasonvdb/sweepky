@@ -22,6 +22,10 @@
 //! - [`loopback`], that server: one flow's page and status on `127.0.0.1`
 //!   at a random port and secret path, under a strict CSP, with bounded
 //!   connections, reads and lifetime.
+//! - [`flow`], the approval itself: the SDK's grant flow on this network's
+//!   own relay, the page, the terminal fallback and the browser, a bounded
+//!   wait, and the refusal (signed out again) of an approval that cannot
+//!   write `/pub/sweepky/`.
 //!
 //! The checks are pure: they take the capabilities and the times as
 //! arguments, so they are tested without a network or a clock.
@@ -33,6 +37,7 @@ use sweepky_core::RecordTime;
 
 use crate::network::SWEEPKY_CAPABILITY;
 
+pub(crate) mod flow;
 pub(crate) mod loopback;
 pub(crate) mod page;
 pub(crate) mod token;
