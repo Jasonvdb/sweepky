@@ -20,6 +20,15 @@ export default defineConfig(({ mode }) => {
   return {
     envDir: webDir,
     plugins: [react()],
+    build: {
+      // The Pubky SDK's chunk, which src/net/sdk.ts loads with a dynamic
+      // import, is 3,404 kB at 0.16.2: its browser entry inlines a 2.5 MB
+      // WASM module as base64, so splitting cannot shrink it. The limit
+      // sits just above it, so that chunk does not warn and anything as
+      // large again, an SDK upgrade included, still does. In kB of
+      // 1000 bytes, as Vite reports sizes.
+      chunkSizeWarningLimit: 3500,
+    },
     test: {
       // Unit tests under src/ only, so browser specs kept outside it never
       // load under vitest.
