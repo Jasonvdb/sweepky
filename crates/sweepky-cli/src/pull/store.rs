@@ -379,7 +379,11 @@ fn copy_path(
 /// added. Each entry is kept once, folded to lower case, and a second one
 /// that folds the same is a collision, so the work is linear in the paths'
 /// length and stops as the count passes [`MAX_ENTRIES`].
-fn check_paths(files: &PackageFiles) -> anyhow::Result<()> {
+///
+/// [`store_sweep`] runs it first. `pull::open` runs it too, before the
+/// store, so that a package refused here, which every later run would
+/// refuse again, is told apart from a store that failed.
+pub(crate) fn check_paths(files: &PackageFiles) -> anyhow::Result<()> {
     if files.len() > MAX_ENTRIES {
         return Err(too_many_entries());
     }

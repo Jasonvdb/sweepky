@@ -306,7 +306,8 @@ impl BountySummary {
 
 /// What `pull` keeps of a sweep record between runs: what it sweeps
 /// (`bounty`, `targets`), whether it can still change (`status`), the tag
-/// to send back, and whether its package has been pulled.
+/// to send back, and whether its package has been pulled, or refused for
+/// good.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct SweepSummary {
     /// The bounty the record names.
@@ -319,6 +320,15 @@ pub(crate) struct SweepSummary {
     pub(crate) etag: Option<ETag>,
     /// Whether its package has been decrypted into the data directory.
     pub(crate) pulled: bool,
+    /// Whether `pull` read its package and refused it for a reason a later
+    /// run would meet again, such as a package not encrypted to this
+    /// install's key (`pull::open`), so it is not read again.
+    // `default`: a file written before this field reads as `false`.
+    // `skip_serializing_if` leaves it out while `false`, so such a file is
+    // written back as it was. `Not::not` is `!` as a function, which serde
+    // calls with `&self.refused`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) refused: bool,
     /// Fields a newer Sweepky wrote here, kept for the rewrite.
     #[serde(flatten)]
     extra: UnknownFields,
@@ -333,16 +343,18 @@ impl SweepSummary {
             status: sweep.status.clone(),
             etag,
             pulled: false,
+            refused: false,
             extra: UnknownFields::new(),
         }
     }
 
     /// Brings this summary up to date with `sweep`, read again with the new
-    /// tag `etag`, keeping whether its package was pulled and the fields a
-    /// newer Sweepky wrote here.
+    /// tag `etag`, keeping whether its package was pulled or refused and
+    /// the fields a newer Sweepky wrote here.
     pub(crate) fn update(&mut self, sweep: &Sweep, etag: Option<ETag>) {
         *self = Self {
             pulled: self.pulled,
+            refused: self.refused,
             extra: std::mem::take(&mut self.extra),
             ..Self::new(sweep, etag)
         };
@@ -799,7 +811,7 @@ mod tests {
     }
 
     #[test]
-    fn an_update_takes_the_record_s_fields_and_keeps_pulled_and_unknown_fields() {
+    fn an_update_takes_the_record_s_fields_and_keeps_pulled_refused_and_unknown_fields() {
         let bounty = BountyRef {
             owner: random_pubky(),
             id: record_id(10),
@@ -812,7 +824,7 @@ mod tests {
         .expect("a summary");
         let mut sweep_summary: SweepSummary = serde_json::from_value(json!({
             "bounty": bounty.to_string(), "targets": ["t1"], "status": "running",
-            "etag": "\"s-1\"", "pulled": true, "progress": "kept",
+            "etag": "\"s-1\"", "pulled": false, "refused": true, "progress": "kept",
         }))
         .expect("a summary");
 
@@ -836,9 +848,14 @@ mod tests {
             serde_json::to_value(&sweep_summary).expect("JSON"),
             json!({
                 "bounty": bounty.to_string(), "targets": ["t1", "t2"], "status": "done",
-                "etag": null, "pulled": true, "progress": "kept",
+                "etag": null, "pulled": false, "refused": true, "progress": "kept",
             })
         );
+        // A new summary is not refused, and leaves the field out, as a file
+        // written before it had none.
+        let fresh = serde_json::to_value(SweepSummary::new(&finished, None)).expect("JSON");
+        assert_eq!(fresh.get("refused"), None);
+        assert_eq!(fresh["pulled"], json!(false));
     }
 
     #[test]

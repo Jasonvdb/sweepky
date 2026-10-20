@@ -114,14 +114,8 @@ pub(crate) trait PublicRecords {
 
     /// The encrypted package of `sweep`, `sweeps/<id>.age` of its sweeper,
     /// at most [`MAX_CIPHERTEXT_BYTES`](sweepky_core::MAX_CIPHERTEXT_BYTES),
-    /// or `None` when there is none.
-    // No caller outside the tests yet, so outside them the compiler would
-    // warn that the method is never used. `expect` (not `allow`) silences
-    // that only while it is true: `pull`, its first caller, must remove it.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "pull, its first caller, comes in a later step")
-    )]
+    /// or `None` when there is none. `pull::open` reads each sweep's
+    /// package through it, from the path it read the record from.
     async fn get_package(&self, sweep: SweepRef) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>>;
 
     /// The bounty `bounty` points at, `bounties/<id>.json` of its owner, or
