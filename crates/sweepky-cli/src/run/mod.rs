@@ -20,7 +20,8 @@
 //!    `fetch::check_sweep_dir` checks that `./sweeps/<id>/` can be made,
 //!    and `sweep_state` that no snapshot of a fetch is there for that id.
 //! 2. **Publish `running`.** `sweeps/<id>.json`, under the writers' lock
-//!    with a fresh session, signed out again at once
+//!    with a fresh session, ended again at once (an identity's signed out,
+//!    a Ring one only dropped)
 //!    ([`LockedSessionPublisher`]). A refused write ends the run here: no
 //!    git has run and no directory was made.
 //! 3. **Fetch, outside the lock.** `fetch::fetch_sweep` builds the sweep
@@ -45,7 +46,7 @@
 //!    `/sweepky`, then `sweepky submit --run-dir sweeps/<id>`.
 //!
 //! So the lock is held twice at most, for the running write and for the
-//! flip, each time around a sign-in, one PUT and a sign-out, and never
+//! flip, each time around a sign-in or restore, one PUT and a sign-out, and never
 //! while git runs or the bounty is read.
 //!
 //! **The playbook.** The record's `playbook` is the one the project's
@@ -262,8 +263,9 @@ trait PublishRecord {
 }
 
 /// The real [`PublishRecord`]: each write under the writers' lock, with a
-/// session signed in for it alone and signed out at once, so the lock is
-/// held around a sign-in, one PUT and a sign-out, and never while git runs.
+/// session opened for it alone and ended at once (an identity's signed
+/// out, a Ring one only dropped), so the lock is held around a sign-in or
+/// restore, one PUT and a sign-out, and never while git runs.
 struct LockedSessionPublisher<'a> {
     ctx: &'a Context,
     /// The pubky `run` checked the bounty for, which the session must be.
@@ -274,7 +276,7 @@ impl PublishRecord for LockedSessionPublisher<'_> {
     async fn publish(&self, path: &str, record: Vec<u8>) -> anyhow::Result<()> {
         // `async move` moves `record` into the body, and copies `self` and
         // `path`, which are references. The body only borrows the session,
-        // so `with_writer_session` signs it out whatever the body returns.
+        // so `with_writer_session` ends it whatever the body returns.
         with_writer_session(self.ctx, async move |signed| {
             // `login.json` is read again under the lock. A `login` as
             // another identity since `run` read it would publish this sweep

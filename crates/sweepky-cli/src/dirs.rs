@@ -17,6 +17,7 @@
 //! | `installs.json` | the device ids this owner's own installs created |
 //! | `owner-keys.json` | per bounty owner, the keys `submit` last encrypted a sweep to, pinned (`crate::pins`) |
 //! | `device.key` | this install's age identity |
+//! | `grant.token` | the Pubky Ring login's grant token, the SDK's exported string, optionally passphrase-wrapped (`crate::ring::token`) |
 //! | `identities/<name>.key` | a dedicated identity's secret (`login --identity`) |
 //! | `identities/<name>.json` | that identity's public details |
 //!
@@ -158,6 +159,12 @@ impl Dirs {
     /// `config/device.key`: this install's age identity.
     pub fn device_key_file(&self) -> PathBuf {
         self.config.join("device.key")
+    }
+
+    /// `config/grant.token`: the grant token of a Pubky Ring login, the
+    /// secret every later command restores its session from.
+    pub fn grant_token_file(&self) -> PathBuf {
+        self.config.join("grant.token")
     }
 
     /// `config/identities/`, the dedicated identities' directory.
@@ -316,6 +323,7 @@ mod tests {
         assert_eq!(dirs.login_file(), Path::new("/x/config/login.json"));
         assert_eq!(dirs.installs_file(), Path::new("/x/config/installs.json"));
         assert_eq!(dirs.device_key_file(), Path::new("/x/config/device.key"));
+        assert_eq!(dirs.grant_token_file(), Path::new("/x/config/grant.token"));
         assert_eq!(
             dirs.owner_keys_file(),
             Path::new("/x/config/owner-keys.json")

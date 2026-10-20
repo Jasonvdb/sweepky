@@ -23,6 +23,20 @@ use sweepky_core::{RecordId, RecordTime, Timestamp};
 /// second. A clock set before 1970 or after the year 9999 is an error with a
 /// message, never a panic.
 pub(crate) fn now() -> anyhow::Result<RecordTime> {
+    // Core refuses a year past 9999; `context` puts what to do in front of
+    // core's reason.
+    RecordTime::from_unix_seconds(now_unix_seconds()?)
+        .context("the system clock reads a time Sweepky cannot write; set it to the right time and try again")
+}
+
+/// The current time in whole seconds since 1970-01-01T00:00:00Z, the form a
+/// Ring login's `grantExpiresAt` is compared in. A clock set before 1970 is
+/// an error with a message, never a panic.
+///
+/// The Pubky SDK reads the clock itself in a function that panics on such a
+/// clock, so a Ring restore calls this first: the bad clock is then refused
+/// here, with words, before the SDK is ever reached.
+pub(crate) fn now_unix_seconds() -> anyhow::Result<u64> {
     // `duration_since` returns an `Err` when the clock reads earlier than the
     // epoch. Its own message ("second time provided was later than self")
     // describes the subtraction, not the problem, so `let ... else` drops it
@@ -32,10 +46,8 @@ pub(crate) fn now() -> anyhow::Result<RecordTime> {
             "the system clock reads earlier than 1970-01-01T00:00:00Z; set it to the right time and try again"
         );
     };
-    // `as_secs` drops the fraction of a second. Core refuses a year past
-    // 9999; `context` puts what to do in front of core's reason.
-    RecordTime::from_unix_seconds(since_epoch.as_secs())
-        .context("the system clock reads a time Sweepky cannot write; set it to the right time and try again")
+    // `as_secs` drops the fraction of a second.
+    Ok(since_epoch.as_secs())
 }
 
 /// The id of a new record, from the clock: 13 characters of upper-case

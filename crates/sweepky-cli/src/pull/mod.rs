@@ -28,8 +28,8 @@
 //!    `merged.json`, the second the circle's findings alone.
 //! 7. **The `discovered.json` write** (`discovered`), `pull`'s one public
 //!    write and the one step that takes the writers' lock, with a fresh
-//!    session that is always signed out, and only when a file's sweeps
-//!    change.
+//!    session (an identity's signed out afterwards, a Ring one only
+//!    dropped), and only when a file's sweeps change.
 //!
 //! `state` is the local state `pull` keeps between runs, whose feed cursors
 //! `post --open` writes too.

@@ -443,10 +443,11 @@ trait FinishSweep {
     async fn finish(&self, upload: Upload<'_>) -> anyhow::Result<()>;
 }
 
-/// The real [`FinishSweep`]: the writers' lock and a session signed in for
-/// these steps alone, and signed out at once, so the lock is held around
-/// a sign-in, the pin write, the uploads and a sign-out, and never while
-/// a question waits on a person.
+/// The real [`FinishSweep`]: the writers' lock and a session opened for
+/// these steps alone and ended at once (an identity's signed out, a Ring
+/// one only dropped), so the lock is held around a sign-in or restore, the
+/// pin write, the uploads and a sign-out, and never while a question waits
+/// on a person.
 struct LockedSession<'a> {
     ctx: &'a Context,
     /// The pubky the sweep directory was checked for, which the session
@@ -457,12 +458,12 @@ struct LockedSession<'a> {
 impl FinishSweep for LockedSession<'_> {
     async fn finish(&self, upload: Upload<'_>) -> anyhow::Result<()> {
         // `async move` moves `upload` into the body. The body only borrows
-        // the session, so `with_writer_session` signs it out whatever the
-        // body returns.
+        // the session, so `with_writer_session` ends it whatever the body
+        // returns.
         //
         // The body hands its own result back inside an `Ok`, so an `Err`
         // out of `with_writer_session` is one the body never saw: the lock
-        // or the sign-in failed, before anything was written. Only that
+        // or the sign-in or restore failed, before anything was written. Only that
         // one gets [`STILL_RUNNING`] here; `?` then leaves the body's own
         // result, whose errors say what they changed, as the value.
         with_writer_session(self.ctx, async move |signed| {

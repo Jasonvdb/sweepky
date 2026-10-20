@@ -28,12 +28,13 @@
 //! 4. **The question**, `prompt::confirm`, unless the flags settle every
 //!    name ([`Decision::of`]). A no writes nothing; `--no-input` fails
 //!    naming the question.
-//! 5. **The rewrite**, under the writers' lock with a fresh session that
-//!    is always signed out: `login.json` still the owner's, the bounty read
+//! 5. **The rewrite**, under the writers' lock with a fresh session (an
+//!    identity session signed out afterwards, a Ring one only dropped):
+//!    `login.json` still the owner's, the bounty read
 //!    back through the session, core's `Bounty::mark_done` with
 //!    `clock::now()` (which refuses the owner again), the record checked
-//!    against `MAX_RECORD_BYTES`, then PUT. The lock covers the sign-in,
-//!    the read-back, the PUT and the sign-out alone; the question is
+//!    against `MAX_RECORD_BYTES`, then PUT. The lock covers the sign-in
+//!    or restore, the read-back, the PUT and the sign-out alone; the question is
 //!    asked before it, so no person's answer ever holds it.
 //!
 //! **"Unless flags settle it"** (P2c's reading): no question only when a
@@ -804,22 +805,23 @@ struct Marked {
 /// callers take `&impl MarkUnderLock`.
 trait MarkUnderLock {
     /// Marks `bounty` done crediting `credits`, as [`rewrite`] does, at
-    /// the time now, under the lock with a fresh session, signed out
-    /// afterwards whatever happened.
+    /// the time now, under the lock with a fresh session, ended afterwards
+    /// whatever happened (an identity's signed out, a Ring one dropped).
     async fn mark(&self, bounty: BountyRef, credits: &[Pubky]) -> anyhow::Result<Marked>;
 }
 
 /// The real [`MarkUnderLock`]: `session::with_writer_session`, which takes
-/// the lock, signs in afresh, runs the rewrite, then signs out and lets the
-/// lock go, also when it fails.
+/// the lock, signs in or restores afresh, runs the rewrite, then ends the
+/// session (signs an identity's out, drops a Ring one) and lets the lock
+/// go, also when it fails.
 struct LockedSession<'a> {
     ctx: &'a Context,
 }
 
 impl MarkUnderLock for LockedSession<'_> {
     async fn mark(&self, bounty: BountyRef, credits: &[Pubky]) -> anyhow::Result<Marked> {
-        // The body only borrows the session, so `with_writer_session` signs
-        // it out whatever the body returns.
+        // The body only borrows the session, so `with_writer_session` ends
+        // it whatever the body returns.
         with_writer_session(self.ctx, async move |signed| {
             // `login.json` is read again under the lock: a `login` as
             // another identity since would write into that one's storage.
