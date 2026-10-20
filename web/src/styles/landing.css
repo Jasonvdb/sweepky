@@ -1,0 +1,133 @@
+/*
+ * The landing page (routes/Landing.tsx): the hero with the board's compact
+ * floor plan beside it, the two lanes of How it works, the trust-label
+ * legend and the final call to action. The sections themselves are
+ * sections.css's pattern. Every grid falls to one column at 375 px, and
+ * nothing here moves: the hero's detectors pulse through board.css's rules,
+ * which base.css's reduced-motion stop already covers.
+ */
+
+.landing-hero {
+  padding-block: clamp(2.5rem, 8vw, 6rem);
+}
+
+.landing-hero__inner {
+  display: grid;
+  gap: 2.5rem;
+  align-items: start;
+}
+
+/* Side by side once both columns have room; `minmax(0, …)` lets a long
+   pubky in the plan shrink its column instead of widening the page. */
+@media (min-width: 56rem) {
+  .landing-hero__inner {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+}
+
+.landing-hero__text {
+  display: grid;
+  gap: 1.5rem;
+}
+
+.landing-hero__title {
+  margin: 0;
+  font-size: clamp(2.5rem, 1.5rem + 4.5vw, 4.5rem);
+  font-weight: 700;
+  line-height: 1.05;
+}
+
+.landing-hero__subtitle {
+  margin: 0;
+  color: var(--muted-foreground);
+  font-size: clamp(1.0625rem, 0.95rem + 0.5vw, 1.25rem);
+}
+
+/* The read-only frame around the live plan. */
+.landing-hero__visual {
+  display: grid;
+  gap: 1rem;
+  min-width: 0;
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.landing-hero__caption {
+  margin: 0;
+  color: var(--muted-foreground);
+  font-size: 0.875rem;
+}
+
+/* The cards and the trust-label legend are lists of cards. */
+.landing-cards,
+.landing-labels {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.landing-card__title {
+  margin: 0 0 0.5rem;
+  font-size: 1.125rem;
+}
+
+.landing-cards p,
+.landing-labels p {
+  margin: 0.5rem 0 0;
+}
+
+/* The lanes are cards, so an anchor jump stops below the page's top edge
+   as a section's does (sections.css). */
+.landing-lanes {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 22rem), 1fr));
+  gap: 1rem;
+}
+
+.landing-lane {
+  scroll-margin-top: 3rem;
+}
+
+.landing-lane__label {
+  margin: 0 0 1rem;
+  color: var(--foreground);
+  font-size: 1.25rem;
+}
+
+.landing-lane__steps {
+  display: grid;
+  gap: 1rem;
+  margin: 0;
+  padding-left: 1.25rem;
+}
+
+.landing-lane__steps code {
+  color: var(--foreground);
+  font-weight: 600;
+}
+
+.landing-note {
+  max-width: 47.5rem;
+  margin: 1.5rem 0 0;
+  color: var(--muted-foreground);
+}
+
+.landing-start {
+  display: grid;
+  gap: 1.5rem;
+  justify-items: start;
+}
+
+.landing-install {
+  margin: 0;
+  font-family: var(--font-mono);
+}
+
+.landing-credits {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1.5rem;
+  margin: 0;
+  color: var(--muted-foreground);
+}

@@ -1,5 +1,5 @@
 // Checks on the files a static host serves as they are, outside the bundle.
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 
 function readWebFile(path: string): string {
@@ -30,5 +30,35 @@ describe('hosting', () => {
     expect(fontLink).not.toBeNull()
     expect(fontLink?.[0]).toContain('rel="stylesheet"')
     expect(fontLink?.[0]).toMatch(/\scrossorigin(\s|>|="anonymous")/)
+  })
+
+  // Link previews work without JavaScript (04, Page rules).
+  describe('index.html link preview', () => {
+    const html = readWebFile('index.html')
+
+    /** The `content` of the `<meta>` whose `attribute` is `name`. */
+    function meta(attribute: 'name' | 'property', name: string): string | undefined {
+      const tag = html.match(new RegExp(`<meta\\b[^>]*\\b${attribute}="${name}"[^>]*>`))?.[0]
+      return tag?.match(/\bcontent="([^"]*)"/)?.[1]
+    }
+
+    it('has a title and a description', () => {
+      expect(html).toMatch(/<title>[^<]+<\/title>/)
+      expect(meta('name', 'description')).toMatch(/\S/)
+    })
+
+    it.each(['og:title', 'og:description', 'og:image'])('has %s', (property) => {
+      expect(meta('property', property)).toMatch(/\S/)
+    })
+
+    it('has a large twitter card', () => {
+      expect(meta('name', 'twitter:card')).toBe('summary_large_image')
+    })
+
+    it("points og:image at Sweepky's own cover, a file the host serves", () => {
+      const image = meta('property', 'og:image') ?? ''
+      expect(image).toMatch(/^\/[\w-]+\.png$/)
+      expect(existsSync(new URL(`../public${image}`, import.meta.url))).toBe(true)
+    })
   })
 })

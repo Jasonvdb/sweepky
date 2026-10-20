@@ -20,6 +20,7 @@ import './styles/sections.css'
 import './styles/layout.css'
 import './styles/board.css'
 import './styles/details.css'
+import './styles/landing.css'
 
 const root = document.getElementById('root')
 if (root === null) {
