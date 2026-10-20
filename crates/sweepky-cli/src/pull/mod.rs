@@ -34,6 +34,16 @@
 //! `state` is the local state `pull` keeps between runs, whose feed cursors
 //! `post --open` writes too.
 //!
+//! **One pull at a time.** After step 1, `pull` takes the pull lock
+//! (`lock::PullLock`, on `<config>/pull.lock`) and holds it to the end of
+//! step 7, so a second `pull` of this install, a scheduled one beside a
+//! manual one, waits for the first, says so on standard error, and gives
+//! up past the lock's timeout saying another pull is running. Each step
+//! writes the local state back whole, built from what the run read as it
+//! started, so two runs at once would write over each other's steps. The
+//! writers' lock is still taken in step 7 alone: held for the whole run, it
+//! would keep `post`, `run`, `submit` and `done` waiting on every `pull`.
+//!
 //! **The report** says, after any alarm: for each watched homeserver whose
 //! feed was read, the cursor its read started after and where that cursor
 //! came from (this install's `feed-cursors.json`, an open bounty's
@@ -80,6 +90,7 @@ use crate::display::{MAX_LABEL_CHARS, sanitize};
 use crate::events::{EventsFeed, HomeserverEvents, SEARCH_PACE};
 use crate::installs::read_installs;
 use crate::keys::key_alarms;
+use crate::lock::PullLock;
 use crate::passphrase::Passphrase;
 use crate::records::{PublicRecordReader, PublicRecords};
 use crate::remote::{pubky_of, public_key_of};
@@ -92,6 +103,11 @@ use crate::{Context, Dirs, Report};
 /// can open no sweep, and only `login` makes one.
 const NO_DEVICE_KEY: &str =
     "this install has no device key, so pull cannot open sweeps: run `sweepky login`";
+
+/// What `pull` says while another `pull` of this install holds the pull
+/// lock.
+const WAITING_FOR_PULL: &str =
+    "waiting for another sweepky pull on this install to finish (it holds the pull lock)";
 
 /// What `pull` adds to a failure to write the poll state back.
 const STATE_NOT_SAVED: &str = "pull could not save what it read this time";
@@ -133,7 +149,19 @@ pub(crate) async fn pull(ctx: &Context) -> anyhow::Result<Report> {
         writer: &writer,
         pace: SEARCH_PACE,
     };
-    pull_with(&seams, &ctx.dirs, install, &watched_homeservers(ctx)).await
+    // One pull at a time on this install, from its first read of the local
+    // state to its last write (`crate::lock`). `install` moves into the
+    // closure, which `hold` calls once, and on into `pull_with`.
+    let mut lock = PullLock::open(&ctx.dirs)?;
+    lock.hold(
+        // A courtesy, as for the writers' lock: if standard error cannot be
+        // written, the pull still waits and goes on.
+        || {
+            let _ = ctx.stderr.line(WAITING_FOR_PULL);
+        },
+        async || pull_with(&seams, &ctx.dirs, install, &watched_homeservers(ctx)).await,
+    )
+    .await
 }
 
 /// The watch list of the context's network, as core's keys: the
@@ -590,6 +618,7 @@ fn push_line(text: &mut String, line: &str) {
 mod tests {
     use std::io;
     use std::mem;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     use clap::Parser;
@@ -601,16 +630,19 @@ mod tests {
         MAX_RECORD_BYTES, Pubky, PubkyUrl, SweepPackage, SweepRef, seal_package,
     };
     use tempfile::TempDir;
+    use tokio::sync::oneshot;
+    use tokio::time::sleep;
 
     use super::discovered::FakeSession;
     use super::feed::MAX_ACCEPTED_PER_BOUNTY;
     use super::state::{FeedCursors, PollState};
-    use super::{NO_DEVICE_KEY, Seams, ThisInstall, pull_with};
+    use super::{NO_DEVICE_KEY, Seams, ThisInstall, WAITING_FOR_PULL, pull_with};
     use crate::device::{
         create_device_key, device_key_bytes, device_key_record, remove_device_key,
     };
     use crate::identity::IdentityName;
     use crate::installs::record_install_key;
+    use crate::lock::PullLock;
     use crate::own_storage::OwnStorage;
     use crate::passphrase::{NeedsPassphrase, Passphrase};
     use crate::session::NOT_LOGGED_IN;
@@ -955,6 +987,52 @@ mod tests {
         assert_eq!(relay.heads().len(), asked);
     }
 
+    // Two pulls of one install never run at once: the second waits for the
+    // first's pull lock, says so once, and starts only once the first lets
+    // go. The first is the lock itself, opened as `pull` opens it: a `flock`
+    // belongs to one open of the file, so two opens in one process exclude
+    // each other as two processes do. All three futures run in this one
+    // task (`tokio::join!`), each going on while the others wait.
+    #[tokio::test]
+    async fn a_second_pull_waits_for_the_first_to_finish_and_says_so() {
+        let home = private_temp();
+        let (ctx, stderr) = test_context(offline_network(), &home, io::empty());
+        log_in(&ctx.dirs, random_pubky(), &DeviceIdentity::generate(), None);
+        let mut first = PullLock::open(&ctx.dirs).expect("opened");
+        let (release, released) = oneshot::channel::<()>();
+        let let_go = AtomicBool::new(false);
+
+        let holding = first.hold(
+            || {},
+            async || {
+                released.await.expect("the test lets go");
+                let_go.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        );
+        let second = async {
+            let cli = Cli::try_parse_from(["sweepky", "pull"]).expect("parses");
+            let pulled = crate::run(cli, &ctx).await;
+            assert!(
+                let_go.load(Ordering::SeqCst),
+                "the second pull ran while the first held the lock"
+            );
+            pulled
+        };
+        let watching = async {
+            sleep(Duration::from_millis(300)).await;
+            // Still waiting, having said so once, and having written none of
+            // pull's state.
+            assert_eq!(stderr.text().matches(WAITING_FOR_PULL).count(), 1);
+            assert!(!ctx.dirs.poll_state_file().exists());
+            release.send(()).expect("the first holds the lock");
+        };
+        let (held, pulled, ()) = tokio::join!(holding, second, watching);
+        held.expect("held");
+        pulled.expect("pulled once the first let go");
+        assert!(ctx.dirs.poll_state_file().exists());
+    }
+
     #[tokio::test]
     async fn the_report_gives_each_sweep_its_label_its_status_and_where_it_is_all_sanitised() {
         let mut fx = Install::new();
@@ -1154,6 +1232,41 @@ mod tests {
             line_of(&report, stranger),
             format!("  {stranger}: unknown; running; not stored: still running")
         );
+    }
+
+    #[tokio::test]
+    async fn a_stranger_s_sweep_rewritten_for_another_open_bounty_moves_to_that_one_s_file() {
+        let mut fx = Install::new();
+        let first = fx.post_open(1, &[(fx.home, 0)], &[]);
+        let second = fx.post_open(2, &[(fx.home, 0)], &[]);
+        let stranger = random_pubky();
+        let moved = fx.sweep(stranger, 10, first, "running", &[]);
+        fx.feed = FakeEventsFeed::of_events(vec![(5, put_event(moved))]);
+        fx.pull().await.expect("pulled");
+        assert_eq!(fx.written(first).await.sweeps, [moved]);
+        fx.serve_written(first).await;
+
+        // Its sweeper rewrites the record for the second bounty.
+        fx.sweep(stranger, 10, second, "running", &[]);
+        fx.feed = FakeEventsFeed::of_events(vec![(5, put_event(moved)), (6, put_event(moved))]);
+        let report = fx.pull().await.expect("pulled again");
+        // The first bounty's file drops it and the second's lists it.
+        assert!(fx.written(first).await.sweeps.is_empty());
+        assert_eq!(fx.written(second).await.sweeps, [moved]);
+        // The report lists it once, under the second bounty.
+        let start = format!("  {moved}: ");
+        assert_eq!(
+            report
+                .lines()
+                .filter(|line| line.starts_with(&start))
+                .count(),
+            1,
+            "{report}"
+        );
+        let (_, under_second) = report
+            .split_once(&format!("Bounty {second} "))
+            .expect("the second bounty");
+        assert!(under_second.contains(&start), "{report}");
     }
 
     #[tokio::test]

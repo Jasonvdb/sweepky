@@ -16,8 +16,11 @@
 //!   creation time). Every one, not only this run's, so a sweep whose write
 //!   was refused before is listed by the next write;
 //! - every sweep whose deletion this run confirmed, by a 404 at its
-//!   sweeper's own storage (`pull::feed`), is dropped. A sweep the feed
-//!   said was deleted but whose record still answers stays listed;
+//!   sweeper's own storage, or whose record this run found naming another
+//!   bounty (`pull::feed`), is dropped, before the appends, so a sweep that
+//!   moved to another open bounty joins that one's file in the same write.
+//!   A sweep the feed said was deleted but whose record still answers stays
+//!   listed;
 //! - this install's current cursor of each feed the run read, from the
 //!   local `feed-cursors.json`, replaces the file's cursor for that
 //!   homeserver. The file's cursor for any other homeserver, one whose
@@ -150,7 +153,8 @@ pub(crate) struct Changes {
     /// sweeps this install accepted for it, oldest first. Its keys are the
     /// bounties whose file is looked at.
     accepted: BTreeMap<RecordId, Vec<SweepRef>>,
-    /// The sweeps whose deletion this run confirmed.
+    /// The sweeps whose deletion this run confirmed, and those whose
+    /// record it found naming another bounty (`FeedWatch::deleted`).
     deleted: BTreeSet<SweepRef>,
     /// This install's current cursor of each feed the run read.
     cursors: BTreeMap<Pubky, EventCursor>,

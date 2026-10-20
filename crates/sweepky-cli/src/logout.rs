@@ -36,8 +36,8 @@
 //! the space, which is why step 2 comes first, and the report says so rather
 //! than promising a secure erase.
 //!
-//! `credential.lock` is never deleted, because a new lock file would let a
-//! second writer in while another command still holds the old one.
+//! `credential.lock` and `pull.lock` are never deleted, because a new lock
+//! file would let a second command in while another still holds the old one.
 //!
 //! P2d slots the Pubky Ring login into steps 3 and 4: revoke the grant (its
 //! sign-out), check that restoring the saved token gets a 401, and delete
@@ -319,7 +319,7 @@ mod tests {
     use crate::identity::{IdentityMeta, IdentityName, IdentitySecret};
     use crate::installs::{read_installs, record_install};
     use crate::keys::{Revocation, revoke_if_published};
-    use crate::lock::WritersLock;
+    use crate::lock::{PullLock, WritersLock};
     use crate::private_fs::lstat;
     use crate::state::{
         LoginState, StoredIdentity, create_identity, read_identity, write_login_state,
@@ -469,9 +469,10 @@ mod tests {
     async fn deletion_removes_exactly_this_installs_files() {
         let keys = FakeKeyStore::default();
         let (_temp, dirs, login, id) = logged_in(&keys);
-        // Files that are not this install's login: the lock, another
+        // Files that are not this install's login: the locks, another
         // identity, another owner's install, a file of the user's own.
         WritersLock::open(&dirs).expect("creates credential.lock");
+        PullLock::open(&dirs).expect("creates pull.lock");
         let other = IdentitySecret::generate();
         let other_meta = IdentityMeta::new(name("other"), other.pubky(), random_pubky(), true);
         create_identity(&dirs, &other, &other_meta, None).expect("creates");
@@ -496,9 +497,10 @@ mod tests {
         // and this owner's entry in installs.json.
         assert_retired(&dirs, &login);
 
-        // Kept: the lock file, which is never deleted, the other identity,
-        // the other owner's install and the user's file.
+        // Kept: the lock files, which are never deleted, the other
+        // identity, the other owner's install and the user's file.
         assert_eq!(mode(&dirs.credential_lock_file()), 0o600);
+        assert_eq!(mode(&dirs.pull_lock_file()), 0o600);
         assert!(matches!(
             read_identity(&dirs, &other_meta.name, None).expect("reads"),
             StoredIdentity::Complete { .. }

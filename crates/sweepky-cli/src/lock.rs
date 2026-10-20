@@ -1,5 +1,6 @@
-//! The writers' lock: on one install, one `sweepky` command at a time holds a
-//! session and writes.
+//! The install's two locks: the writers' lock, so that one `sweepky`
+//! command at a time holds a session and writes, and the pull lock, so that
+//! one `pull` at a time reads and writes its local state.
 //!
 //! **Why.** Under a Ring login (P2d) every command restores the saved grant
 //! token, and each restore mints a fresh bearer that invalidates the previous
@@ -10,9 +11,24 @@
 //! `discovered.json` write. `keys list` and `circle show` read public data and
 //! take no lock.
 //!
-//! **How.** An exclusive `flock` on `<config>/credential.lock`, through the
-//! `fd-lock` crate, which makes the system call with rustix, so there is no
-//! `unsafe` here. What that gives, and what it asks of the code:
+//! **The pull lock** ([`PullLock`]) is the same kind of lock on a file of its
+//! own, `<config>/pull.lock`, which `pull` alone takes and holds for its whole
+//! run. `pull` reads its local state (`poll-state.json`, `feed-cursors.json`)
+//! as it starts, changes it in memory for minutes, and writes it back after
+//! each step, each write replacing this owner's whole entry. Two pulls at once
+//! would each write back what they read before the other's write: one could
+//! drop the strangers' sweeps the other accepted while the other's feed cursor
+//! had already moved past their events, so they would never be read again.
+//! Holding the writers' lock that long instead would keep `post`, `run`,
+//! `submit` and `done` waiting on every `pull`. `pull` takes the writers' lock
+//! inside the pull lock, for its one public write, and no command takes the
+//! pull lock while it holds the writers' lock, so the two never wait on each
+//! other.
+//!
+//! **How.** An exclusive `flock` on the lock's file, `<config>/credential.lock`
+//! or `<config>/pull.lock`, through the `fd-lock` crate, which makes the
+//! system call with rustix, so there is no `unsafe` here. What that gives,
+//! and what it asks of the code, for both:
 //!
 //! - **Advisory.** Only `sweepky` commands look at the lock; it stops nothing
 //!   else from touching the config directory.
@@ -31,10 +47,10 @@
 //!   would park a runtime worker thread instead, and with two commands on one
 //!   runtime it could deadlock: the waiting one would sit on the thread the
 //!   holder needs in order to finish. A wait gives up after [`WAIT_TIMEOUT`].
-//! - **The lock file stays.** Nothing deletes, replaces or writes to
-//!   `credential.lock`, `logout` included: if it were deleted while one
-//!   command held it, the next command would create a new file and lock that
-//!   one, and two writers would be in at once. It is always empty, and is
+//! - **The lock files stay.** Nothing deletes, replaces or writes to
+//!   `credential.lock` or `pull.lock`, `logout` included: if one were deleted
+//!   while a command held it, the next command would create a new file and
+//!   lock that one, and two would be in at once. Each is always empty, and is
 //!   opened with [`open_private_lock_file`] under the rules of every other
 //!   file in the config directory: 0600 in a 0700 directory, never through a
 //!   link.
@@ -81,18 +97,22 @@ const FIRST_RETRY_PAUSE: Duration = Duration::from_millis(10);
 /// a second after the lock comes free.
 const MAX_RETRY_PAUSE: Duration = Duration::from_millis(500);
 
+/// What a command that gives up waiting for the writers' lock says holds it.
+const WRITERS_LOCK_HELD: &str = "another sweepky command still holds the writers' lock";
+
+/// What a `pull` that gives up waiting for the pull lock says holds it.
+const PULL_LOCK_HELD: &str =
+    "another sweepky pull on this install is still running and holds the pull lock";
+
 /// The writers' lock file, open and ready to lock: `<config>/credential.lock`.
 ///
 /// Opening it takes no lock; [`WritersLock::hold`] does. Each command opens its
 /// own, even inside one process (see the module docs).
+// A struct of one unnamed field (a "newtype"): the two locks work alike, so
+// each wraps the same `LockFile`, and as two types the compiler never lets
+// one stand in for the other.
 #[derive(Debug)]
-pub(crate) struct WritersLock {
-    /// Where the lock file is, for messages.
-    path: PathBuf,
-    /// The open lock file. `fd_lock::RwLock` owns the `File` and hands out
-    /// guards; dropping a guard releases the lock.
-    file: RwLock<File>,
-}
+pub(crate) struct WritersLock(LockFile);
 
 impl WritersLock {
     /// Opens `credential.lock` in the config directory of `dirs`, creating the
@@ -104,13 +124,7 @@ impl WritersLock {
     /// in async code, as `init` does; only the wait for the lock itself has to
     /// avoid blocking.
     pub(crate) fn open(dirs: &Dirs) -> anyhow::Result<Self> {
-        ensure_private_dir(dirs.config())?;
-        let path = dirs.credential_lock_file();
-        let file = open_private_lock_file(&path)?;
-        Ok(Self {
-            path,
-            file: RwLock::new(file),
-        })
+        LockFile::open(dirs, dirs.credential_lock_file(), WRITERS_LOCK_HELD).map(Self)
     }
 
     /// Takes the lock, runs `work` while holding it, then releases it and
@@ -135,7 +149,59 @@ impl WritersLock {
         on_wait: impl FnOnce(),
         work: impl AsyncFnOnce() -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
-        self.hold_within(WAIT_TIMEOUT, on_wait, work).await
+        self.0.hold_within(WAIT_TIMEOUT, on_wait, work).await
+    }
+}
+
+/// The pull lock file, open and ready to lock: `<config>/pull.lock`, which
+/// `pull` holds for its whole run (see the module docs).
+#[derive(Debug)]
+pub(crate) struct PullLock(LockFile);
+
+impl PullLock {
+    /// Opens `pull.lock` in the config directory of `dirs`, as
+    /// [`WritersLock::open`] opens `credential.lock`.
+    pub(crate) fn open(dirs: &Dirs) -> anyhow::Result<Self> {
+        LockFile::open(dirs, dirs.pull_lock_file(), PULL_LOCK_HELD).map(Self)
+    }
+
+    /// Takes the lock and runs `work` while holding it, as
+    /// [`WritersLock::hold`] does: a `pull` that waits past [`WAIT_TIMEOUT`]
+    /// for another to finish gives up, saying another pull is running.
+    pub(crate) async fn hold<T>(
+        &mut self,
+        on_wait: impl FnOnce(),
+        work: impl AsyncFnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        self.0.hold_within(WAIT_TIMEOUT, on_wait, work).await
+    }
+}
+
+/// One of the install's lock files, open and ready to lock: what
+/// [`WritersLock`] and [`PullLock`] share.
+#[derive(Debug)]
+struct LockFile {
+    /// Where the lock file is, for messages.
+    path: PathBuf,
+    /// The open lock file. `fd_lock::RwLock` owns the `File` and hands out
+    /// guards; dropping a guard releases the lock.
+    file: RwLock<File>,
+    /// What holds the lock, for the message of a wait that gives up: fixed
+    /// text.
+    held: &'static str,
+}
+
+impl LockFile {
+    /// Opens the lock file at `path`, in the config directory of `dirs`,
+    /// creating both if they are not there yet: see [`WritersLock::open`].
+    fn open(dirs: &Dirs, path: PathBuf, held: &'static str) -> anyhow::Result<Self> {
+        ensure_private_dir(dirs.config())?;
+        let file = open_private_lock_file(&path)?;
+        Ok(Self {
+            path,
+            file: RwLock::new(file),
+            held,
+        })
     }
 
     /// [`WritersLock::hold`] with the wait limited to `timeout`, so the tests
@@ -182,8 +248,9 @@ impl WritersLock {
             }
             if backoff.has_timed_out() {
                 bail!(
-                    "another sweepky command still holds the writers' lock ({}) after {timeout:?} \
-                     of waiting; let it finish, then run this command again",
+                    "{} ({}) after {timeout:?} of waiting; let it finish, then run this command \
+                     again",
+                    self.held,
                     self.path.display()
                 );
             }
@@ -241,7 +308,7 @@ mod tests {
     use tokio::sync::{Barrier, oneshot};
     use tokio::time::{sleep, timeout};
 
-    use super::WritersLock;
+    use super::{PullLock, WritersLock};
     use crate::Dirs;
     use crate::private_fs::ensure_private_dir;
     use crate::test_support::{chmod, dirs_in, mode, private_temp};
@@ -395,6 +462,7 @@ mod tests {
                     // its work.
                     let ran = AtomicBool::new(false);
                     let err = second
+                        .0
                         .hold_within(
                             Duration::from_millis(200),
                             || {},
@@ -412,6 +480,81 @@ mod tests {
             )
             .await
             .expect("held");
+    }
+
+    // Two pulls of one install exclude each other as two writers do, and a
+    // pull that waits past its timeout says another pull is running.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pull_gives_up_after_its_timeout_saying_another_pull_is_running() {
+        let home = private_temp();
+        let dirs = dirs_in(&home);
+        let mut first = PullLock::open(&dirs).expect("opened");
+        let mut second = PullLock::open(&dirs).expect("opened");
+
+        first
+            .hold(
+                || {},
+                async || {
+                    let ran = AtomicBool::new(false);
+                    let err = second
+                        .0
+                        .hold_within(
+                            Duration::from_millis(200),
+                            || {},
+                            async || {
+                                ran.store(true, Ordering::SeqCst);
+                                Ok(())
+                            },
+                        )
+                        .await
+                        .expect_err("gives up");
+                    let shown = format!("{err:#}");
+                    assert!(
+                        shown.contains("another sweepky pull on this install is still running"),
+                        "{shown}"
+                    );
+                    assert!(shown.contains("pull.lock"), "{shown}");
+                    assert!(!ran.load(Ordering::SeqCst));
+                    Ok(())
+                },
+            )
+            .await
+            .expect("held");
+    }
+
+    // The pull lock is a file of its own, made as the writers' lock is:
+    // 0600 and empty, in the 0700 config directory. `pull` holds it for its
+    // whole run and the writers' lock for its one public write alone, so
+    // holding one never makes the other wait: a zero timeout still takes it,
+    // and `on_wait` never runs.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_pull_lock_is_its_own_private_file_and_never_waits_for_the_writers_lock() {
+        let home = private_temp();
+        let dirs = dirs_in(&home);
+        let mut pull = PullLock::open(&dirs).expect("opened");
+        let mut writers = WritersLock::open(&dirs).expect("opened");
+
+        pull.hold(
+            || {},
+            async || {
+                writers
+                    .0
+                    .hold_within(
+                        Duration::ZERO,
+                        || panic!("the writers' lock waited for the pull lock"),
+                        async || Ok(()),
+                    )
+                    .await
+            },
+        )
+        .await
+        .expect("both held at once");
+
+        let path = dirs.pull_lock_file();
+        assert_ne!(path, dirs.credential_lock_file());
+        assert_eq!(mode(dirs.config()), 0o700);
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(fs::symlink_metadata(&path).expect("exists").len(), 0);
     }
 
     /// The directories under `home`, with the config directory made but no

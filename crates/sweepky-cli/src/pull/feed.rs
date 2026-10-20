@@ -13,15 +13,20 @@
 //!
 //! 1. **What each open bounty's `discovered.json` lists.** Read from the
 //!    owner's own storage with the tag of its last answer as
-//!    `If-None-Match`, so an unchanged file costs a 304. A new answer gives
-//!    the cursors it holds, and the sweeps it lists that this install has
-//!    neither accepted nor seen deleted are confirmed one by one, as a
-//!    feed's are (below), at most [`MAX_LISTED_SWEEPS_PER_RUN`] a run. A
-//!    listed sweep whose record is gone is a confirmed deletion. This is how
-//!    a second install of the owner sees what the first discovered: its own
-//!    cursor may start past those events. The tag is kept only once every
-//!    sweep the file lists is settled, so a file with sweeps still to
-//!    confirm is read whole again next run. Then the poll state is written.
+//!    `If-None-Match`, so an unchanged file costs a 304, but only while
+//!    this install holds a local cursor for every watched homeserver: the
+//!    tag is kept here and the cursors the file gave only in step 2, so a
+//!    run stopped in between, or a cursor dropped since, would otherwise
+//!    get a 304 with no cursor and start that feed at its head, past the
+//!    events in between. A new answer gives the cursors it holds, and the
+//!    sweeps it lists that this install has neither accepted nor seen
+//!    deleted are confirmed one by one, as a feed's are (below), at most
+//!    [`MAX_LISTED_SWEEPS_PER_RUN`] a run. A listed sweep whose record is
+//!    gone is a confirmed deletion. This is how a second install of the
+//!    owner sees what the first discovered: its own cursor may start past
+//!    those events. The tag is kept only once every sweep the file lists is
+//!    settled, so a file with sweeps still to confirm is read whole again
+//!    next run. Then the poll state is written.
 //! 2. **Where each watched homeserver's feed starts** ([`Start`]): at the
 //!    local cursor; else at the lowest cursor the open bounties'
 //!    `discovered.json` give it; else at its head, found by
@@ -50,9 +55,12 @@
 //! [`Homeservers`] (which on production puts the host policy in front):
 //! never the feed's host's word, which can be any bytes for a path. A sweep
 //! is accepted when that record names one of the owner's bounties open to
-//! strangers. A `DEL` drops a sweep only once its sweeper's storage answers
-//! 404 for it; a `DEL` of a sweep this install never accepted is not looked
-//! into.
+//! strangers, and for that bounty alone: one accepted before whose record
+//! now names another bounty leaves the first, whose `discovered.json` drops
+//! it as it drops a deletion, and is taken as new for the one it names, if
+//! that one is open to strangers and has room. A `DEL` drops a sweep only
+//! once its sweeper's storage answers 404 for it; a `DEL` of a sweep this
+//! install never accepted is not looked into.
 //!
 //! **Bounded.** A page's body is capped at core's `MAX_FEED_BODY_BYTES` and
 //! holds at most [`FEED_PAGE_SIZE`] events, a run reads a finite number of
@@ -207,9 +215,12 @@ pub(crate) struct FeedWatch {
     /// The strangers' sweeps accepted this run, in the order accepted, each
     /// once. The poll state's `acceptedSweeps` holds them too.
     pub(crate) accepted: Vec<BountySweep>,
-    /// The sweeps whose deletion was confirmed this run: accepted before, or
-    /// listed in a `discovered.json`, and gone from their sweeper's storage.
-    /// The poll state's `deletedSweeps` holds them too.
+    /// The sweeps the `discovered.json` write drops from a bounty's file,
+    /// each with that bounty: those whose deletion was confirmed this run,
+    /// accepted before, or listed in a `discovered.json`, and gone from
+    /// their sweeper's storage, which the poll state's `deletedSweeps` holds
+    /// too; and those accepted before whose record now names another
+    /// bounty, which are not deleted.
     pub(crate) deleted: Vec<BountySweep>,
     /// One line for each fault skipped, in fixed text that names keys,
     /// URLs and paths, never a feed's or a record's content.
@@ -284,13 +295,16 @@ where
         poll_state_full: false,
         found: FeedWatch::default(),
     };
-    let listed = watcher.read_discovered().await?;
+    // Read once, for both questions it answers: whether a kept tag may be
+    // sent (`read_discovered`), and where each feed starts (`starts`).
+    let local = FeedCursors::read(dirs, owner)?;
+    let listed = watcher.read_discovered(&local, watch_list).await?;
     // With no room for what the listings added, a feed's would have none
     // either, so no feed is read.
     if watcher.poll_state_full {
         return Ok(watcher.found);
     }
-    let starts = watcher.starts(watch_list, &listed, pace).await?;
+    let starts = watcher.starts(watch_list, &local, &listed, pace).await?;
     for (&homeserver, start) in &starts {
         watcher.read_feed(homeserver, start.cursor).await?;
     }
@@ -391,8 +405,21 @@ impl<F: EventsFeed, R: PublicRecords, H: ResolveHomeserver> Watcher<'_, '_, F, R
     /// Reads each open bounty's `discovered.json`, confirms the sweeps it
     /// lists that are new to this install, stores the poll state, and gives
     /// the lowest cursor the files give each homeserver, in memory only.
-    async fn read_discovered(&mut self) -> anyhow::Result<FeedCursors> {
+    ///
+    /// A file's kept tag is sent only while `local`, this install's
+    /// cursors, holds one for every homeserver of `watch_list`: the tag is
+    /// stored here, before `starts` stores the cursors the file gave, and a
+    /// 304 to a tag whose cursors were not stored would give no cursor at
+    /// all (the module docs).
+    async fn read_discovered(
+        &mut self,
+        local: &FeedCursors,
+        watch_list: &[Pubky],
+    ) -> anyhow::Result<FeedCursors> {
         let before = self.before_step();
+        let send_tags = watch_list
+            .iter()
+            .all(|homeserver| local.get(homeserver).is_some());
         let mut lowest = FeedCursors::default();
         let mut budget = MAX_LISTED_SWEEPS_PER_RUN;
         let mut cut = false;
@@ -400,7 +427,14 @@ impl<F: EventsFeed, R: PublicRecords, H: ResolveHomeserver> Watcher<'_, '_, F, R
         // while its body changes the state.
         let open: Vec<RecordId> = self.open.iter().copied().collect();
         for id in open {
-            let Some((discovered, etag)) = self.read_one_discovered(id).await else {
+            // `filter` turns the kept tag into `None` when none is sent.
+            let sent = self
+                .state
+                .discovered_etags
+                .get(&id)
+                .filter(|_| send_tags)
+                .cloned();
+            let Some((discovered, etag)) = self.read_one_discovered(id, sent).await else {
                 continue;
             };
             // Iterating a `&BTreeMap` lends each key and value; `&homeserver`
@@ -436,11 +470,15 @@ impl<F: EventsFeed, R: PublicRecords, H: ResolveHomeserver> Watcher<'_, '_, F, R
     }
 
     /// Bounty `id`'s `discovered.json` with the tag its answer gave, when
-    /// it changed since the tag kept; `None` when it did not, when there is
-    /// none, or when it could not be read, with a warning.
-    async fn read_one_discovered(&mut self, id: RecordId) -> Option<(Discovered, Option<ETag>)> {
+    /// it changed since `etag`, the tag sent as `If-None-Match` (none reads
+    /// it whole); `None` when it did not change, when there is none, or
+    /// when it could not be read, with a warning.
+    async fn read_one_discovered(
+        &mut self,
+        id: RecordId,
+        etag: Option<ETag>,
+    ) -> Option<(Discovered, Option<ETag>)> {
         let path = paths::discovered(id);
-        let etag = self.state.discovered_etags.get(&id).cloned();
         let answer = self
             .records
             .get_record_if_changed(self.owner, &path, etag.as_ref())
@@ -509,19 +547,21 @@ impl<F: EventsFeed, R: PublicRecords, H: ResolveHomeserver> Watcher<'_, '_, F, R
         listed
     }
 
-    /// Where each feed of `watch_list` starts: see the module docs. A start
-    /// that did not come from the local file is stored there before any page
-    /// is read. A head search waits `pace` between its requests.
+    /// Where each feed of `watch_list` starts, from `local`, this install's
+    /// cursors, and `listed`, the open bounties' lowest: see the module
+    /// docs. A start that did not come from the local file is stored there
+    /// before any page is read. A head search waits `pace` between its
+    /// requests.
     async fn starts(
         &mut self,
         watch_list: &[Pubky],
+        local: &FeedCursors,
         listed: &FeedCursors,
         pace: Duration,
     ) -> anyhow::Result<BTreeMap<Pubky, Start>> {
-        let local = FeedCursors::read(self.dirs, self.owner)?;
         let mut starts = BTreeMap::new();
         for &homeserver in watch_list {
-            if let Some(start) = self.start_of(homeserver, &local, listed, pace).await {
+            if let Some(start) = self.start_of(homeserver, local, listed, pace).await {
                 starts.insert(homeserver, start);
             }
         }
@@ -751,23 +791,36 @@ impl<F: EventsFeed, R: PublicRecords, H: ResolveHomeserver> Watcher<'_, '_, F, R
 
     /// Takes `record`, just read as `sweep`'s: accepts the sweep when the
     /// record names one of the owner's bounties open to strangers, and
-    /// brings the summary of a sweep accepted before up to date, whatever its
-    /// bounty's status now. A sweep of any other bounty leaves nothing.
+    /// brings the summary of a sweep accepted before for that bounty up to
+    /// date, whatever its status now. A sweep accepted before for another
+    /// bounty, whose record has moved, first leaves that one, as a
+    /// deletion would, and is then taken as new. A sweep of any other
+    /// bounty leaves nothing.
     fn accept(&mut self, sweep: SweepRef, record: &Sweep, etag: Option<ETag>) {
         let bounty = record.bounty;
-        if bounty.owner != self.owner {
+        // The owner's bounty the record names, when it names one of theirs:
+        // an id is its owner's alone, so another owner's is none of these.
+        let named = (bounty.owner == self.owner).then_some(bounty.id);
+        let previous = self.accepted_for(sweep);
+        // A sweep is accepted for one bounty at a time, the one its record
+        // names, so neither the state nor a `discovered.json` lists it
+        // under two, and the caps count it once. `if let … && …` (a let
+        // chain, from the 2024 edition) runs the block only when the sweep
+        // was accepted before and its record names another bounty now.
+        if let Some(moved_from) = previous
+            && Some(moved_from) != named
+        {
+            self.take_out(moved_from, sweep);
+        }
+        let Some(id) = named else {
+            return;
+        };
+        let before = previous == Some(id);
+        if !before && !self.open.contains(&id) {
             return;
         }
-        let before = self
-            .state
-            .accepted_sweeps
-            .get(&bounty.id)
-            .is_some_and(|accepted| accepted.contains(&sweep));
-        if !before && !self.open.contains(&bounty.id) {
-            return;
-        }
-        if !before && !self.has_room_for(bounty.id) {
-            self.leave_out(bounty.id);
+        if !before && !self.has_room_for(id) {
+            self.leave_out(id);
             return;
         }
         match self.state.sweeps.get_mut(&sweep) {
@@ -781,15 +834,12 @@ impl<F: EventsFeed, R: PublicRecords, H: ResolveHomeserver> Watcher<'_, '_, F, R
         if !before {
             self.state
                 .accepted_sweeps
-                .entry(bounty.id)
+                .entry(id)
                 .or_default()
                 .insert(sweep);
             // Deleted once, and written again since.
             self.state.deleted_sweeps.remove(&sweep);
-            self.found.accepted.push(BountySweep {
-                bounty: bounty.id,
-                sweep,
-            });
+            self.found.accepted.push(BountySweep { bounty: id, sweep });
         }
     }
 
@@ -875,13 +925,22 @@ impl<F: EventsFeed, R: PublicRecords, H: ResolveHomeserver> Watcher<'_, '_, F, R
     }
 
     /// Records that `sweep`, of bounty `bounty`, is gone from its sweeper's
-    /// storage: no longer accepted, no summary, and deleted.
+    /// storage: taken out of the bounty, and deleted.
     fn record_deletion(&mut self, bounty: RecordId, sweep: SweepRef) {
+        self.take_out(bounty, sweep);
+        self.state.deleted_sweeps.insert(sweep);
+    }
+
+    /// Takes `sweep` out of bounty `bounty`: no longer accepted for it, no
+    /// summary, and in [`FeedWatch::deleted`], so the `discovered.json`
+    /// write drops it from the bounty's file. The summary goes too because
+    /// a stranger's summary is kept only for a sweep accepted for a bounty,
+    /// which the caps count; and the `pulled` it holds was the bounty's.
+    fn take_out(&mut self, bounty: RecordId, sweep: SweepRef) {
         if let Some(accepted) = self.state.accepted_sweeps.get_mut(&bounty) {
             accepted.remove(&sweep);
         }
         self.state.sweeps.remove(&sweep);
-        self.state.deleted_sweeps.insert(sweep);
         self.found.deleted.push(BountySweep { bounty, sweep });
     }
 
@@ -1600,6 +1659,133 @@ mod tests {
             records.conditional_asked().last(),
             Some(&(owner, discovered, tag))
         );
+    }
+
+    #[tokio::test]
+    async fn a_kept_tag_is_not_sent_while_a_watched_feed_has_no_local_cursor() {
+        // A run stopped after the poll state kept a discovered.json's tag
+        // and before feed-cursors.json kept the cursor the file gave. Were
+        // the tag sent next run, its 304 would give no cursor, and the feed
+        // would start at its head, skipping what came in between for good.
+        let install = Install::new();
+        let (owner, home) = (install.owner, install.home);
+        let open = bounty(owner, 10);
+        let discovered = paths::discovered(open.id);
+        let records = FakePublicRecords::default().with_record(
+            owner,
+            &discovered,
+            &discovered_json(&[], &[(home, 5)]),
+        );
+        let resolver = FakeHomeservers::default();
+        let mut state = one_open(open);
+        let quiet = FakeEventsFeed::of_ids(&[]);
+        let watch = install.watch(&quiet, &records, &resolver, &mut state).await;
+        assert_eq!(watch.starts[&home], start(5, StartSource::Discovered));
+        assert!(state.discovered_etags.contains_key(&open.id));
+        // The stop: the tag is kept, the cursor is not.
+        FeedCursors::drop_owner(&install.dirs, owner).expect("dropped");
+
+        // Meanwhile a stranger swept the bounty, after the file's cursor.
+        let stranger = stranger_sweep(20);
+        let records = with_sweep(records, stranger, open, "running");
+        let feed = FakeEventsFeed::of_events(vec![(7, put(stranger))]);
+        let asked_before = records.conditional_asked().len();
+        let watch = install.watch(&feed, &records, &resolver, &mut state).await;
+        assert!(watch.warnings.is_empty(), "{:?}", watch.warnings);
+        // The file is read whole, with no tag, and the feed starts at its
+        // cursor, not at the head: the stranger's sweep is found.
+        assert_eq!(
+            records.conditional_asked().split_off(asked_before).first(),
+            Some(&(owner, discovered.clone(), None))
+        );
+        assert_eq!(watch.starts[&home], start(5, StartSource::Discovered));
+        assert_eq!(watch.accepted, [of(open, stranger)]);
+
+        // With the local cursor stored again, the tag is sent and the 304
+        // taken: nothing else is read of the owner's storage.
+        let tag = state.discovered_etags.get(&open.id).cloned();
+        assert!(tag.is_some(), "kept once every listed sweep is settled");
+        let asked_before = records.asked().len();
+        let watch = install.watch(&feed, &records, &resolver, &mut state).await;
+        assert_eq!(watch.starts[&home], start(7, StartSource::Local));
+        assert_eq!(
+            records.conditional_asked().last(),
+            Some(&(owner, discovered.clone(), tag))
+        );
+        assert_eq!(
+            records.asked().split_off(asked_before),
+            [(owner, discovered)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sweep_rewritten_for_another_open_bounty_leaves_the_first_for_the_second() {
+        let install = Install::new();
+        let owner = install.owner;
+        let (first, second) = (bounty(owner, 10), bounty(owner, 11));
+        let moved = stranger_sweep(20);
+        install.store_cursor(install.home, 0);
+        let records = with_sweep(FakePublicRecords::default(), moved, first, "running");
+        let resolver = FakeHomeservers::default();
+        let mut state = state_of(&[
+            (first, bounty_record(true, "open")),
+            (second, bounty_record(true, "open")),
+        ]);
+        let feed = FakeEventsFeed::of_events(vec![(1, put(moved))]);
+        let watch = install.watch(&feed, &records, &resolver, &mut state).await;
+        assert_eq!(watch.accepted, [of(first, moved)]);
+
+        // Its sweeper rewrites the record for the second bounty.
+        let records = with_sweep(records, moved, second, "running");
+        let feed = FakeEventsFeed::of_events(vec![(1, put(moved)), (2, put(moved))]);
+        let watch = install.watch(&feed, &records, &resolver, &mut state).await;
+        assert!(watch.warnings.is_empty(), "{:?}", watch.warnings);
+        // It leaves the first bounty, whose discovered.json drops it as it
+        // drops a deletion, and joins the second, whose file lists it.
+        assert_eq!(watch.deleted, [of(first, moved)]);
+        assert_eq!(watch.accepted, [of(second, moved)]);
+        assert!(!state.accepted_sweeps[&first.id].contains(&moved));
+        assert_eq!(state.accepted_sweeps[&second.id], BTreeSet::from([moved]));
+        assert_eq!(state.sweeps[&moved].bounty, second);
+        // The caps count it once, and not as deleted: its record is there.
+        let accepted: usize = state.accepted_sweeps.values().map(BTreeSet::len).sum();
+        assert_eq!(accepted, 1);
+        assert!(state.deleted_sweeps.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_sweep_rewritten_for_a_bounty_not_open_to_strangers_leaves_the_first_for_none() {
+        let install = Install::new();
+        let owner = install.owner;
+        let (open, closed) = (bounty(owner, 10), bounty(owner, 11));
+        // Another owner's bounty under the open one's id: an id is its
+        // owner's alone.
+        let theirs = bounty(random_pubky(), 10);
+        let (to_closed, to_theirs) = (stranger_sweep(20), stranger_sweep(21));
+        install.store_cursor(install.home, 0);
+        let records = with_running(FakePublicRecords::default(), &[to_closed, to_theirs], open);
+        let resolver = FakeHomeservers::default();
+        let mut state = state_of(&[
+            (open, bounty_record(true, "open")),
+            (closed, bounty_record(false, "open")),
+        ]);
+        let feed = feed_of_puts(&[to_closed, to_theirs]);
+        let watch = install.watch(&feed, &records, &resolver, &mut state).await;
+        assert_eq!(watch.accepted, [of(open, to_closed), of(open, to_theirs)]);
+
+        // Each record now names a bounty that takes no strangers' sweeps.
+        let records = with_sweep(records, to_closed, closed, "running");
+        let records = with_sweep(records, to_theirs, theirs, "running");
+        let feed = feed_of_puts(&[to_closed, to_theirs, to_closed, to_theirs]);
+        let watch = install.watch(&feed, &records, &resolver, &mut state).await;
+        assert!(watch.warnings.is_empty(), "{:?}", watch.warnings);
+        // Both leave the open bounty and join no other. No summary is left
+        // behind, which no cap would count.
+        assert!(watch.accepted.is_empty());
+        assert_eq!(watch.deleted, [of(open, to_closed), of(open, to_theirs)]);
+        assert!(state.accepted_sweeps.values().all(BTreeSet::is_empty));
+        assert!(state.sweeps.is_empty());
+        assert!(state.deleted_sweeps.is_empty());
     }
 
     #[tokio::test]

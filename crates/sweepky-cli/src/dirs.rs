@@ -12,6 +12,7 @@
 //! | File | What |
 //! |---|---|
 //! | `credential.lock` | the writers' lock |
+//! | `pull.lock` | the pull lock: one `pull` at a time on this install |
 //! | `login.json` | which login this install uses |
 //! | `installs.json` | the device ids this owner's own installs created |
 //! | `owner-keys.json` | per bounty owner, the keys `submit` last encrypted a sweep to, pinned (`crate::pins`) |
@@ -128,6 +129,12 @@ impl Dirs {
     /// rather than pointing into `config`.
     pub fn credential_lock_file(&self) -> PathBuf {
         self.config.join("credential.lock")
+    }
+
+    /// `config/pull.lock`, the file the pull lock is taken on, so that one
+    /// `pull` at a time reads and writes its local state (`crate::lock`).
+    pub(crate) fn pull_lock_file(&self) -> PathBuf {
+        self.config.join("pull.lock")
     }
 
     /// `config/login.json`: which login this install uses.
@@ -305,6 +312,7 @@ mod tests {
             dirs.credential_lock_file(),
             Path::new("/x/config/credential.lock")
         );
+        assert_eq!(dirs.pull_lock_file(), Path::new("/x/config/pull.lock"));
         assert_eq!(dirs.login_file(), Path::new("/x/config/login.json"));
         assert_eq!(dirs.installs_file(), Path::new("/x/config/installs.json"));
         assert_eq!(dirs.device_key_file(), Path::new("/x/config/device.key"));

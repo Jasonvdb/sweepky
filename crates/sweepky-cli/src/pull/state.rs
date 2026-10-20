@@ -56,9 +56,21 @@
 //!
 //! **Writing.** `write` reads the file again and replaces this owner's
 //! entry alone, so another owner's stays as the file has it now. That is
-//! a read, a change and a write, and nothing here locks: a caller that
-//! must not lose an update to a concurrent `pull` holds the writers' lock
-//! around it.
+//! a read, a change and a write, and nothing here locks:
+//!
+//! - **`pull`** reads both files as it starts and writes them back after
+//!   each step, so it holds the pull lock (`crate::lock::PullLock`) from
+//!   its first read to its last write: two pulls of one install run one
+//!   after the other, and neither writes back a state that lacks the
+//!   other's steps.
+//! - **`post --open`** lowers `feed-cursors.json`'s cursors for a new open
+//!   bounty under the writers' lock alone. It does not take the pull lock:
+//!   it would wait for a `pull` that runs for minutes, and `pull` takes the
+//!   writers' lock while it holds the pull lock, so the two could each
+//!   wait for the other. Its read and write take a moment, and
+//!   [`FeedCursors::advance`]'s compare-and-set keeps a cursor it lowered
+//!   while `pull` read a batch.
+//! - **`logout`** reads and writes neither file.
 //!
 //! **What the poll state holds came from other people's records.** A
 //! status is an open string, and credits and targets are lists, so a
@@ -162,13 +174,14 @@ impl FeedCursors {
     /// whether it did: only while the file still holds `from` there, the
     /// cursor this run started the batch from. A cursor another writer
     /// stored meanwhile is left as the file has it: one `post --open`
-    /// lowered for a new bounty, so that its sweeps are not skipped, or one
-    /// a concurrent `pull` moved on. Checking that `to` is past `from` is
-    /// the caller's (`pull::feed`).
+    /// lowered for a new bounty, so that its sweeps are not skipped. Two
+    /// pulls of one install never run at once (they hold the pull lock), so
+    /// against a second `pull` this is a second line of defence. Checking
+    /// that `to` is past `from` is the caller's (`pull::feed`).
     ///
-    /// Nothing here locks, so another writer can still come between this
+    /// Nothing here locks, so `post --open` can still come between this
     /// read and its write; the check narrows that to the moment of the
-    /// write, where a whole run would be otherwise.
+    /// write, where a whole batch would be otherwise.
     pub(crate) fn advance(
         dirs: &Dirs,
         owner: Pubky,
