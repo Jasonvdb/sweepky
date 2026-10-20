@@ -253,8 +253,9 @@ where
 }
 
 /// The ids of `owner`'s bounties in `state` that are open to strangers:
-/// `open: true`, with status `open`.
-fn open_to_strangers(state: &PollState, owner: Pubky) -> BTreeSet<RecordId> {
+/// `open: true`, with status `open`. `pull::discovered` writes the
+/// `discovered.json` of these alone.
+pub(super) fn open_to_strangers(state: &PollState, owner: Pubky) -> BTreeSet<RecordId> {
     state
         .bounties
         .iter()
