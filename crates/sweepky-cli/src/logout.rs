@@ -61,6 +61,14 @@
 //! is not published, and stops otherwise, naming `sweepky keys revoke <id>`
 //! to run from another install; that is how 02's "revoked from another
 //! install with `keys revoke`" lets this logout finish.
+//!
+//! **An expired grant is not a confirmed end.** The SDK compares the
+//! grant's `exp` with this machine's clock and refuses to send a grant that
+//! clock says has expired, so a clock set ahead of the homeserver's cannot
+//! be told apart from a real expiry here. Logout still finishes, through
+//! the anonymous key-record read above, but its report warns that the grant
+//! could not be revoked on the homeserver and to revoke `sweepky-cli` in
+//! Pubky Ring if it is still listed there, rather than claim it ended.
 
 use anyhow::{Context as _, bail};
 use sweepky_core::{DeviceId, DeviceKey, RecordTime, Zeroizing};
@@ -103,8 +111,10 @@ enum EndedGrant {
     /// The homeserver refused the saved token with a 401 before anything
     /// was done: the grant was revoked (in Ring, say) or had expired.
     AlreadyRevoked,
-    /// `login.json`'s `grantExpiresAt`, this time (Unix seconds), had passed,
-    /// so nothing was sent with the token.
+    /// `login.json`'s `grantExpiresAt`, this time (Unix seconds), had passed
+    /// by this machine's clock, so nothing was sent with the token (the SDK
+    /// would refuse to). A clock set ahead looks the same, so this is no
+    /// proof that the grant ended on the homeserver: the report warns.
     Expired(u64),
 }
 
@@ -503,8 +513,11 @@ impl EndedGrant {
                  revoked or expired: the homeserver refused the saved token with 401.\n"
             ),
             Self::Expired(at) => format!(
-                "This install's Pubky Ring grant (sweepky-cli, pubky {pubky}) had expired, at \
-                 {}, so logout sent nothing with it.\n",
+                "warning: this install's Pubky Ring grant (sweepky-cli, pubky {pubky}) had \
+                 expired at {} by this machine's clock, so logout sent nothing with the token and \
+                 could not revoke the grant on the homeserver (the Pubky SDK sends no grant its \
+                 clock says has expired); if Pubky Ring still lists sweepky-cli, revoke it there, \
+                 and check this machine's clock if that happens.\n",
                 expiry_text(*at)
             ),
         }
@@ -565,8 +578,8 @@ mod tests {
     use crate::lock::{PullLock, WritersLock};
     use crate::private_fs::lstat;
     use crate::remote::{BodyTooLarge, public_key_of, status_of};
-    use crate::ring::Restored;
     use crate::ring::token::{GrantToken, read_grant_token, write_grant_token};
+    use crate::ring::{Restored, expiry_text};
     use crate::state::{
         LoginState, StoredIdentity, create_identity, read_identity, read_login_state,
         write_login_state,
@@ -1146,7 +1159,17 @@ mod tests {
             assert_eq!(fakes.steps(), ["read own"]);
             assert_ring_retired(&dirs, &login);
             let text = report(&dirs, &login, &key, Some(&grant));
-            assert!(text.contains("had expired"), "{text}");
+            assert!(
+                text.contains(&format!(
+                    "warning: this install's Pubky Ring grant (sweepky-cli, pubky {}) had expired \
+                     at {} by this machine's clock, so logout sent nothing with the token and \
+                     could not revoke the grant on the homeserver",
+                    login.pubky,
+                    expiry_text(EXPIRED_AT)
+                )),
+                "{text}"
+            );
+            assert!(text.contains("revoke it there"), "{text}");
             assert!(text.contains("deleted, not overwritten"), "{text}");
             assert!(
                 text.contains(&dirs.grant_token_file().display().to_string()),

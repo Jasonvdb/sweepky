@@ -41,7 +41,12 @@
 //!    `/pub/sweepky/`; on a re-login the key `login.json` records reused,
 //!    never replaced; then `login.json` written as a `ring` login with the
 //!    new grant's expiry, then the check of `keys/`. Last, the grant the
-//!    new one replaces is revoked ([`revoke_replaced`]).
+//!    new one replaces is revoked ([`revoke_replaced`]), unless
+//!    `login.json` says it has expired by this machine's clock: the SDK
+//!    compares the grant's `exp` with the local clock and refuses to send
+//!    an expired grant, so a clock set ahead cannot be told from a real
+//!    expiry here, and the report warns and names Ring rather than claim
+//!    the grant ended. Only a 401 from the homeserver counts as that.
 //! 5. **The report** ([`report`]): who and where, the grant's expiry in RFC
 //!    3339 and that it is two years from approval, the device key and the
 //!    reminder to back up the config directory, the files wrapped, what
@@ -343,9 +348,14 @@ enum Replaced {
     /// `--passphrase-file`, or not a token), and why. Its grant cannot be
     /// revoked from here.
     Unreadable(anyhow::Error),
-    /// The token of the grant replaced. `expired` is true when `login.json`
-    /// says that grant has expired, so there is nothing left to revoke.
-    Token { token: GrantToken, expired: bool },
+    /// The token of the grant replaced. `expired_at` is `login.json`'s
+    /// `grantExpiresAt` (Unix seconds) when this machine's clock says it
+    /// has passed, `None` otherwise (and always for an orphan, which no
+    /// `login.json` describes).
+    Token {
+        token: GrantToken,
+        expired_at: Option<u64>,
+    },
 }
 
 /// What became of the grant a login replaced, once the new one was saved.
@@ -355,8 +365,16 @@ enum ReplacedGrant {
     Nothing,
     /// Signed out, and its token now restores to a 401.
     Revoked,
-    /// It had been revoked or had expired already.
+    /// The homeserver refused its token with a 401 before the sign-out:
+    /// it had been revoked or had expired already. Only that answer counts
+    /// as proof that it ended.
     AlreadyEnded,
+    /// `login.json` says it expired, at this time (Unix seconds), by this
+    /// machine's clock, so nothing was sent with it: the SDK compares the
+    /// grant's `exp` with the local clock and refuses to send an expired
+    /// grant. A clock set ahead looks the same, so the grant may still be
+    /// live on the homeserver: a warning, not a confirmed end.
+    ExpiredUnconfirmed(u64),
     /// It may still be live, for this reason (fixed text): a warning, since
     /// the new login is saved and works.
     NotRevoked(anyhow::Error),
@@ -442,7 +460,7 @@ fn plan_save(
             let replaced = match old_token {
                 Some(token) => Replaced::Token {
                     token,
-                    expired: expired_grant_at(&login, now).is_some(),
+                    expired_at: expired_grant_at(&login, now),
                 },
                 None => Replaced::Nothing,
             };
@@ -457,7 +475,7 @@ fn read_orphan(dirs: &Dirs, passphrase: Option<&Passphrase>) -> Replaced {
     match read_grant_token(dirs, passphrase) {
         Ok(Some(token)) => Replaced::Token {
             token,
-            expired: false,
+            expired_at: None,
         },
         // Gone since it was looked at.
         Ok(None) => Replaced::Nothing,
@@ -473,9 +491,16 @@ async fn end_replaced(client: &pubky::Pubky, replaced: Replaced) -> ReplacedGran
     match replaced {
         Replaced::Nothing => ReplacedGrant::Nothing,
         Replaced::Unreadable(error) => ReplacedGrant::NotRevoked(error),
-        // A grant past its `grantExpiresAt` sends no request at all.
-        Replaced::Token { expired: true, .. } => ReplacedGrant::AlreadyEnded,
-        Replaced::Token { token, .. } => revoke_replaced(client, &token).await,
+        // Expired by this clock: the SDK would not send the token, so no
+        // request is tried (see `ExpiredUnconfirmed`).
+        Replaced::Token {
+            expired_at: Some(at),
+            ..
+        } => ReplacedGrant::ExpiredUnconfirmed(at),
+        Replaced::Token {
+            token,
+            expired_at: None,
+        } => revoke_replaced(client, &token).await,
     }
 }
 
@@ -595,7 +620,8 @@ fn report(ctx: &Context, grant: &ApprovedGrant, saved: &Saved) -> String {
         expiry_text(grant.expires_at)
     );
     match &saved.replaced {
-        // Nothing to say: no earlier grant, or one already dead.
+        // Nothing to say: no earlier grant, or one the homeserver already
+        // refused with a 401.
         ReplacedGrant::Nothing | ReplacedGrant::AlreadyEnded => {}
         ReplacedGrant::Revoked => text.push_str(
             "Revoked the earlier sweepky-cli grant this install held; restoring its token now \
@@ -604,6 +630,14 @@ fn report(ctx: &Context, grant: &ApprovedGrant, saved: &Saved) -> String {
         ReplacedGrant::NotRevoked(why) => text.push_str(&format!(
             "warning: could not revoke the earlier sweepky-cli grant this install held ({why:#}); \
              it may still be listed in Pubky Ring, so revoke the older sweepky-cli grant there.\n"
+        )),
+        ReplacedGrant::ExpiredUnconfirmed(at) => text.push_str(&format!(
+            "warning: the earlier sweepky-cli grant this install held had expired at {} by this \
+             machine's clock, so it was not revoked from here and the homeserver was not asked \
+             (the Pubky SDK sends no grant its clock says has expired); if Pubky Ring still lists \
+             an older sweepky-cli grant, revoke it there, and check this machine's clock if that \
+             happens.\n",
+            expiry_text(*at)
         )),
     }
     text.push_str(&device_key_report(dirs, &saved.tail.device));
@@ -638,7 +672,9 @@ mod tests {
     use tokio::sync::mpsc::error::TryRecvError;
     use url::Url;
 
-    use super::{ApprovedGrant, NOT_SAVED, approved_by_another_pubky, save_grant};
+    use super::{
+        ApprovedGrant, NOT_SAVED, ReplacedGrant, approved_by_another_pubky, report, save_grant,
+    };
     use crate::cli::Cli;
     use crate::device::{
         PublicKeyReader, PublicKeys as _, create_device_key, device_key_bytes, device_key_record,
@@ -1155,6 +1191,60 @@ mod tests {
             .expect("reads")
             .expect("put back");
         assert_eq!(token.expose_secret(), old.expose_secret());
+    }
+
+    #[tokio::test]
+    async fn a_relogin_over_a_grant_expired_by_this_clock_warns_instead_of_claiming_it_ended() {
+        let home = private_temp();
+        let (ctx, stderr, _urls) = ring_context(offline_network(), &home, io::empty());
+        let grant = approved();
+        let id: DeviceId = "this-install".parse().expect("valid");
+        ring_logged_in_offline(&ctx.dirs, grant.pubky, &id, None);
+        // login.json says the old grant expired a day ago. This machine's
+        // clock may be ahead of the homeserver's, so that is no proof the
+        // grant has ended there.
+        let expired_at = now() - 86_400;
+        let mut login = read_login_state(&ctx.dirs)
+            .expect("reads")
+            .expect("logged in");
+        login.grant_expires_at = Some(expired_at);
+        write_login_state(&ctx.dirs, &login).expect("writes");
+
+        let (saved, signed_out) = save_with(&ctx, &grant, FakeKeyStore::default()).await;
+        let saved = saved.expect("the new login is saved");
+        assert!(
+            matches!(saved.replaced, ReplacedGrant::ExpiredUnconfirmed(at) if at == expired_at),
+            "{:?}",
+            saved.replaced
+        );
+        // The new grant stays: it is not signed out, its token is saved and
+        // login.json records its expiry.
+        assert!(signed_out.is_empty());
+        let token = read_grant_token(&ctx.dirs, None)
+            .expect("reads")
+            .expect("saved");
+        assert_eq!(token.expose_secret(), grant.token.expose_secret());
+        let after = read_login_state(&ctx.dirs)
+            .expect("reads")
+            .expect("logged in");
+        assert_eq!(after.grant_expires_at, Some(grant.expires_at));
+        assert_eq!(after.device_id, Some(id));
+
+        // The report warns, names the time and Ring, and claims no end.
+        let text = report(&ctx, &grant, &saved);
+        assert!(
+            text.contains(&format!(
+                "warning: the earlier sweepky-cli grant this install held had expired at {} by \
+                 this machine's clock, so it was not revoked from here",
+                expiry_text(expired_at)
+            )),
+            "{text}"
+        );
+        assert!(text.contains("revoke it there"), "{text}");
+        assert!(text.contains("check this machine's clock"), "{text}");
+        assert!(!text.contains("Revoked the earlier"), "{text}");
+        assert!(!text.contains(PLANTED), "{text}");
+        assert!(!stderr.text().contains(PLANTED));
     }
 
     #[tokio::test]
