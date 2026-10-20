@@ -683,7 +683,7 @@ mod tests {
     use crate::Dirs;
     use crate::git::{GitCommand, GitRunner, RunGit};
     use crate::identity::Refusal;
-    use crate::init::{self, MARKER};
+    use crate::init::{self, MARKER, PLAYBOOK_COMMIT};
     use crate::own_storage::OwnStorage;
     use crate::private_fs::{ensure_private_dir, write_private_file};
     use crate::remote::{QUOTA_FULL, WRITE_FORBIDDEN};
@@ -702,7 +702,7 @@ mod tests {
 
         // A P2a project passes, read through init's own reader.
         let project = temp.path().join("project");
-        init::init(&project).expect("init");
+        init::init_without_playbook(&project).expect("init");
         let marker = require_project(&project).expect("an init project");
         assert_eq!(marker.playbook(), None);
 
@@ -1091,13 +1091,21 @@ mod tests {
     async fn running_is_published_before_git_runs_and_the_marker_written_after_the_fetch() {
         let shas = recorded_fixture_shas();
         let checked = fixture_bounty(json!([commit_target(shas["M"].as_str())])).await;
-        let playbook: Playbook = PLAYBOOK.parse().expect("a playbook");
+        // A project whose `init` installed the playbook (with a stand-in
+        // for npx): the playbook comes from its marker, as `run` reads it.
         let project = private_temp();
+        init::init_with_fake_playbook(project.path()).expect("init");
+        let marker = require_project(project.path()).expect("an init project");
+        let playbook = marker.playbook().expect("init recorded the playbook");
+        assert_eq!(
+            playbook.as_str(),
+            format!("cloudflare/security-audit@{PLAYBOOK_COMMIT}")
+        );
         // Declared before the runner, so the runner, whose private HOME is
         // under it, is dropped first.
         let home = private_temp();
         let dirs = dirs_in(&home);
-        let new = new_sweep(project.path(), &dirs, &checked, Some(&playbook));
+        let new = new_sweep(project.path(), &dirs, &checked, Some(playbook));
         let path = paths::sweep_record(new.sweep.id);
         let sweep_dir = project.path().join("sweeps").join(new.sweep.id.to_string());
         let source = TargetSource::Fixture(fixture_targets());
@@ -1123,7 +1131,7 @@ mod tests {
         let record = Sweep::from_json(&stored).expect("a sweep record");
         assert_eq!(record.status.as_known(), Some(KnownSweepStatus::Running));
         assert_eq!(record.bounty, checked.bounty_ref);
-        assert_eq!(record.playbook, playbook);
+        assert_eq!(&record.playbook, playbook);
         // The marker, after the fetch, names the sweep and the record's
         // bounty and targets.
         let marker: Value =
@@ -1132,7 +1140,7 @@ mod tests {
         assert_eq!(marker["sweep"], new.sweep.to_string());
         assert_eq!(marker["bounty"], checked.bounty_ref.to_string());
         assert_eq!(marker["targets"], json!(["t1"]));
-        assert_eq!(marker["playbook"], PLAYBOOK);
+        assert_eq!(marker["playbook"], playbook.as_str());
         assert_eq!(fetched.targets.len(), 1);
         // The snapshot, 0600 under the data directory, out of the agent's
         // reach: t1 at the commit checked out, M, while the bounty agrees.
@@ -1323,7 +1331,7 @@ mod tests {
         let home = private_temp();
         let (mut ctx, _stderr) = test_context(offline_network(), &home, io::empty());
         let project = home.path().join("project");
-        init::init(&project).expect("init");
+        init::init_without_playbook(&project).expect("init");
         ctx.cwd = project;
 
         // Refused before anything is read, and the flag is not quoted.

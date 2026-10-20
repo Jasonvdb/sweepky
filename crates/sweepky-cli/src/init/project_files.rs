@@ -255,7 +255,7 @@ mod tests {
     use super::{PROJECT_CLAUDE_MD, SETTINGS_TEMPLATE, SKILL, glob_safe, settings_bytes};
     use crate::dirs::Dirs;
     use crate::identity::IdentityName;
-    use crate::init::{MARKER, init};
+    use crate::init::{MARKER, init_without_playbook as init};
 
     /// 02's sandbox template, as its "Sweeper safety" section shows it, with
     /// the project's path filled in.

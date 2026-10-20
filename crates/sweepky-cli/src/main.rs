@@ -4,9 +4,10 @@
 //!
 //! 1. parses the arguments ([`Cli`]);
 //! 2. runs `init <dir>` at once, through [`run_without_context`]: it needs
-//!    only its directory, so it reads no environment variable, never opens
-//!    the `--passphrase-file` and builds no network client, and works with
-//!    HOME unset;
+//!    only its directory, and standard input and standard error for its one
+//!    question, so it reads no environment variable, never opens the
+//!    `--passphrase-file` and builds no network client, and works with HOME
+//!    unset (the playbook's `npx`, when it runs, inherits the environment);
 //! 3. for every other command, reads the environment. This file is the only
 //!    place that does, with `std::env::var_os` and, for the working
 //!    directory, `std::env::current_dir`, and it passes each value in, so
@@ -75,12 +76,21 @@ async fn main() -> ExitCode {
 /// Runs `init` with no context, or builds the context from the arguments and
 /// the environment and then runs the command.
 async fn execute(cli: Cli) -> anyhow::Result<Report> {
+    // The answers to a command's questions. A `BufReader` around `Stdin`,
+    // because `Stdin` itself is not `BufRead` and its lock is not `Send`
+    // (see `StdinReader::new`). Built first, because `init` asks on them too.
+    let stdin = StdinReader::new(BufReader::new(std::io::stdin()));
+    // A command's warnings go straight to standard error, so they appear
+    // before it acts; its report goes to standard output at the end.
+    let stderr = StderrWriter::new(std::io::stderr());
     // `init <dir>` first, before anything below can fail or reach out: it
     // takes no HOME, no passphrase and no network, so a missing HOME, an
     // unreadable passphrase file or a bad SWEEPKY_TESTNET cannot stop it, and
-    // it never starts the DHT node a production client would. Every other
-    // command comes back as `None` and goes on to the steps below.
-    if let Some(result) = run_without_context(&cli) {
+    // it never starts the DHT node a production client would. It only
+    // borrows `stdin` and `stderr`, so they can still move into the context
+    // below. Every other command comes back as `None` and goes on to the
+    // steps below.
+    if let Some(result) = run_without_context(&cli, &stdin, &stderr) {
         return result;
     }
     // `var_os` returns the raw value, or `None` when the variable is unset. It
@@ -111,13 +121,8 @@ async fn execute(cli: Cli) -> anyhow::Result<Report> {
         network: Network::for_kind(kind)?,
         dirs,
         cwd,
-        // The answers to a command's questions. A `BufReader` around `Stdin`,
-        // because `Stdin` itself is not `BufRead` and its lock is not `Send`
-        // (see `StdinReader::new`).
-        stdin: StdinReader::new(BufReader::new(std::io::stdin())),
-        // A command's warnings go straight to standard error, so they appear
-        // before it acts; its report goes to standard output at the end.
-        stderr: StderrWriter::new(std::io::stderr()),
+        stdin,
+        stderr,
         passphrase,
         // The only variables git will see of this environment, read here
         // so that the library reads none: `capture` asks `var_os` for each

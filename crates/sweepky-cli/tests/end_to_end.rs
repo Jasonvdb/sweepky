@@ -1431,12 +1431,20 @@ async fn end_to_end() {
     // B's project, made by `init`; B then works in it, as `run` must be
     // run in the project's own directory. Besides the marker and the
     // `.gitignore`, init wrote what Claude Code reads: the sandbox
-    // settings, the project's `CLAUDE.md` and the skill.
+    // settings, the project's `CLAUDE.md` and the skill. `--no-playbook`,
+    // so the test never reaches npm.
     let b_projects = tempfile::tempdir().expect("temp dir");
     let project = b_projects.path().join("project");
-    sweepky(&b, &["init", project.to_str().expect("a UTF-8 path")])
-        .await
-        .expect("B's init");
+    sweepky(
+        &b,
+        &[
+            "init",
+            project.to_str().expect("a UTF-8 path"),
+            "--no-playbook",
+        ],
+    )
+    .await
+    .expect("B's init");
     let mut made: Vec<String> = fs::read_dir(&project)
         .expect("the project")
         .map(|entry| {
@@ -1492,7 +1500,7 @@ async fn end_to_end() {
 
     // Anyone can read B's sweep record: running, for A's bounty, with all
     // three targets, and the placeholder playbook, since B's `init`
-    // recorded none.
+    // installed none (`--no-playbook`).
     let b_user = PublicKey::try_from_z32(&b_pubky.to_string()).expect("a key");
     let record = get_capped(
         &testnet,
@@ -1980,9 +1988,16 @@ async fn end_to_end() {
     // is open, and its agent leaves the common-format run directory.
     let c_projects = tempfile::tempdir().expect("temp dir");
     let c_project = c_projects.path().join("project");
-    sweepky(&c, &["init", c_project.to_str().expect("a UTF-8 path")])
-        .await
-        .expect("C's init");
+    sweepky(
+        &c,
+        &[
+            "init",
+            c_project.to_str().expect("a UTF-8 path"),
+            "--no-playbook",
+        ],
+    )
+    .await
+    .expect("C's init");
     c.cwd = c_project.clone();
     let c_sweep = SweepRef {
         sweeper: c_pubky,

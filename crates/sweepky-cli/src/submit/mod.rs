@@ -669,7 +669,7 @@ mod fixture {
 
         fn make(root: &Path, name: &str, sweeper: Pubky, id: RecordId) -> Self {
             let project = root.join(name);
-            crate::init::init(&project).expect("init");
+            crate::init::init_without_playbook(&project).expect("init");
             let fixture = Self {
                 root: root.to_owned(),
                 project,

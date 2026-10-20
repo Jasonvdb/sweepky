@@ -8,4 +8,4 @@
 
 `sweepky init <dir>` builds all three into the binary with `include_str!` and writes them into a sweeper project: the skill to `.claude/skills/sweepky/SKILL.md` byte for byte, `project-CLAUDE.md` to `CLAUDE.md`, and the template to `.claude/settings.json` with `claudeMdExcludes` set to the project's canonical path followed by `/sweeps/**/target/**`. Before P3, [P2a](../../docs/plan/phases/P2a-cli-identity.md) built a minimal `init` that writes only the `.sweepky` marker and a `.gitignore` containing `sweeps/`.
 
-The Cloudflare `security-audit` playbook is referenced, not vendored here. `init` offers to install it into the project at the pinned commit.
+The Cloudflare `security-audit` playbook is referenced, not vendored here. When the sweeper agrees (`init --install-playbook`, or a yes to the question `init` asks without `--no-playbook`), `init` installs it into the project's `.claude/skills/security-audit/` with the pinned `npx skills@1.7.2 add …#<full sha> --copy` line from [03](../../docs/plan/03-cli-and-skill.md#the-sweepky-skill), checks that it is plain files, and records `cloudflare/security-audit@<full sha>` as the `.sweepky` marker's `playbook`.

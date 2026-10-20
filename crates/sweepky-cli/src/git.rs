@@ -681,8 +681,8 @@ impl Drop for PrivateHome {
 
 /// What a bounded run produced: the exit status and both outputs, each
 /// within its cap.
-struct Finished {
-    status: ExitStatus,
+pub(crate) struct Finished {
+    pub(crate) status: ExitStatus,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
 }
@@ -695,7 +695,10 @@ struct Finished {
 /// terminal. A child past its timeout or either cap is killed and waited
 /// for before this returns, and `kill_on_drop` kills it too if this future
 /// is itself dropped half-way (when the command it serves is cancelled).
-async fn run_bounded(
+///
+/// `init` runs `npx` through it too (`init::playbook`), so both children
+/// get the same caps, timeout and `/dev/null` standard input.
+pub(crate) async fn run_bounded(
     mut command: tokio::process::Command,
     what: &str,
     limits: &Limits,

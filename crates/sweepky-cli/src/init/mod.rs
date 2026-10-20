@@ -1,15 +1,17 @@
 //! `sweepky init <dir>`: create the directory, a `.gitignore` that ignores
 //! `sweeps/`, the files Claude Code reads (the sandbox settings
 //! `.claude/settings.json`, the project's `CLAUDE.md` and a copy of the
-//! `/sweepky` skill, see [`project_files`]), and, last, the `.sweepky` marker
+//! `/sweepky` skill, see [`project_files`]), when the sweeper agrees the
+//! Cloudflare playbook (see [`playbook`]), and, last, the `.sweepky` marker
 //! that `run` requires. P2a built the directory, the `.gitignore` and the
-//! marker; P3 adds the Claude Code files. The playbook arrives later in P3.
+//! marker; P3 adds the Claude Code files and the playbook.
 //!
 //! The marker is a small JSON file, `{"schemaVersion":1}` and a newline, so
-//! later phases can add fields to it the way records grow. One is read
-//! already: `playbook`, the playbook P3's `init` will record it installed,
-//! which [`read_project_marker`] hands `run` (and later `submit`) when it is
-//! there. This build never writes it.
+//! later phases can add fields to it the way records grow. One is there
+//! when `init` installed the playbook: `playbook`,
+//! `cloudflare/security-audit@<full commit>`, which [`read_project_marker`]
+//! hands `run`, which writes it into the sweep record that `submit`
+//! completes. The marker is written only once the install is checked.
 //!
 //! File safety: init writes into a directory the user named, which may
 //! already hold files, so it never writes through a link and never replaces
@@ -46,6 +48,11 @@ use serde::{Deserialize, Serialize};
 use sweepky_core::{Playbook, RecordError, SchemaVersion, UnknownFields};
 
 use crate::Report;
+use crate::prompt::Terminal;
+#[cfg(test)]
+pub(crate) use playbook::PLAYBOOK_COMMIT;
+pub(crate) use playbook::{NpxRunner, PlaybookChoice};
+use playbook::{RunNpx, check_before_install, installed_line, wants_install};
 use project_files::{ClaudeFiles, SETTINGS, glob_safe};
 // File steps shared with the secret files' writer: the temp name, the synced
 // write, the open that checks it got the file it inspected, the capped read
@@ -57,6 +64,7 @@ use crate::private_fs::{
 /// The project marker's file name, directly inside the project directory.
 pub(crate) const MARKER: &str = ".sweepky";
 
+mod playbook;
 mod project_files;
 
 /// The project's git ignore file.
@@ -78,13 +86,14 @@ pub(crate) struct ProjectMarker {
     /// The format's version, 1. Reading one refuses a newer version, as a
     /// record's does.
     schema_version: SchemaVersion,
-    /// The playbook the project has installed, which P3's `init` records
-    /// and `run` writes into the sweep record. Read through core's
+    /// The playbook the project has installed, which `init` records after
+    /// a checked install and `run` writes into the sweep record. Read
+    /// through core's
     /// [`Playbook`], so a value outside 01's pattern makes the file no
     /// marker this build reads.
     // `default` reads a missing key as `None`, and `skip_serializing_if`
-    // leaves `None` out, so the marker this build writes is still exactly
-    // `{"schemaVersion":1}`: P2a's marker, unchanged.
+    // leaves `None` out, so the marker of a project without the playbook is
+    // still exactly `{"schemaVersion":1}`: P2a's marker, unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     playbook: Option<Playbook>,
     /// Fields a newer Sweepky wrote. `flatten` collects every key not named
@@ -116,26 +125,39 @@ const MAX_MARKER_BYTES: usize = 64 * 1024;
 /// sparse) file from being read into memory whole.
 const MAX_GITIGNORE_BYTES: usize = 1024 * 1024;
 
-/// Runs `sweepky init <dir>`.
+/// Runs `sweepky init <dir>`, installing the playbook as `playbook` says,
+/// asking on `terminal` when it says ask, through `npx`.
 ///
 /// Every check runs before the first write: the path, the marker, the
-/// Claude Code files ([`ClaudeFiles::inspect`]) and the `.gitignore`. Then
-/// the `.gitignore`, the Claude Code files and, last, the marker.
-pub(crate) fn init(dir: &Path) -> anyhow::Result<Report> {
+/// answer, the Claude Code files ([`ClaudeFiles::inspect`]), what npm would
+/// read ([`check_before_install`]) and the `.gitignore`. Then the
+/// `.gitignore`, the Claude Code files, the playbook and, last, the marker,
+/// so a failed install leaves no marker and the next run starts again.
+pub(crate) fn init(
+    dir: &Path,
+    playbook: PlaybookChoice,
+    terminal: Terminal<'_>,
+    npx: &impl RunNpx,
+) -> anyhow::Result<Report> {
     // The path goes into a glob pattern in the settings, so one that would
     // change the pattern is refused before even the directory is made. The
     // canonical path is checked again below, since a parent link can lead
     // anywhere.
     glob_safe(dir)?;
-    // Like `mkdir -p`: creates every missing parent, and succeeds if the
-    // directory is already there.
-    fs::create_dir_all(dir).with_context(|| format!("could not create {}", dir.display()))?;
 
+    // Looked at before the directory is made: `lstat` of a name inside a
+    // directory that does not exist is simply nothing there.
     let marker = dir.join(MARKER);
     if is_initialised(&marker)? {
         return already_initialised(dir);
     }
+    // The question comes before anything is made, so `--no-input` without
+    // either playbook flag fails with nothing written.
+    let install = wants_install(playbook, terminal)?;
 
+    // Like `mkdir -p`: creates every missing parent, and succeeds if the
+    // directory is already there.
+    fs::create_dir_all(dir).with_context(|| format!("could not create {}", dir.display()))?;
     refuse_symlinked_project_dir(&marker)?;
     // `canonicalize` resolves every link and `..` in the path, which now
     // exists. Claude Code matches `claudeMdExcludes` against files' real
@@ -144,6 +166,9 @@ pub(crate) fn init(dir: &Path) -> anyhow::Result<Report> {
     let canonical =
         fs::canonicalize(dir).with_context(|| format!("could not resolve {}", dir.display()))?;
     let claude_files = ClaudeFiles::inspect(dir, &canonical)?;
+    if install {
+        check_before_install(dir)?;
+    }
 
     let mut done = vec![
         ensure_gitignore(&dir.join(GITIGNORE))?
@@ -151,10 +176,28 @@ pub(crate) fn init(dir: &Path) -> anyhow::Result<Report> {
             .to_owned(),
     ];
     done.extend(claude_files.write()?);
-    write_new(&marker, &marker_bytes()?)?;
-    done.push(format!("wrote {MARKER}"));
+    // `then` runs the install only when `install` is true, giving
+    // `Some(result)`, and `transpose` turns that `Option<Result<…>>` into
+    // a `Result<Option<…>>`, so `?` stops here on a failed install, before
+    // the marker.
+    let installed = install.then(|| playbook::install(dir, npx)).transpose()?;
+    match &installed {
+        Some(playbook) => {
+            done.push(installed_line());
+            write_new(&marker, &marker_bytes(Some(playbook))?)?;
+            done.push(format!("wrote {MARKER}, naming the playbook {playbook}"));
+        }
+        None => {
+            done.push(NO_PLAYBOOK_LINE.to_owned());
+            write_new(&marker, &marker_bytes(None)?)?;
+            done.push(format!("wrote {MARKER}"));
+        }
+    }
     Ok(finished(dir, &canonical, &done))
 }
+
+/// The report's line when no playbook was installed.
+const NO_PLAYBOOK_LINE: &str = "installed no playbook, so the agent does a careful review unless                                 the bounty's suggested playbook is installed here";
 
 /// The report of a finished `init`: what it did, one line each, then the
 /// project's real path, the Node requirement and how to launch a sweep.
@@ -359,11 +402,14 @@ fn existing(path: &Path) -> anyhow::Result<Existing> {
     }
 }
 
-/// The marker file's bytes: the JSON object and a newline.
-fn marker_bytes() -> anyhow::Result<Vec<u8>> {
+/// The marker file's bytes, naming `playbook` when there is one: the JSON
+/// object and a newline.
+fn marker_bytes(playbook: Option<&Playbook>) -> anyhow::Result<Vec<u8>> {
     let marker = ProjectMarker {
         schema_version: SchemaVersion::CURRENT,
-        playbook: None,
+        // `cloned` copies the borrowed playbook, a short string, into the
+        // marker, which owns its fields.
+        playbook: playbook.cloned(),
         extra: UnknownFields::new(),
     };
     let mut bytes = serde_json::to_vec(&marker).context("could not write the marker")?;
@@ -536,6 +582,38 @@ fn create_with(temp: &Path, path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     linked.and(removed)
 }
 
+/// `init <dir> --no-playbook`, with nothing to ask and an npx that fails
+/// the run if anything starts it: what most tests need of a project.
+#[cfg(test)]
+pub(crate) fn init_without_playbook(dir: &Path) -> anyhow::Result<Report> {
+    init_with(dir, PlaybookChoice::Skip, &playbook::FakeNpx::failing())
+}
+
+/// `init <dir> --install-playbook`, with an npx that installs what
+/// skills@1.7.2 would: a project whose marker names the playbook.
+#[cfg(test)]
+pub(crate) fn init_with_fake_playbook(dir: &Path) -> anyhow::Result<Report> {
+    init_with(
+        dir,
+        PlaybookChoice::Install,
+        &playbook::FakeNpx::installing(),
+    )
+}
+
+/// [`init`] with `choice` and `npx`, an empty standard input and standard
+/// error thrown away.
+#[cfg(test)]
+fn init_with(dir: &Path, choice: PlaybookChoice, npx: &impl RunNpx) -> anyhow::Result<Report> {
+    let stdin = crate::StdinReader::new(std::io::empty());
+    let stderr = crate::StderrWriter::new(std::io::sink());
+    let terminal = Terminal {
+        stdin: &stdin,
+        stderr: &stderr,
+        prompting: crate::prompt::Prompting::Allowed,
+    };
+    init(dir, choice, terminal, npx)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -546,9 +624,17 @@ mod tests {
     use sweepky_core::Playbook;
     use tempfile::TempDir;
 
+    // Most tests here are about the files, not the playbook, so they call
+    // `init --no-playbook` by the short name `init`; the playbook's own
+    // tests call the real `super::init` with their choice and fake npx.
+    use super::playbook::{FakeNpx, NpxCommand, PLAYBOOK_COMMIT, SKILL_DIR, install_command};
     use super::{
-        GITIGNORE, MARKER, MAX_GITIGNORE_BYTES, create_with, init, read_project_marker, write_new,
+        GITIGNORE, MARKER, MAX_GITIGNORE_BYTES, PlaybookChoice, create_with,
+        init_without_playbook as init, read_project_marker, write_new,
     };
+    use crate::prompt::{MAX_ANSWER_BYTES, Prompting, Terminal};
+    use crate::test_support::SharedBuffer;
+    use crate::{Report, StderrWriter, StdinReader};
 
     /// A new, empty directory `name` inside `temp`.
     fn project_dir(temp: &TempDir, name: &str) -> PathBuf {
@@ -1070,5 +1156,300 @@ mod tests {
         assert_eq!(entries(&dir), initialised());
         assert_eq!(fs::read(dir.join(MARKER)).expect("marker"), marker);
         assert_eq!(fs::read(dir.join(GITIGNORE)).expect("gitignore"), gitignore);
+    }
+
+    // -----------------------------------------------------------------------
+    // The playbook.
+
+    /// Runs the real `init` on `dir` with `choice`, `answer` as standard
+    /// input, `prompting` and `npx`, and returns its result and what it
+    /// wrote to standard error.
+    fn init_answering(
+        dir: &Path,
+        choice: PlaybookChoice,
+        answer: &str,
+        prompting: Prompting,
+        npx: &FakeNpx,
+    ) -> (anyhow::Result<Report>, String) {
+        let stdin = StdinReader::new(std::io::Cursor::new(answer.to_owned()));
+        let said = SharedBuffer::default();
+        let stderr = StderrWriter::new(said.clone());
+        let terminal = Terminal {
+            stdin: &stdin,
+            stderr: &stderr,
+            prompting,
+        };
+        (super::init(dir, choice, terminal, npx), said.text())
+    }
+
+    /// A test's way of planting one case: given the project and a file
+    /// outside it.
+    type Plant = fn(&Path, &Path);
+
+    /// The full playbook value the marker names after an install.
+    fn full_playbook() -> String {
+        format!("cloudflare/security-audit@{PLAYBOOK_COMMIT}")
+    }
+
+    #[test]
+    fn install_playbook_runs_03_s_line_in_the_project_and_the_marker_names_it() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let dir = temp.path().join("project");
+        let npx = FakeNpx::installing();
+
+        let (result, said) = init_answering(
+            &dir,
+            PlaybookChoice::Install,
+            "",
+            Prompting::Forbidden,
+            &npx,
+        );
+        let report = result.expect("init succeeds");
+
+        // Exactly one run: the pinned argv, in the project, with telemetry
+        // off. Under --no-input too, since the flag answered the question.
+        assert_eq!(
+            npx.calls(),
+            [NpxCommand {
+                args: [
+                    "skills@1.7.2",
+                    "add",
+                    "https://github.com/cloudflare/security-audit-skill#\
+                     c1c8a8c1471069fb0e188eeaff69b8e8db6564a8",
+                    "--skill",
+                    "security-audit",
+                    "--agent",
+                    "claude-code",
+                    "--copy",
+                    "-y",
+                ]
+                .map(str::to_owned)
+                .to_vec(),
+                dir: dir.clone(),
+                env: &[("DISABLE_TELEMETRY", "1")],
+            }]
+        );
+        assert_eq!(said, "", "nothing asked");
+        let marker = read_project_marker(&dir).expect("the marker reads");
+        assert_eq!(
+            marker
+                .playbook()
+                .map(|playbook| playbook.as_str().to_owned()),
+            Some(full_playbook())
+        );
+        assert!(dir.join(SKILL_DIR).join("SKILL.md").is_file());
+        assert!(
+            report.text().contains(&full_playbook()),
+            "{}",
+            report.text()
+        );
+    }
+
+    #[test]
+    fn no_playbook_never_runs_npx_and_the_marker_names_none() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let dir = temp.path().join("project");
+        let npx = FakeNpx::installing();
+
+        let (result, said) =
+            init_answering(&dir, PlaybookChoice::Skip, "", Prompting::Allowed, &npx);
+        let report = result.expect("init succeeds");
+
+        assert!(npx.calls().is_empty());
+        assert_eq!(said, "");
+        assert_eq!(
+            fs::read_to_string(dir.join(MARKER)).expect("marker"),
+            "{\"schemaVersion\":1}\n"
+        );
+        assert!(
+            report.text().contains("installed no playbook"),
+            "{}",
+            report.text()
+        );
+    }
+
+    #[test]
+    fn without_a_flag_init_asks_once_and_only_yes_installs() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        for (answer, installs) in [
+            ("y\n", true),
+            ("YES\n", true),
+            ("n\n", false),
+            ("\n", false),
+            ("", false),
+            ("sure\n", false),
+        ] {
+            let dir = temp.path().join(format!("p{}", answer.len()));
+            let _ = fs::remove_dir_all(&dir);
+            let npx = FakeNpx::installing();
+            let (result, said) =
+                init_answering(&dir, PlaybookChoice::Ask, answer, Prompting::Allowed, &npx);
+            result.expect("init succeeds");
+            // One question on standard error, naming the commit and both
+            // flags.
+            assert_eq!(said.matches("[y/N]").count(), 1, "{answer:?}: {said}");
+            for phrase in [PLAYBOOK_COMMIT, "--install-playbook", "--no-playbook"] {
+                assert!(said.contains(phrase), "{answer:?}: {said}");
+            }
+            assert_eq!(npx.calls().len(), usize::from(installs), "{answer:?}");
+            let marker = read_project_marker(&dir).expect("reads");
+            assert_eq!(marker.playbook().is_some(), installs, "{answer:?}");
+        }
+
+        // An answer past the cap is an error before anything is written.
+        let dir = temp.path().join("too-long");
+        let npx = FakeNpx::installing();
+        let long = format!("{}\n", "y".repeat(MAX_ANSWER_BYTES));
+        let (result, _) =
+            init_answering(&dir, PlaybookChoice::Ask, &long, Prompting::Allowed, &npx);
+        assert!(result.is_err());
+        assert!(npx.calls().is_empty());
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn no_input_without_a_flag_fails_naming_both_flags_with_nothing_written() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let npx = FakeNpx::installing();
+
+        // A directory that does not exist yet is not even made, and one
+        // that does is left empty.
+        let missing = temp.path().join("missing");
+        let empty = project_dir(&temp, "empty");
+        for dir in [&missing, &empty] {
+            let (result, said) =
+                init_answering(dir, PlaybookChoice::Ask, "y\n", Prompting::Forbidden, &npx);
+            let message = format!("{:#}", result.expect_err("refused"));
+            for phrase in ["--no-input", "--install-playbook", "--no-playbook"] {
+                assert!(message.contains(phrase), "{message}");
+            }
+            assert_eq!(said, "");
+        }
+        assert!(!missing.exists());
+        assert!(entries(&empty).is_empty());
+        assert!(npx.calls().is_empty());
+    }
+
+    #[test]
+    fn a_failed_install_leaves_no_marker_and_the_next_run_finishes() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let dir = temp.path().join("project");
+
+        // npx fails as the real runner does on a bad exit, a timeout or too
+        // much output (its own tests check those say none of npx's words).
+        let (result, _) = init_answering(
+            &dir,
+            PlaybookChoice::Install,
+            "",
+            Prompting::Allowed,
+            &FakeNpx::failing(),
+        );
+        assert!(result.is_err());
+        assert!(!dir.join(MARKER).exists());
+
+        // A failure part way through the copy, as a killed npx leaves it.
+        let (result, _) = init_answering(
+            &dir,
+            PlaybookChoice::Install,
+            "",
+            Prompting::Allowed,
+            &FakeNpx::doing(|dir| {
+                fs::create_dir_all(dir.join(SKILL_DIR))?;
+                fs::write(dir.join(SKILL_DIR).join("HALF.md"), "half\n")?;
+                anyhow::bail!("killed")
+            }),
+        );
+        assert!(result.is_err());
+        assert!(!dir.join(MARKER).exists());
+
+        // The next run keeps the identical files, installs over what was
+        // left, and finishes.
+        let npx = FakeNpx::installing();
+        let (result, _) =
+            init_answering(&dir, PlaybookChoice::Install, "", Prompting::Allowed, &npx);
+        let report = result.expect("the second run finishes");
+        assert!(
+            report.text().contains("kept CLAUDE.md"),
+            "{}",
+            report.text()
+        );
+        assert_eq!(npx.calls(), [install_command(&dir)]);
+        let marker = read_project_marker(&dir).expect("reads");
+        assert!(marker.playbook().is_some());
+    }
+
+    #[test]
+    fn an_install_that_holds_a_link_is_refused_and_leaves_no_marker() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).expect("mkdir");
+        fs::write(outside.join("secret"), "not the playbook\n").expect("write");
+        let dir = temp.path().join("project");
+        let planted = outside.clone();
+
+        let (result, _) = init_answering(
+            &dir,
+            PlaybookChoice::Install,
+            "",
+            Prompting::Allowed,
+            &FakeNpx::doing(move |dir| {
+                let skill = dir.join(SKILL_DIR);
+                fs::create_dir_all(&skill)?;
+                fs::write(skill.join("SKILL.md"), "skill\n")?;
+                symlink(&planted, skill.join("refs"))?;
+                Ok(())
+            }),
+        );
+        let message = format!("{:#}", result.expect_err("refused"));
+        assert!(message.contains("symbolic link"), "{message}");
+        assert!(!dir.join(MARKER).exists());
+    }
+
+    #[test]
+    fn a_project_npm_would_read_config_from_is_refused_before_npx_runs() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let elsewhere = temp.path().join("elsewhere");
+        fs::write(&elsewhere, "{}\n").expect("write");
+
+        // npm's own project files, of any kind, and a lock file or skill
+        // directory that npx would write through.
+        let cases: [(&str, Plant); 6] = [
+            (".npmrc", |dir, _| {
+                fs::write(dir.join(".npmrc"), "x\n").expect("write")
+            }),
+            ("package.json", |dir, _| {
+                fs::write(dir.join("package.json"), "{}\n").expect("write")
+            }),
+            ("node_modules", |dir, _| {
+                fs::create_dir(dir.join("node_modules")).expect("mkdir")
+            }),
+            ("linked-npmrc", |dir, elsewhere| {
+                symlink(elsewhere, dir.join(".npmrc")).expect("symlink")
+            }),
+            ("linked-lock", |dir, elsewhere| {
+                symlink(elsewhere, dir.join("skills-lock.json")).expect("symlink")
+            }),
+            ("linked-skill", |dir, elsewhere| {
+                let skills = dir.join(".claude/skills");
+                fs::create_dir_all(&skills).expect("mkdir");
+                symlink(
+                    elsewhere.parent().expect("parent"),
+                    skills.join("security-audit"),
+                )
+                .expect("symlink");
+            }),
+        ];
+        for (name, plant) in cases {
+            let dir = project_dir(&temp, &format!("p-{name}"));
+            plant(&dir, &elsewhere);
+            let before = entries(&dir);
+            let npx = FakeNpx::installing();
+            let (result, _) =
+                init_answering(&dir, PlaybookChoice::Install, "", Prompting::Allowed, &npx);
+            assert!(result.is_err(), "{name}");
+            assert!(npx.calls().is_empty(), "{name}");
+            assert_eq!(entries(&dir), before, "{name}: nothing written");
+        }
+        assert_eq!(fs::read_to_string(&elsewhere).expect("read"), "{}\n");
     }
 }
