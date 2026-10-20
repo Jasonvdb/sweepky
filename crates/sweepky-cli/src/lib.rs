@@ -239,7 +239,10 @@
 //!   `grant.token`, the owner-only file that holds the grant token the SDK
 //!   exports, optionally passphrase-wrapped, read back within a cap and
 //!   refused in fixed text when it is not a token. `login.json` records a
-//!   Ring login as the kind `ring`, with the grant's expiry.
+//!   Ring login as the kind `ring`, with the grant's expiry. And the sign-in
+//!   page, one HTML string with the QR code as an inline SVG, a copy button
+//!   and a live status, made to run under a strict nonce CSP, plus the QR
+//!   code the terminal prints as the fallback.
 //!
 //! The rules that hold for everything here (see "Rust conventions" in
 //! `docs/plan/03-cli-and-skill.md`):
@@ -341,7 +344,8 @@ mod private_fs;
 // Standard input, and the one yes-or-no question a command asks on it.
 mod prompt;
 // The Pubky Ring login: the check that a grant can write every Sweepky
-// record, the expiry notice, and `grant.token`, the grant token's file.
+// record, the expiry notice, `grant.token`, the grant token's file, and the
+// sign-in page with its QR codes.
 // The Ring login flow, a later P2d step, is the first caller outside the
 // tests; until then the compiler would warn that nothing here is used.
 // `expect` (not `allow`) warns as soon as that stops being true, so the

@@ -16,6 +16,9 @@
 //!   the SDK fixes; `login.json` keeps its end as `grantExpiresAt`
 //!   (`crate::state::LoginState`).
 //! - [`token`], `grant.token`, the owner-only file that holds the token.
+//! - [`page`], the sign-in page the loopback server serves, with the
+//!   authorization URL's QR code as an inline SVG, a copy button and a live
+//!   status, and the QR code `login` prints in the terminal as its fallback.
 //!
 //! The checks are pure: they take the capabilities and the times as
 //! arguments, so they are tested without a network or a clock.
@@ -27,6 +30,7 @@ use sweepky_core::RecordTime;
 
 use crate::network::SWEEPKY_CAPABILITY;
 
+pub(crate) mod page;
 pub(crate) mod token;
 
 /// The letter for write in a capability's actions, as in `/pub/sweepky/:rw`.

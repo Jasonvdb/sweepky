@@ -60,6 +60,12 @@ rustix = { workspace = true, features = ["fs"] }
 # listing can add its query and parse `https://` listing lines. The release
 # pubky itself uses, so it adds no code.
 url = { workspace = true }
+# The QR codes of the Pubky Ring sign-in (P2d): the sign-in page's, as an
+# inline SVG, and the terminal's, in block characters. The workspace entry
+# turns defaults off and only `svg` on, so qrcode's image stack stays out;
+# its terminal renderer needs no feature. With these features qrcode has no
+# dependencies of its own.
+qrcode = { workspace = true }
 
 # Crates for this crate's own tests only; none of them reaches the binary.
 [dev-dependencies]
