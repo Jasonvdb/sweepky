@@ -28,9 +28,10 @@ pub struct Cli {
 
     /// Read the passphrase that wraps this install's secret files from
     /// FILE: its one line, without the line ending. With it, `login` writes
-    /// the identity file and device key it creates wrapped with the
-    /// passphrase (age's scrypt), and every command that reads a wrapped
-    /// file needs it again. Meant for process substitution, as in
+    /// the secret files it creates wrapped with the passphrase (age's
+    /// scrypt): the identity file and device key with --identity, the grant
+    /// token and device key for a Pubky Ring login. Every command that
+    /// reads a wrapped file needs it again. Meant for process substitution, as in
     /// --passphrase-file <(pass show sweepky), which keeps the passphrase out
     /// of the argument list, the shell history and the disk.
     //
@@ -82,11 +83,15 @@ pub enum Command {
         dir: PathBuf,
     },
 
-    /// Log in. With --identity NAME: create a dedicated identity under that
-    /// name, or reuse the one created earlier, sign it up on its homeserver
-    /// the first time, and sign in. With --passphrase-file, the identity
-    /// file and device key it creates are wrapped with that passphrase.
-    /// (The Pubky Ring sign-in comes in a later build.)
+    /// Log in. Without --identity: through Pubky Ring, by approving the
+    /// sign-in page it opens in the browser (or the link and QR code it
+    /// prints) in Ring; it saves the grant token Ring approves, which lasts
+    /// two years. With --identity NAME: create a dedicated identity under
+    /// that name, or reuse the one created earlier, sign it up on its
+    /// homeserver the first time, and sign in. Either way it publishes this
+    /// install's device key. With --passphrase-file, the secret files it
+    /// creates (the grant token or the identity file, and the device key)
+    /// are wrapped with that passphrase.
     Login {
         /// The name of a dedicated Sweepky identity: 1 to 32 characters of
         /// a-z, 0-9, - and _, starting with a letter. Never a key, a recovery
@@ -100,7 +105,7 @@ pub enum Command {
 
         /// The homeserver to sign the identity up on, as its public key.
         /// Defaults to the local testnet's homeserver under --testnet, else to
-        /// homeserver.pubky.app.
+        /// homeserver.pubky.app. Only with --identity.
         //
         // Read as text and parsed by `login`, not by clap: clap's error for a
         // value it cannot parse quotes the value, and a key pasted into the
@@ -109,7 +114,7 @@ pub enum Command {
         homeserver: Option<String>,
 
         /// The signup token homeserver.pubky.app asks for when an identity
-        /// first signs up. Spent by that signup.
+        /// first signs up. Spent by that signup. Only with --identity.
         //
         // `value_parser` moves the text into a `SecretString` as clap parses
         // it, so the rest of the program only ever holds the wrapped value,

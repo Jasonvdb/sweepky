@@ -1,5 +1,8 @@
 //! `sweepky login --identity <name> [--homeserver <pk>] [--signup-token
 //! <code>]`: login option B, a dedicated identity the CLI holds itself.
+//! Without `--identity`, [`login`] hands over to option A, the Pubky Ring
+//! sign-in ([`crate::ring::login`]), which runs this module's shared tail
+//! ([`record_login_and_check_keys`]) with the grant's session.
 //!
 //! The flow, every step after the first under the writers' lock:
 //!
@@ -90,9 +93,16 @@ use crate::state::{
 };
 use crate::{Context, Dirs, Report};
 
-/// What `login` without `--identity` says until P2d builds the Ring sign-in.
-const RING_LOGIN_LATER: &str =
-    "the Pubky Ring sign-in arrives in a later build; use --identity <name>";
+/// Why `--homeserver` without `--identity` is refused. The value is not
+/// quoted, as for every refusal of a flag here.
+const HOMESERVER_NEEDS_IDENTITY: &str = "--homeserver goes with --identity <name>: a Pubky Ring \
+     login (`sweepky login` alone) uses the homeserver your Ring identity already lives on";
+
+/// Why `--signup-token` without `--identity` is refused, before it could be
+/// sent anywhere.
+const SIGNUP_TOKEN_NEEDS_IDENTITY: &str = "--signup-token goes with --identity <name>: a Pubky \
+     Ring login (`sweepky login` alone) signs nothing up, so the token was not sent and is still \
+     unspent";
 
 /// Why a signup on homeserver.pubky.app needs `--signup-token`, and the ways
 /// to get one, from 06 ("Production homeserver").
@@ -384,7 +394,7 @@ async fn sign_up(
 
 /// What [`record_login`] did about this install's device key.
 #[derive(Debug)]
-enum DeviceKeyOutcome {
+pub(crate) enum DeviceKeyOutcome {
     /// This run made a new device key and published it under this id.
     Published(DeviceId),
     /// `login.json` already records this install's key under this id, and
@@ -409,13 +419,13 @@ impl DeviceKeyOutcome {
 
 /// What the shared tail did, and what the check of `keys/` after it found.
 #[derive(Debug)]
-struct TailOutcome {
+pub(crate) struct TailOutcome {
     /// What [`record_login`] did about this install's device key.
-    device: DeviceKeyOutcome,
+    pub(crate) device: DeviceKeyOutcome,
     /// The report's lines from the check of `keys/` ([`check_key_ids`]): an
     /// alarm per unknown id or replaced key, or a warning that the check
     /// could not run. Empty when all is well.
-    key_check: String,
+    pub(crate) key_check: String,
 }
 
 /// The shared tail ([`record_login`]) and then the check of the identity's
@@ -424,7 +434,7 @@ struct TailOutcome {
 /// and on every later one alike. The check runs only once the tail has
 /// succeeded, so this install's own key is published and recorded in
 /// `installs.json`, with its key, by then, and never reads as unknown.
-async fn record_login_and_check_keys(
+pub(crate) async fn record_login_and_check_keys(
     dirs: &Dirs,
     passphrase: Option<&Passphrase>,
     keys: &impl KeyStore,
@@ -668,7 +678,7 @@ async fn reuse_device_key(
 /// second published key while the sweeps encrypted to the first stay
 /// unopened. A wrapped file read without `passphrase` is refused with how to
 /// give it, and nothing else: the file is fine.
-fn read_recorded_device_key(
+pub(crate) fn read_recorded_device_key(
     dirs: &Dirs,
     passphrase: Option<&Passphrase>,
     id: &DeviceId,
@@ -779,7 +789,7 @@ fn not_this_installs_key(id: &DeviceId) -> String {
 
 /// What the report says about this install's device key, for each thing
 /// [`record_login`] can have done with it.
-fn device_key_report(dirs: &Dirs, outcome: &DeviceKeyOutcome) -> String {
+pub(crate) fn device_key_report(dirs: &Dirs, outcome: &DeviceKeyOutcome) -> String {
     match outcome {
         DeviceKeyOutcome::Published(id) => published_key_report(dirs, id),
         DeviceKeyOutcome::Reused(id) => {
@@ -813,6 +823,11 @@ fn published_key_report(dirs: &Dirs, id: &DeviceId) -> String {
 
 /// Runs `login`. `identity`, `homeserver` and `signup_token` are the flags,
 /// `None` when not given.
+///
+/// Without `--identity` it is the Pubky Ring login ([`crate::ring::login`]).
+/// `--homeserver` and `--signup-token` belong to a dedicated identity, so
+/// with neither of them given they are refused first, before any file is
+/// read or any request sent, in fixed text that quotes neither value.
 pub(crate) async fn login(
     ctx: &Context,
     identity: Option<&str>,
@@ -820,7 +835,13 @@ pub(crate) async fn login(
     signup_token: Option<&SecretString>,
 ) -> anyhow::Result<Report> {
     let Some(identity) = identity else {
-        bail!(RING_LOGIN_LATER);
+        if homeserver.is_some() {
+            bail!(HOMESERVER_NEEDS_IDENTITY);
+        }
+        if signup_token.is_some() {
+            bail!(SIGNUP_TOKEN_NEEDS_IDENTITY);
+        }
+        return crate::ring::login::login(ctx).await;
     };
     // 1. The argument is a name or is refused, before the lock is taken or
     // any file is touched.
@@ -941,7 +962,7 @@ async fn login_locked(
 /// passphrase, `paths`: nothing when it wrapped none.
 ///
 /// `&[PathBuf]` is a borrowed slice, so the caller keeps its `Vec`.
-fn wrapped_report(paths: &[PathBuf]) -> String {
+pub(crate) fn wrapped_report(paths: &[PathBuf]) -> String {
     if paths.is_empty() {
         return String::new();
     }
@@ -951,9 +972,9 @@ fn wrapped_report(paths: &[PathBuf]) -> String {
         .collect();
     format!(
         "Wrapped {} with the passphrase from --passphrase-file. Give --passphrase-file again to \
-         every command that signs in or reads this install's key (login, logout, keys revoke, \
-         circle create, add and remove), and keep the passphrase as safe as the files: without \
-         it they cannot be opened.\n",
+         every command that signs in or reads this install's key (every command but init, keys \
+         list and circle show), and keep the passphrase as safe as the files: without it they \
+         cannot be opened.\n",
         shown.join(" and ")
     )
 }

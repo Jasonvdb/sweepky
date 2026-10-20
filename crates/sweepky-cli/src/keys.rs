@@ -54,8 +54,9 @@
 //! points at.
 //!
 //! **`keys revoke <deviceId>`** ([`revoke`]) checks the id, then, under the
-//! writers' lock with a session of its own that is always signed out
-//! (`session::with_writer_session`), reads the signed-in user's own
+//! writers' lock with a session of its own (`session::with_writer_session`:
+//! an identity session is signed out afterwards, a Ring one only dropped),
+//! reads the signed-in user's own
 //! `keys/<id>.json`, sets `revokedAt` to now unless it is set already, and
 //! writes it back with every field it does not know kept ([`revoke_key`]).
 //! Revoking this install's own key is allowed; the report then says to log
@@ -923,8 +924,8 @@ pub(crate) async fn revoke(ctx: &Context, device_id: &str) -> anyhow::Result<Rep
     let id: DeviceId = device_id
         .parse()
         .context("keys revoke takes a device id, as `sweepky keys list` shows it")?;
-    // The writers' lock, a fresh sign-in and a sign-out that is always
-    // attempted, around the read and the write. The `async |signed|` closure
+    // The writers' lock and a fresh session around the read and the write;
+    // afterwards an identity session is signed out, a Ring one only dropped. The `async |signed|` closure
     // borrows `id` and `ctx` from this function; `signed` is lent to it for
     // the call only.
     with_writer_session(ctx, async |signed| {

@@ -22,8 +22,9 @@
 //!      and ask whether to publish it. Anything but `y` or `yes` publishes
 //!      nothing, and so does `--no-input`, which fails instead of asking;
 //!   4. only then make the bounty's id from the clock and, under the
-//!      writers' lock with a fresh session that is always signed out
-//!      (`session::with_writer_session`), PUT the record through
+//!      writers' lock with a fresh session (`session::with_writer_session`:
+//!      an identity session is signed out afterwards, a Ring one only
+//!      dropped), PUT the record through
 //!      [`OwnStorage`] ([`publish`]), and report its `pubky://` URL. An
 //!      open bounty goes through `open` instead, which searches before it
 //!      takes the lock and writes its discovered-sweeps file after the
@@ -32,7 +33,7 @@
 //! **Why the question comes before the lock.** The lock serialises every
 //! writing command on this install, and a person may take minutes to
 //! answer, so no other command waits on them and no session is open
-//! meanwhile. The lock covers the sign-in, the PUT and the sign-out alone
+//! meanwhile. The lock covers the sign-in or restore, the PUT and the sign-out alone
 //! (for `--open`, see `open` for the little more it covers).
 //!
 //! **Agent-written text is sanitised on its way to the terminal.** The
@@ -159,16 +160,16 @@ fn bounty_bytes(bounty: &Bounty) -> anyhow::Result<Vec<u8>> {
 }
 
 /// Publishes `record` under a new bounty id, under the writers' lock with
-/// a fresh session that is always signed out, and gives the bounty's
-/// address.
+/// a fresh session (an identity's signed out afterwards, a Ring one only
+/// dropped), and gives the bounty's address.
 async fn publish_signed_in(ctx: &Context, record: Vec<u8>) -> anyhow::Result<BountyRef> {
     // From the clock, which `new_record_id` checks first, so a clock before
     // 1970 is an error here rather than a panic.
     let id = clock::new_record_id()?;
     // `async move` moves `record` into the closure, which `publish` then
     // consumes; `id` is `Copy`, so the closure gets a copy. The closure
-    // only borrows the session, so `with_writer_session` still signs it
-    // out afterwards, whatever `publish` returned.
+    // only borrows the session, so `with_writer_session` still ends it
+    // afterwards, whatever `publish` returned.
     with_writer_session(ctx, async move |signed| {
         publish(&SessionStorage::new(signed), id, record).await?;
         Ok(BountyRef {

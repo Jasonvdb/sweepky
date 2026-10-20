@@ -39,20 +39,50 @@
 //! `credential.lock` and `pull.lock` are never deleted, because a new lock
 //! file would let a second command in while another still holds the old one.
 //!
-//! P2d slots the Pubky Ring login into steps 3 and 4: revoke the grant (its
-//! sign-out), check that restoring the saved token gets a 401, and delete
-//! the token instead of an identity.
+//! **A Pubky Ring login** ([`logout_ring`], [`retire_ring`]) runs the same
+//! steps, with the grant in place of the identity:
+//!
+//! 1. Restore the session from `grant.token` (`session::restore_saved_grant`).
+//! 2. Revoke this install's device key with that live session, as above.
+//! 3. Revoke the grant: its sign-out.
+//! 4. Check that restoring the saved token now gets a 401, the proof that
+//!    the grant is gone ([`crate::ring::revoke_grant`] runs 1 to 4).
+//! 5. Only then delete `grant.token`, and this install's files as above.
+//!
+//! It differs from the identity's order in three ways. A failed step 2 does
+//! **not** sign out: that would revoke the grant and so lock this install
+//! out of the key it could not yet revoke. A failed or unconfirmed step 3 or
+//! 4 stops before anything is deleted, so `logout` can run again with the
+//! token. And an install already **locked out** (its grant revoked in Ring,
+//! or past `grantExpiresAt`, which is checked first, without a request) has
+//! no session to revoke its key with, so it reads its own
+//! `keys/<deviceId>.json` anonymously from public storage instead, through
+//! the capped public read. It finishes when that record reads revoked, or
+//! is not published, and stops otherwise, naming `sweepky keys revoke <id>`
+//! to run from another install; that is how 02's "revoked from another
+//! install with `keys revoke`" lets this logout finish.
+//!
+//! **An expired grant is not a confirmed end.** The SDK compares the
+//! grant's `exp` with this machine's clock and refuses to send a grant that
+//! clock says has expired, so a clock set ahead of the homeserver's cannot
+//! be told apart from a real expiry here. Logout still finishes, through
+//! the anonymous key-record read above, but its report warns that the grant
+//! could not be revoked on the homeserver and to revoke `sweepky-cli` in
+//! Pubky Ring if it is still listed there, rather than claim it ended.
 
 use anyhow::{Context as _, bail};
-use sweepky_core::{DeviceId, RecordTime};
+use sweepky_core::{DeviceId, DeviceKey, RecordTime, Zeroizing};
 
 use crate::clock;
-use crate::device::{SessionKeyStore, remove_device_key};
+use crate::device::{PublicKeyReader, PublicKeys, SessionKeyStore, remove_device_key};
 use crate::display::sanitize;
 use crate::installs::forget_owner;
 use crate::keys::{Revocation, revoke_if_published};
 use crate::private_fs::{lstat, remove_private_file};
-use crate::session::{sign_in, with_writers_lock};
+use crate::remote::public_key_of;
+use crate::ring::token::remove_grant_token;
+use crate::ring::{GrantRevocation, Restored, expired_grant_at, expiry_text, revoke_grant};
+use crate::session::{restore_saved_grant, sign_in, with_writers_lock};
 use crate::state::{KnownLoginKind, LoginState, read_login_state};
 use crate::{Context, Dirs, Report};
 
@@ -72,6 +102,30 @@ enum RetiredKey {
     Revoked(DeviceId, Revocation),
 }
 
+/// How this install's Pubky Ring grant ended, for the report.
+#[derive(Debug, PartialEq, Eq)]
+enum EndedGrant {
+    /// This logout signed it out, and a restore of the saved token then got
+    /// a 401.
+    Revoked,
+    /// The homeserver refused the saved token with a 401 before anything
+    /// was done: the grant was revoked (in Ring, say) or had expired.
+    AlreadyRevoked,
+    /// `login.json`'s `grantExpiresAt`, this time (Unix seconds), had passed
+    /// by this machine's clock, so nothing was sent with the token (the SDK
+    /// would refuse to). A clock set ahead looks the same, so this is no
+    /// proof that the grant ended on the homeserver: the report warns.
+    Expired(u64),
+}
+
+/// What a Ring logout says when the grant may still be live, and why it
+/// kept everything: the sign-out failed, or the restore after it was not a
+/// 401.
+const GRANT_NOT_CONFIRMED: &str = "logout could not confirm that this install's Pubky Ring grant \
+     is revoked, so it deleted nothing, kept grant.token, and this install is still logged in; \
+     run `sweepky logout` again, or revoke sweepky-cli in Pubky Ring and then run `sweepky \
+     logout` here again";
+
 /// Runs `logout`: steps 1 to 5 of the module docs.
 pub(crate) async fn logout(ctx: &Context) -> anyhow::Result<Report> {
     with_writers_lock(ctx, async || {
@@ -79,6 +133,9 @@ pub(crate) async fn logout(ctx: &Context) -> anyhow::Result<Report> {
         // Read before the sign-in: a `?` between the sign-in and `retire`
         // would return before the sign-out.
         let now = clock::now()?;
+        if login.kind.as_known() == Some(KnownLoginKind::Ring) {
+            return logout_ring(ctx, &login, now).await;
+        }
         // 1. The sign-in reads `login.json` again, under the same lock, with
         // the identity it names.
         let signed = sign_in(ctx)
@@ -100,9 +157,163 @@ pub(crate) async fn logout(ctx: &Context) -> anyhow::Result<Report> {
             async |signed| signed.sign_out(ctx).await,
         )
         .await?;
-        Ok(Report::new(report(&ctx.dirs, &login, &key)))
+        Ok(Report::new(report(&ctx.dirs, &login, &key, None)))
     })
     .await
+}
+
+/// `logout` for a Pubky Ring login, under the writers' lock that [`logout`]
+/// holds: [`retire_ring`] with the real seams.
+async fn logout_ring(ctx: &Context, login: &LoginState, now: RecordTime) -> anyhow::Result<Report> {
+    // The clock as Unix seconds, for `grantExpiresAt`. Read before any
+    // request: the SDK's own clock read during a restore panics on a clock
+    // before 1970, which this refuses in words.
+    let now_unix = clock::now_unix_seconds()?;
+    let owner = public_key_of(&login.pubky)?;
+    let (key, grant) = retire_ring(
+        &ctx.dirs,
+        login,
+        now_unix,
+        // Called twice, so it clones the login each time: the session it
+        // returns owns its copy.
+        async || restore_saved_grant(ctx, login.clone()).await,
+        async |signed, id| {
+            let keys = SessionKeyStore::new(signed.session(), ctx.network.pubky());
+            revoke_if_published(&keys, id, now).await
+        },
+        async |signed| signed.sign_out_checked().await,
+        // The anonymous read: public storage with no session, capped at
+        // `MAX_RECORD_BYTES` and refusing a redirect (`remote::get_public`).
+        async |id| {
+            PublicKeyReader::new(ctx.network.pubky())
+                .get_key(&owner, id)
+                .await
+        },
+    )
+    .await?;
+    Ok(Report::new(report(&ctx.dirs, login, &key, Some(&grant))))
+}
+
+/// The Ring branch of steps 1 to 5 (module docs), for the `login.json` that
+/// `login` holds and the time `now` (Unix seconds). The four requests are
+/// passed in as closures, as for [`retire`], so the unit tests run every
+/// ending with fakes:
+///
+/// - `restore` restores a session `S` from `grant.token`, or reports a 401;
+/// - `revoke` revokes `keys/<id>.json` with the borrowed live session;
+/// - `sign_out` takes the session by value and revokes the grant;
+/// - `read_own` reads `keys/<id>.json` anonymously, for an install that is
+///   locked out.
+///
+/// An expired `grantExpiresAt` is checked first, so such a grant sends no
+/// request with the token at all.
+async fn retire_ring<S>(
+    dirs: &Dirs,
+    login: &LoginState,
+    now: u64,
+    restore: impl AsyncFn() -> anyhow::Result<Restored<S>>,
+    revoke: impl AsyncFnOnce(&S, &DeviceId) -> anyhow::Result<Option<Revocation>>,
+    sign_out: impl AsyncFnOnce(S) -> anyhow::Result<()>,
+    read_own: impl AsyncFnOnce(&DeviceId) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>>,
+) -> anyhow::Result<(RetiredKey, EndedGrant)> {
+    // `read_own` is moved into one branch or the other: only one of them
+    // runs, so the compiler accepts the move in both.
+    let (key, grant) = if let Some(expired_at) = expired_grant_at(login, now) {
+        (
+            locked_out_key(login, read_own).await?,
+            EndedGrant::Expired(expired_at),
+        )
+    } else {
+        let revoked = revoke_grant(
+            restore,
+            async |session| revoke_recorded_key(login, session, revoke).await,
+            sign_out,
+        )
+        .await
+        .with_context(|| ring_nothing_deleted_message(login))?;
+        match revoked {
+            GrantRevocation::Revoked(key) => (key, EndedGrant::Revoked),
+            GrantRevocation::AlreadyRevoked => (
+                locked_out_key(login, read_own).await?,
+                EndedGrant::AlreadyRevoked,
+            ),
+            GrantRevocation::NotConfirmed => bail!(GRANT_NOT_CONFIRMED),
+        }
+    };
+    // 5. The token, then this install's files, as for an identity.
+    forget_credential(dirs, login).context(
+        "logout could not delete grant.token, so it left this install's other files alone; fix \
+         that and run `sweepky logout` again",
+    )?;
+    delete_install_files(dirs, login)?;
+    Ok((key, grant))
+}
+
+/// What a locked-out install knows about its own device key: its
+/// `keys/<id>.json` read anonymously through `read_own`. Revoked (from
+/// another install, say) or not published, logout can finish; unrevoked, or
+/// unreadable, it stops, since no session here can revoke it any more.
+///
+/// The bytes are the homeserver's and go only through `DeviceKey::from_json`,
+/// which never panics and whose error is fixed text.
+async fn locked_out_key(
+    login: &LoginState,
+    read_own: impl AsyncFnOnce(&DeviceId) -> anyhow::Result<Option<Zeroizing<Vec<u8>>>>,
+) -> anyhow::Result<RetiredKey> {
+    let Some(id) = &login.device_id else {
+        return Ok(RetiredKey::NoneRecorded);
+    };
+    let read = read_own(id).await.with_context(|| unreadable_own_key(id))?;
+    // A 404, P2a's "nothing to revoke".
+    let Some(bytes) = read else {
+        return Ok(RetiredKey::NotPublished(id.clone()));
+    };
+    // `&bytes` lends the `Zeroizing<Vec<u8>>` as the `&[u8]` `from_json`
+    // takes, through `Deref`.
+    let record = DeviceKey::from_json(&bytes).with_context(|| unreadable_own_key(id))?;
+    match record.revoked_at {
+        Some(at) => Ok(RetiredKey::Revoked(
+            id.clone(),
+            Revocation::AlreadyRevoked(at),
+        )),
+        None => bail!(
+            "this install's Pubky Ring grant is revoked or expired, so this install can no longer \
+             revoke its own device key keys/{id}.json, which is still unrevoked; logout deleted \
+             nothing. Revoke it from another install of this identity with `sweepky keys revoke \
+             {id}`, then run `sweepky logout` here again"
+        ),
+    }
+}
+
+/// Why a locked-out logout stopped when it could not read its own key
+/// record: a failed request, a body over the cap, or a record this build
+/// cannot parse.
+fn unreadable_own_key(id: &DeviceId) -> String {
+    format!(
+        "this install's Pubky Ring grant is revoked or expired, and logout could not read \
+         keys/{id}.json to tell whether this install's device key is revoked, so it deleted \
+         nothing; run `sweepky logout` again later, or revoke the key from another install of \
+         this identity with `sweepky keys revoke {id}` first"
+    )
+}
+
+/// Why a Ring logout stopped before deleting anything, for an error from
+/// the restore or the key revoke: the grant has not been revoked, so the
+/// token stays, and the two ways out.
+fn ring_nothing_deleted_message(login: &LoginState) -> String {
+    match &login.device_id {
+        Some(id) => format!(
+            "logout deleted nothing, kept grant.token, and this install is still logged in, \
+             because this install's device key keys/{id}.json has to be revoked before its Pubky \
+             Ring grant is. Run `sweepky logout` again later; or revoke sweepky-cli in Pubky \
+             Ring, revoke the key from another install of this identity with `sweepky keys \
+             revoke {id}`, and then run `sweepky logout` here again"
+        ),
+        None => "logout deleted nothing, kept grant.token, and this install is still logged in; \
+                 run `sweepky logout` again later, or revoke sweepky-cli in Pubky Ring and then \
+                 run `sweepky logout` here again"
+            .to_owned(),
+    }
 }
 
 /// Reads `login.json` for `logout`, and refuses before anything is done
@@ -205,21 +416,27 @@ fn nothing_deleted_message(login: &LoginState) -> String {
 }
 
 /// Step 4: forgets the credential this install signed in with. For a
-/// dedicated identity that is its two files.
+/// dedicated identity that is its two files; for a Pubky Ring login,
+/// `grant.token`, whose grant is revoked or dead by now.
 ///
-/// The details go first, then the secret: should the second deletion fail,
-/// the key file alone is still an identity the next `logout` can sign in
-/// with. The other way round would leave details without their key, which
-/// nothing signs in with any more.
+/// An identity's details go first, then the secret: should the second
+/// deletion fail, the key file alone is still an identity the next `logout`
+/// can sign in with. The other way round would leave details without their
+/// key, which nothing signs in with any more.
 fn forget_credential(dirs: &Dirs, login: &LoginState) -> anyhow::Result<()> {
-    // `sign_in` has refused any other kind of login by now, so this is a
-    // second check, not a branch that runs. P2d adds the Ring kind here,
-    // whose credential is the saved grant token.
-    let (Some(KnownLoginKind::Identity), Some(name)) = (login.kind.as_known(), &login.name) else {
-        bail!("login.json does not name a dedicated identity, so there is no identity to forget");
-    };
-    remove_private_file(&dirs.identity_file(name))?;
-    remove_private_file(&dirs.identity_key_file(name))
+    // `logout` sends a Ring login one way and every other kind through
+    // `sign_in`, which refuses a kind it does not know, so the last arm is a
+    // second check, not a branch that runs.
+    match (login.kind.as_known(), &login.name) {
+        (Some(KnownLoginKind::Identity), Some(name)) => {
+            remove_private_file(&dirs.identity_file(name))?;
+            remove_private_file(&dirs.identity_key_file(name))
+        }
+        (Some(KnownLoginKind::Ring), _) => remove_grant_token(dirs),
+        _ => bail!(
+            "login.json does not name a dedicated identity, so there is no identity to forget"
+        ),
+    }
 }
 
 /// Step 5: deletes this install's own files: `device.key`, `login.json`, and
@@ -245,8 +462,8 @@ fn delete_install_files(dirs: &Dirs, login: &LoginState) -> anyhow::Result<()> {
         .collect();
     if !left.is_empty() {
         bail!(
-            "logout forgot the identity, but could not delete all of this install's files ({}); \
-             delete what is left by hand",
+            "logout forgot this install's credential, but could not delete all of this \
+             install's files ({}); delete what is left by hand",
             left.join("; ")
         );
     }
@@ -254,9 +471,15 @@ fn delete_install_files(dirs: &Dirs, login: &LoginState) -> anyhow::Result<()> {
 }
 
 /// What `logout` reports once it is done: fixed text, device ids, the
-/// user's own paths and pubky, and the time this logout wrote.
-fn report(dirs: &Dirs, login: &LoginState, key: &RetiredKey) -> String {
+/// user's own paths and pubky, and the times this logout wrote or
+/// `login.json` holds. `grant` is how a Ring login's grant ended, `None`
+/// for an identity.
+fn report(dirs: &Dirs, login: &LoginState, key: &RetiredKey, grant: Option<&EndedGrant>) -> String {
     let mut text = key.report_line();
+    if let Some(grant) = grant {
+        text.push_str(&grant.report_line(&login.pubky));
+        text.push_str(&format!("Deleted {}.\n", dirs.grant_token_file().display()));
+    }
     if let Some(name) = &login.name {
         text.push_str(&format!(
             "Forgot the identity {name}, pubky {}: deleted {} and {}.\n",
@@ -275,6 +498,30 @@ fn report(dirs: &Dirs, login: &LoginState, key: &RetiredKey) -> String {
         dirs.installs_file().display()
     ));
     text
+}
+
+impl EndedGrant {
+    /// The report's line about the grant, ending in its newline.
+    fn report_line(&self, pubky: &sweepky_core::Pubky) -> String {
+        match self {
+            Self::Revoked => format!(
+                "Revoked this install's Pubky Ring grant (sweepky-cli, pubky {pubky}) by signing \
+                 it out: restoring the saved token now gets 401 from the homeserver.\n"
+            ),
+            Self::AlreadyRevoked => format!(
+                "This install's Pubky Ring grant (sweepky-cli, pubky {pubky}) was already \
+                 revoked or expired: the homeserver refused the saved token with 401.\n"
+            ),
+            Self::Expired(at) => format!(
+                "warning: this install's Pubky Ring grant (sweepky-cli, pubky {pubky}) had \
+                 expired at {} by this machine's clock, so logout sent nothing with the token and \
+                 could not revoke the grant on the homeserver (the Pubky SDK sends no grant its \
+                 clock says has expired); if Pubky Ring still lists sweepky-cli, revoke it there, \
+                 and check this machine's clock if that happens.\n",
+                expiry_text(*at)
+            ),
+        }
+    }
 }
 
 impl RetiredKey {
@@ -305,28 +552,41 @@ impl RetiredKey {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::fs;
+    use std::os::unix::fs::DirBuilderExt;
     use std::path::Path;
+    use std::sync::Mutex;
 
+    use anyhow::bail;
     use pubky::StatusCode;
     use serde_json::json;
-    use sweepky_core::{DeviceId, DeviceIdentity, DeviceKey, RecordTime};
+    use sweepky_core::{DeviceId, DeviceIdentity, DeviceKey, MAX_RECORD_BYTES, RecordTime, paths};
     use tempfile::TempDir;
 
-    use super::{RetiredKey, login_to_retire, retire};
+    use super::{
+        EndedGrant, GRANT_NOT_CONFIRMED, RetiredKey, login_to_retire, logout, report, retire,
+        retire_ring,
+    };
     use crate::Dirs;
-    use crate::device::{create_device_key, device_key_bytes, device_key_record};
+    use crate::device::{
+        PublicKeyReader, PublicKeys, create_device_key, device_key_bytes, device_key_record,
+    };
     use crate::identity::{IdentityMeta, IdentityName, IdentitySecret};
     use crate::installs::{read_installs, record_install};
     use crate::keys::{Revocation, revoke_if_published};
     use crate::lock::{PullLock, WritersLock};
     use crate::private_fs::lstat;
+    use crate::remote::{BodyTooLarge, public_key_of, status_of};
+    use crate::ring::token::{GrantToken, read_grant_token, write_grant_token};
+    use crate::ring::{Restored, expiry_text};
     use crate::state::{
-        LoginState, StoredIdentity, create_identity, read_identity, write_login_state,
+        LoginState, StoredIdentity, create_identity, read_identity, read_login_state,
+        write_login_state,
     };
     use crate::test_support::{
-        FAKE_SERVER_TEXT, FakeKeyStore, FileSnapshot, KeyStoreCall, dirs_in, mode, private_temp,
-        random_pubky,
+        FAKE_READ_FAILURE, FAKE_SERVER_TEXT, FakeKeyStore, FileSnapshot, KeyStoreCall, PLANTED,
+        dirs_in, mode, private_temp, random_pubky, ring_login, ring_testnet,
     };
 
     /// The time the revoke step is handed as "now".
@@ -576,5 +836,512 @@ mod tests {
         // Without it, there is nothing to revoke, and logout goes ahead.
         fs::remove_file(dirs.device_key_file()).expect("remove device.key");
         assert_eq!(login_to_retire(&dirs).expect("goes ahead"), login);
+    }
+
+    // -----------------------------------------------------------------------
+    // A Pubky Ring login.
+
+    /// 2026-10-20T00:00:00Z, the time a Ring logout is handed as "now", in
+    /// Unix seconds.
+    const NOW_UNIX: u64 = 1_792_454_400;
+
+    /// A grant that is still valid at [`NOW_UNIX`], and one that is not.
+    const LIVE_UNTIL: u64 = NOW_UNIX + 400 * 86_400;
+    const EXPIRED_AT: u64 = NOW_UNIX - 1;
+
+    /// A temp `SWEEPKY_HOME` after a Ring login whose grant expires at
+    /// `expires_at` and whose shared tail published this install's key into
+    /// `keys`: a synthetic `grant.token`, `device.key`, the id in
+    /// `installs.json` and in `login.json`.
+    fn ring_logged_in(
+        keys: &FakeKeyStore,
+        expires_at: u64,
+    ) -> (TempDir, Dirs, LoginState, DeviceId) {
+        let temp = private_temp();
+        let dirs = dirs_in(&temp);
+        let token = GrantToken::from_exported(format!("pubky-grant-credential-v1:{PLANTED}"))
+            .expect("a synthetic token");
+        write_grant_token(&dirs, &token, None).expect("writes grant.token");
+        let device = DeviceIdentity::generate();
+        create_device_key(&dirs, &device, None).expect("writes device.key");
+        let id: DeviceId = "0035G87EK4XFE".parse().expect("a valid id");
+        let mut login = LoginState::ring(random_pubky(), random_pubky(), expires_at);
+        record_install(&dirs, login.pubky, &id).expect("records");
+        let record = device_key_record(&device.recipient(), time("2026-10-16T09:41:07Z"));
+        keys.set_record(&id, device_key_bytes(&record).expect("JSON"));
+        login.device_id = Some(id.clone());
+        write_login_state(&dirs, &login).expect("writes");
+        (temp, dirs, login, id)
+    }
+
+    /// The local files a Ring logout deletes, as snapshots.
+    fn ring_files(dirs: &Dirs) -> [Option<FileSnapshot>; 4] {
+        [
+            dirs.grant_token_file(),
+            dirs.device_key_file(),
+            dirs.installs_file(),
+            dirs.login_file(),
+        ]
+        .map(|path| FileSnapshot::of(&path))
+    }
+
+    /// Asserts that a Ring login's token and this install's files are gone.
+    fn assert_ring_retired(dirs: &Dirs, login: &LoginState) {
+        assert_gone(&dirs.grant_token_file());
+        assert_gone(&dirs.device_key_file());
+        assert_gone(&dirs.login_file());
+        let installs = read_installs(dirs).expect("reads");
+        assert!(installs.ids_of(&login.pubky).is_empty());
+    }
+
+    /// How the fake homeserver answers one restore of the saved token.
+    #[derive(Clone, Copy)]
+    enum Answer {
+        /// A live session.
+        Session,
+        /// 401: the grant is revoked.
+        Unauthorized,
+        /// Anything else, such as a network error.
+        Fails,
+    }
+
+    /// The four seams of a Ring logout, faked: `keys` as the homeserver's
+    /// `keys/` (written with the live session, read anonymously), the
+    /// restores' answers in order, whether the sign-out fails, whether the
+    /// anonymous read is over its cap, and the steps taken, in order.
+    #[derive(Default)]
+    struct RingFakes {
+        keys: FakeKeyStore,
+        answers: Mutex<VecDeque<Answer>>,
+        sign_out_fails: bool,
+        own_read_too_large: bool,
+        steps: Mutex<Vec<&'static str>>,
+    }
+
+    impl RingFakes {
+        fn answering(answers: &[Answer]) -> Self {
+            Self {
+                answers: Mutex::new(answers.iter().copied().collect()),
+                ..Self::default()
+            }
+        }
+
+        fn step(&self, step: &'static str) {
+            self.steps.lock().expect("lock").push(step);
+        }
+
+        fn steps(&self) -> Vec<&'static str> {
+            self.steps.lock().expect("lock").clone()
+        }
+    }
+
+    /// Runs [`retire_ring`] at [`NOW_UNIX`] with `fakes` as its seams; the
+    /// fake session is the key store itself.
+    async fn retire_ring_with(
+        dirs: &Dirs,
+        login: &LoginState,
+        fakes: &RingFakes,
+    ) -> anyhow::Result<(RetiredKey, EndedGrant)> {
+        let owner = public_key_of(&login.pubky).expect("a key");
+        retire_ring(
+            dirs,
+            login,
+            NOW_UNIX,
+            async || {
+                fakes.step("restore");
+                let answer = fakes.answers.lock().expect("lock").pop_front();
+                match answer.expect("a scripted answer") {
+                    Answer::Session => Ok(Restored::Live(&fakes.keys)),
+                    Answer::Unauthorized => Ok(Restored::Refused),
+                    Answer::Fails => bail!(FAKE_READ_FAILURE),
+                }
+            },
+            async |keys, id| {
+                fakes.step("revoke key");
+                revoke_if_published(*keys, id, time(NOW)).await
+            },
+            async |_keys| {
+                fakes.step("sign out");
+                if fakes.sign_out_fails {
+                    bail!(FAKE_READ_FAILURE);
+                }
+                Ok(())
+            },
+            async |id| {
+                fakes.step("read own");
+                if fakes.own_read_too_large {
+                    return Err(BodyTooLarge {
+                        cap: MAX_RECORD_BYTES,
+                    }
+                    .into());
+                }
+                fakes.keys.get_key(&owner, id).await
+            },
+        )
+        .await
+    }
+
+    /// Marks the fake's `keys/<id>.json` revoked at `at`, as `keys revoke`
+    /// from another install would.
+    fn revoke_behind_the_back(keys: &FakeKeyStore, id: &DeviceId, at: &str) {
+        let mut record = DeviceKey::from_json(&keys.record(id).expect("there")).expect("a record");
+        record.revoked_at = Some(time(at));
+        keys.set_record(id, device_key_bytes(&record).expect("JSON"));
+    }
+
+    #[tokio::test]
+    async fn a_ring_logout_revokes_the_key_then_the_grant_then_checks_for_401() {
+        let fakes = RingFakes::answering(&[Answer::Session, Answer::Unauthorized]);
+        let (_temp, dirs, login, id) = ring_logged_in(&fakes.keys, LIVE_UNTIL);
+
+        let retired = retire_ring_with(&dirs, &login, &fakes)
+            .await
+            .expect("logs out");
+        assert_eq!(
+            retired,
+            (
+                RetiredKey::Revoked(id.clone(), Revocation::Revoked(time(NOW))),
+                EndedGrant::Revoked
+            )
+        );
+        // The key with the live session, then the grant, then the restore
+        // that proves it gone; nothing anonymous.
+        assert_eq!(
+            fakes.steps(),
+            ["restore", "revoke key", "sign out", "restore"]
+        );
+        assert_eq!(revoked_at(&fakes.keys, &id), Some(time(NOW)));
+        assert_ring_retired(&dirs, &login);
+    }
+
+    #[tokio::test]
+    async fn the_token_goes_before_the_install_files() {
+        // A grant.token that cannot be deleted (a directory in its place):
+        // the grant is revoked by then, but device.key, login.json and the
+        // install entry stay, so a second logout finds them and finishes.
+        let fakes = RingFakes::answering(&[Answer::Session, Answer::Unauthorized]);
+        let (_temp, dirs, login, _id) = ring_logged_in(&fakes.keys, LIVE_UNTIL);
+        fs::remove_file(dirs.grant_token_file()).expect("remove");
+        fs::create_dir(dirs.grant_token_file()).expect("a directory in its place");
+        // The files deleted after grant.token, whose snapshot cannot read a
+        // directory.
+        let install_files = || {
+            [
+                dirs.device_key_file(),
+                dirs.installs_file(),
+                dirs.login_file(),
+            ]
+            .map(|path| FileSnapshot::of(&path))
+        };
+        let before = install_files();
+
+        let err = retire_ring_with(&dirs, &login, &fakes)
+            .await
+            .expect_err("stops");
+        let shown = format!("{err:#}");
+        assert!(shown.contains("could not delete grant.token"), "{shown}");
+        assert_eq!(install_files(), before);
+    }
+
+    #[tokio::test]
+    async fn every_failure_before_the_401_keeps_the_token_and_the_files() {
+        // (answers, sign-out fails, refuse key writes, steps taken)
+        let cases: [(&[Answer], bool, bool, &[&str]); 5] = [
+            // The first restore fails: nothing else is tried.
+            (&[Answer::Fails], false, false, &["restore"]),
+            // The key revoke fails: no sign-out, so the grant stays.
+            (&[Answer::Session], false, true, &["restore", "revoke key"]),
+            // The sign-out fails.
+            (
+                &[Answer::Session],
+                true,
+                false,
+                &["restore", "revoke key", "sign out"],
+            ),
+            // The token still restores after the sign-out.
+            (
+                &[Answer::Session, Answer::Session],
+                false,
+                false,
+                &["restore", "revoke key", "sign out", "restore"],
+            ),
+            // The restore after the sign-out fails, which proves nothing.
+            (
+                &[Answer::Session, Answer::Fails],
+                false,
+                false,
+                &["restore", "revoke key", "sign out", "restore"],
+            ),
+        ];
+        for (answers, sign_out_fails, refuse_puts, steps) in cases {
+            let fakes = RingFakes {
+                keys: if refuse_puts {
+                    FakeKeyStore::refusing_puts(StatusCode::INTERNAL_SERVER_ERROR)
+                } else {
+                    FakeKeyStore::default()
+                },
+                sign_out_fails,
+                ..RingFakes::answering(answers)
+            };
+            let (_temp, dirs, login, _id) = ring_logged_in(&fakes.keys, LIVE_UNTIL);
+            let before = ring_files(&dirs);
+
+            let err = retire_ring_with(&dirs, &login, &fakes)
+                .await
+                .expect_err("stops");
+            let shown = format!("{err:#}");
+            assert_eq!(fakes.steps(), steps);
+            assert!(shown.contains("deleted nothing"), "{shown}");
+            assert!(shown.contains("kept grant.token"), "{shown}");
+            assert!(shown.contains("`sweepky logout` again"), "{shown}");
+            assert!(
+                shown.contains("revoke sweepky-cli in Pubky Ring"),
+                "{shown}"
+            );
+            assert!(!shown.contains(FAKE_SERVER_TEXT), "{shown}");
+            assert!(!shown.contains(PLANTED), "{shown}");
+            assert_eq!(ring_files(&dirs), before);
+        }
+        // After the key revoke, the fixed text alone.
+        let fakes = RingFakes {
+            sign_out_fails: true,
+            ..RingFakes::answering(&[Answer::Session])
+        };
+        let (_temp, dirs, login, _id) = ring_logged_in(&fakes.keys, LIVE_UNTIL);
+        let err = retire_ring_with(&dirs, &login, &fakes)
+            .await
+            .expect_err("stops");
+        assert_eq!(format!("{err:#}"), GRANT_NOT_CONFIRMED);
+    }
+
+    #[tokio::test]
+    async fn an_expired_grant_with_an_unrevoked_key_stops_without_a_request() {
+        let fakes = RingFakes::default();
+        let (_temp, dirs, login, id) = ring_logged_in(&fakes.keys, EXPIRED_AT);
+        let before = ring_files(&dirs);
+
+        let err = retire_ring_with(&dirs, &login, &fakes)
+            .await
+            .expect_err("stops");
+        let shown = format!("{err:#}");
+        // Only the anonymous read: never a restore with the token.
+        assert_eq!(fakes.steps(), ["read own"]);
+        assert!(shown.contains("deleted nothing"), "{shown}");
+        assert!(
+            shown.contains(&format!("`sweepky keys revoke {id}`")),
+            "{shown}"
+        );
+        assert_eq!(ring_files(&dirs), before);
+    }
+
+    #[tokio::test]
+    async fn an_expired_grant_with_its_key_revoked_or_gone_finishes() {
+        for revoked in [true, false] {
+            let fakes = RingFakes::default();
+            let (_temp, dirs, login, id) = ring_logged_in(&fakes.keys, EXPIRED_AT);
+            let expected = if revoked {
+                revoke_behind_the_back(&fakes.keys, &id, "2026-10-19T00:00:00Z");
+                RetiredKey::Revoked(
+                    id.clone(),
+                    Revocation::AlreadyRevoked(time("2026-10-19T00:00:00Z")),
+                )
+            } else {
+                // A 404, as P2a's NotPublished.
+                fakes.keys.remove_record(&id);
+                RetiredKey::NotPublished(id.clone())
+            };
+
+            let (key, grant) = retire_ring_with(&dirs, &login, &fakes)
+                .await
+                .expect("logs out");
+            assert_eq!(key, expected);
+            assert_eq!(grant, EndedGrant::Expired(EXPIRED_AT));
+            assert_eq!(fakes.steps(), ["read own"]);
+            assert_ring_retired(&dirs, &login);
+            let text = report(&dirs, &login, &key, Some(&grant));
+            assert!(
+                text.contains(&format!(
+                    "warning: this install's Pubky Ring grant (sweepky-cli, pubky {}) had expired \
+                     at {} by this machine's clock, so logout sent nothing with the token and \
+                     could not revoke the grant on the homeserver",
+                    login.pubky,
+                    expiry_text(EXPIRED_AT)
+                )),
+                "{text}"
+            );
+            assert!(text.contains("revoke it there"), "{text}");
+            assert!(text.contains("deleted, not overwritten"), "{text}");
+            assert!(
+                text.contains(&dirs.grant_token_file().display().to_string()),
+                "{text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_own_record_that_cannot_be_read_stops_a_locked_out_logout() {
+        // A failed request, a body over the cap, a record that does not
+        // parse; locked out by a 401 this time.
+        for case in ["transport", "too large", "not a record"] {
+            let mut fakes = RingFakes::answering(&[Answer::Unauthorized]);
+            let (_temp, dirs, login, id) = ring_logged_in(&fakes.keys, LIVE_UNTIL);
+            match case {
+                "transport" => fakes.keys.fail_reads_of(&id),
+                "too large" => fakes.own_read_too_large = true,
+                _ => fakes
+                    .keys
+                    .set_record(&id, format!("{PLANTED} not JSON").into_bytes()),
+            }
+            let before = ring_files(&dirs);
+
+            let err = retire_ring_with(&dirs, &login, &fakes)
+                .await
+                .expect_err("stops");
+            let shown = format!("{err:#}");
+            assert_eq!(fakes.steps(), ["restore", "read own"], "{case}");
+            assert!(
+                shown.contains(&format!("could not read keys/{id}.json")),
+                "{shown}"
+            );
+            assert!(shown.contains("deleted nothing"), "{shown}");
+            assert!(!shown.contains(PLANTED), "{shown}");
+            assert_eq!(ring_files(&dirs), before, "{case}");
+        }
+    }
+
+    /// Reads `id`'s record under `owner` from public storage, as anyone can.
+    async fn public_record(
+        ctx: &crate::Context,
+        owner: &pubky::PublicKey,
+        id: &DeviceId,
+    ) -> DeviceKey {
+        let bytes = PublicKeyReader::new(ctx.network.pubky())
+            .get_key(owner, id)
+            .await
+            .expect("reads")
+            .expect("published");
+        DeviceKey::from_json(&bytes).expect("a record")
+    }
+
+    /// Creates `path` with `text`, and its directory 0700 if need be.
+    fn write_state_file(path: &Path, text: &str) {
+        let dir = path.parent().expect("a directory");
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .expect("creates");
+        fs::write(path, text).expect("writes");
+    }
+
+    #[tokio::test]
+    #[pubky_testnet::test]
+    async fn a_ring_logout_leaves_the_saved_token_unable_to_restore() {
+        let testnet = ring_testnet().await;
+        let home = private_temp();
+        let (ctx, _stderr, ring) = ring_login(&testnet, &home).await;
+        let login = read_login_state(&ctx.dirs)
+            .expect("reads")
+            .expect("logged in");
+        let id = login.device_id.clone().expect("a device key");
+        let owner = ring.public_key();
+        let published = public_record(&ctx, &owner, &id).await;
+        // The token A saved at login, copied before logout.
+        let saved = read_grant_token(&ctx.dirs, None)
+            .expect("reads")
+            .expect("saved");
+        // The locks and the state files logout must leave alone.
+        PullLock::open(&ctx.dirs).expect("creates pull.lock");
+        write_state_file(&ctx.dirs.feed_cursors_file(), "synthetic cursors");
+        write_state_file(&ctx.dirs.poll_state_file(), "synthetic poll state");
+        let state = [ctx.dirs.feed_cursors_file(), ctx.dirs.poll_state_file()]
+            .map(|path| FileSnapshot::of(&path));
+
+        let report = logout(&ctx).await.expect("logs out");
+        let text = report.text();
+        assert!(text.contains(&format!("Revoked keys/{id}.json")), "{text}");
+        assert!(
+            text.contains("Revoked this install's Pubky Ring grant"),
+            "{text}"
+        );
+        assert!(!text.contains(saved.expose_secret()), "{text}");
+
+        // Anyone reading the record sees it revoked, with the same key.
+        let retired = public_record(&ctx, &owner, &id).await;
+        assert!(retired.revoked_at.is_some());
+        assert_eq!(retired.recipient, published.recipient);
+        assert_ring_retired(&ctx.dirs, &login);
+        assert_eq!(mode(&ctx.dirs.credential_lock_file()), 0o600);
+        assert_eq!(mode(&ctx.dirs.pull_lock_file()), 0o600);
+        assert_eq!(
+            [ctx.dirs.feed_cursors_file(), ctx.dirs.poll_state_file()]
+                .map(|path| FileSnapshot::of(&path)),
+            state
+        );
+
+        // Done when: the token saved at login now restores to a 401.
+        let Err(error) = testnet
+            .sdk()
+            .expect("client")
+            .restore_session(saved.expose_secret())
+            .await
+        else {
+            panic!("the saved token still restores after logout");
+        };
+        assert_eq!(status_of(&error), Some(StatusCode::UNAUTHORIZED));
+    }
+
+    #[tokio::test]
+    #[pubky_testnet::test]
+    async fn a_grant_revoked_in_ring_logs_out_once_the_key_is_revoked_elsewhere() {
+        let testnet = ring_testnet().await;
+        let home = private_temp();
+        let (ctx, _stderr, ring) = ring_login(&testnet, &home).await;
+        let login = read_login_state(&ctx.dirs)
+            .expect("reads")
+            .expect("logged in");
+        let id = login.device_id.clone().expect("a device key");
+        // Revoked behind this install's back: the test restores the saved
+        // token and signs it out.
+        let token = read_grant_token(&ctx.dirs, None)
+            .expect("reads")
+            .expect("saved");
+        let Ok(session) = testnet
+            .sdk()
+            .expect("client")
+            .restore_session(token.expose_secret())
+            .await
+        else {
+            panic!("the saved token does not restore");
+        };
+        if session.signout().await.is_err() {
+            panic!("the test's sign-out failed");
+        }
+        let before = ring_files(&ctx.dirs);
+
+        // The key record is still unrevoked: logout stops and keeps it all.
+        let err = logout(&ctx).await.expect_err("stops");
+        let shown = format!("{err:#}");
+        assert!(shown.contains("deleted nothing"), "{shown}");
+        assert!(
+            shown.contains(&format!("`sweepky keys revoke {id}`")),
+            "{shown}"
+        );
+        assert_eq!(ring_files(&ctx.dirs), before);
+
+        // Another install (here the root key) revokes the record.
+        let mut record = public_record(&ctx, &ring.public_key(), &id).await;
+        record.revoked_at = Some(time(NOW));
+        ring.root()
+            .storage()
+            .put(paths::key(&id), device_key_bytes(&record).expect("JSON"))
+            .await
+            .expect("the root key writes");
+
+        let report = logout(&ctx).await.expect("logs out");
+        let text = report.text();
+        assert!(text.contains("already revoked or expired"), "{text}");
+        assert!(text.contains("was revoked already"), "{text}");
+        assert_ring_retired(&ctx.dirs, &login);
     }
 }

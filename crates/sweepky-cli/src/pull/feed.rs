@@ -14,40 +14,42 @@
 //! 1. **What each open bounty's `discovered.json` lists.** Read from the
 //!    owner's own storage with the tag of its last answer as
 //!    `If-None-Match`, so an unchanged file costs a 304, but only while
-//!    this install holds a local cursor for every watched homeserver: the
-//!    tag is kept here and the cursors the file gave only in step 2, so a
-//!    run stopped in between, or a cursor dropped since, would otherwise
-//!    get a 304 with no cursor and start that feed at its head, past the
-//!    events in between. A new answer gives the cursors it holds, and the
-//!    sweeps it lists that this install has neither accepted nor seen
-//!    deleted are confirmed one by one, as a feed's are (below), at most
-//!    [`MAX_LISTED_SWEEPS_PER_RUN`] a run. A listed sweep whose record is
-//!    gone is a confirmed deletion. This is how a second install of the
+//!    this install holds a local cursor for every watched homeserver: a
+//!    304 gives no cursor, so a feed whose local cursor went after the tag
+//!    was kept, or one new to the watch list, would start at its head,
+//!    past the events in between. A new answer gives the cursors it holds,
+//!    and the sweeps it lists that this install has neither accepted nor
+//!    seen deleted are confirmed one by one, as a feed's are (below), at
+//!    most [`MAX_LISTED_SWEEPS_PER_RUN`] a run. A listed sweep whose record
+//!    is gone is a confirmed deletion. This is how a second install of the
 //!    owner sees what the first discovered: its own cursor may start past
-//!    those events. The tag is kept only once every sweep the file lists is
-//!    settled, so a file with sweeps still to confirm is read whole again
-//!    next run. While tags are sent, a file read whole whose tag is kept
-//!    now lowers each local cursor it gives a lower one for (step 2), stored
-//!    before the poll state. Then the poll state is written.
+//!    those events. The tag is kept only when every sweep the file lists is
+//!    settled and this run sends tags; the file read whole then lowers each
+//!    local cursor it gives a lower one for (step 2), stored before the
+//!    poll state. Kept by a run that could not lower, the tag would take
+//!    the 304 next run and that lowering would never come. Otherwise any
+//!    tag kept for the file goes, so it is read whole again next run, to
+//!    confirm the rest of its sweeps or to lower the cursors. Then the poll
+//!    state is written.
 //! 2. **Where each watched homeserver's feed starts** ([`Start`]): at the
 //!    local cursor; else at the lowest cursor the open bounties'
 //!    `discovered.json` give it; else at its head, found by
 //!    `events::find_head`, with a warning. A local cursor is lowered first
-//!    to a lower one a file of step 1 gives, as `post --open` lowers it for
-//!    a new bounty, so a lowering it never stored (it stopped after its
-//!    `discovered.json` PUT), or another install's newer open bounty, is
-//!    caught up with. Only once a file: the next run takes its 304. A file
-//!    read whole every run (no tag sent, or none kept while a listed sweep
-//!    waits) lowers nothing, as the files' cursors lag behind the local ones
-//!    (`pull::discovered` rewrites a file only when its sweeps change), and
-//!    lowering to the same one every run would read the same pages every
-//!    run. Lowering costs a re-read, which accepts nothing twice. A start
-//!    that did not come from the local file is stored there at once, so the
-//!    next run starts from it even if this one reads no page of that feed.
-//!    There is one cursor per owner and homeserver, not per bounty: a sweep
-//!    record names its bounty, so reading from the lowest start serves
-//!    every open bounty on that homeserver, and no sweep can name a bounty
-//!    from before it existed.
+//!    to a lower one a file of step 1 gives as its tag is kept, as
+//!    `post --open` lowers it for a new bounty, so a lowering it never
+//!    stored (it stopped after its `discovered.json` PUT), or another
+//!    install's newer open bounty, is caught up with. Only once a file: the
+//!    next run takes its 304. A file read whole every run (no tag sent, or
+//!    none kept while a listed sweep waits) lowers nothing, as the files'
+//!    cursors lag behind the local ones (`pull::discovered` rewrites a file
+//!    only when its sweeps change), and lowering to the same one every run
+//!    would read the same pages every run. Lowering costs a re-read, which
+//!    accepts nothing twice. A start that did not come from the local file
+//!    is stored there at once, so the next run starts from it even if this
+//!    one reads no page of that feed. There is one cursor per owner and
+//!    homeserver, not per bounty: a sweep record names its bounty, so
+//!    reading from the lowest start serves every open bounty on that
+//!    homeserver, and no sweep can name a bounty from before it existed.
 //! 3. **Each feed, a batch at a time**: a page of up to [`FEED_PAGE_SIZE`]
 //!    events, at most [`MAX_FEED_PAGES_PER_RUN`] pages a run. A page with
 //!    more events than asked for is refused by the events seam; one with no
@@ -419,14 +421,15 @@ impl<F: EventsFeed, R: PublicRecords, H: ResolveHomeserver> Watcher<'_, '_, F, R
     /// the lowest cursor the files give each homeserver, in memory only.
     ///
     /// A file's kept tag is sent only while `local`, this install's
-    /// cursors, holds one for every homeserver of `watch_list`: the tag is
-    /// stored here, before `starts` stores the cursors the file gave, and a
-    /// 304 to a tag whose cursors were not stored would give no cursor at
-    /// all (the module docs).
+    /// cursors, holds one for every homeserver of `watch_list`: a 304 gives
+    /// no cursor, and a homeserver with none would start at its head (the
+    /// module docs).
     ///
-    /// While tags are sent, a file read whole whose tag is kept now lowers
-    /// each cursor of `local` it gives a lower one for, in `local` and in
-    /// the file, before the poll state keeps the tag (the module docs).
+    /// A file's tag is kept only on such a run, once every sweep it lists
+    /// is settled, and the file read whole then lowers each cursor of
+    /// `local` it gives a lower one for, in `local` and in the file, before
+    /// the poll state keeps the tag. Otherwise any tag kept for the file
+    /// goes, and the next run reads it whole (the module docs).
     async fn read_discovered(
         &mut self,
         local: &mut FeedCursors,
@@ -463,16 +466,22 @@ impl<F: EventsFeed, R: PublicRecords, H: ResolveHomeserver> Watcher<'_, '_, F, R
                 .confirm_listed(id, &discovered.sweeps, &mut budget)
                 .await;
             cut |= matches!(listed, Listed::OutOfBudget);
+            // The tag is kept only where the lowering runs. The next run
+            // sends a kept tag and takes its 304, so the file's cursors are
+            // used now or never: kept by a run that lowers nothing (a watched
+            // homeserver had no local cursor), the tag would skip the events
+            // between the file's cursor and the local one for good. Lowering
+            // here alone also means a file lowers a cursor once, not every
+            // run. `if send_tags` after the pattern is a match guard: the arm
+            // is taken only when both hold, and `_` takes everything else.
             match (listed, etag) {
-                (Listed::Settled, Some(etag)) => {
+                (Listed::Settled, Some(etag)) if send_tags => {
+                    lowered |= local.lower_kept_to(&discovered.cursors);
                     self.state.discovered_etags.insert(id, etag);
-                    // Here alone: the next run sends this tag and takes its
-                    // 304, so a file lowers a cursor once, not every run.
-                    if send_tags {
-                        lowered |= local.lower_kept_to(&discovered.cursors);
-                    }
                 }
-                // Read whole again next run, so the rest is confirmed then.
+                // Read whole again next run: to confirm the rest of its
+                // sweeps, or to lower the cursors once every watched
+                // homeserver has a local one.
                 _ => {
                     self.state.discovered_etags.remove(&id);
                 }
@@ -1674,10 +1683,28 @@ mod tests {
         assert!(resolver.asked().contains(&listed.sweeper));
         assert!(resolver.asked().contains(&gone.sweeper));
 
-        // The next run sends the file's tag, and an unchanged file has
-        // nothing new to confirm.
+        // The home feed had no local cursor as this run began, so the file's
+        // cursors lowered none and its tag is not kept.
+        assert!(!state.discovered_etags.contains_key(&open.id));
+
+        // The next run, with the home feed's cursor stored, reads the file
+        // whole again and keeps its tag. Nothing it lists is new: the listed
+        // sweep is not accepted again, nor the gone one read again.
+        let asked_before = records.conditional_asked().len();
+        let watch = install.watch(&feed, &records, &resolver, &mut state).await;
+        assert!(watch.warnings.is_empty(), "{:?}", watch.warnings);
+        assert!(watch.accepted.is_empty());
+        assert!(watch.deleted.is_empty());
+        assert_eq!(reads_of(&records, gone), 1);
+        assert_eq!(
+            records.conditional_asked().split_off(asked_before).first(),
+            Some(&(owner, discovered.clone(), None))
+        );
         let tag = state.discovered_etags.get(&open.id).cloned();
-        assert!(tag.is_some(), "kept once every listed sweep is settled");
+        assert!(tag.is_some(), "kept by a run that began with every cursor");
+
+        // The run after sends the tag, and an unchanged file has nothing new
+        // to confirm.
         let asked_before = records.asked().len();
         let watch = install.watch(&feed, &records, &resolver, &mut state).await;
         assert!(watch.accepted.is_empty());
@@ -1694,12 +1721,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_kept_tag_is_not_sent_while_a_watched_feed_has_no_local_cursor() {
-        // A run stopped after the poll state kept a discovered.json's tag
-        // and before feed-cursors.json kept the cursor the file gave. Were
-        // the tag sent next run, its 304 would give no cursor, and the feed
-        // would start at its head, skipping what came in between for good.
+        // A discovered.json's tag kept, and this install's local cursor gone
+        // since, as when feed-cursors.json is lost. Were the tag sent next
+        // run, its 304 would give no cursor, and the feed would start at its
+        // head, skipping what came in between for good.
         let install = Install::new();
         let (owner, home) = (install.owner, install.home);
+        install.store_cursor(home, 5);
         let open = bounty(owner, 10);
         let discovered = paths::discovered(open.id);
         let records = FakePublicRecords::default().with_record(
@@ -1710,10 +1738,11 @@ mod tests {
         let resolver = FakeHomeservers::default();
         let mut state = one_open(open);
         let quiet = FakeEventsFeed::of_ids(&[]);
+        // A run that begins with every local cursor keeps the file's tag.
         let watch = install.watch(&quiet, &records, &resolver, &mut state).await;
-        assert_eq!(watch.starts[&home], start(5, StartSource::Discovered));
+        assert_eq!(watch.starts[&home], start(5, StartSource::Local));
         assert!(state.discovered_etags.contains_key(&open.id));
-        // The stop: the tag is kept, the cursor is not.
+        // The tag is kept, the cursor is not.
         FeedCursors::drop_owner(&install.dirs, owner).expect("dropped");
 
         // Meanwhile a stranger swept the bounty, after the file's cursor.
@@ -1731,22 +1760,9 @@ mod tests {
         );
         assert_eq!(watch.starts[&home], start(5, StartSource::Discovered));
         assert_eq!(watch.accepted, [of(open, stranger)]);
-
-        // With the local cursor stored again, the tag is sent and the 304
-        // taken: nothing else is read of the owner's storage.
-        let tag = state.discovered_etags.get(&open.id).cloned();
-        assert!(tag.is_some(), "kept once every listed sweep is settled");
-        let asked_before = records.asked().len();
-        let watch = install.watch(&feed, &records, &resolver, &mut state).await;
-        assert_eq!(watch.starts[&home], start(7, StartSource::Local));
-        assert_eq!(
-            records.conditional_asked().last(),
-            Some(&(owner, discovered.clone(), tag))
-        );
-        assert_eq!(
-            records.asked().split_off(asked_before),
-            [(owner, discovered)]
-        );
+        // And the tag it held goes: this run had no local cursor for the
+        // file's to lower, so the next one reads the file whole too.
+        assert!(!state.discovered_etags.contains_key(&open.id));
     }
 
     #[tokio::test]
@@ -1831,6 +1847,91 @@ mod tests {
             );
             assert_eq!(watch.starts[&home], start(expected, StartSource::Local));
         }
+    }
+
+    #[tokio::test]
+    async fn a_discovered_json_read_while_a_feed_had_no_local_cursor_lowers_the_others_next_run() {
+        // P2c's review: a run that begins without a local cursor for every
+        // watched homeserver sends no tag and lowers no cursor. Had it kept
+        // the file's tag, the next run would send it and take the 304, so
+        // the cursor the file gives `ahead` would never lower the local one,
+        // and the stranger's sweep between the two would be skipped for good.
+        let mut install = Install::new();
+        let owner = install.owner;
+        // `missing` has no local cursor yet; `ahead`'s is past the one the
+        // file gives it.
+        let (missing, ahead) = (random_pubky(), install.home);
+        install.watch_list = vec![missing, ahead];
+        install.store_cursor(ahead, 100);
+        let open = bounty(owner, 10);
+        let discovered = paths::discovered(open.id);
+        let stranger = stranger_sweep(20);
+        let records = FakePublicRecords::default().with_record(
+            owner,
+            &discovered,
+            &discovered_json(&[], &[(missing, 200), (ahead, 30)]),
+        );
+        let records = with_sweep(records, stranger, open, "running");
+        // Every feed holds the stranger's sweep at 40: past `ahead`'s cursor
+        // in the file, before its local one and before `missing`'s.
+        let feed = FakeEventsFeed::of_events(vec![(40, put(stranger))]);
+        let resolver = FakeHomeservers::default();
+        let mut state = one_open(open);
+
+        // The first run reads the file whole and lowers nothing, so neither
+        // feed reaches the stranger's sweep, and keeps no tag.
+        let watch = install.watch(&feed, &records, &resolver, &mut state).await;
+        assert!(watch.warnings.is_empty(), "{:?}", watch.warnings);
+        assert_eq!(
+            records.conditional_asked(),
+            [(owner, discovered.clone(), None)]
+        );
+        assert_eq!(
+            watch.starts,
+            BTreeMap::from([
+                (missing, start(200, StartSource::Discovered)),
+                (ahead, start(100, StartSource::Local)),
+            ])
+        );
+        assert!(watch.accepted.is_empty());
+        assert_eq!(install.stored_cursor(ahead), Some(100));
+        assert!(!state.discovered_etags.contains_key(&open.id));
+
+        // The next run begins with every cursor, so it reads the file whole
+        // again and lowers `ahead`'s cursor to the file's, where its feed
+        // finds the stranger's sweep; now the tag is kept.
+        let asked_before = records.conditional_asked().len();
+        let watch = install.watch(&feed, &records, &resolver, &mut state).await;
+        assert!(watch.warnings.is_empty(), "{:?}", watch.warnings);
+        assert_eq!(
+            records.conditional_asked().split_off(asked_before).first(),
+            Some(&(owner, discovered.clone(), None))
+        );
+        assert_eq!(
+            watch.starts,
+            BTreeMap::from([
+                (missing, start(200, StartSource::Local)),
+                (ahead, start(30, StartSource::Local)),
+            ])
+        );
+        assert_eq!(watch.accepted, [of(open, stranger)]);
+        let tag = state.discovered_etags.get(&open.id).cloned();
+        assert!(tag.is_some(), "kept by the run that lowered the cursors");
+
+        // The run after sends the tag and takes the 304: nothing else is
+        // read, and no cursor is lowered again.
+        let asked_before = records.asked().len();
+        let watch = install.watch(&feed, &records, &resolver, &mut state).await;
+        assert_eq!(
+            records.conditional_asked().last(),
+            Some(&(owner, discovered.clone(), tag))
+        );
+        assert_eq!(
+            records.asked().split_off(asked_before),
+            [(owner, discovered)]
+        );
+        assert_eq!(watch.starts[&ahead], start(40, StartSource::Local));
+        assert!(watch.accepted.is_empty());
     }
 
     #[tokio::test]

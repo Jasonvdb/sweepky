@@ -18,6 +18,15 @@ disallowed-methods = [
     { path = "pubky::Pubky::start_cookie_auth_flow", reason = "deprecated cookie auth flow; use the grant flow (PubkyGrantAuthFlow::builder with the network's relay)" },
     { path = "pubky::Pubky::resume_cookie_auth_flow", reason = "deprecated cookie auth flow; use the grant flow" },
 
+    # The grant flow's two convenience constructors. Neither sets a relay, so
+    # both post the approval through the production relay whatever network
+    # the CLI is on, and a testnet login would leave the testnet (03, "How
+    # the Ring sign-in looks"). The builder's own `start`
+    # (`GrantAuthFlowBuilder::start`) is a different method and stays
+    # allowed: `ring::flow` sets the network's relay and client on it.
+    { path = "pubky::PubkyGrantAuthFlow::start", reason = "sets no relay; use PubkyGrantAuthFlow::builder(..).relay(network relay).client(network client).start()" },
+    { path = "pubky::Pubky::start_grant_auth_flow", reason = "sets no relay; use PubkyGrantAuthFlow::builder(..).relay(network relay).client(network client).start()" },
+
     # The other deprecated cookie-session paths, belt and braces: deprecation
     # already fails the build under -D warnings, but an #[allow(deprecated)]
     # would silence that and not this.

@@ -15,7 +15,8 @@
 //!    come before it. The search is paced for production's rate limit and
 //!    can take some seconds, so it runs outside the writers' lock;
 //! 3. under the pull lock, and inside it the writers' lock with a fresh
-//!    session that is always signed out (`session::with_writer_session`),
+//!    session (`session::with_writer_session`: an identity session is
+//!    signed out afterwards, a Ring one only dropped),
 //!    after checking that `login.json` still says what step 1 read:
 //!    1. PUT the bounty, `bounties/<id>.json`;
 //!    2. when the owner's homeserver is on the watch list, read its
