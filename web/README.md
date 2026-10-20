@@ -54,9 +54,31 @@ testnet switch at port 5179 and stops it when the run ends, so that port must
 be free.
 
 The specs check layout at 375 px and 1440 px, the keyboard walk, reduced
-motion, the intro strip's link to `#sweep`, and the network log. Each spec
-uses a new random circle and answers the testnet relay's lookups itself, so
-the specs write nothing and need no testnet running.
+motion, the intro strip's link to `#sweep`, and the network log. The layout and
+network specs use a new random circle and answer the testnet relay's lookups
+themselves, so they write nothing and need no testnet running.
 
 Neither `pnpm test` nor CI runs these specs. Results go to `test-results/`,
 which Git ignores.
+
+### Against the local testnet
+
+Two specs need the local testnet answering on its fixed ports (pkarr relay
+`15411`, homeserver `6286`; see
+[06](../docs/plan/06-verification-and-limits.md)). Both are skipped unless
+`SWEEPKY_E2E_TESTNET=1` is set:
+
+```sh
+# Reads only: a fresh random key shows the empty state.
+SWEEPKY_E2E_TESTNET=1 pnpm e2e --grep @empty
+
+# Writes: signs up three new keys and seeds synthetic records.
+SWEEPKY_E2E_TESTNET=1 pnpm e2e --grep @testnet
+```
+
+`@testnet` writes to the testnet. `e2e/seed.ts` signs up an owner, a circle
+member and a stranger on the testnet homeserver, then writes the records the
+CLI would write. The spec watches the board follow each change within one
+30-second poll, so a run takes a few minutes. The seed talks only to
+`localhost`. To use another testnet homeserver key, set
+`SWEEPKY_E2E_HOMESERVER`.
