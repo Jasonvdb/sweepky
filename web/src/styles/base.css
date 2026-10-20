@@ -1,0 +1,111 @@
+/*
+ * Page-wide rules: type, the focus ring, fluid layout primitives that keep a
+ * 375 px viewport from scrolling sideways, the destructive mark, and the
+ * reduced-motion stop (04, Page rules).
+ */
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  color-scheme: dark;
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  line-height: 1.5;
+  overflow-wrap: break-word;
+}
+
+img,
+svg,
+video {
+  max-width: 100%;
+}
+
+a {
+  color: inherit;
+}
+
+/* Keyboard focus is always visible; --foreground clears 3:1 on every surface. */
+:focus-visible {
+  outline: 2px solid var(--foreground);
+  outline-offset: 2px;
+}
+
+/* Commands and pubkys are monospace and wrap anywhere: a 52-character pubky
+   or a long command must not push a 375 px page sideways. */
+code,
+kbd,
+pre,
+samp,
+.mono {
+  font-family: var(--font-mono);
+}
+
+pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.pubky {
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+/* One line, cut with an ellipsis; `min-width: 0` lets it shrink in a flex or grid cell. */
+.truncate {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.container {
+  width: 100%;
+  max-width: 72rem;
+  margin-inline: auto;
+  padding-inline: clamp(1rem, 4vw, 2rem);
+}
+
+/* A state's colour is a mark beside its label, never the label's text:
+   destructive text falls below 4.5:1 on a card, the mark clears 3:1. */
+.state-mark {
+  display: inline-block;
+  flex: none;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.state-mark--aborted,
+.state-mark--unreachable {
+  background: var(--destructive);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  html {
+    scroll-behavior: smooth;
+  }
+}
+
+/* All motion stops under reduce. `!important` because a component's own,
+   more specific animation or transition rule would otherwise win. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
+}

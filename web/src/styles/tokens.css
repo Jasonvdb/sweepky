@@ -1,0 +1,34 @@
+/*
+ * Design tokens, copied by hand from pubky/pubky-app at commit
+ * ef6ad207e680169b1b01a6fb92695ffc646583b2, src/app/globals.css: the colours
+ * and radius from its :root block, the md radius and the two shadows from its
+ * @theme block. Names and values are pubky-app's, so Sweepky reads as part of
+ * the Pubky ecosystem (04, Design reference). Nothing imports or fetches that
+ * repository; change a value here only against a newer pinned commit.
+ *
+ * This is the one file that holds colour literals: every other rule reaches a
+ * colour through these properties, so the one accent is --brand.
+ */
+:root {
+  --radius: 0.625rem;
+  --radius-md: calc(var(--radius) - 2px);
+
+  --background: oklch(0.118 0.014 284.115);
+  --foreground: oklch(1 0 0);
+  --card: oklch(0.232 0.006 285.946);
+  --card-foreground: oklch(0.951 0.011 286.195);
+  --secondary: #303034;
+  --muted-foreground: #89898f;
+  --border: oklch(0.311 0.007 285.98);
+  /* The one accent: detectors, swept rooms, primary buttons and eyebrows. */
+  --brand: oklch(0.928 0.23 123.978);
+  /* Only for `aborted` sweeps and "unreachable" members, as a mark beside the label. */
+  --destructive: oklch(0.628 0.258 29.234);
+
+  --shadow-xs: 0 1px 2px 0 rgba(5, 5, 10, 0.2);
+  --shadow-sm: 0 1px 3px 0 rgba(5, 5, 10, 0.25), 0 1px 2px 0 rgba(5, 5, 10, 0.25);
+
+  /* pubky-app sets Inter Tight throughout; the fallbacks match index.html's. */
+  --font-sans: 'Inter Tight', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
