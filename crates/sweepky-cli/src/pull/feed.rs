@@ -21,7 +21,7 @@
 //!    a second install of the owner sees what the first discovered: its own
 //!    cursor may start past those events. The tag is kept only once every
 //!    sweep the file lists is settled, so a file with sweeps still to
-//!    confirm is read whole again next run.
+//!    confirm is read whole again next run. Then the poll state is written.
 //! 2. **Where each watched homeserver's feed starts** ([`Start`]): at the
 //!    local cursor; else at the lowest cursor the open bounties'
 //!    `discovered.json` give it; else at its head, found by
@@ -60,6 +60,19 @@
 //! `MAX_RECORD_BYTES`, with the roster poll's limits on what a summary may
 //! carry.
 //!
+//! **What it keeps of strangers is capped too**, because the feed is
+//! anyone's to write to and only a confirmed deletion takes a sweep out of
+//! the poll state: at most [`MAX_ACCEPTED_PER_BOUNTY`] sweeps accepted for
+//! one bounty and [`MAX_STRANGERS_SWEEPS_KEPT`] kept in all, deletions
+//! included. Past them a new stranger's sweep is left out, with a warning
+//! that names the bounty, and the feed reads on: the sweeps already
+//! accepted still come up to date, and once no open bounty has room, a new
+//! sweep is not even read. Should the poll state's file still have no room
+//! for a step's changes (the roster's records fill the rest of it), the
+//! step is dropped: the state goes back to what it was before it, the
+//! cursor stays, nothing more is read this run, and a warning says so. So
+//! nothing the watcher adds can make a later write of the poll state fail.
+//!
 //! **Faults skip, they do not stall.** A sweeper whose homeserver does not
 //! resolve, or a read of whose storage fails, is read no more this run, with
 //! one warning; a record that does not parse is skipped with one. The
@@ -80,13 +93,13 @@ use std::time::Duration;
 use anyhow::Context as _;
 use sweepky_core::paths;
 use sweepky_core::{
-    Circle, Discovered, EventCursor, FeedOp, FeedPage, KnownBountyStatus, Pubky, RecordId, Sweep,
-    SweepRef,
+    BountyRef, Circle, Discovered, EventCursor, FeedOp, FeedPage, KnownBountyStatus, Pubky,
+    RecordId, Sweep, SweepRef,
 };
 
 use super::resolve::{Homeservers, ResolveHomeserver};
 use super::roster::{Fetched, Stop, fetch};
-use super::state::{FeedCursors, PollState, SweepSummary};
+use super::state::{FeedCursors, PollState, SweepSummary, WouldPassCap};
 use crate::Dirs;
 use crate::events::{EventsFeed, find_head};
 use crate::records::{PublicRecords, not_a_record};
@@ -108,6 +121,23 @@ pub(crate) const MAX_FEED_PAGES_PER_RUN: usize = 10;
 /// runs.
 pub(crate) const MAX_LISTED_SWEEPS_PER_RUN: usize = 256;
 
+/// The most strangers' sweeps the poll state keeps accepted for one of the
+/// owner's bounties: 256, as many as a run confirms from the open bounties'
+/// `discovered.json`, so a second install takes in a full bounty's list in
+/// one run. The feed is anyone's to write to and nothing but a confirmed
+/// deletion takes a sweep out of the poll state, so without a cap a flood
+/// of sweeps under throwaway keys would grow it until its write failed.
+pub(crate) const MAX_ACCEPTED_PER_BOUNTY: usize = 256;
+
+/// The most strangers' sweeps the poll state keeps in all, accepted for any
+/// of the owner's bounties, open or not, or confirmed deleted: 1024. One
+/// accepted takes at most about 1.6 KiB of the file (a summary of 32
+/// targets with its tag, and its URL in `acceptedSweeps`), so the feed
+/// fills under half of the 4 MiB cap and leaves the rest to the roster.
+/// Deletions count, as a flood could otherwise cycle sweeps through
+/// acceptance and deletion and grow the file by a URL each time.
+pub(crate) const MAX_STRANGERS_SWEEPS_KEPT: usize = 1024;
+
 /// Why a feed stops when its page holds events, or malformed lines, but no
 /// cursor to go on from.
 const NO_CURSOR: &str = "the homeserver sent a page with no cursor to go on from, which breaks \
@@ -123,6 +153,13 @@ const CURSOR_NOT_FORWARD: &str = "the homeserver's cursor did not move past the 
 const CURSOR_MOVED: &str = "its cursor in feed-cursors.json changed while pull read it, as \
                             another pull or a post --open changes it; pull goes on from there \
                             next time";
+
+/// What the watcher says when the poll state's file has no room for what a
+/// step of it read: the step is dropped, and nothing more is read.
+const POLL_STATE_FULL: &str = "poll-state.json has no room for the strangers' sweeps pull just \
+                               read for your open bounties, so it keeps none of them, leaves the \
+                               events feeds' cursors where they were and reads no more of them \
+                               this time; the sweeps it already holds are opened as usual";
 
 /// Where a feed's start came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,9 +237,11 @@ pub(crate) struct FeedReaders<'a, 'h, F, R, H> {
 /// The cursors in `dirs` move on after each batch, with `state` written
 /// first, so a sweep accepted is in the poll state's file before the
 /// cursor moves past its event: a run stopped between the two reads the
-/// page again next time, and accepts nothing twice. Writing `state` once
-/// more at the end, for what came after the last batch, is the caller's.
-/// Only a failure of those local files is an error.
+/// page again next time, and accepts nothing twice. A step whose changes
+/// the file has no room for is dropped, its cursor kept, with a warning,
+/// and nothing more is read. Writing `state` once more at the end, for
+/// what came after the last batch, is the caller's. Only a failure to
+/// read or write those local files is an error.
 pub(crate) async fn watch_open_bounties<F, R, H>(
     readers: FeedReaders<'_, '_, F, R, H>,
     dirs: &Dirs,
@@ -241,9 +280,16 @@ where
         state,
         open,
         given_up: BTreeSet::new(),
+        bounties_full: BTreeSet::new(),
+        poll_state_full: false,
         found: FeedWatch::default(),
     };
-    let listed = watcher.read_discovered().await;
+    let listed = watcher.read_discovered().await?;
+    // With no room for what the listings added, a feed's would have none
+    // either, so no feed is read.
+    if watcher.poll_state_full {
+        return Ok(watcher.found);
+    }
     let starts = watcher.starts(watch_list, &listed, pace).await?;
     for (&homeserver, start) in &starts {
         watcher.read_feed(homeserver, start.cursor).await?;
@@ -320,15 +366,33 @@ struct Watcher<'w, 'h, F, R, H> {
     open: BTreeSet<RecordId>,
     /// The sweepers read no more this run: unreachable, or a read failed.
     given_up: BTreeSet<Pubky>,
+    /// The open bounties found with no room for another stranger's sweep
+    /// this run, each named in one warning.
+    bounties_full: BTreeSet<RecordId>,
+    /// Whether the poll state's file had no room for a step's changes: the
+    /// step was dropped, and nothing more is read this run.
+    poll_state_full: bool,
     /// What the run found so far.
     found: FeedWatch,
 }
 
+/// What the watcher held before a step that changes the poll state, to go
+/// back to when the file has no room for the step's changes.
+struct Before {
+    /// The whole poll state.
+    state: PollState,
+    /// How many sweeps the run had accepted.
+    accepted: usize,
+    /// How many deletions the run had confirmed.
+    deleted: usize,
+}
+
 impl<F: EventsFeed, R: PublicRecords, H: ResolveHomeserver> Watcher<'_, '_, F, R, H> {
     /// Reads each open bounty's `discovered.json`, confirms the sweeps it
-    /// lists that are new to this install, and gives the lowest cursor the
-    /// files give each homeserver, in memory only.
-    async fn read_discovered(&mut self) -> FeedCursors {
+    /// lists that are new to this install, stores the poll state, and gives
+    /// the lowest cursor the files give each homeserver, in memory only.
+    async fn read_discovered(&mut self) -> anyhow::Result<FeedCursors> {
+        let before = self.before_step();
         let mut lowest = FeedCursors::default();
         let mut budget = MAX_LISTED_SWEEPS_PER_RUN;
         let mut cut = false;
@@ -365,7 +429,10 @@ impl<F: EventsFeed, R: PublicRecords, H: ResolveHomeserver> Watcher<'_, '_, F, R
                  many this time and the rest next time"
             ));
         }
-        lowest
+        // Stored before any feed is read, as a batch is, so that a feed's
+        // batch dropped for want of room goes back to a state that fits.
+        self.keep_step(before)?;
+        Ok(lowest)
     }
 
     /// Bounty `id`'s `discovered.json` with the tag its answer gave, when
@@ -533,6 +600,10 @@ impl<F: EventsFeed, R: PublicRecords, H: ResolveHomeserver> Watcher<'_, '_, F, R
         homeserver: Pubky,
         mut cursor: EventCursor,
     ) -> anyhow::Result<()> {
+        // Once a step was dropped for want of room, no feed is read on.
+        if self.poll_state_full {
+            return Ok(());
+        }
         for _ in 0..MAX_FEED_PAGES_PER_RUN {
             match self.batch(homeserver, cursor).await? {
                 Batch::Read { next, full: true } => cursor = next,
@@ -562,9 +633,13 @@ impl<F: EventsFeed, R: PublicRecords, H: ResolveHomeserver> Watcher<'_, '_, F, R
             Ok(next) => next,
             Err(why) => return Ok(self.stop_feed(homeserver, why)),
         };
+        let before = self.before_step();
         self.act_on(&page).await;
         // The poll state first, then the cursor: see `watch_open_bounties`.
-        self.state.write(self.dirs, self.owner)?;
+        // A batch dropped for want of room leaves the cursor where it was.
+        if !self.keep_step(before)? {
+            return Ok(Batch::Stop);
+        }
         if !FeedCursors::advance(self.dirs, self.owner, homeserver, cursor, next)? {
             return Ok(self.stop_feed(homeserver, CURSOR_MOVED));
         }
@@ -605,6 +680,12 @@ impl<F: EventsFeed, R: PublicRecords, H: ResolveHomeserver> Watcher<'_, '_, F, R
 
     /// A `PUT` of `sweep`'s record: reads it, and accepts it when it is one.
     async fn on_put(&mut self, sweep: SweepRef) {
+        // A sweep new to this install could be accepted only into room, so
+        // once no open bounty has any, it is not even read: a flood's later
+        // pages cost no reads of its keys' storage.
+        if self.accepted_for(sweep).is_none() && self.no_open_bounty_has_room() {
+            return;
+        }
         match self.refetch(sweep).await {
             Some(Fetched::Record { record, etag }) => self.accept(sweep, &record, etag),
             Some(Fetched::Unreadable(error)) => self.skipped(&error),
@@ -685,6 +766,10 @@ impl<F: EventsFeed, R: PublicRecords, H: ResolveHomeserver> Watcher<'_, '_, F, R
         if !before && !self.open.contains(&bounty.id) {
             return;
         }
+        if !before && !self.has_room_for(bounty.id) {
+            self.leave_out(bounty.id);
+            return;
+        }
         match self.state.sweeps.get_mut(&sweep) {
             Some(summary) => summary.update(record, etag),
             None => {
@@ -706,6 +791,87 @@ impl<F: EventsFeed, R: PublicRecords, H: ResolveHomeserver> Watcher<'_, '_, F, R
                 sweep,
             });
         }
+    }
+
+    /// Whether the poll state has room for one more stranger's sweep of
+    /// bounty `id`: [`MAX_ACCEPTED_PER_BOUNTY`] for the bounty, and
+    /// [`MAX_STRANGERS_SWEEPS_KEPT`] in all, deletions included.
+    fn has_room_for(&self, id: RecordId) -> bool {
+        // `map_or` gives 0 for a bounty with no sweep accepted yet; the
+        // function `BTreeSet::len` counts each set, as `|set| set.len()`
+        // would.
+        let of_bounty = self.state.accepted_sweeps.get(&id).map_or(0, BTreeSet::len);
+        of_bounty < MAX_ACCEPTED_PER_BOUNTY
+            && self.strangers_sweeps_kept() < MAX_STRANGERS_SWEEPS_KEPT
+    }
+
+    /// How many strangers' sweeps the poll state keeps: accepted for any of
+    /// the owner's bounties, or confirmed deleted.
+    fn strangers_sweeps_kept(&self) -> usize {
+        let accepted: usize = self.state.accepted_sweeps.values().map(BTreeSet::len).sum();
+        accepted.saturating_add(self.state.deleted_sweeps.len())
+    }
+
+    /// Whether every open bounty was found with no room this run, so that
+    /// no new stranger's sweep could be accepted.
+    fn no_open_bounty_has_room(&self) -> bool {
+        // Every bounty `leave_out` names is open, so this is the two sets
+        // being equal.
+        self.open.is_subset(&self.bounties_full)
+    }
+
+    /// Leaves a new stranger's sweep of bounty `id` out for want of room,
+    /// with one warning a bounty a run, which names the bounty.
+    fn leave_out(&mut self, id: RecordId) {
+        // `insert` says whether `id` was new to the set: the first sweep of
+        // this bounty left out this run.
+        if self.bounties_full.insert(id) {
+            let bounty = BountyRef {
+                owner: self.owner,
+                id,
+            };
+            self.warn(format_args!(
+                "pull leaves out new strangers' sweeps of your bounty {bounty} this time: it \
+                 keeps at most {MAX_ACCEPTED_PER_BOUNTY} accepted for one bounty and \
+                 {MAX_STRANGERS_SWEEPS_KEPT} strangers' sweeps in all, deleted ones included, \
+                 and has no room for more"
+            ));
+        }
+    }
+
+    /// What the watcher holds now, before a step that changes the poll
+    /// state. A copy of the whole state: each step already reads, parses
+    /// and rewrites the whole file, so the copy costs less than its write.
+    fn before_step(&self) -> Before {
+        Before {
+            state: self.state.clone(),
+            accepted: self.found.accepted.len(),
+            deleted: self.found.deleted.len(),
+        }
+    }
+
+    /// Writes the poll state with the changes of the step that began at
+    /// `before`, and says whether they are kept. When the file has no room
+    /// for them ([`WouldPassCap`], which leaves the file as it was), the
+    /// state and what the run found go back to `before`, so a later write
+    /// of the state has the room it had, and nothing more is read this run,
+    /// with a warning. A file that could not be written at all is an error.
+    fn keep_step(&mut self, before: Before) -> anyhow::Result<bool> {
+        match self.state.write(self.dirs, self.owner) {
+            Ok(()) => return Ok(true),
+            // `downcast_ref` finds `state`'s typed refusal under any context
+            // added to it: the file is as it was, and the run can go on.
+            Err(error) if error.downcast_ref::<WouldPassCap>().is_some() => {}
+            Err(error) => return Err(error),
+        }
+        // `*` writes through the `&mut` into the caller's state itself.
+        *self.state = before.state;
+        // `truncate` drops what the step pushed and keeps what came before.
+        self.found.accepted.truncate(before.accepted);
+        self.found.deleted.truncate(before.deleted);
+        self.poll_state_full = true;
+        self.warn(format_args!("{POLL_STATE_FULL}"));
+        Ok(false)
     }
 
     /// Records that `sweep`, of bounty `bounty`, is gone from its sweeper's
@@ -762,16 +928,19 @@ mod tests {
 
     use serde_json::{Map, Value, json};
     use sweepky_core::paths;
-    use sweepky_core::{Bounty, BountyRef, Circle, EventCursor, KnownSweepStatus, Pubky, SweepRef};
+    use sweepky_core::{
+        Bounty, BountyRef, Circle, EventCursor, KnownSweepStatus, Pubky, Sweep, SweepRef,
+    };
     use tempfile::TempDir;
 
     use super::{
-        BountySweep, CURSOR_NOT_FORWARD, FeedReaders, FeedWatch, MAX_FEED_PAGES_PER_RUN, NO_CURSOR,
-        Start, StartSource, watch_open_bounties,
+        BountySweep, CURSOR_NOT_FORWARD, FeedReaders, FeedWatch, MAX_ACCEPTED_PER_BOUNTY,
+        MAX_FEED_PAGES_PER_RUN, MAX_STRANGERS_SWEEPS_KEPT, NO_CURSOR, POLL_STATE_FULL, Start,
+        StartSource, watch_open_bounties,
     };
     use crate::Dirs;
     use crate::pull::resolve::Homeservers;
-    use crate::pull::state::{BountySummary, FeedCursors, PollState};
+    use crate::pull::state::{BountySummary, FeedCursors, PollState, SweepSummary};
     use crate::remote::ETag;
     use crate::test_support::{
         FakeEventsFeed, FakeHomeservers, FakeLookup, FakePublicRecords, PLANTED, bounty_json,
@@ -1459,5 +1628,172 @@ mod tests {
             [(EventCursor::new(full), 1000)]
         );
         assert_eq!(install.stored_cursor(install.home), Some(last));
+    }
+
+    /// `records` holding a running sweep of `bounty` for each of `sweeps`.
+    fn with_running(
+        records: FakePublicRecords,
+        sweeps: &[SweepRef],
+        bounty: BountyRef,
+    ) -> FakePublicRecords {
+        // `fold` threads the fake through each sweep, as a chain of
+        // `with_sweep` calls would.
+        sweeps.iter().fold(records, |records, &sweep| {
+            with_sweep(records, sweep, bounty, "running")
+        })
+    }
+
+    /// A feed of a `PUT` of each of `sweeps`, at events 1, 2 and on.
+    fn feed_of_puts(sweeps: &[SweepRef]) -> FakeEventsFeed {
+        // `(1..).zip(..)` numbers the lines from 1, as the events' ids.
+        FakeEventsFeed::of_events((1..).zip(sweeps.iter().map(|&sweep| put(sweep))).collect())
+    }
+
+    #[tokio::test]
+    async fn past_a_bounty_s_cap_its_new_strangers_sweeps_are_left_out_and_the_feed_reads_on() {
+        let install = Install::new();
+        let open = bounty(install.owner, 10);
+        install.store_cursor(install.home, 0);
+        // A stranger's sweep an earlier run accepted while it was running;
+        // it is done now.
+        let earlier = stranger_sweep(5);
+        let running =
+            Sweep::from_json(&json_bytes(&sweep_json(open, &["t1"], "running"))).expect("a sweep");
+        let mut state = one_open(open);
+        state
+            .sweeps
+            .insert(earlier, SweepSummary::new(&running, None));
+        state
+            .accepted_sweeps
+            .insert(open.id, BTreeSet::from([earlier]));
+        // A flood of sweeps under throwaway keys, more than the bounty has
+        // room for, then the earlier sweep's done PUT.
+        let flood: Vec<SweepRef> = (100..)
+            .take(MAX_ACCEPTED_PER_BOUNTY + 3)
+            .map(stranger_sweep)
+            .collect();
+        let records = with_sweep(FakePublicRecords::default(), earlier, open, "done");
+        let records = with_running(records, &flood, open);
+        let mut sweeps = flood.clone();
+        sweeps.push(earlier);
+        let feed = feed_of_puts(&sweeps);
+        let last = u64::try_from(sweeps.len()).expect("a few");
+        let resolver = FakeHomeservers::default();
+
+        let watch = install.watch(&feed, &records, &resolver, &mut state).await;
+        // Room for all but one of the flood: the earlier sweep holds a place.
+        let room = MAX_ACCEPTED_PER_BOUNTY - 1;
+        assert_eq!(watch.accepted.len(), room);
+        assert_eq!(
+            state.accepted_sweeps[&open.id].len(),
+            MAX_ACCEPTED_PER_BOUNTY
+        );
+        assert!(!state.sweeps.contains_key(&flood[room]));
+        // The first sweep with no room was read and left out; once no open
+        // bounty had room, the rest were not even read.
+        assert_eq!(reads_of(&records, flood[room]), 1);
+        for &sweep in &flood[room + 1..] {
+            assert_eq!(reads_of(&records, sweep), 0);
+        }
+        // The feed read on: the earlier sweep is up to date, and the cursor
+        // is past the page.
+        let summary = &state.sweeps[&earlier];
+        assert_eq!(summary.status.as_known(), Some(KnownSweepStatus::Done));
+        assert_eq!(install.stored_cursor(install.home), Some(last));
+        // One warning, which names the bounty and the caps, and quotes no
+        // stranger.
+        assert_eq!(watch.warnings.len(), 1, "{:?}", watch.warnings);
+        for part in [
+            open.to_string(),
+            MAX_ACCEPTED_PER_BOUNTY.to_string(),
+            MAX_STRANGERS_SWEEPS_KEPT.to_string(),
+        ] {
+            assert!(watch.warnings[0].contains(&part), "{}", watch.warnings[0]);
+        }
+        assert_quotes_nothing(&watch.warnings);
+        // What was kept is in the poll state's file.
+        assert_eq!(
+            PollState::read(&install.dirs, install.owner).expect("reads"),
+            state
+        );
+    }
+
+    #[tokio::test]
+    async fn deletions_count_against_the_cap_on_strangers_sweeps_kept_in_all() {
+        let install = Install::new();
+        let owner = install.owner;
+        let (first, second) = (bounty(owner, 10), bounty(owner, 11));
+        install.store_cursor(install.home, 0);
+        let mut state = state_of(&[
+            (first, bounty_record(true, "open")),
+            (second, bounty_record(true, "open")),
+        ]);
+        // Deletions earlier runs confirmed: all but two of the strangers'
+        // sweeps pull keeps in all.
+        let gone = random_pubky();
+        state.deleted_sweeps = (0..)
+            .take(MAX_STRANGERS_SWEEPS_KEPT - 2)
+            .map(|n| SweepRef {
+                sweeper: gone,
+                id: record_id(n),
+            })
+            .collect();
+        // Two sweeps of each bounty, one of each, then one of each again.
+        let of_first = [stranger_sweep(100), stranger_sweep(102)];
+        let of_second = [stranger_sweep(101), stranger_sweep(103)];
+        let records = with_running(FakePublicRecords::default(), &of_first, first);
+        let records = with_running(records, &of_second, second);
+        let feed = feed_of_puts(&[of_first[0], of_second[0], of_first[1], of_second[1]]);
+        let resolver = FakeHomeservers::default();
+
+        let watch = install.watch(&feed, &records, &resolver, &mut state).await;
+        assert_eq!(
+            watch.accepted,
+            [of(first, of_first[0]), of(second, of_second[0])]
+        );
+        // Each bounty's first sweep left out is a warning that names it.
+        assert_eq!(watch.warnings.len(), 2, "{:?}", watch.warnings);
+        assert!(watch.warnings[0].contains(&first.to_string()));
+        assert!(watch.warnings[1].contains(&second.to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_page_the_poll_state_has_no_room_for_is_dropped_and_asked_for_again_next_run() {
+        let mut install = Install::new();
+        let owner = install.owner;
+        // Two watched homeservers with the same feed: once the poll state
+        // has no room, the second is not read.
+        install.watch_list.push(random_pubky());
+        for &homeserver in &install.watch_list {
+            install.store_cursor(homeserver, 0);
+        }
+        let open = bounty(owner, 10);
+        let flood: Vec<SweepRef> = (100..110).map(stranger_sweep).collect();
+        let records = with_running(FakePublicRecords::default(), &flood, open);
+        let feed = feed_of_puts(&flood);
+        let resolver = FakeHomeservers::default();
+        // A poll state with room for less than one sweep more.
+        let mut state = one_open(open);
+        state.write_with_room(&install.dirs, owner, 300);
+        let before = state.clone();
+
+        for run in 1..=2 {
+            let watch = install.watch(&feed, &records, &resolver, &mut state).await;
+            assert_eq!(watch.warnings, [POLL_STATE_FULL]);
+            assert!(watch.accepted.is_empty());
+            // The state is as it was, in memory and in its file, and so is
+            // every cursor.
+            assert_eq!(state, before);
+            assert_eq!(
+                PollState::read(&install.dirs, owner).expect("reads"),
+                before
+            );
+            for &homeserver in &install.watch_list {
+                assert_eq!(install.stored_cursor(homeserver), Some(0));
+            }
+            // One page a run, of one homeserver: no feed is read on.
+            assert_eq!(feed.asked().len(), run);
+        }
+        assert_eq!(feed.homeservers_asked().len(), 1);
     }
 }

@@ -59,15 +59,21 @@
 //!
 //! **What the poll state holds came from other people's records.** A
 //! status is an open string, and credits and targets are lists, so a
-//! summary is as long as its record makes it. `pull` bounds how many
-//! records it reads a run and what a record may carry into a summary
-//! (`pull::roster`), so that one run cannot fill it; the cap keeps the file
-//! finite, and is the backstop for how many summaries it holds.
+//! summary is as long as its record makes it. `pull` bounds what a record
+//! may carry into a summary and how many records the roster poll reads a
+//! run (`pull::roster`), and how many strangers' sweeps the feed watcher
+//! keeps in all, under half of the cap (`pull::feed`). So no stranger alone
+//! can fill the file, but the roster's records are bounded per run only,
+//! and a roster key can fill it over many runs. The cap keeps the file
+//! finite and is the backstop: a write that would pass it is refused with
+//! [`WouldPassCap`], which the feed watcher takes as no room for what it
+//! read, and every other caller as an error.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::path::PathBuf;
 
-use anyhow::{Context as _, bail};
+use anyhow::Context as _;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sweepky_core::{
@@ -238,6 +244,28 @@ impl PollState {
     /// the file has it.
     pub(crate) fn write(&self, dirs: &Dirs, owner: Pubky) -> anyhow::Result<()> {
         write_entry(dirs, owner, self)
+    }
+}
+
+#[cfg(test)]
+impl PollState {
+    /// Writes this as `owner`'s poll state, then pads the file with a field
+    /// at the top, as a newer Sweepky could have written one, until it is
+    /// `room` bytes short of its cap: a file this state still fits, and a
+    /// little more does not. For the tests of the callers that must cope
+    /// with a full file.
+    pub(crate) fn write_with_room(&self, dirs: &Dirs, owner: Pubky, room: usize) {
+        self.write(dirs, owner).expect("written");
+        let path = dirs.poll_state_file();
+        let written = std::fs::read(&path).expect("readable");
+        let mut file: serde_json::Value = serde_json::from_slice(&written).expect("JSON");
+        // In compact JSON the field adds `"filler":"",` to its own bytes.
+        let filler = MAX_POLL_STATE_BYTES - room - written.len() - r#""filler":"","#.len();
+        file["filler"] = serde_json::Value::String("x".repeat(filler));
+        let mut bytes = serde_json::to_vec(&file).expect("JSON");
+        bytes.push(b'\n');
+        assert_eq!(bytes.len(), MAX_POLL_STATE_BYTES - room);
+        write_private_file(&path, &bytes).expect("written");
     }
 }
 
@@ -413,6 +441,36 @@ impl OwnerEntry for PollState {
     }
 }
 
+/// A write refused because the file would pass its cap, which leaves the
+/// file as it was. A type of its own, not a message alone, so that a caller
+/// that can go on without the write tells it apart from a file that could
+/// not be written at all: `pull::feed` then drops what it added and reads
+/// no more (`downcast_ref::<WouldPassCap>()`).
+///
+/// A path and a number, so deriving `Debug` prints nothing secret.
+#[derive(Debug)]
+pub(crate) struct WouldPassCap {
+    /// The file not written.
+    path: PathBuf,
+    /// Its cap, in bytes.
+    cap: usize,
+}
+
+impl fmt::Display for WouldPassCap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} would grow past the {} bytes Sweepky reads from it, so it was not written",
+            self.path.display(),
+            self.cap
+        )
+    }
+}
+
+// An empty impl: `Error`'s methods all have defaults. Implementing it (with
+// `Display` and `Debug` above) is what lets an `anyhow::Error` hold one.
+impl std::error::Error for WouldPassCap {}
+
 /// Reads `E`'s file whole, or an empty one when there is no file.
 ///
 /// Through `private_fs`: a link, anything but a regular file, a file
@@ -436,18 +494,20 @@ fn read_file<E: OwnerEntry>(dirs: &Dirs) -> anyhow::Result<OwnerFile<E>> {
 
 /// Writes `file` as `E`'s file: compact JSON and a newline, 0600 in the
 /// 0700 data directory, made if it is missing. Refused, with the file left
-/// as it was, when it would pass `E::MAX_BYTES`.
+/// as it was, when it would pass `E::MAX_BYTES`: [`WouldPassCap`].
 fn write_file<E: OwnerEntry>(dirs: &Dirs, file: &OwnerFile<E>) -> anyhow::Result<()> {
     let path = E::path(dirs);
     let mut bytes =
         serde_json::to_vec(file).with_context(|| format!("could not write {}", path.display()))?;
     bytes.push(b'\n');
     if bytes.len() > E::MAX_BYTES {
-        bail!(
-            "{} would grow past the {} bytes Sweepky reads from it, so it was not written",
-            path.display(),
-            E::MAX_BYTES
-        );
+        // `into` wraps the typed error in an `anyhow::Error`, which keeps it
+        // for a caller's `downcast_ref`.
+        return Err(WouldPassCap {
+            path,
+            cap: E::MAX_BYTES,
+        }
+        .into());
     }
     ensure_private_dir(dirs.data())?;
     write_private_file(&path, &bytes)
@@ -484,7 +544,8 @@ mod tests {
     use sweepky_core::{Bounty, BountyRef, EventCursor, Pubky, Sweep, SweepRef};
 
     use super::{
-        BountySummary, FeedCursors, OwnerEntry, PollState, SweepSummary, read_entry, write_entry,
+        BountySummary, FeedCursors, OwnerEntry, PollState, SweepSummary, WouldPassCap, read_entry,
+        write_entry,
     };
     use crate::Dirs;
     use crate::private_fs::{ensure_private_dir, write_private_file};
@@ -581,6 +642,9 @@ mod tests {
         let before = FileSnapshot::of(&path);
 
         let err = write_entry(dirs, random_pubky(), entry).expect_err("past the cap");
+        // A type of its own, so a caller that can go on without the write
+        // tells it apart from a file that could not be written at all.
+        assert!(err.downcast_ref::<WouldPassCap>().is_some(), "{err:#}");
         let shown = format!("{err:#}");
         assert!(shown.contains(&E::MAX_BYTES.to_string()), "{shown}");
         assert_eq!(FileSnapshot::of(&path), before);

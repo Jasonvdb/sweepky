@@ -603,7 +603,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::discovered::FakeSession;
-    use super::state::FeedCursors;
+    use super::feed::MAX_ACCEPTED_PER_BOUNTY;
+    use super::state::{FeedCursors, PollState};
     use super::{NO_DEVICE_KEY, Seams, ThisInstall, pull_with};
     use crate::device::{
         create_device_key, device_key_bytes, device_key_record, remove_device_key,
@@ -1245,5 +1246,111 @@ mod tests {
             report.contains("alarm: keys/other-install.json is a device key"),
             "{report}"
         );
+    }
+
+    /// A feed of a `PUT` of each of `sweeps`, at events 1, 2 and on.
+    fn feed_of_puts(sweeps: &[SweepRef]) -> FakeEventsFeed {
+        FakeEventsFeed::of_events(
+            (1..)
+                .zip(sweeps.iter().map(|&sweep| put_event(sweep)))
+                .collect(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_flood_past_the_cap_is_left_out_and_the_circle_s_sweeps_are_still_opened_and_grouped()
+    {
+        let mut fx = Install::new();
+        let member = random_pubky();
+        fx.circle(&[member]);
+        let open = fx.post_open(1, &[(fx.home, 0)], &[]);
+        let ours = fx.ours();
+        let circle_sweep = fx.sweep(member, 10, open, "done", &ours);
+        // A flood of running sweeps, each under a throwaway key: more than
+        // one bounty keeps.
+        let flood: Vec<SweepRef> = (100..)
+            .take(MAX_ACCEPTED_PER_BOUNTY + 4)
+            .map(|n| fx.sweep(random_pubky(), n, open, "running", &[]))
+            .collect();
+        fx.feed = feed_of_puts(&flood);
+
+        let report = fx.pull().await.expect("pulled");
+        assert_safe_to_print(&report);
+        // The cap held, the poll state was written, and the report says
+        // sweeps were left out.
+        let state = PollState::read(&fx.dirs, fx.owner).expect("reads");
+        assert_eq!(
+            state.accepted_sweeps[&open.id].len(),
+            MAX_ACCEPTED_PER_BOUNTY
+        );
+        assert!(
+            report.contains(&format!(
+                "warning: pull leaves out new strangers' sweeps of your bounty {open}"
+            )),
+            "{report}"
+        );
+        assert_eq!(fx.written(open).await.sweeps.len(), MAX_ACCEPTED_PER_BOUNTY);
+        // The feed read on past them.
+        let last = u64::try_from(flood.len()).expect("a few");
+        assert_eq!(fx.stored_cursor(fx.home), Some(last));
+        // The circle's sweep was opened, stored and grouped as ever.
+        assert!(
+            line_of(&report, circle_sweep)
+                .starts_with(&format!("  {circle_sweep}: circle; done; stored now in ")),
+            "{report}"
+        );
+        assert!(
+            report.contains("  groups.json and merged.json are in "),
+            "{report}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_poll_state_with_no_room_for_the_feed_does_not_fail_pull_run_after_run() {
+        let mut fx = Install::new();
+        let member = random_pubky();
+        fx.circle(&[member]);
+        let open = fx.post_open(1, &[(fx.home, 0)], &[]);
+        // A first pull with a quiet feed, then the poll state filled to
+        // within 1 KiB of its cap: room for what the roster adds next, a
+        // circle member's done sweep, and none for a page of strangers'.
+        fx.pull().await.expect("pulled");
+        PollState::read(&fx.dirs, fx.owner)
+            .expect("reads")
+            .write_with_room(&fx.dirs, fx.owner, 1024);
+        let ours = fx.ours();
+        let circle_sweep = fx.sweep(member, 10, open, "done", &ours);
+        let flood: Vec<SweepRef> = (100..120)
+            .map(|n| fx.sweep(random_pubky(), n, open, "running", &[]))
+            .collect();
+        fx.feed = feed_of_puts(&flood);
+
+        for (run, place) in [(1, "stored now in"), (2, "stored in")] {
+            let report = fx
+                .pull()
+                .await
+                .unwrap_or_else(|error| panic!("pull {run} failed: {error:#}"));
+            assert_safe_to_print(&report);
+            assert!(
+                report.contains("warning: poll-state.json has no room for the strangers' sweeps"),
+                "{report}"
+            );
+            // Nothing of the page is kept, and the cursor is where it was.
+            let state = PollState::read(&fx.dirs, fx.owner).expect("reads");
+            assert!(state.accepted_sweeps.is_empty());
+            assert_eq!(fx.stored_cursor(fx.home), Some(0));
+            // The circle's sweep is opened, stored and grouped all the same.
+            assert!(
+                line_of(&report, circle_sweep)
+                    .starts_with(&format!("  {circle_sweep}: circle; done; {place} ")),
+                "{report}"
+            );
+            assert!(
+                report.contains("  groups.json and merged.json are in "),
+                "{report}"
+            );
+        }
+        // No sweep was accepted, so no discovered.json was rewritten.
+        assert!(fx.session.storage.puts().is_empty());
     }
 }
