@@ -1428,13 +1428,27 @@ async fn end_to_end() {
 
     // ----- P2b: B runs A's bounty in an init project -----
 
-    // B's project, made by the minimal `init`; B then works in it, as
-    // `run` must be run in the project's own directory.
+    // B's project, made by `init`; B then works in it, as `run` must be
+    // run in the project's own directory. Besides the marker and the
+    // `.gitignore`, init wrote what Claude Code reads: the sandbox
+    // settings, the project's `CLAUDE.md` and the skill.
     let b_projects = tempfile::tempdir().expect("temp dir");
     let project = b_projects.path().join("project");
     sweepky(&b, &["init", project.to_str().expect("a UTF-8 path")])
         .await
         .expect("B's init");
+    let mut made: Vec<String> = fs::read_dir(&project)
+        .expect("the project")
+        .map(|entry| {
+            let name = entry.expect("an entry").file_name();
+            name.into_string().expect("UTF-8")
+        })
+        .collect();
+    made.sort();
+    assert_eq!(made, [".claude", ".gitignore", ".sweepky", "CLAUDE.md"]);
+    for file in [".claude/settings.json", ".claude/skills/sweepky/SKILL.md"] {
+        assert!(project.join(file).is_file(), "{file}");
+    }
     b.cwd = project.clone();
 
     let report = sweepky(&b, &["run", &posted.to_string()])

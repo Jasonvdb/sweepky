@@ -1,7 +1,9 @@
-//! `sweepky init <dir>`, the minimal version (P2a): create the directory, a
-//! `.gitignore` that ignores `sweeps/`, and the `.sweepky` marker that `run`
-//! requires. Nothing else; the sandbox settings, the project `CLAUDE.md`, the
-//! skill and the playbook arrive in P3.
+//! `sweepky init <dir>`: create the directory, a `.gitignore` that ignores
+//! `sweeps/`, the files Claude Code reads (the sandbox settings
+//! `.claude/settings.json`, the project's `CLAUDE.md` and a copy of the
+//! `/sweepky` skill, see [`project_files`]), and, last, the `.sweepky` marker
+//! that `run` requires. P2a built the directory, the `.gitignore` and the
+//! marker; P3 adds the Claude Code files. The playbook arrives later in P3.
 //!
 //! The marker is a small JSON file, `{"schemaVersion":1}` and a newline, so
 //! later phases can add fields to it the way records grow. One is read
@@ -44,6 +46,7 @@ use serde::{Deserialize, Serialize};
 use sweepky_core::{Playbook, RecordError, SchemaVersion, UnknownFields};
 
 use crate::Report;
+use project_files::{ClaudeFiles, SETTINGS, glob_safe};
 // File steps shared with the secret files' writer: the temp name, the synced
 // write, the open that checks it got the file it inspected, the capped read
 // and the directory sync.
@@ -53,6 +56,8 @@ use crate::private_fs::{
 
 /// The project marker's file name, directly inside the project directory.
 pub(crate) const MARKER: &str = ".sweepky";
+
+mod project_files;
 
 /// The project's git ignore file.
 const GITIGNORE: &str = ".gitignore";
@@ -112,28 +117,88 @@ const MAX_MARKER_BYTES: usize = 64 * 1024;
 const MAX_GITIGNORE_BYTES: usize = 1024 * 1024;
 
 /// Runs `sweepky init <dir>`.
+///
+/// Every check runs before the first write: the path, the marker, the
+/// Claude Code files ([`ClaudeFiles::inspect`]) and the `.gitignore`. Then
+/// the `.gitignore`, the Claude Code files and, last, the marker.
 pub(crate) fn init(dir: &Path) -> anyhow::Result<Report> {
+    // The path goes into a glob pattern in the settings, so one that would
+    // change the pattern is refused before even the directory is made. The
+    // canonical path is checked again below, since a parent link can lead
+    // anywhere.
+    glob_safe(dir)?;
     // Like `mkdir -p`: creates every missing parent, and succeeds if the
     // directory is already there.
     fs::create_dir_all(dir).with_context(|| format!("could not create {}", dir.display()))?;
 
     let marker = dir.join(MARKER);
     if is_initialised(&marker)? {
-        return Ok(Report::new(format!(
-            "{} is already initialised: it has a {MARKER} marker. Nothing changed.\n",
-            dir.display()
-        )));
+        return already_initialised(dir);
     }
 
     refuse_symlinked_project_dir(&marker)?;
-    let gitignore = ensure_gitignore(&dir.join(GITIGNORE))?;
-    write_new(&marker, &marker_bytes()?)?;
+    // `canonicalize` resolves every link and `..` in the path, which now
+    // exists. Claude Code matches `claudeMdExcludes` against files' real
+    // absolute paths, so that is the path the settings name: on macOS a
+    // project under `/tmp` is really under `/private/tmp`.
+    let canonical =
+        fs::canonicalize(dir).with_context(|| format!("could not resolve {}", dir.display()))?;
+    let claude_files = ClaudeFiles::inspect(dir, &canonical)?;
 
-    Ok(Report::new(format!(
-        "Initialised {} as a Sweepky project:\n  wrote {MARKER}\n  {}\n",
-        dir.display(),
-        gitignore.describe()
-    )))
+    let mut done = vec![
+        ensure_gitignore(&dir.join(GITIGNORE))?
+            .describe()
+            .to_owned(),
+    ];
+    done.extend(claude_files.write()?);
+    write_new(&marker, &marker_bytes()?)?;
+    done.push(format!("wrote {MARKER}"));
+    Ok(finished(dir, &canonical, &done))
+}
+
+/// The report of a finished `init`: what it did, one line each, then the
+/// project's real path, the Node requirement and how to launch a sweep.
+fn finished(dir: &Path, canonical: &Path, done: &[String]) -> Report {
+    let mut text = format!("Initialised {} as a Sweepky project:\n", dir.display());
+    for line in done {
+        text.push_str(&format!("  {line}\n"));
+    }
+    text.push_str(&format!(
+        "The sandbox settings name the project by its real path, {}.\n{NODE_LINE}\n\
+         {LAUNCH_LINE}\n",
+        canonical.display()
+    ));
+    Report::new(text)
+}
+
+/// The report's line on Node, which sandboxed commands can run only when it
+/// is installed outside the home directory.
+const NODE_LINE: &str = "Install Node outside $HOME (Homebrew: `brew install node`), not with nvm \
+                         or another installer under your home directory: sandboxed commands \
+                         cannot read $HOME, and the sandbox needs Node to run the playbook's \
+                         validators.";
+
+/// The report's line on how a sweep runs in the project.
+const LAUNCH_LINE: &str = "To sweep: run `sweepky run <bounty-url>` here, then start the agent \
+                           here with `claude --setting-sources project,local` and type \
+                           `/sweepky`, then run `sweepky submit` once the agent has exited.";
+
+/// The report for a project that already has its marker. Nothing is
+/// changed. A project without `.claude/settings.json` was made by P2a's
+/// `init`, before the sandbox existed; the report says so, and points at a
+/// new directory rather than adding files beside an older marker.
+fn already_initialised(dir: &Path) -> anyhow::Result<Report> {
+    let mut text = format!(
+        "{} is already initialised: it has a {MARKER} marker. Nothing changed.\n",
+        dir.display()
+    );
+    if let Existing::Missing = existing(&dir.join(SETTINGS))? {
+        text.push_str(&format!(
+            "It has no {SETTINGS}, so it has no sandbox: an older `sweepky init` made it. Run \
+             `sweepky init` on a new directory and sweep there.\n"
+        ));
+    }
+    Ok(Report::new(text))
 }
 
 /// Refuses a project directory that is a symbolic link, before anything is
@@ -510,6 +575,12 @@ mod tests {
         list.iter().map(|name| (*name).to_owned()).collect()
     }
 
+    /// The names directly inside a project init finished in an empty
+    /// directory.
+    fn initialised() -> BTreeSet<String> {
+        names(&[MARKER, GITIGNORE, ".claude", "CLAUDE.md"])
+    }
+
     #[test]
     fn init_creates_directory_marker_and_gitignore() {
         let temp = tempfile::tempdir().expect("temp dir");
@@ -518,7 +589,7 @@ mod tests {
         init(&dir).expect("init succeeds");
 
         assert!(dir.is_dir());
-        assert_eq!(entries(&dir), names(&[MARKER, GITIGNORE]));
+        assert_eq!(entries(&dir), initialised());
         assert_eq!(
             fs::read_to_string(dir.join(MARKER)).expect("marker"),
             "{\"schemaVersion\":1}\n"
@@ -528,9 +599,25 @@ mod tests {
             "sweeps/\n"
         );
 
+        assert_eq!(
+            entries(&dir.join(".claude")),
+            names(&["settings.json", "skills"])
+        );
+        assert_eq!(entries(&dir.join(".claude/skills")), names(&["sweepky"]));
+        assert_eq!(
+            entries(&dir.join(".claude/skills/sweepky")),
+            names(&["SKILL.md"])
+        );
+
         // Each file was made through a temp file and a hard link, and the
         // temp name is gone again, so each has the one name.
-        for name in [MARKER, GITIGNORE] {
+        for name in [
+            MARKER,
+            GITIGNORE,
+            "CLAUDE.md",
+            ".claude/settings.json",
+            ".claude/skills/sweepky/SKILL.md",
+        ] {
             let meta = fs::symlink_metadata(dir.join(name)).expect("lstat");
             assert_eq!(meta.nlink(), 1, "{name}");
         }
@@ -538,7 +625,7 @@ mod tests {
         // Nested directories are created too.
         let nested = temp.path().join("a").join("b");
         init(&nested).expect("init succeeds");
-        assert_eq!(entries(&nested), names(&[MARKER, GITIGNORE]));
+        assert_eq!(entries(&nested), initialised());
     }
 
     #[test]
@@ -624,7 +711,7 @@ mod tests {
         init(&dir).expect("init succeeds");
         let after = fs::read(dir.join(GITIGNORE)).expect("read");
         assert_eq!(after, [before, b"\nsweeps/\n"].concat());
-        assert_eq!(entries(&dir), names(&[MARKER, GITIGNORE]));
+        assert_eq!(entries(&dir), initialised());
 
         // A file that ends in a newline gets just the one line.
         let dir = project_dir(&temp, "newline");
@@ -656,7 +743,7 @@ mod tests {
         init(&dir).expect("init succeeds");
         let after = fs::read(dir.join(GITIGNORE)).expect("read");
         assert_eq!(after, [at_cap.as_slice(), b"\nsweeps/\n"].concat());
-        assert_eq!(entries(&dir), names(&[MARKER, GITIGNORE]));
+        assert_eq!(entries(&dir), initialised());
 
         // One byte more is refused with a message that names the file and the
         // line to add by hand; the file is left byte for byte as it was, and
@@ -686,7 +773,7 @@ mod tests {
         fs::write(dir.join(GITIGNORE), before).expect("write");
         init(&dir).expect("init succeeds");
         assert_eq!(fs::read(dir.join(GITIGNORE)).expect("read"), before);
-        assert_eq!(entries(&dir), names(&[MARKER, GITIGNORE]));
+        assert_eq!(entries(&dir), initialised());
     }
 
     #[test]
@@ -753,7 +840,7 @@ mod tests {
         fs::hard_link(&listed, dir.join(GITIGNORE)).expect("hard link");
         init(&dir).expect("init succeeds");
         assert_eq!(fs::read_to_string(&listed).expect("read"), "sweeps/\n");
-        assert_eq!(entries(&dir), names(&[MARKER, GITIGNORE]));
+        assert_eq!(entries(&dir), initialised());
     }
 
     #[test]
@@ -925,6 +1012,39 @@ mod tests {
     }
 
     #[test]
+    fn the_report_gives_the_launch_line_and_the_node_requirement() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let report = init(&temp.path().join("project")).expect("init succeeds");
+        let text = report.text();
+        for phrase in [
+            "claude --setting-sources project,local",
+            "Install Node outside $HOME (Homebrew",
+            "wrote .claude/settings.json",
+            "wrote CLAUDE.md",
+            "wrote .claude/skills/sweepky/SKILL.md",
+        ] {
+            assert!(text.contains(phrase), "{phrase} not in {text}");
+        }
+    }
+
+    #[test]
+    fn a_p2a_project_without_settings_is_left_and_pointed_at_a_new_directory() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        // What P2a's init left: the marker and the `.gitignore`, no
+        // `.claude/`. Init changes nothing and says why it will not add
+        // the sandbox here.
+        let dir = project_dir(&temp, "p2a");
+        fs::write(dir.join(MARKER), "{\"schemaVersion\":1}\n").expect("write");
+        fs::write(dir.join(GITIGNORE), "sweeps/\n").expect("write");
+        let report = init(&dir).expect("init succeeds");
+        let text = report.text();
+        assert!(text.contains("already initialised"), "{text}");
+        assert!(text.contains("no .claude/settings.json"), "{text}");
+        assert!(text.contains("new directory"), "{text}");
+        assert_eq!(entries(&dir), names(&[MARKER, GITIGNORE]));
+    }
+
+    #[test]
     fn init_twice_is_idempotent() {
         let temp = tempfile::tempdir().expect("temp dir");
         let dir = temp.path().join("project");
@@ -934,13 +1054,20 @@ mod tests {
         let marker = fs::read(dir.join(MARKER)).expect("marker");
         let gitignore = fs::read(dir.join(GITIGNORE)).expect("gitignore");
 
+        let settings = fs::read(dir.join(".claude/settings.json")).expect("settings");
+
         let second = init(&dir).expect("second run");
         assert!(
             second.text().contains("already initialised"),
             "{}",
             second.text()
         );
-        assert_eq!(entries(&dir), names(&[MARKER, GITIGNORE]));
+        assert!(!second.text().contains("no .claude"), "{}", second.text());
+        assert_eq!(
+            fs::read(dir.join(".claude/settings.json")).expect("settings"),
+            settings
+        );
+        assert_eq!(entries(&dir), initialised());
         assert_eq!(fs::read(dir.join(MARKER)).expect("marker"), marker);
         assert_eq!(fs::read(dir.join(GITIGNORE)).expect("gitignore"), gitignore);
     }

@@ -69,8 +69,10 @@ pub struct Cli {
 /// `Debug` prints `[REDACTED]` in the token's place.
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Make DIR a sweeper project: create it, write the .sweepky marker
-    /// and a .gitignore that ignores sweeps/.
+    /// Make DIR a sweeper project: create it, write a .gitignore that
+    /// ignores sweeps/, the sandbox settings .claude/settings.json, a
+    /// CLAUDE.md for the agent, a copy of the /sweepky skill, and last the
+    /// .sweepky marker.
     //
     // `DIR`, not `<DIR>`: this text is both the `--help` line and rustdoc,
     // and rustdoc reads `<DIR>` as an unclosed HTML tag. clap's usage line

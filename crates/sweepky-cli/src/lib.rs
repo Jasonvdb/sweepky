@@ -18,8 +18,10 @@
 //!   refuses a value it does not know instead of falling back to production.
 //! - [`CLIENT_ID`] and [`SWEEPKY_CAPABILITY`], the client id and the
 //!   capability Sweepky asks for when it signs in through a grant.
-//! - `init <dir>`, the first command: it creates the directory, the `.sweepky`
-//!   marker and a `.gitignore` with `sweeps/`. It needs no [`Context`], so
+//! - `init <dir>`, the first command: it creates the directory, a
+//!   `.gitignore` with `sweeps/`, the sandbox settings, a `CLAUDE.md` and a
+//!   copy of the `/sweepky` skill for Claude Code, and the `.sweepky` marker.
+//!   It needs no [`Context`], so
 //!   the binary runs it through [`run_without_context`] before it reads
 //!   HOME or the passphrase file or builds a network.
 //! - `clock::now()`, the current time for a record's time fields
