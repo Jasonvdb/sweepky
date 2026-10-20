@@ -555,8 +555,9 @@ fn feed_line(homeserver: Pubky, start: Start) -> String {
 }
 
 /// A sweeper's trust as the report shows it: `circle`, `known: N credits
-/// across M owners` (00's words), or `unknown`.
-fn label_text(trust: Trust) -> String {
+/// across M owners` (00's words), or `unknown`. `done` shows a proposed
+/// sweeper's label in the same words.
+pub(crate) fn label_text(trust: Trust) -> String {
     match trust.label {
         TrustLabel::Circle => "circle".to_owned(),
         TrustLabel::Known => format!(
@@ -571,7 +572,7 @@ fn label_text(trust: Trust) -> String {
 /// `n` and `noun`, plural unless `n` is 1. Generic over `n`'s type, any
 /// that compares with 1 and prints, so a `u64` tally and a `usize` length
 /// both go in as they are.
-fn counted<N: PartialEq + From<u8> + std::fmt::Display>(n: N, noun: &str) -> String {
+pub(crate) fn counted<N: PartialEq + From<u8> + std::fmt::Display>(n: N, noun: &str) -> String {
     if n == N::from(1) {
         format!("1 {noun}")
     } else {

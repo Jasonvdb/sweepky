@@ -223,6 +223,16 @@
 //!   public event, an open bounty's starting cursor there: exponential, then
 //!   binary, with `limit=1`, bounded in its requests, never past cursor
 //!   2^62, paced for production's rate limit and stopped by a 429.
+//! - `done <bounty> [--credit <pubky>]… [--no-credit <pubky>]…` (P2c,
+//!   `done`): the URL and every pubky checked as text, a `--credit` naming
+//!   the bounty's owner refused in one line before any file is read; then
+//!   the credits proposed from the groups `pull` wrote, the sweepers of the
+//!   done sweeps in them and never the owner, each shown with its trust
+//!   label and the places it reported, sanitised; the flags applied; a
+//!   question unless they name every proposed sweeper; and, under the
+//!   writers' lock with a fresh session, the bounty read back, marked done
+//!   by core with the time and the credits, checked against the record cap
+//!   and written again with every field this build does not know kept.
 //!
 //! The rules that hold for everything here (see "Rust conventions" in
 //! `docs/plan/03-cli-and-skill.md`):
@@ -286,6 +296,9 @@ mod git;
 mod identity;
 // The terminal sanitiser.
 mod display;
+// `done`: the credits proposed from `pull`'s groups, confirmed, and the
+// bounty rewritten as done under the writers' lock.
+mod done;
 mod init;
 // `installs.json`: the device ids this owner's own installs created.
 mod installs;
@@ -527,7 +540,8 @@ pub fn run_without_context(cli: &Cli) -> Option<anyhow::Result<Report>> {
         | Command::Post { .. }
         | Command::Run { .. }
         | Command::Submit { .. }
-        | Command::Pull => None,
+        | Command::Pull
+        | Command::Done { .. } => None,
     }
 }
 
@@ -601,6 +615,14 @@ pub async fn run(cli: Cli, ctx: &Context) -> anyhow::Result<Report> {
         }
         // `pull` asks nothing, so it takes no `Prompting`.
         Command::Pull => pull::pull(ctx).await,
+        Command::Done {
+            bounty,
+            credit,
+            no_credit,
+        } => {
+            let prompting = prompt::Prompting::from_no_input_flag(cli.no_input);
+            done::done(ctx, prompting, &bounty, &credit, &no_credit).await
+        }
     }
 }
 
@@ -676,6 +698,14 @@ mod tests {
                 "cloudflare/security-audit@c1c8a8c",
             ],
             &["pull"],
+            &[
+                "done",
+                "pubky://owner/pub/sweepky/bounties/0035G87EK4XFE.json",
+                "--credit",
+                "b",
+                "--no-credit",
+                "c",
+            ],
         ];
         for args in commands {
             // With and without `--no-input`, which changes nothing here: the

@@ -45,9 +45,10 @@ pub struct Cli {
     pub passphrase_file: Option<PathBuf>,
 
     /// Never stop to ask a question. Where a command needs an answer, such
-    /// as `post` confirming a bounty's title and brief, or `submit` finding
-    /// keys the owner added since the last submit, it fails instead and says
-    /// what it would have asked.
+    /// as `post` confirming a bounty's title and brief, `submit` finding
+    /// keys the owner added since the last submit, or `done` confirming
+    /// credits its flags do not settle, it fails instead and says what it
+    /// would have asked.
     //
     // Global, like --testnet. `run` hands it, as a `prompt::Prompting`, to
     // each command that asks; the context does not carry it, so this field
@@ -257,6 +258,37 @@ pub enum Command {
     // No arguments: everything it needs is the login, the device key and
     // the state files of this install, and the network settings.
     Pull,
+
+    /// Mark the bounty at BOUNTY_URL done and credit every sweeper whose
+    /// sweep helped. From the groups your last `pull` wrote, done proposes
+    /// each sweeper with a done sweep in a group, never you, and shows each
+    /// one's trust label and the places they reported. --credit adds a
+    /// sweeper and --no-credit drops one. Then it asks before it rewrites
+    /// /pub/sweepky/bounties/ID.json, where anyone can read it, with status
+    /// done, doneAt and the credits, keeping every other field. It does not
+    /// ask when the flags name every proposed sweeper. Run it again to
+    /// change the credits: the last write wins.
+    //
+    // Every value is plain text, checked by `done`, as `run`'s arguments
+    // are: clap's own parse error would quote a value, and a key pasted in
+    // the wrong place must not be printed back.
+    Done {
+        /// The bounty's pubky:// URL, as `sweepky post` printed it.
+        #[arg(value_name = "BOUNTY_URL")]
+        bounty: String,
+
+        /// Credit this sweeper, proposed or not: a pubky, with or without
+        /// the `pubky` prefix. Repeat it for each one. Never your own.
+        //
+        // A `Vec` makes the flag repeatable: clap appends each value.
+        #[arg(long, value_name = "PUBKY")]
+        credit: Vec<String>,
+
+        /// Do not credit this proposed sweeper, a pubky in either form.
+        /// Repeat it for each one.
+        #[arg(long, value_name = "PUBKY")]
+        no_credit: Vec<String>,
+    },
 }
 
 /// The `circle` commands.
@@ -531,6 +563,46 @@ mod tests {
         // Nothing else: no positional argument and no flag of its own.
         assert!(Cli::try_parse_from(["sweepky", "pull", "bounty"]).is_err());
         assert!(Cli::try_parse_from(["sweepky", "pull", "--open"]).is_err());
+    }
+
+    #[test]
+    fn done_takes_one_url_and_repeated_credit_flags_as_text() {
+        let url = "pubky://owner/pub/sweepky/bounties/0035G87EK4XFE.json";
+        let cli = Cli::try_parse_from([
+            "sweepky",
+            "done",
+            url,
+            "--credit",
+            "b",
+            "--no-credit",
+            "c",
+            "--credit",
+            "d",
+        ])
+        .expect("parses");
+        let Command::Done {
+            bounty,
+            credit,
+            no_credit,
+        } = &cli.command
+        else {
+            panic!("done parses as Done: {cli:?}");
+        };
+        // Plain text, in the order given: `done` checks every value.
+        assert_eq!(bounty, url);
+        assert_eq!(credit, &["b", "d"]);
+        assert_eq!(no_credit, &["c"]);
+
+        let cli = Cli::try_parse_from(["sweepky", "done", url]).expect("parses");
+        assert!(
+            matches!(&cli.command, Command::Done { credit, no_credit, .. }
+                if credit.is_empty() && no_credit.is_empty()),
+            "{cli:?}"
+        );
+        // Exactly one URL, and a flag with no value is a usage error.
+        assert!(Cli::try_parse_from(["sweepky", "done"]).is_err());
+        assert!(Cli::try_parse_from(["sweepky", "done", url, url]).is_err());
+        assert!(Cli::try_parse_from(["sweepky", "done", url, "--credit"]).is_err());
     }
 
     #[test]

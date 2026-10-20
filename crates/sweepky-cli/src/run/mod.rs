@@ -162,7 +162,9 @@ pub(crate) async fn run(
     let project_marker = require_project(&ctx.cwd)?;
     // `map` parses only a `Some`, and `transpose` turns the
     // `Option<Result<..>>` into the `Result<Option<..>>` that `?` takes.
-    let bounty = bounty_url.map(parse_bounty_url).transpose()?;
+    let bounty = bounty_url
+        .map(|text| parse_bounty_url(text, "run"))
+        .transpose()?;
     if bounty.is_none() && target.is_some() {
         bail!(TARGET_NEEDS_URL);
     }
@@ -457,48 +459,62 @@ pub(crate) fn require_project(cwd: &Path) -> anyhow::Result<ProjectMarker> {
         .context("run must be run inside an init project, in the directory `sweepky init` made")
 }
 
-/// What `run` takes as its bounty, said by every refusal of another.
-const BOUNTY_URL: &str = "run takes a bounty's URL, pubky://<owner>/pub/sweepky/bounties/<id>.json, \
-                          as `sweepky post` printed it";
+/// What `command` takes as its bounty, said by every refusal of another.
+fn bounty_url_hint(command: &str) -> String {
+    format!(
+        "{command} takes a bounty's URL, pubky://<owner>/pub/sweepky/bounties/<id>.json, as \
+         `sweepky post` printed it"
+    )
+}
 
-/// The bounty `text`, `run`'s argument, points at: a bounty record's
-/// `pubky://` URL, its owner in either spelling. Every refusal is fixed
-/// text, so a key pasted in the wrong place is never printed back.
-pub(crate) fn parse_bounty_url(text: &str) -> anyhow::Result<BountyRef> {
+/// The bounty `text`, the argument of `command` (`run`, `done`), points
+/// at: a bounty record's `pubky://` URL, its owner in either spelling.
+/// Every refusal is fixed text, so a key pasted in the wrong place is
+/// never printed back.
+pub(crate) fn parse_bounty_url(text: &str, command: &str) -> anyhow::Result<BountyRef> {
     // The exact scheme `PubkyUrl` reads, first: a bounty URL holds a
     // 52-character key, which the classifier below would take for a raw
     // secret key.
     if text.starts_with("pubky://") {
-        return bounty_of_url(text);
+        return bounty_of_url(text, command);
     }
     if text.starts_with("https://") || text.starts_with("http://") {
-        bail!("that is a web address; {BOUNTY_URL}");
+        bail!("that is a web address; {}", bounty_url_hint(command));
     }
     if let Some(refusal) = refuse_secret_material(text.as_bytes()) {
         // `into` makes the `Refusal` the error itself, which says what the
         // text looks like and why Sweepky never takes one.
         return Err(refusal.into());
     }
-    bail!(BOUNTY_URL)
+    bail!(bounty_url_hint(command))
 }
 
-/// The bounty `text`, a `pubky://` URL, points at.
-fn bounty_of_url(text: &str) -> anyhow::Result<BountyRef> {
+/// The bounty `text`, a `pubky://` URL given to `command`, points at.
+fn bounty_of_url(text: &str, command: &str) -> anyhow::Result<BountyRef> {
     // Core's error says what is wrong with the URL in fixed text.
-    let url: PubkyUrl = text.parse().context(BOUNTY_URL)?;
+    let url: PubkyUrl = text.parse().with_context(|| bounty_url_hint(command))?;
     if let Some(bounty) = BountyRef::from_url(&url) {
         // The SDK reads a key only when it is a point on Ed25519, so a key
         // that is not one is refused here, in fixed text, rather than later
         // in a message that names it.
         if public_key_of(&bounty.owner).is_err() {
-            bail!("the owner in that URL is not an Ed25519 public key; {BOUNTY_URL}");
+            bail!(
+                "the owner in that URL is not an Ed25519 public key; {}",
+                bounty_url_hint(command)
+            );
         }
         return Ok(bounty);
     }
     if SweepRef::from_url(&url).is_some() {
-        bail!("that is a sweep record's URL, not its bounty's; {BOUNTY_URL}");
+        bail!(
+            "that is a sweep record's URL, not its bounty's; {}",
+            bounty_url_hint(command)
+        );
     }
-    bail!("that pubky:// URL names another file than a bounty record; {BOUNTY_URL}")
+    bail!(
+        "that pubky:// URL names another file than a bounty record; {}",
+        bounty_url_hint(command)
+    )
 }
 
 /// What `run` was asked to check: the bounty, who sweeps it, and the two
@@ -728,7 +744,7 @@ mod tests {
             format!("pubky://{owner}/pub/sweepky/bounties/{id}.json"),
             format!("pubky://pubky{owner}/pub/sweepky/bounties/{id}.json"),
         ] {
-            assert_eq!(parse_bounty_url(&url).expect(&url), expected);
+            assert_eq!(parse_bounty_url(&url, "run").expect(&url), expected);
         }
     }
 
@@ -762,7 +778,7 @@ mod tests {
             (format!("{PLANTED} or so"), "takes a bounty's URL"),
         ];
         for (argument, expected) in &cases {
-            let err = parse_bounty_url(argument).expect_err(argument);
+            let err = parse_bounty_url(argument, "run").expect_err(argument);
             let message = format!("{err:#}");
             assert!(message.contains(expected), "{argument}: {message}");
             assert_unquoted(&message, &[argument, &owner.to_string(), PLANTED]);
@@ -770,7 +786,7 @@ mod tests {
 
         // A pasted key is refused by the same classifier `login` uses.
         for argument in [&z32_secret, &hex_secret] {
-            let err = parse_bounty_url(argument).expect_err("refused");
+            let err = parse_bounty_url(argument, "run").expect_err("refused");
             assert_eq!(err.downcast_ref::<Refusal>(), Some(&Refusal::RawKey));
             assert_unquoted(&format!("{err:#}"), &[argument]);
         }

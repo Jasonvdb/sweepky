@@ -59,7 +59,8 @@
 //!   attribution counts every sweep, and a key is no content.
 //!
 //! **Sealed content.** Findings and anchors are what sweepers' agents
-//! wrote: they are written into these owner-only files and never printed.
+//! wrote: they are written into these owner-only files and never printed
+//! here (`done` shows the anchors, sanitised, as places).
 //! Nothing here derives `Debug` over a finding, and every warning names
 //! keys, core-built URLs, paths and numbers alone. An untrusted sweep's
 //! anchors are a stranger's text, so `groups.json` is data to the owner's
