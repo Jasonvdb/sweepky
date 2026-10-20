@@ -381,11 +381,22 @@ export interface MemberView {
   readonly reachability: Reachability
   /** Its badge, and the credits received behind it. */
   readonly trust: Trust
+  /**
+   * Its last activity: the newest time any of its held records gives, in
+   * milliseconds since 1970, or `null` when the board holds none of them.
+   */
+  readonly lastActivityMs: number | null
 }
 
 /** The roster, the admin first, as the Circle page lists it. */
 export function circleMembers(state: BoardState): readonly MemberView[] {
-  return circleMembersOf(state.admin, state.circle, state.members, trustTable(state))
+  return circleMembersOf(
+    state.admin,
+    state.circle,
+    state.members,
+    trustTable(state),
+    lastActivityOf(state.bounties, state.sweeps),
+  )
 }
 
 const circleMembersOf = lastResult(
@@ -394,6 +405,7 @@ const circleMembersOf = lastResult(
     circle: Circle | null,
     members: ReadonlyMap<Pubky, MemberState>,
     table: TrustTable,
+    lastActivity: ReadonlyMap<Pubky, number>,
   ): readonly MemberView[] => {
     // Inside the memo: `rosterOf` builds a new circle while circle.json has
     // no answer, which would never be `===` the last one.
@@ -409,8 +421,35 @@ const circleMembersOf = lastResult(
         homeserver: homeserverOf(resolution),
         reachability: reachabilityOf(resolution),
         trust: table.get(pubky),
+        lastActivityMs: lastActivity.get(pubky) ?? null,
       }
     })
+  },
+)
+
+/**
+ * Each writer's newest record time: a bounty's `doneAt` or `createdAt`, a
+ * sweep's `finishedAt` or `startedAt`, whichever is latest. Strangers'
+ * sweeps get an entry too, which the Circle page never asks for.
+ */
+const lastActivityOf = lastResult(
+  (
+    bounties: ReadonlyMap<RecordKey, BountyEntry>,
+    sweeps: ReadonlyMap<RecordKey, SweepEntry>,
+  ): ReadonlyMap<Pubky, number> => {
+    const newest = new Map<Pubky, number>()
+    const note = (writer: Pubky, ms: number) => {
+      newest.set(writer, Math.max(ms, newest.get(writer) ?? -Infinity))
+    }
+    for (const { ref, record } of bounties.values()) {
+      note(ref.owner, recordTimeMs(record.createdAt, ref.id))
+      if (record.doneAt !== null) note(ref.owner, recordTimeMs(record.doneAt, ref.id))
+    }
+    for (const { ref, record } of sweeps.values()) {
+      note(ref.sweeper, recordTimeMs(record.startedAt, ref.id))
+      if (record.finishedAt !== null) note(ref.sweeper, recordTimeMs(record.finishedAt, ref.id))
+    }
+    return newest
   },
 )
 

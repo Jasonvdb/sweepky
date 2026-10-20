@@ -66,8 +66,8 @@ export function Board() {
   )
 }
 
-/** Why the board cannot read the circle, or nothing while it can. */
-function StatusNotice({ status }: { readonly status: BoardStatus }) {
+/** Why the board cannot read the circle, or nothing while it can. The Circle page shows it too. */
+export function StatusNotice({ status }: { readonly status: BoardStatus }) {
   switch (status) {
     case 'ok':
       return null
