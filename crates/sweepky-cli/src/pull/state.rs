@@ -8,8 +8,9 @@
 //! - `poll-state.json`, an owner's [`PollState`]: what the roster polling
 //!   learnt (01, "Circle"). For each member, the newest record id seen in
 //!   their `bounties/` and `sweeps/` ([`Watermarks`]), where the next
-//!   newest-first listing stops, and their done bounty read again last,
-//!   where the next turn through them starts; a summary of each bounty and
+//!   newest-first listing stops, and the last of their done bounties, open
+//!   bounties and running sweeps read again, where the next turn through
+//!   each kind starts; a summary of each bounty and
 //!   sweep read ([`BountySummary`], [`SweepSummary`]), with the `ETag` its
 //!   last answer gave, so a record that can still change is read again
 //!   with `If-None-Match`; the `ETag` of each of the owner's own
@@ -19,7 +20,8 @@
 //! ```json
 //! {"schemaVersion":1,"owners":{"<owner z32>":{"cursors":{"<homeserver z32>":"<event id>"}}}}
 //! {"schemaVersion":1,"owners":{"<owner z32>":{
-//!   "watermarks":{"<member z32>":{"bounties":"<id>","sweeps":"<id>","rereadDoneAfter":"<id>"}},
+//!   "watermarks":{"<member z32>":{"bounties":"<id>","sweeps":"<id>","rereadDoneAfter":"<id>",
+//!     "rereadOpenAfter":"<id>","rereadRunningAfter":"<id>"}},
 //!   "bounties":{"pubky://<owner>/pub/sweepky/bounties/<id>.json":
 //!     {"status":"open","open":true,"credits":[],"etag":"<tag>"}},
 //!   "sweeps":{"pubky://<sweeper>/pub/sweepky/sweeps/<id>.json":
@@ -273,8 +275,8 @@ impl PollState {
 /// Where the roster poll stands in one member's storage: the newest record
 /// id seen in each of their directories with record ids, `bounties/` and
 /// `sweeps/` (`keys/` files are named by device id, which no listing stops
-/// at), and the done bounty of theirs read again last. Each `None` until
-/// there is one.
+/// at), and the last of their done bounties, open bounties and running
+/// sweeps read again. Each `None` until there is one.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct Watermarks {
@@ -288,6 +290,14 @@ pub(crate) struct Watermarks {
     // field is written back as it was.
     #[serde(rename = "rereadDoneAfter", skip_serializing_if = "Option::is_none")]
     pub(crate) reread_done_after: Option<RecordId>,
+    /// The id of the member's open bounty read again last: when they have
+    /// more than a run reads again, the next run's turn through them starts
+    /// after it (`pull::roster`). Left out while `None`, as above.
+    #[serde(rename = "rereadOpenAfter", skip_serializing_if = "Option::is_none")]
+    pub(crate) reread_open_after: Option<RecordId>,
+    /// The same for the member's `running` sweeps of the owner's bounties.
+    #[serde(rename = "rereadRunningAfter", skip_serializing_if = "Option::is_none")]
+    pub(crate) reread_running_after: Option<RecordId>,
     /// Fields a newer Sweepky wrote here, kept for the rewrite.
     #[serde(flatten)]
     extra: UnknownFields,
@@ -1017,6 +1027,9 @@ mod tests {
         let marks = state.watermarks.entry(member).or_default();
         marks.bounties = Some(record_id(10));
         marks.sweeps = Some(record_id(12));
+        marks.reread_done_after = Some(record_id(10));
+        marks.reread_open_after = Some(record_id(8));
+        marks.reread_running_after = Some(record_id(12));
         state
             .bounties
             .insert(bounty, BountySummary::new(&record, Some(tag("\"b-1\""))));
@@ -1044,6 +1057,9 @@ mod tests {
                     "watermarks": { member.to_string(): {
                         "bounties": record_id(10).to_string(),
                         "sweeps": record_id(12).to_string(),
+                        "rereadDoneAfter": record_id(10).to_string(),
+                        "rereadOpenAfter": record_id(8).to_string(),
+                        "rereadRunningAfter": record_id(12).to_string(),
                     } },
                     "bounties": { bounty.to_string(): {
                         "status": "done",
