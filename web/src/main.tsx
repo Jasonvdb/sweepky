@@ -18,6 +18,7 @@ import './styles/base.css'
 import './styles/buttons.css'
 import './styles/sections.css'
 import './styles/layout.css'
+import './styles/board.css'
 
 const root = document.getElementById('root')
 if (root === null) {
