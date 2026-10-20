@@ -102,8 +102,8 @@ export const LANDING_COPY = {
       },
       {
         title: 'No claims, no locks',
-        text: 'Sweeps are non-exclusive. Anyone the bounty accepts can sweep it, and the owner gets every independent report.',
-        sources: [DECISIONS, WHAT_IT_IS],
+        text: "Sweeps are non-exclusive. Anyone the bounty accepts can sweep it, and the owner gets every independent report the CLI discovers: circle members' sweeps, and strangers' sweeps on watched homeservers.",
+        sources: [DECISIONS, WHAT_IT_IS, KNOWN_LIMITS],
       },
     ] satisfies readonly Card[],
   },

@@ -305,6 +305,14 @@ describe('the copy', () => {
     }
   })
 
+  // 06: open-bounty discovery sees only watched homeservers, so a stranger
+  // elsewhere can sweep an open bounty without the owner ever seeing it.
+  it('promises the owner only the reports discovery can see', () => {
+    const card = LANDING_COPY.problem.cards.find((each) => each.title === 'No claims, no locks')
+    expect(card?.text).toMatch(/strangers' sweeps on watched homeservers/)
+    expect(card?.sources).toContain('06-verification-and-limits.md#known-limits-say-them-in-the-readme')
+  })
+
   it("never says 'private'", () => {
     for (const shipped of [JSON.stringify(LANDING_COPY), text(render(board([])))]) {
       expect(shipped).not.toMatch(/\bprivate\b/i)
