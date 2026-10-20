@@ -19,6 +19,10 @@
 // - An error answer's body is never read, and no message quotes a server,
 //   a URL or the SDK: the SDK's fetch errors carry the browser's own text,
 //   which names the URL.
+// - Every request has a deadline, `REQUEST_TIMEOUT_MS` for headers and body
+//   together, and ends early when the caller's signal is aborted: a
+//   homeserver that never answers, or trickles a body below the cap, is a
+//   failed read, not a pass that never ends.
 
 import { MAX_PAGE_SIZE, MAX_RECORD_BYTES, maxPageBytes } from '../records/limits.ts'
 import { formatSweepkyPath } from '../records/paths.ts'
@@ -29,6 +33,13 @@ import type { Body, CacheMode, Failure, ListOptions, Transport } from './transpo
 
 /** What a request that did not complete is reported as: fixed text. */
 export const REQUEST_FAILED = 'the request to the homeserver did not complete'
+
+/**
+ * The most time one request may take, headers and body together: 30 s, the
+ * poll interval, so a pass waits on a silent homeserver no longer than one
+ * poll. The CLI's `remote.rs` sets no request timeout of its own to mirror.
+ */
+export const REQUEST_TIMEOUT_MS = 30_000
 
 /** One `GET`'s answer, before a 404 is given its meaning for a record or a listing. */
 type Fetched = Body | { readonly kind: 'notFound' } | Failure
@@ -43,6 +54,8 @@ interface StorageRequest {
   readonly cache: CacheMode
   /** The most body bytes read. */
   readonly cap: number
+  /** The caller's: aborting it ends the request. */
+  readonly signal: AbortSignal | undefined
 }
 
 const NOT_FOUND = { kind: 'notFound' } as const
@@ -54,13 +67,14 @@ const LOOKUP_FAILED = { kind: 'unreachable', reason: 'lookupFailed' } as const
 /** A `Transport` that reaches homeservers through `sdk`. */
 export function createSdkTransport(sdk: PubkySdk): Transport {
   return {
-    async getRecord(owner, path, { cache }) {
+    async getRecord(owner, path, { cache, signal }) {
       const fetched = await fetchCapped(sdk, {
         owner,
         path: formatSweepkyPath(path),
         query: [],
         cache,
         cap: MAX_RECORD_BYTES,
+        signal,
       })
       return fetched.kind === 'notFound' ? { kind: 'absent' } : fetched
     },
@@ -73,6 +87,7 @@ export function createSdkTransport(sdk: PubkySdk): Transport {
         query: listingQuery(options),
         cache: options.cache,
         cap: maxPageBytes(options.limit),
+        signal: options.signal,
       })
       return fetched.kind === 'notFound' ? { kind: 'empty' } : fetched
     },
@@ -117,16 +132,37 @@ function listingQuery({ limit, reverse, cursor }: ListOptions): [string, string]
 }
 
 /**
- * Sends one `StorageRequest` and reads its body under its cap. A 404 is
- * `notFound`; what that means is the caller's to say.
+ * Sends one `StorageRequest` and reads its body under its cap, within
+ * `REQUEST_TIMEOUT_MS` and while its signal holds. A 404 is `notFound`; what
+ * that means is the caller's to say.
+ */
+async function fetchCapped(sdk: PubkySdk, request: StorageRequest): Promise<Fetched> {
+  const deadline = startDeadline(request.signal)
+  try {
+    return await fetchUntil(sdk, request, deadline.signal)
+  } finally {
+    deadline.clear()
+  }
+}
+
+/**
+ * `fetchCapped`'s request, ended by `signal`: the fetch is handed it, and
+ * every wait is raced against it too.
+ *
+ * Why both: `client.fetch` gives its init to `new Request` (pubky-sdk
+ * 0.16.2, `bindings/js/src/client/http.rs`), so the browser aborts the
+ * request and its body on the signal; but before that it resolves the
+ * owner's pkarr record, which the signal does not reach. The race bounds
+ * that part too.
  *
  * The query goes in through `URLSearchParams`, which percent-encodes every
  * name and value, so a cursor holding `&`, `=`, `#` or `?` stays one value
  * and cannot add a parameter, as `append_pair` keeps it in the CLI.
  */
-async function fetchCapped(
+async function fetchUntil(
   sdk: PubkySdk,
   { owner, path, query, cache, cap }: StorageRequest,
+  signal: AbortSignal,
 ): Promise<Fetched> {
   let response: Response
   try {
@@ -138,12 +174,10 @@ async function fetchCapped(
     for (const [name, value] of query) url.searchParams.append(name, value)
     // A new init for every request: `client.fetch` adds its `pubky-host`
     // header to the init object it is given.
-    response = await sdk.fetch(url.href, {
-      method: 'GET',
-      credentials: 'omit',
-      redirect: 'error',
-      cache,
-    })
+    response = await untilAborted(
+      sdk.fetch(url.href, { method: 'GET', credentials: 'omit', redirect: 'error', cache, signal }),
+      signal,
+    )
   } catch (error) {
     return isNoHttpsEndpoints(error) ? NOT_BROWSER_REACHABLE : DID_NOT_COMPLETE
   }
@@ -156,7 +190,39 @@ async function fetchCapped(
     // The status is a number the browser checked, not the server's text.
     return { kind: 'failed', message: `the homeserver answered HTTP ${response.status}` }
   }
-  return readCapped(response, cap)
+  return readCapped(response, cap, signal)
+}
+
+/** A signal that aborts after `REQUEST_TIMEOUT_MS`, or as soon as `caller` does. */
+function startDeadline(caller: AbortSignal | undefined) {
+  // One controller and the global `setTimeout`, rather than
+  // `AbortSignal.any` with `AbortSignal.timeout`, so that a test's fake
+  // timers drive the deadline like any other timer.
+  const controller = new AbortController()
+  const abort = (): void => controller.abort()
+  const timer = setTimeout(abort, REQUEST_TIMEOUT_MS)
+  if (caller?.aborted) abort()
+  caller?.addEventListener('abort', abort)
+  return {
+    signal: controller.signal,
+    /** Stops the timer and lets go of `caller`, which may outlive the request. */
+    clear(): void {
+      clearTimeout(timer)
+      caller?.removeEventListener('abort', abort)
+    },
+  }
+}
+
+/** `promise`, or a rejection as soon as `signal` is aborted, whichever comes first. */
+function untilAborted<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const abort = (): void => reject(signal.reason)
+    if (signal.aborted) abort()
+    signal.addEventListener('abort', abort)
+    // The losing side is still handled, so a rejection that comes late is
+    // never an unhandled one.
+    promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', abort))
+  })
 }
 
 /**
@@ -177,9 +243,15 @@ function isNoHttpsEndpoints(error: unknown): boolean {
 /**
  * `response`'s whole body, at most `cap` bytes: `tooLarge` when its
  * `Content-Length` is over the cap, before anything is read, or at the first
- * chunk that would take it past, without asking for another.
+ * chunk that would take it past, without asking for another. A body still
+ * coming when `signal` is aborted did not complete, and the rest of it is
+ * cancelled.
  */
-async function readCapped(response: Response, cap: number): Promise<Body | Failure> {
+async function readCapped(
+  response: Response,
+  cap: number,
+  signal: AbortSignal,
+): Promise<Body | Failure> {
   const declared = declaredLength(response)
   if (declared !== null && declared > cap) {
     discardBody(response)
@@ -192,7 +264,7 @@ async function readCapped(response: Response, cap: number): Promise<Body | Failu
   let length = 0
   try {
     for (;;) {
-      const { done, value } = await reader.read()
+      const { done, value } = await untilAborted(reader.read(), signal)
       if (done) break
       length += value.byteLength
       if (length > cap) {
@@ -203,6 +275,8 @@ async function readCapped(response: Response, cap: number): Promise<Body | Failu
       chunks.push(value)
     }
   } catch {
+    // An abort leaves the stream open; a broken stream refuses the cancel.
+    ignoreRejection(reader.cancel())
     return DID_NOT_COMPLETE
   }
   return { kind: 'body', body: concat(chunks, length) }

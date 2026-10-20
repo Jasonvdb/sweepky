@@ -35,6 +35,7 @@ Poll, the same rules as the CLI ([01](01-records-and-discovery.md#discovery)):
 - Re-GET only records that can still change (open bounties, `running` sweeps) with `cache: 'no-cache'`, so the browser revalidates by ETag and unchanged records cost a 304.
 - Open bounties: read the owner's `bounties/<id>.discovered.json`, then each listed sweeper's record from their own homeserver. The board never reads an events feed; a fresh browser cannot replay a homeserver's whole public history, and does not need to.
 - Every request goes through `pubky.client.fetch` with `credentials: 'omit'`, so a legacy homeserver cookie from another app never rides along.
+- A stalled homeserver cannot stall the board: every request has a deadline, after which it is a failed read and the poll moves on.
 - Zustand reducer → derived views. Trust badges and credits received are computed from the roster plus the `credits` on done bounties, the same rule as the CLI, including ignoring self-credits.
 
 Signals are honest: a sweeper arrives (`running` PUT), a sweep is in progress (pulsing while `running` and younger than 6 h; older fades to "left"), a sweep completes (`done`), aborted (struck), a bounty is marked done (credits appear), a stranger's sweep appears once the owner's `pull` has published it. Nothing is faked; a closed tab misses nothing because every view is derived from current records, not from a stream.

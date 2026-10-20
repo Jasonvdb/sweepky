@@ -1,11 +1,11 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { parseRecordId, type RecordId } from '../records/ids.ts'
 import { MAX_RECORD_BYTES, maxPageBytes } from '../records/limits.ts'
 import { BOUNTIES_DIR, SWEEPS_DIR, type SweepkyPath } from '../records/paths.ts'
 import { parsePubky, type Pubky } from '../records/pubky.ts'
 import { formatPubkyUrl, type PubkyUrl } from '../records/urls.ts'
 import type { PubkySdk } from './sdk.ts'
-import { createSdkTransport, REQUEST_FAILED } from './sdkTransport.ts'
+import { createSdkTransport, REQUEST_FAILED, REQUEST_TIMEOUT_MS } from './sdkTransport.ts'
 import type { CacheMode, Transport } from './transport.ts'
 
 /** A, the roster's admin in fixtures/trust-labels.json, as the owner read from. */
@@ -40,8 +40,11 @@ interface FetchCall {
   readonly init: RequestInit
 }
 
-/** What the fake's `fetch` answers: a response, or an error it throws. */
-type Answer = Response | Error
+/**
+ * What the fake's `fetch` answers: a response, an error it throws, or a
+ * promise of a response, for one that never settles.
+ */
+type Answer = Response | Error | Promise<Response>
 
 /** A fake SDK that records each call and answers every fetch with `answer()`. */
 interface FakeSdk extends PubkySdk {
@@ -153,7 +156,13 @@ describe('every request', () => {
       const [{ url, init }] = sdk.fetches as [FetchCall]
       // `toEqual` with the whole init: a method, a body or a header of our
       // own would show up here.
-      expect(init).toEqual({ method: 'GET', credentials: 'omit', redirect: 'error', cache })
+      expect(init).toEqual({
+        method: 'GET',
+        credentials: 'omit',
+        redirect: 'error',
+        cache,
+        signal: expect.any(AbortSignal),
+      })
       expect(url.startsWith(STORAGE)).toBe(true)
       expect(url).not.toContain('pubky://')
       expect(new URL(url).pathname).not.toContain('/events')
@@ -391,5 +400,99 @@ describe('resolution', () => {
       kind: 'unreachable',
       reason,
     })
+  })
+})
+
+describe('deadlines', () => {
+  // Only the timers the deadline uses: the streams' own scheduling stays real.
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  const FAILED = { kind: 'failed', message: REQUEST_FAILED }
+  const never = () => new Promise<Response>(() => {})
+
+  /** A body that sends one byte a second, for ever: far below any cap. */
+  function tricklingBody() {
+    const seen = { cancelled: false }
+    const stream = new ReadableStream<Uint8Array>(
+      {
+        pull: (controller) =>
+          new Promise<void>((resolve) => {
+            setTimeout(() => {
+              if (!seen.cancelled) controller.enqueue(bytes(1))
+              resolve()
+            }, 1000)
+          }),
+        cancel() {
+          seen.cancelled = true
+        },
+      },
+      { highWaterMark: 0 },
+    )
+    return { stream, seen }
+  }
+
+  it.each(REQUESTS)('fails %s whose answer never comes, at the deadline', async (_what, cache, send) => {
+    const sent = send(createSdkTransport(fakeSdk(never)), cache) as Promise<unknown>
+    let settled = false
+    void sent.then(() => (settled = true))
+    await vi.advanceTimersByTimeAsync(REQUEST_TIMEOUT_MS - 1)
+    expect(settled).toBe(false)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(await sent).toEqual(FAILED)
+  })
+
+  it('cuts a body that trickles in below the cap at the deadline, and cancels the rest', async () => {
+    const { stream, seen } = tricklingBody()
+    const sent = createSdkTransport(fakeSdk(() => new Response(stream))).getRecord(OWNER, BOUNTY, {
+      cache: 'no-cache',
+    })
+    await vi.advanceTimersByTimeAsync(REQUEST_TIMEOUT_MS)
+    expect(await sent).toEqual(FAILED)
+    expect(seen.cancelled).toBe(true)
+  })
+
+  it.each(REQUESTS)('fails %s at once when its signal is aborted', async (_what, cache) => {
+    const controller = new AbortController()
+    const sdk = fakeSdk(never)
+    const transport = createSdkTransport(sdk)
+    const sent =
+      cache === 'default'
+        ? transport.getRecord(OWNER, BOUNTY, { cache, signal: controller.signal })
+        : transport.list(OWNER, SWEEPS_DIR, {
+            limit: 100,
+            reverse: true,
+            cache,
+            signal: controller.signal,
+          })
+    controller.abort()
+    // No timer moves: the abort alone settles it, and reaches the fetch.
+    expect(await sent).toEqual(FAILED)
+    expect(sdk.fetches[0]?.init.signal?.aborted).toBe(true)
+  })
+
+  it('fails a body being read at once when its signal is aborted', async () => {
+    const controller = new AbortController()
+    const { stream, seen } = tricklingBody()
+    const sent = createSdkTransport(fakeSdk(() => new Response(stream))).getRecord(OWNER, BOUNTY, {
+      cache: 'no-cache',
+      signal: controller.signal,
+    })
+    await vi.advanceTimersByTimeAsync(2500)
+    controller.abort()
+    expect(await sent).toEqual(FAILED)
+    expect(seen.cancelled).toBe(true)
+  })
+
+  it('leaves an answer within the deadline as it is, and no timer behind', async () => {
+    const sdk = fakeSdk(() => new Response('{}'))
+    const answer = await createSdkTransport(sdk).getRecord(OWNER, BOUNTY, { cache: 'no-cache' })
+    expect(answer).toEqual({ kind: 'body', body: new TextEncoder().encode('{}') })
+    expect(sdk.fetches[0]?.init.signal?.aborted).toBe(false)
+    expect(vi.getTimerCount()).toBe(0)
   })
 })

@@ -55,7 +55,7 @@
 // with a stale listing or record. Nothing here reads a feed: strangers'
 // sweeps come only from the owners' discovered.json.
 
-import { listDirNewestFirst } from '../net/listing.ts'
+import { DEFAULT_LIST_LIMITS, listDirNewestFirst } from '../net/listing.ts'
 import type { ListedDir, RecordAnswer, Transport } from '../net/transport.ts'
 import type { RecordId } from '../records/ids.ts'
 import { asKnownBountyStatus, asKnownSweepStatus } from '../records/parse.ts'
@@ -107,7 +107,10 @@ export interface PollDeps {
   readonly dispatch: (action: BoardAction) => void
   /** Milliseconds since 1970, stamped on every action. */
   readonly now: () => number
-  /** Once aborted, the pass sends no further request. */
+  /**
+   * Once aborted, the pass sends no further request, and every request it
+   * has in flight ends as a failed read: each is handed this signal.
+   */
   readonly signal: AbortSignal
 }
 
@@ -136,7 +139,11 @@ export async function pollOnce(deps: PollDeps): Promise<void> {
 
 async function readCircle(pass: Pass, admin: Pubky): Promise<void> {
   if (pass.signal.aborted) return
-  const answer = await pass.transport.getRecord(admin, { kind: 'circle' }, { cache: 'no-cache' })
+  const answer = await pass.transport.getRecord(
+    admin,
+    { kind: 'circle' },
+    { cache: 'no-cache', signal: pass.signal },
+  )
   pass.dispatch({ type: 'circleRead', admin, answer, at: pass.now() })
   if (isFailure(answer)) pass.failed.add(admin)
 }
@@ -302,7 +309,14 @@ const MAX_NEW: Readonly<Record<ListedDir, number>> = {
 async function readNew(pass: Pass, key: Pubky, dir: ListedDir): Promise<boolean> {
   if (pass.signal.aborted) return false
   const { watermark } = memberState(pass.getState(), key).listings[dir]
-  const result = await listDirNewestFirst(pass.transport, key, dir, watermark)
+  const result = await listDirNewestFirst(
+    pass.transport,
+    key,
+    dir,
+    watermark,
+    DEFAULT_LIST_LIMITS,
+    pass.signal,
+  )
   pass.dispatch({ type: 'listingRead', member: key, dir, result, at: pass.now() })
   if (result.kind !== 'listed') return false
 
@@ -329,7 +343,7 @@ async function readDiscovered(pass: Pass, owner: Pubky): Promise<boolean> {
     const answer = await pass.transport.getRecord(
       owner,
       { kind: 'discovered', id: bounty.id },
-      { cache: 'no-cache' },
+      { cache: 'no-cache', signal: pass.signal },
     )
     pass.dispatch({ type: 'discoveredRead', bounty, answer, at: pass.now() })
     if (isFailure(answer)) return false
@@ -363,7 +377,7 @@ async function readBounty(pass: Pass, owner: Pubky, id: RecordId): Promise<Recor
   const answer = await pass.transport.getRecord(
     owner,
     { kind: 'bounty', id },
-    { cache: 'no-cache' },
+    { cache: 'no-cache', signal: pass.signal },
   )
   pass.dispatch({ type: 'bountyRead', ref: { owner, id }, answer, at: pass.now() })
   pass.bountiesRead.add(bountyKey({ owner, id }))
@@ -374,7 +388,7 @@ async function readSweep(pass: Pass, sweeper: Pubky, id: RecordId): Promise<Reco
   const answer = await pass.transport.getRecord(
     sweeper,
     { kind: 'sweepRecord', id },
-    { cache: 'no-cache' },
+    { cache: 'no-cache', signal: pass.signal },
   )
   pass.dispatch({ type: 'sweepRead', ref: { sweeper, id }, answer, at: pass.now() })
   return answer

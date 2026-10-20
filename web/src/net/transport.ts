@@ -6,7 +6,9 @@
 //
 // Every answer is a value, never an exception, so a stranger's homeserver
 // that is down, slow to resolve or misbehaving changes what the board shows
-// and cannot break the poll. Bodies come back as bytes, capped, for the
+// and cannot break the poll. A read also has a deadline, so one that never
+// answers cannot stall it either: it answers `failed` once the deadline or
+// its caller's signal ends it. Bodies come back as bytes, capped, for the
 // parsers in `records/parse.ts` to read: the transport decodes nothing.
 //
 // `sdkTransport.ts` is the implementation over the Pubky SDK; tests give the
@@ -30,6 +32,8 @@ export type ListedDir = typeof BOUNTIES_DIR | typeof SWEEPS_DIR
 
 export interface RecordOptions {
   readonly cache: CacheMode
+  /** Ends the request when aborted: it then answers `failed`. */
+  readonly signal?: AbortSignal
 }
 
 export interface ListOptions {
@@ -44,6 +48,8 @@ export interface ListOptions {
   /** The last entry of the page before, sent as `cursor=`; none on the first page. */
   readonly cursor?: PubkyUrl
   readonly cache: CacheMode
+  /** Ends the request when aborted: it then answers `failed`. */
+  readonly signal?: AbortSignal
 }
 
 /** A 2xx answer's body, every byte the homeserver sent, within the cap. */

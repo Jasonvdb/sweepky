@@ -117,6 +117,8 @@ export type ListingResult =
  * 404; a 404 on the first page is an empty directory. Any failure on any page
  * fails the whole listing: nothing read before it is returned.
  *
+ * Every page is asked for with `signal`, so aborting it fails the listing.
+ *
  * Rejects with the transport's `RangeError` only when `limits.pageSize` is
  * not one the homeserver honours, a mistake in the caller.
  */
@@ -126,6 +128,7 @@ export async function listDirNewestFirst(
   dir: ListedDir,
   newestSeen: RecordId | null,
   limits: ListLimits = DEFAULT_LIST_LIMITS,
+  signal?: AbortSignal,
 ): Promise<ListingResult> {
   const parser = new ListingParser(owner, dir, newestSeen, limits)
   let cursor: PubkyUrl | undefined
@@ -138,6 +141,7 @@ export async function listDirNewestFirst(
         // A poll wants the directory as it is now, so the browser asks the
         // homeserver every time rather than answering from its cache.
         cache: 'no-cache',
+        signal,
       })
       if (answer.kind === 'empty') break
       if (answer.kind === 'tooLarge') return refused('pageTooLarge')

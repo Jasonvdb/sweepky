@@ -1,9 +1,12 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import type { PubkySdk } from '../net/sdk.ts'
+import { createSdkTransport, REQUEST_TIMEOUT_MS } from '../net/sdkTransport.ts'
 import type {
   CacheMode,
   HomeserverLookup,
   ListedDir,
   ListingAnswer,
+  Failure,
   ListOptions,
   RecordAnswer,
   RecordOptions,
@@ -114,6 +117,11 @@ class FakeNetwork implements Transport {
   readonly lookups = new Map<Pubky, HomeserverLookup>()
   /** Keys whose every read fails. */
   readonly failing = new Set<Pubky>()
+  /**
+   * Keys whose every read gets no answer: it waits until its signal is
+   * aborted and then fails, as the SDK transport's does.
+   */
+  readonly stalled = new Set<Pubky>()
 
   put(owner: Pubky, path: SweepkyPath, value: unknown): void {
     const files = this.files.get(owner) ?? new Map<string, string>()
@@ -136,6 +144,7 @@ class FakeNetwork implements Transport {
   async getRecord(owner: Pubky, path: SweepkyPath, options: RecordOptions): Promise<RecordAnswer> {
     const text = formatSweepkyPath(path)
     this.requests.push({ op: 'get', owner, path: text, cache: options.cache })
+    if (this.stalled.has(owner)) return stall(options.signal)
     if (this.failing.has(owner)) return { kind: 'failed', message: 'the homeserver answered 503' }
     const file = this.files.get(owner)?.get(text)
     return file === undefined ? { kind: 'absent' } : { kind: 'body', body: encode(file) }
@@ -143,6 +152,7 @@ class FakeNetwork implements Transport {
 
   async list(owner: Pubky, dir: ListedDir, options: ListOptions): Promise<ListingAnswer> {
     this.requests.push({ op: 'list', owner, path: dir, cache: options.cache })
+    if (this.stalled.has(owner)) return stall(options.signal)
     if (this.failing.has(owner)) return { kind: 'failed', message: 'the homeserver answered 503' }
     const cursor = options.cursor?.path
     const paths = [...(this.files.get(owner)?.keys() ?? [])]
@@ -165,6 +175,15 @@ class FakeNetwork implements Transport {
   }
 }
 
+/** A read with no answer: it fails once `signal` is aborted, and never without one. */
+function stall(signal: AbortSignal | undefined): Promise<Failure> {
+  return new Promise((resolve) => {
+    signal?.addEventListener('abort', () =>
+      resolve({ kind: 'failed', message: 'the request did not complete' }),
+    )
+  })
+}
+
 const encoder = new TextEncoder()
 function encode(text: string): Uint8Array {
   return encoder.encode(text)
@@ -179,7 +198,7 @@ function harness(admin: Pubky | null = A) {
     net,
     state: () => state,
     /** One pass at the clock's time, then the clock moves on `POLL_INTERVAL_MS`. */
-    async poll(): Promise<Request[]> {
+    async poll(signal = new AbortController().signal): Promise<Request[]> {
       await pollOnce({
         transport: net,
         getState: () => state,
@@ -187,7 +206,7 @@ function harness(admin: Pubky | null = A) {
           state = boardReducer(state, action)
         },
         now: () => clock,
-        signal: new AbortController().signal,
+        signal,
       })
       clock += POLL_INTERVAL_MS
       return net.take()
@@ -351,6 +370,40 @@ describe('pollOnce: requests', () => {
       expect(request.path.startsWith('/pub/sweepky/')).toBe(true)
       expect(request.path).not.toContain('/events')
     }
+  })
+})
+
+describe('pollOnce: requests that never answer', () => {
+  it('hands every read the pass signal, so aborting it ends the pass', async () => {
+    const board = harness()
+    const X: BountyRef = { owner: B, id: id(1) }
+    board.net.putCircle([B])
+    board.net.putBounty(X)
+    await board.poll()
+    // B's next pass starts with the re-read of its open bounty, a record
+    // GET; on a fresh pass its first read would be the listing.
+    board.net.stalled.add(B)
+    const controller = new AbortController()
+    let over = false
+    const pass = board.poll(controller.signal).then(() => (over = true))
+    await settle()
+    expect(over).toBe(false)
+    controller.abort()
+    await pass
+    expect(over).toBe(true)
+  })
+
+  it('ends a pass stalled on a listing once its signal is aborted', async () => {
+    const board = harness()
+    board.net.putCircle([B])
+    board.net.stalled.add(B)
+    const controller = new AbortController()
+    const pass = board.poll(controller.signal)
+    await settle()
+    controller.abort()
+    // The aborted listing is B's last request: its pass ended there.
+    const ofB = summary(await pass).filter((request) => request.includes(B))
+    expect(ofB.at(-1)).toBe(`list ${B} ${BOUNTIES_DIR}`)
   })
 })
 
@@ -593,5 +646,60 @@ describe('createBoardStore', () => {
     expect(loads).toBe(2)
     expect(lookups(net.take())).toEqual([A])
     unsubscribe()
+  })
+  it('ends the pass in flight when the last subscriber leaves, so the next starts at once', async () => {
+    const net = new FakeNetwork()
+    net.putCircle([])
+    net.stalled.add(A)
+    const { store, scheduler } = storeOver(net, A)
+    const first = store.subscribe(() => {})
+    await settle()
+    expect(summary(net.take())).toEqual([`lookup ${A}`, `get ${A} ${circlePath}`])
+    first()
+    await settle()
+    expect(scheduler.pending()).toEqual([])
+
+    const second = store.subscribe(() => {})
+    await settle()
+    expect(summary(net.take())).toContain(`get ${A} ${circlePath}`)
+    second()
+  })
+
+  describe('over the SDK transport', () => {
+    afterEach(() => {
+      vi.useRealTimers()
+    })
+
+    it('fails a homeserver that never answers at the deadline, and polls again on time', async () => {
+      // Only the deadline's timers are fake; `settle` stays real.
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+      let fetches = 0
+      const silent: PubkySdk = {
+        fetch: () => {
+          fetches += 1
+          return new Promise<Response>(() => {})
+        },
+        resolvePubky: (identifier) => `https://homeserver.test/${identifier}`,
+        getHomeserverOf: async () => HOMESERVER,
+      }
+      const scheduler = new FakeScheduler()
+      const store = createBoardStore({
+        admin: A,
+        loadTransport: async () => createSdkTransport(silent),
+        scheduler,
+        now: () => T0,
+      })
+      const unsubscribe = store.subscribe(() => {})
+      await settle()
+      expect(fetches).toBe(1)
+      expect(scheduler.pending()).toEqual([])
+
+      await vi.advanceTimersByTimeAsync(REQUEST_TIMEOUT_MS)
+      await settle()
+      expect(scheduler.pending()).toEqual([POLL_INTERVAL_MS])
+      await scheduler.fire()
+      expect(fetches).toBe(2)
+      unsubscribe()
+    })
   })
 })
