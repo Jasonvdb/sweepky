@@ -1050,6 +1050,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_stranger_s_sweep_with_an_agent_instruction_file_is_refused_for_good() {
+        // A file the owner's agent would load as instructions once it read
+        // `untrusted/`: the store refuses the path, and every later run
+        // would refuse it again.
+        let mut fx = Fixture::new(json!([repo_target_json("t1")]));
+        let stranger = random_pubky();
+        let sweep = sweep_of(stranger, 10);
+        let mut value = package_json(stranger, fx.bounty, json!({ "t1": SYNTHETIC_SHA }));
+        value["attachments"]["audit/CLAUDE.md"] = json!(PLANTED);
+        let package = SweepPackage::from_json(&json_bytes(&value)).expect("a package");
+        let record = done_record(fx.bounty, &["t1"]);
+        fx.publish(sweep, &record, Some(fx.sealed(&package)));
+        fx.summarise(sweep, &record);
+
+        let opened = fx.open().await;
+        let warning = warning_about(&opened, sweep);
+        assert!(warning.contains("load as their instructions"), "{warning}");
+        assert!(!warning.contains("CLAUDE"), "{warning}");
+        assert_prints_no_finding(&opened);
+        assert_eq!(fx.stored(sweep), None);
+        let summary = &fx.state.sweeps[&sweep];
+        assert!(summary.refused && !summary.pulled);
+        let asked = fx.records.asked().len();
+        let again = fx.open().await;
+        assert!(again.warnings.is_empty(), "{:?}", again.warnings);
+        assert_eq!(fx.records.asked().len(), asked);
+    }
+
+    #[tokio::test]
     async fn the_cap_per_bounty_stops_a_run_with_a_warning_and_the_rest_open_next_run() {
         let mut fx = Fixture::new(json!([repo_target_json("t1")]));
         // Five members with their share each: one more turn than the cap

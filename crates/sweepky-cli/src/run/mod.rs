@@ -96,7 +96,9 @@ mod pick;
 pub(crate) mod place;
 mod scope_file;
 mod select;
-mod strip;
+// `pub(crate)`: `pull` refuses a package path named as one of the files
+// `strip` takes out of a target, with the same check.
+pub(crate) mod strip;
 
 use std::path::Path;
 

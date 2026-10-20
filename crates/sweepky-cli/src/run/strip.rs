@@ -101,7 +101,11 @@ pub(super) fn strip_agent_files(root: &Path) -> anyhow::Result<Vec<String>> {
 
 /// Whether `name` is one of [`AGENT_FILES`] once case is ignored. A name
 /// that is not UTF-8 is none of them.
-fn is_agent_file(name: &OsStr) -> bool {
+///
+/// `pull::store` refuses a package path with a part this matches, so the
+/// files `run` strips from a target and the ones `pull` will not write are
+/// one list.
+pub(crate) fn is_agent_file(name: &OsStr) -> bool {
     let Some(name) = name.to_str() else {
         return false;
     };

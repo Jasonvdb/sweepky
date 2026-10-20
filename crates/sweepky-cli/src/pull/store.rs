@@ -23,9 +23,12 @@
 //!   A package's paths passed core's lexical check (`AttachmentPath`), which
 //!   lets through what a file system or a tool reads in its own way: a part
 //!   that starts with `.` (`.git/config`, `.claude/settings.json`), which
-//!   tools read as settings, and two paths that differ only in case
+//!   tools read as settings; a part named as a file an agent loads as its
+//!   instructions (`CLAUDE.md`, `AGENTS.md`: the names `run` strips from a
+//!   target, in any case), which the owner's agent, reading `untrusted/`,
+//!   must take as data (02); and two paths that differ only in case
 //!   (`README.md` and `readme.md`), which macOS's default file system takes
-//!   as one. Either refuses the whole sweep, as do more entries than
+//!   as one. Each refuses the whole sweep, as do more entries than
 //!   `submit`'s walk takes ([`MAX_ENTRIES`] files and directories) and a path
 //!   of more than [`MAX_DEPTH`] parts.
 //! - **Staged, then moved into place in one step.** The sweep is written into
@@ -101,6 +104,7 @@ use crate::private_fs::{
     ensure_private_dir, lstat, read_private_file, refuse_unless_dir, temp_path_beside, write_synced,
 };
 use crate::run::place::{NEW_FILE_FLAGS, copy_sweep, open_dir_path};
+use crate::run::strip::is_agent_file;
 use crate::submit::walk::{DIR_FLAGS, MAX_DEPTH, MAX_ENTRIES, entry_at, kind, same_entry};
 
 // `c"…"` is a C string literal, the bytes and a closing NUL, which is what
@@ -451,9 +455,10 @@ fn copy_path(
 }
 
 /// Refuses `files` unless every path keeps the rules the module docs list:
-/// no part that starts with `.`, no two paths that name one entry once case
-/// is set aside, at most [`MAX_ENTRIES`] files and directories, and at most
-/// [`MAX_DEPTH`] parts in a path. No message names a path.
+/// no part that starts with `.` or is named as an agent's instruction file,
+/// no two paths that name one entry once case is set aside, at most
+/// [`MAX_ENTRIES`] files and directories, and at most [`MAX_DEPTH`] parts in
+/// a path. No message names a path.
 ///
 /// [`MAX_DEPTH`] is `submit`'s cap on how many directories deep its walk
 /// goes below the sweep directory, where `audit/`, which a package's paths
@@ -490,8 +495,9 @@ pub(crate) fn check_paths(files: &PackageFiles) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Refuses a path of `parts` that is deeper than [`MAX_DEPTH`] or has a
-/// part that starts with `.`.
+/// Refuses a path of `parts` that is deeper than [`MAX_DEPTH`], has a part
+/// that starts with `.`, or has a part named as a file an agent loads as
+/// its instructions.
 fn check_parts(parts: &[&str]) -> anyhow::Result<()> {
     if parts.len() > MAX_DEPTH {
         bail!(
@@ -503,6 +509,15 @@ fn check_parts(parts: &[&str]) -> anyhow::Result<()> {
         bail!(
             "its package has a path with a part that starts with '.', which tools read as their \
              settings, so pull writes none of its files"
+        );
+    }
+    // `run::strip`'s own check, so this list and the one `run` strips from
+    // a target never drift apart. `OsStr::new` views the `&str` as the
+    // `&OsStr` a file name is, without copying it.
+    if parts.iter().any(|part| is_agent_file(OsStr::new(part))) {
+        bail!(
+            "its package has a path with a part named as a file that agents load as their \
+             instructions, so pull writes none of its files"
         );
     }
     Ok(())
@@ -1280,6 +1295,63 @@ mod tests {
             assert!(
                 !fixture.dirs.data().exists(),
                 "{path}: something was written"
+            );
+        }
+    }
+
+    #[test]
+    fn a_part_named_as_an_agent_instruction_file_refuses_the_sweep_before_anything_is_written() {
+        // The names `run` strips from a target, at any depth, as a file or a
+        // directory, in any case, and with the long s, which APFS folds to
+        // `s`.
+        for path in [
+            "audit/CLAUDE.md",
+            "AGENTS.md",
+            "claude.md",
+            "CLAUDE.local.md",
+            "AGENT\u{17F}.md",
+            "notes/Claude.MD/inside.md",
+        ] {
+            let fixture = Fixture::new();
+
+            let message = fixture.refusal(
+                Placement::Untrusted,
+                package(&[("REPORT.md", "# Report\n"), (path, PLANTED)]),
+            );
+
+            assert!(
+                message.contains("load as their instructions"),
+                "{path}: {message}"
+            );
+            assert_quotes_none(&message, &[path, "CLAUDE", "AGENTS", ".md"]);
+            assert!(
+                !fixture.dirs.data().exists(),
+                "{path}: something was written"
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_that_only_looks_like_an_agent_instruction_file_is_stored() {
+        let fixture = Fixture::new();
+        let package = package(&[
+            ("README.md", PLANTED),
+            ("claude-notes.md", PLANTED),
+            ("audit/CLAUDE.md.txt", PLANTED),
+        ]);
+        let expected = split(&package);
+        let sweep = new_sweep();
+
+        fixture
+            .store(sweep, Placement::Untrusted, package)
+            .expect("stored");
+
+        let tree = tree(&fixture.untrusted_dir().join(sweep_dir_name(sweep)));
+        for (path, bytes) in &expected {
+            assert_eq!(
+                tree.get(path),
+                Some(&("file", 0o600, bytes.clone())),
+                "{path}"
             );
         }
     }
