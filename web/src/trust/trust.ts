@@ -152,10 +152,13 @@ function isCounted(bounty: CreditedBounty, roster: ReadonlySet<Pubky>): boolean 
 }
 
 /**
- * The sweepers `bounty` credits, each once and without its owner. The set
- * drops a repeated credit, so one bounty adds at most one to a pubky's
- * `bounties`.
+ * The sweepers `bounty` credits, each once and without its owner, in the
+ * order its `credits` first name them. The set drops a repeated credit, so
+ * one bounty adds at most one to a pubky's `bounties`. Whatever its status:
+ * whether the credits count is the caller's rule. The board's credited
+ * sweepers come from here too, so the door of a dark room and the tally
+ * behind a badge never disagree.
  */
-function creditedSweepers(bounty: CreditedBounty): Set<Pubky> {
+export function creditedSweepers(bounty: CreditedBounty): ReadonlySet<Pubky> {
   return new Set(bounty.credits.filter((credit) => credit !== bounty.owner))
 }
