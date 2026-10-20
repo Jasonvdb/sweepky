@@ -95,8 +95,12 @@
 //! - `state`, this install's own state files: `login.json` and a dedicated
 //!   identity's key and details files, read and written together.
 //! - `session`, the per-command session every writing command runs in: the
-//!   writers' lock, a fresh sign-in, the command's work, and a sign-out that
-//!   is always attempted.
+//!   writers' lock, a fresh session (a sign-in with a dedicated identity's
+//!   key, or a restore from a Ring login's grant token, refused before any
+//!   request once the grant has expired and checked after it), the
+//!   command's work, and the end of the session: an identity session is
+//!   always signed out, a Ring session only dropped, since signing it out
+//!   would revoke the grant.
 //! - `passphrase`, [`Passphrase`], read from the global `--passphrase-file`,
 //!   and the one way every secret file is written and read: wrapped with
 //!   that passphrase through age's scrypt recipient when one is given
@@ -249,6 +253,8 @@
 //!   `/pub/sweepky/` signed out again and refused; and `login` without
 //!   `--identity`, which runs them and then, under the writers' lock, saves
 //!   the token and runs `login`'s shared tail with the grant's session.
+//!   [`run`](fn@run) prints the expiry notice once per command, before every
+//!   command but `init`, `login` and `logout`, from `login.json` alone.
 //!
 //! The rules that hold for everything here (see "Rust conventions" in
 //! `docs/plan/03-cli-and-skill.md`):
@@ -381,10 +387,12 @@ mod submit;
 // What `run` fetched for each sweep, kept under the data directory, which
 // `submit` builds the manifest's commits from.
 mod sweep_state;
-// The per-command session: the writers' lock, a fresh sign-in and a sign-out
-// that is always attempted. `login` holds its lock; `keys revoke` is the
-// first command to run in a whole session; `logout` runs the sign-in and the
-// sign-out itself, because it deletes files after the sign-out.
+// The per-command session: the writers' lock, a fresh sign-in or Ring
+// restore, and at the end a sign-out for an identity session (always
+// attempted) or a plain drop for a Ring one. `login` holds its lock;
+// `keys revoke` is the first command to run in a whole session; `logout`
+// runs the sign-in and the sign-out itself, because it deletes files after
+// the sign-out.
 mod session;
 mod state;
 // Where `post` and `run` get a target's repository from, and the network
@@ -597,6 +605,22 @@ pub async fn run(cli: Cli, ctx: &Context) -> anyhow::Result<Report> {
              ran; this is a bug in the caller of sweepky_cli::run"
         );
     }
+    // Once per command, before it starts: the warning that this install's
+    // Ring grant is close to its end, or past it. Here rather than in the
+    // writer session, because one command can open several sessions (`run`
+    // publishes twice) or none (`keys list`), and the line should come out
+    // exactly once either way. It reads `login.json` alone, so it comes
+    // before any network read and works offline.
+    //
+    // `&& let` is a let chain (edition 2024): the `if` runs only when the
+    // command shows the notice *and* there is one to show.
+    if shows_expiry_notice(&cli.command)
+        && let Some(notice) = ring::expiry_warning(&ctx.dirs)
+    {
+        // A courtesy line, as the lock's waiting line is: if standard
+        // error cannot be written, the command still runs.
+        let _ = ctx.stderr.line(&format!("warning: {notice}"));
+    }
     match cli.command {
         Command::Init { dir } => init::init(&dir),
         Command::Login {
@@ -657,13 +681,131 @@ pub async fn run(cli: Cli, ctx: &Context) -> anyhow::Result<Report> {
     }
 }
 
+/// Whether [`run`](fn@run) prints the Ring grant's expiry notice before
+/// `command`: every command but `init`, which has no login, and `login` and
+/// `logout`, which make and end the grant the notice is about.
+///
+/// Every variant is named, with no `_` arm, so a new command does not
+/// compile until someone decides.
+fn shows_expiry_notice(command: &Command) -> bool {
+    match command {
+        Command::Init { .. } | Command::Login { .. } | Command::Logout => false,
+        Command::Keys { .. }
+        | Command::Circle { .. }
+        | Command::Post { .. }
+        | Command::Run { .. }
+        | Command::Submit { .. }
+        | Command::Pull
+        | Command::Done { .. } => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
+    use std::io;
 
     use clap::Parser;
+    use sweepky_core::DeviceIdentity;
 
-    use super::{Cli, VERSION, run_without_context};
+    use super::{Cli, Context, VERSION, run, run_without_context};
+    use crate::clock;
+    use crate::device::create_device_key;
+    use crate::ring::ExpiryNotice;
+    use crate::state::{LoginState, write_login_state};
+    use crate::test_support::{
+        SharedBuffer, offline_network, private_temp, random_pubky, test_context,
+    };
+
+    /// An offline install logged in through Ring, with a device key, whose
+    /// grant expires at `expires_at`; its context and standard error.
+    /// Nothing is reachable, so every command fails once it needs the
+    /// network: what it printed before then is what these tests look at.
+    fn offline_ring_install(home: &tempfile::TempDir, expires_at: u64) -> (Context, SharedBuffer) {
+        let (ctx, stderr) = test_context(offline_network(), home, io::empty());
+        write_login_state(
+            &ctx.dirs,
+            &LoginState::ring(random_pubky(), random_pubky(), expires_at),
+        )
+        .expect("writes login.json");
+        create_device_key(&ctx.dirs, &DeviceIdentity::generate(), None).expect("writes device.key");
+        (ctx, stderr)
+    }
+
+    /// Runs `args` through `run` on `ctx`, and returns what it wrote to
+    /// standard error, how many of those lines hold `notice`, and its result.
+    async fn notices_printed(
+        ctx: &Context,
+        stderr: &SharedBuffer,
+        args: &[&str],
+        notice: &str,
+    ) -> (String, usize, anyhow::Result<super::Report>) {
+        let before = stderr.text().len();
+        let cli = Cli::try_parse_from(std::iter::once("sweepky").chain(args.iter().copied()))
+            .expect("parses");
+        let result = run(cli, ctx).await;
+        let said = stderr.text();
+        let said = said.get(before..).expect("only grows").to_owned();
+        let count = said.lines().filter(|line| line.contains(notice)).count();
+        (said, count, result)
+    }
+
+    #[tokio::test]
+    async fn the_expiry_warning_comes_once_per_command_before_any_request() {
+        let home = private_temp();
+        let now = clock::now_unix_seconds().expect("a clock");
+        let expires_at = now + 10 * 86_400;
+        let (ctx, stderr) = offline_ring_install(&home, expires_at);
+        let line = format!("warning: {}", ExpiryNotice::Soon { expires_at });
+
+        // `pull` reads login.json and device.key, then every network read
+        // it tries fails on this offline network, and `keys list` needs a
+        // public read: each says the warning once, as its first line, so
+        // before anything a network read made it say.
+        for args in [&["pull"][..], &["keys", "list"]] {
+            let (said, count, _) = notices_printed(&ctx, &stderr, args, &line).await;
+            assert_eq!(count, 1, "{args:?}: {said}");
+            assert!(said.starts_with(&line), "{args:?}: {said}");
+        }
+
+        // `login` and `logout` make and end the grant, so they say nothing.
+        for args in [&["login"][..], &["logout"]] {
+            let (said, count, _) = notices_printed(&ctx, &stderr, args, "Pubky Ring grant").await;
+            assert_eq!(count, 0, "{args:?}: {said}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_expired_grant_is_noticed_once_and_a_read_only_command_still_runs() {
+        let home = private_temp();
+        let expires_at = 1_000_000_000;
+        let (ctx, stderr) = offline_ring_install(&home, expires_at);
+        let line = format!("warning: {}", ExpiryNotice::Expired { expires_at });
+
+        let (said, count, result) = notices_printed(&ctx, &stderr, &["keys", "list"], &line).await;
+        assert_eq!(count, 1, "{said}");
+        // `keys list` went on after the notice: what stopped it is the
+        // offline network, not the grant, which a public read never uses.
+        let error = format!("{:#}", result.expect_err("offline"));
+        assert!(!error.contains("Pubky Ring grant"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn no_ring_login_no_notice() {
+        // No login.json, and a broken one: nothing from the notice; the
+        // command reports the file itself.
+        let home = private_temp();
+        let (ctx, stderr) = test_context(offline_network(), &home, io::empty());
+        let (_, count, _) =
+            notices_printed(&ctx, &stderr, &["keys", "list"], "Pubky Ring grant").await;
+        assert_eq!(count, 0);
+        crate::private_fs::ensure_private_dir(ctx.dirs.config()).expect("mkdir");
+        crate::private_fs::write_private_file(&ctx.dirs.login_file(), b"{").expect("writes");
+        let (_, count, result) =
+            notices_printed(&ctx, &stderr, &["keys", "list"], "Pubky Ring grant").await;
+        assert_eq!(count, 0);
+        assert!(result.is_err());
+    }
 
     #[test]
     fn init_runs_with_no_context() {

@@ -51,9 +51,9 @@
 //! seen to name the owner still, each file is read back through the
 //! session, the changes made again to what it holds now, its size checked
 //! again, and it is PUT unless its sweeps are already as they would be.
-//! The session is signed out and the lock let go whatever happened. So
-//! the lock covers the sign-in, the read-back, the PUT and the sign-out
-//! alone, no local file is read or written under it, and a file another
+//! The session is ended (an identity's signed out, a Ring one only
+//! dropped) and the lock let go whatever happened. So the lock covers the
+//! sign-in or restore, the read-back, the PUT and the sign-out alone, no local file is read or written under it, and a file another
 //! install wrote meanwhile loses nothing it lists but what this run
 //! confirmed gone.
 //!
@@ -281,8 +281,8 @@ fn accepted_in_upload_order(state: &PollState, bounty: RecordId) -> Vec<SweepRef
 /// callers take `&impl WriteUnderLock`.
 pub(crate) trait WriteUnderLock {
     /// Writes each of `due`'s files with `changes`, as [`write_due`] does,
-    /// under the writers' lock with a fresh session, signed out afterwards
-    /// whatever happened.
+    /// under the writers' lock with a fresh session, ended afterwards
+    /// whatever happened (an identity's signed out, a Ring one dropped).
     async fn write(
         &self,
         due: &[RecordId],
@@ -292,8 +292,9 @@ pub(crate) trait WriteUnderLock {
 }
 
 /// The real [`WriteUnderLock`]: `session::with_writer_session`, which
-/// takes the lock, signs in afresh, runs the writes, then signs out and lets
-/// the lock go, also when they fail.
+/// takes the lock, signs in or restores afresh, runs the writes, then ends
+/// the session (signs an identity's out, drops a Ring one) and lets the lock
+/// go, also when they fail.
 pub(crate) struct LockedSession<'a> {
     ctx: &'a Context,
     /// The owner `pull` read for, whom the session must be.
@@ -1043,7 +1044,7 @@ mod tests {
         let after_login = stderr.text().len();
 
         // Under the lock, a login that is not the owner pull read writes
-        // nothing; its session is signed out and the lock let go all the
+        // nothing; its session is ended and the lock let go all the
         // same, so the next write neither waits nor warns.
         let published = run
             .publish(&records, &LockedSession::new(&ctx, random_pubky()))

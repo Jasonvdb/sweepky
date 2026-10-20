@@ -11,8 +11,9 @@
 //!    a label must be short plain text ([`RosterText`]). The result is a
 //!    [`Change`], which holds only checked values, so a bad argument never
 //!    takes the lock, signs in or reaches the homeserver.
-//! 2. Under the writers' lock, with a session of its own that is always
-//!    signed out (`session::with_writer_session`), the signed-in user's own
+//! 2. Under the writers' lock, with a session of its own
+//!    (`session::with_writer_session`: an identity session is signed out
+//!    afterwards, a Ring one only dropped), the signed-in user's own
 //!    `circle.json` is read (capped at `MAX_RECORD_BYTES`) and handed to
 //!    [`apply`], a pure function: it parses the record with core's
 //!    `Circle::from_json`, makes the change and says what to write, if
@@ -441,8 +442,8 @@ pub(crate) async fn remove(ctx: &Context, pubky: &str) -> anyhow::Result<Report>
 }
 
 /// Reads this identity's `circle.json`, applies `change` and writes the
-/// result, under the writers' lock with a session that is always signed out
-/// afterwards.
+/// result, under the writers' lock with a session of its own: an identity
+/// session is signed out afterwards, a Ring one only dropped.
 async fn change_circle(ctx: &Context, change: Change) -> anyhow::Result<Report> {
     // `async move` moves `change` into the closure, which `apply` then
     // consumes: the closure is called once (`AsyncFnOnce`), so it may give

@@ -14,7 +14,12 @@
 //!   past, and [`expiry_text`], how that expiry is shown, as `login` shows
 //!   it after approval. The grant lasts two years from approval, a lifetime
 //!   the SDK fixes; `login.json` keeps its end as `grantExpiresAt`
-//!   (`crate::state::LoginState`).
+//!   (`crate::state::LoginState`). [`expiry_warning`] is the notice as
+//!   `crate::run` prints it, once per command, from `login.json` alone.
+//! - What a writing command checks when it restores its session from the
+//!   token (`crate::session`): [`refuse_expired_grant`] before any request,
+//!   [`check_restored_session`] on what the homeserver restored, and
+//!   [`restore_error`], the restore's own errors in fixed text.
 //! - [`token`], `grant.token`, the owner-only file that holds the token.
 //! - [`page`], the sign-in page the loopback server serves, with the
 //!   authorization URL's QR code as an inline SVG, a copy button and a live
@@ -35,10 +40,15 @@
 
 use std::fmt;
 
-use pubky::Capability;
-use sweepky_core::RecordTime;
+use anyhow::bail;
+use pubky::{Capability, StatusCode};
+use sweepky_core::{Pubky, RecordTime};
 
-use crate::network::SWEEPKY_CAPABILITY;
+use crate::Dirs;
+use crate::clock;
+use crate::network::{CLIENT_ID, SWEEPKY_CAPABILITY};
+use crate::remote::{request_error, status_of};
+use crate::state::{KnownLoginKind, LoginState, read_login_state};
 
 pub(crate) mod flow;
 pub(crate) mod login;
@@ -127,18 +137,6 @@ pub(crate) enum ExpiryNotice {
 // Denies plain `+`, `-` and `*` on integers inside this function, which
 // could overflow, so a later edit cannot slip one in.
 #[deny(clippy::arithmetic_side_effects)]
-// The commands that restore the grant show the notice, a later P2d step;
-// until then nothing outside the tests calls this. `expect` (not `allow`)
-// warns once that stops being true, so the attribute cannot outlive its
-// reason. What only this uses (the notice type, the 30 days) is covered by
-// it too.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the expiry warning on later runs, a later P2d step, is the first caller"
-    )
-)]
 pub(crate) fn expiry_notice(now: u64, expires_at: u64) -> Option<ExpiryNotice> {
     // `checked_sub` is `None` when `now` is past `expires_at`. A plain `-`
     // would overflow there: a panic in a debug build, and in a release
@@ -172,6 +170,113 @@ impl fmt::Display for ExpiryNotice {
     }
 }
 
+/// The expiry notice for this install's Ring login, as `crate::run` prints
+/// it once per command: `None` unless `login.json` records a Ring login
+/// within [`EXPIRY_WARNING_SECS`] of its `grantExpiresAt`, or past it.
+///
+/// It reads `login.json` and the clock, and nothing else: no `grant.token`,
+/// no passphrase and no network, so it works offline and before any command
+/// has started. Whatever it cannot read gives `None` (`.ok()` turns an
+/// error into `None`, and `?` on an `Option` returns `None` early): the
+/// command itself reads `login.json` again and reports a broken file or
+/// clock in its own words, so a second report here would only repeat it.
+pub(crate) fn expiry_warning(dirs: &Dirs) -> Option<ExpiryNotice> {
+    let login = read_login_state(dirs).ok().flatten()?;
+    if login.kind.as_known() != Some(KnownLoginKind::Ring) {
+        return None;
+    }
+    let expires_at = login.grant_expires_at?;
+    expiry_notice(clock::now_unix_seconds().ok()?, expires_at)
+}
+
+/// Refuses a Ring `login` whose grant has expired by `now` (Unix seconds),
+/// or that records no expiry at all, in fixed text and before any request:
+/// the homeserver would refuse the restore anyway, and asking it would only
+/// send the token for nothing.
+pub(crate) fn refuse_expired_grant(login: &LoginState, now: u64) -> anyhow::Result<()> {
+    let Some(expires_at) = login.grant_expires_at else {
+        bail!(NO_GRANT_EXPIRY);
+    };
+    // `@` binds the whole matched value to `notice` while the pattern still
+    // checks it is the `Expired` variant; a grant that is merely close to its
+    // end is the dispatch's warning, not a refusal.
+    if let Some(notice @ ExpiryNotice::Expired { .. }) = expiry_notice(now, expires_at) {
+        bail!(notice.to_string());
+    }
+    Ok(())
+}
+
+/// What a Ring login whose `login.json` has no `grantExpiresAt` says.
+pub(crate) const NO_GRANT_EXPIRY: &str = "login.json records a Pubky Ring login with no \
+     grantExpiresAt, so Sweepky cannot tell whether its grant is still valid; run `sweepky login` \
+     again";
+
+/// What a writing command says when the homeserver no longer takes the
+/// saved grant: it was revoked (in Ring, or by a `logout` elsewhere) or has
+/// expired.
+pub(crate) const GRANT_NOT_ACCEPTED: &str = "the homeserver no longer accepts this install's \
+     Pubky Ring grant (it was revoked, or it expired), so Sweepky cannot write with it; run \
+     `sweepky login` again to approve a new one in Ring";
+
+/// What a restored session for another pubky than `login.json`'s says.
+pub(crate) const RESTORED_OTHER_PUBKY: &str = "the saved Pubky Ring grant restored a session \
+     for another pubky than the one login.json records, so Sweepky will not write with it; run \
+     `sweepky login` again";
+
+/// What a restored session made for another app than `sweepky-cli` says.
+pub(crate) const RESTORED_OTHER_CLIENT: &str = "the saved Pubky Ring grant was not made for \
+     sweepky-cli, so Sweepky will not write with it; run `sweepky login` again";
+
+/// What a restored session that cannot write `/pub/sweepky/` says.
+pub(crate) const RESTORED_NO_WRITE: &str = "the saved Pubky Ring grant cannot write \
+     /pub/sweepky/, so Sweepky will not write with it; run `sweepky login` again and approve \
+     the full request in Ring";
+
+/// Checks what the homeserver restored from the saved token before any
+/// write: the session's `pubky` must be `expected`, `login.json`'s; its
+/// `client_id` must be `sweepky-cli`; and its `capabilities` must write
+/// `/pub/sweepky/` ([`grants_sweepky_write`]).
+///
+/// The values come from the server, so they are only compared, never
+/// printed: each refusal is one of the fixed texts above. The pubky is
+/// compared as bytes (`Pubky`'s `==`), the client id as an exact string.
+pub(crate) fn check_restored_session(
+    expected: Pubky,
+    pubky: Pubky,
+    client_id: &str,
+    capabilities: &[Capability],
+) -> anyhow::Result<()> {
+    if pubky != expected {
+        bail!(RESTORED_OTHER_PUBKY);
+    }
+    if client_id != CLIENT_ID {
+        bail!(RESTORED_OTHER_CLIENT);
+    }
+    if !grants_sweepky_write(capabilities) {
+        bail!(RESTORED_NO_WRITE);
+    }
+    Ok(())
+}
+
+/// The error of `restore_session` as fixed text: [`GRANT_NOT_ACCEPTED`]
+/// when the homeserver or the SDK refused the grant itself (a 401 or 403,
+/// or the SDK's authentication error, which covers an expired or mismatched
+/// stored grant), and `remote::request_error`'s fixed text for anything
+/// else, such as a network failure, which says nothing about the grant.
+///
+/// The SDK's own `Display` is never used: it can quote the server's answer.
+pub(crate) fn restore_error(error: &pubky::Error) -> anyhow::Error {
+    let refused = matches!(
+        status_of(error),
+        Some(StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+    ) || matches!(error, pubky::Error::Authentication(_));
+    if refused {
+        anyhow::Error::msg(GRANT_NOT_ACCEPTED)
+    } else {
+        request_error(error).context("could not restore this install's Pubky Ring session")
+    }
+}
+
 /// `expires_at`, Unix seconds, as `login` and the notices show it: RFC 3339
 /// in UTC to the second, such as `2028-10-19T09:41:07Z`, the form Sweepky
 /// writes in records (core's `RecordTime::from_unix_seconds`).
@@ -192,8 +297,13 @@ mod tests {
     use sweepky_core::RecordTime;
 
     use super::{
-        EXPIRY_WARNING_SECS, ExpiryNotice, expiry_notice, expiry_text, grants_sweepky_write,
+        EXPIRY_WARNING_SECS, ExpiryNotice, NO_GRANT_EXPIRY, RESTORED_NO_WRITE,
+        RESTORED_OTHER_CLIENT, RESTORED_OTHER_PUBKY, check_restored_session, expiry_notice,
+        expiry_text, grants_sweepky_write, refuse_expired_grant,
     };
+    use crate::CLIENT_ID;
+    use crate::state::LoginState;
+    use crate::test_support::random_pubky;
 
     /// One day in seconds.
     const DAY: u64 = 86_400;
@@ -313,5 +423,59 @@ mod tests {
         assert_eq!(expiry_text(0), "1970-01-01T00:00:00Z");
         // RFC 3339 has no year past 9999, so such a time says so.
         assert_eq!(expiry_text(u64::MAX), "after 9999-12-31T23:59:59Z");
+    }
+
+    #[test]
+    fn a_restored_session_must_be_this_login_for_sweepky_cli_with_write() {
+        let expected = random_pubky();
+        let full = caps(&["/pub/sweepky/:rw"]);
+        assert!(check_restored_session(expected, expected, CLIENT_ID, &full).is_ok());
+
+        // Each value wrong on its own, with the others right: each refusal
+        // is its fixed text, quoting none of the values.
+        let other = random_pubky();
+        for (pubky, client_id, granted, refusal) in [
+            (other, CLIENT_ID, full.clone(), RESTORED_OTHER_PUBKY),
+            (expected, "another-app", full.clone(), RESTORED_OTHER_CLIENT),
+            (
+                expected,
+                "sweepky-cli ",
+                full.clone(),
+                RESTORED_OTHER_CLIENT,
+            ),
+            (
+                expected,
+                CLIENT_ID,
+                caps(&["/pub/sweepky/:r"]),
+                RESTORED_NO_WRITE,
+            ),
+            (expected, CLIENT_ID, Vec::new(), RESTORED_NO_WRITE),
+        ] {
+            let error =
+                check_restored_session(expected, pubky, client_id, &granted).expect_err("refused");
+            assert_eq!(format!("{error:#}"), refusal);
+            assert!(!refusal.contains(&other.to_string()), "{refusal}");
+        }
+    }
+
+    #[test]
+    fn only_an_expired_grant_is_refused_before_the_restore() {
+        let login = |expires_at| LoginState::ring(random_pubky(), random_pubky(), expires_at);
+        // Plenty left, and close to the end: both restore.
+        assert!(refuse_expired_grant(&login(NOW + 400 * DAY), NOW).is_ok());
+        assert!(refuse_expired_grant(&login(NOW + 10 * DAY), NOW).is_ok());
+        // At or past the end: the expired notice's own text.
+        for expires_at in [NOW, NOW - 1, 0] {
+            let error = refuse_expired_grant(&login(expires_at), NOW).expect_err("refused");
+            assert_eq!(
+                error.to_string(),
+                ExpiryNotice::Expired { expires_at }.to_string()
+            );
+        }
+        // No expiry recorded at all: refused too, never taken as unlimited.
+        let mut unknown = login(NOW + 400 * DAY);
+        unknown.grant_expires_at = None;
+        let error = refuse_expired_grant(&unknown, NOW).expect_err("refused");
+        assert_eq!(error.to_string(), NO_GRANT_EXPIRY);
     }
 }
