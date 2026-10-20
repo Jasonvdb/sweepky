@@ -282,3 +282,179 @@
 .empty-state__way ol {
   padding-left: 1.25rem;
 }
+
+/* The board page (routes/Board.tsx): the intro strip, any notice, the floor
+   plan, then the four panels, as many side by side as fit and one column at
+   375 px. */
+.board {
+  display: grid;
+  gap: 1.5rem;
+}
+
+.board h1 {
+  margin: 0;
+}
+
+/* The intro strip: one line that wraps on a narrow screen, its dismiss
+   button at the end. */
+.intro-strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 1rem;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  color: var(--card-foreground);
+}
+
+.intro-strip__text,
+.intro-strip__links {
+  margin: 0;
+}
+
+.intro-strip__text {
+  flex: 1 1 18rem;
+}
+
+.intro-strip__links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 1rem;
+}
+
+/* What is left once dismissed: the "?" alone, at the start of the row. */
+.intro-strip--dismissed {
+  padding: 0;
+  border: none;
+}
+
+/* Both controls are small round buttons, at least 2rem so a finger finds them. */
+.intro-strip__dismiss,
+.intro-strip__restore {
+  display: inline-grid;
+  place-items: center;
+  min-width: 2rem;
+  min-height: 2rem;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--foreground);
+  font: inherit;
+  cursor: pointer;
+}
+
+.intro-strip__dismiss {
+  margin-left: auto;
+}
+
+/* Why the board cannot read the circle. An unreachable admin has
+   base.css's destructive mark beside the text, which stays --foreground. */
+.board-notice {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  margin: 0;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  color: var(--foreground);
+}
+
+.board__panels {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 20rem), 1fr));
+  gap: 1rem;
+}
+
+.board-panel {
+  display: grid;
+  align-content: start;
+  gap: 0.75rem;
+  border: 1px solid var(--border);
+}
+
+.board-panel__heading {
+  margin: 0;
+  font-size: 1.0625rem;
+  font-weight: 600;
+}
+
+.board-panel__none {
+  margin: 0;
+  color: var(--muted-foreground);
+}
+
+/* A time a record gives, quieter than what happened. */
+.record-time {
+  color: var(--muted-foreground);
+  font-size: 0.8125rem;
+  white-space: nowrap;
+}
+
+/* Sweeps in progress, the ticker and recently done: rows that wrap, so a
+   52-character pubky never pushes the page sideways. */
+.sweep-list,
+.ticker__items,
+.done-list {
+  display: grid;
+  gap: 0.625rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.sweep-list__item,
+.ticker__item,
+.done-list__item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.25rem 0.625rem;
+  min-width: 0;
+  font-size: 0.875rem;
+}
+
+.sweep-list__item .pubky,
+.ticker__item .pubky,
+.done-list__item .door {
+  flex-basis: 100%;
+}
+
+.sweep-list__state,
+.ticker__kind {
+  font-weight: 600;
+}
+
+/* The ticker scrolls once, when an event happens after the page opened:
+   Ticker.tsx mounts the list afresh under a new key, which runs this one
+   animation a single time. It never repeats on its own. */
+.ticker__items--scroll {
+  animation: ticker-arrive 0.6s ease-out 1;
+}
+
+@keyframes ticker-arrive {
+  from {
+    transform: translateY(-0.75rem);
+    opacity: 0.4;
+  }
+  to {
+    transform: none;
+    opacity: 1;
+  }
+}
+
+.board-stat {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  margin: 0;
+}
+
+.board-stat__value {
+  color: var(--foreground);
+  font-size: 2rem;
+  font-weight: 700;
+  line-height: 1;
+}
