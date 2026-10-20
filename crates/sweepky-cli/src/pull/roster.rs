@@ -1,8 +1,8 @@
 //! `pull`'s roster polling (01, "Circle"): the owner's circle read; each of
 //! its keys' `bounties/` and `sweeps/` listed newest first, down to what the
-//! poll state has seen; the new records read; the open bounties and
-//! `running` sweeps read again only if they changed; and the poll state
-//! brought up to date.
+//! poll state has seen; the new records read; the records that can still
+//! change read again only if they changed; and the poll state brought up
+//! to date.
 //!
 //! [`poll_roster`] reads public records alone, through `PublicRecords`,
 //! with no session and no lock, in this order:
@@ -22,12 +22,18 @@
 //!    run): a key whose pkarr record names no homeserver, or whose lookup
 //!    fails, is skipped with one warning that names it. Then:
 //!    - *Again, if changed.* The key's records in the poll state that can
-//!      still change (01): its open bounties (status `open`) and its
-//!      `running` sweeps of the owner's bounties, newest first, at most
-//!      [`MAX_REREADS_PER_MEMBER`], each read with the `ETag` its last
-//!      answer gave as `If-None-Match`. A 304 leaves its summary as it was,
-//!      a 404 drops it, and a new answer updates it, keeping whether its
-//!      package was pulled.
+//!      still change (01), each read with the `ETag` its last answer gave
+//!      as `If-None-Match`: its open bounties (status `open`) and its
+//!      `running` sweeps of the owner's bounties, the newest of each first,
+//!      and its done bounties, whose credits the owner may revise, in turn,
+//!      at most [`MAX_DONE_REREADS_PER_MEMBER`] a run from the one after
+//!      where the last run's turn stopped, going round, so each is read
+//!      again within a bounded number of runs. At most
+//!      [`MAX_REREADS_PER_MEMBER`] in all, shared by [`reread_shares`] so
+//!      that no kind starves another, with a warning when open bounties or
+//!      running sweeps are left. A 304 leaves its summary as it was, a 404
+//!      drops it, and a new answer updates it, keeping whether its package
+//!      was pulled.
 //!    - *What is new.* `bounties/`, then `sweeps/`, listed newest first
 //!      down to the key's watermark there (`PublicRecords::list_newest_first`;
 //!      a 404 is an empty directory, never an unreachable key). The records
@@ -96,9 +102,20 @@ pub(crate) const MAX_NEW_BOUNTIES_PER_MEMBER: usize = 16;
 /// bounties: a sweep takes an hour, a bounty is posted far more rarely.
 pub(crate) const MAX_NEW_SWEEPS_PER_MEMBER: usize = 32;
 
-/// The most records of one key read again in a run, if changed: its open
-/// bounties, then its `running` sweeps, the newest of each first.
+/// The most records of one key read again in a run, if changed, of every
+/// kind together: its open bounties, its `running` sweeps and its done
+/// bounties, each kind with its share ([`reread_shares`]).
 pub(crate) const MAX_REREADS_PER_MEMBER: usize = 32;
+
+/// The most done bounties of one key read again in a run, in turn. A done
+/// bounty changes only when its owner revises the credits (01), so a few a
+/// run, going round, bring each one up to date within a bounded number of
+/// runs however many there are, for a request each that is mostly a 304.
+pub(crate) const MAX_DONE_REREADS_PER_MEMBER: usize = 8;
+
+// Checked when the crate compiles: the done bounties' number leaves room in
+// the budget for the other two kinds, so `reread_shares` cannot underflow.
+const _: () = assert!(MAX_DONE_REREADS_PER_MEMBER < MAX_REREADS_PER_MEMBER);
 
 /// The longest status a summary keeps, in bytes. Every status Sweepky
 /// writes is a short word (`running` is the longest, at 7), and one a newer
@@ -267,11 +284,34 @@ impl Directory {
     }
 }
 
-/// A record of the poll state that can still change, to read again.
-#[derive(Clone, Copy)]
-enum Reread {
-    Bounty(BountyRef),
-    Sweep(SweepRef),
+/// One key's records in the poll state that can still change, by kind, to
+/// read again.
+struct Rereads {
+    /// Its open bounties, newest first.
+    open: Vec<BountyRef>,
+    /// Its `running` sweeps of the owner's bounties, newest first.
+    running: Vec<SweepRef>,
+    /// Its done bounties, whose credits the owner may revise (01), oldest
+    /// first.
+    done: Vec<BountyRef>,
+}
+
+impl Rereads {
+    /// What of these this run reads, each kind within its share of the
+    /// budget ([`reread_shares`]): the newest open bounties and running
+    /// sweeps, and the done bounties next in turn after `after`, in the
+    /// order they are read. And how many open bounties and running sweeps
+    /// are left for a later run; the done bounties left wait for their turn.
+    // It takes `self` by value and hands back the lists cut: nothing is
+    // copied, and the uncut lists cannot be used by mistake afterwards.
+    fn this_run(mut self, after: Option<RecordId>) -> (Self, usize) {
+        let shares = reread_shares(self.open.len(), self.running.len(), self.done.len());
+        let left = (self.open.len() - shares.open) + (self.running.len() - shares.running);
+        self.open.truncate(shares.open);
+        self.running.truncate(shares.running);
+        self.done = next_turn(&self.done, after, shares.done);
+        (self, left)
+    }
 }
 
 /// What one read of a record gave.
@@ -458,59 +498,67 @@ impl<R: PublicRecords, H: ResolveHomeserver> Poller<'_, '_, R, H> {
     }
 
     /// Reads `key`'s records that can still change again, each only if it
-    /// changed since its tag.
+    /// changed since its tag: those [`Rereads::this_run`] picks, with a
+    /// warning when open bounties or running sweeps are left. The done
+    /// bounties' turn starts after the one the last run read last.
     async fn reread(&mut self, key: Pubky) -> Result<(), Stop> {
-        let mut rereads = self.can_change(key);
-        if rereads.len() > MAX_REREADS_PER_MEMBER {
+        let after = self
+            .state
+            .watermarks
+            .get(&key)
+            .and_then(|marks| marks.reread_done_after);
+        let (this_run, left) = self.can_change(key).this_run(after);
+        if left > 0 {
             self.warnings.push(format!(
-                "roster key {key} has {} records that can still change; pull reads the newest \
-                 {MAX_REREADS_PER_MEMBER} of them again this time",
-                rereads.len()
+                "pull reads the newest open bounties and running sweeps of roster key {key} \
+                 again this time and leaves {left} for a later run"
             ));
-            rereads.truncate(MAX_REREADS_PER_MEMBER);
         }
-        for reread in rereads {
-            match reread {
-                Reread::Bounty(bounty) => {
-                    // A copy of the tag, so the state is not borrowed while
-                    // the read below changes it.
-                    let etag = self
-                        .state
-                        .bounties
-                        .get(&bounty)
-                        .and_then(|s| s.etag.clone());
-                    let fetched =
-                        fetch(self.records, bounty.owner, bounty.id, etag.as_ref()).await?;
-                    self.keep_bounty(bounty, fetched);
-                }
-                Reread::Sweep(sweep) => {
-                    let etag = self.state.sweeps.get(&sweep).and_then(|s| s.etag.clone());
-                    let fetched =
-                        fetch(self.records, sweep.sweeper, sweep.id, etag.as_ref()).await?;
-                    self.keep_sweep(sweep, fetched);
-                }
-            }
+        for bounty in this_run.open {
+            self.reread_bounty(bounty).await?;
+        }
+        for sweep in this_run.running {
+            self.reread_sweep(sweep).await?;
+        }
+        for bounty in this_run.done {
+            self.reread_bounty(bounty).await?;
+            // Moved as each is read, so one a failed read leaves unread
+            // comes first next run.
+            let marks = self.state.watermarks.entry(key).or_default();
+            marks.reread_done_after = Some(bounty.id);
         }
         Ok(())
     }
 
-    /// `key`'s records in the poll state that can still change: its open
-    /// bounties, then its `running` sweeps of the owner's bounties, each
-    /// newest first.
-    fn can_change(&self, key: Pubky) -> Vec<Reread> {
-        // `rev` walks a map from its last key down. A ref orders by its key,
-        // then its id, and an id is its record's creation time, so each
-        // key's records come newest first.
-        let bounties = self
+    /// Reads `bounty` again, if it changed since its tag.
+    async fn reread_bounty(&mut self, bounty: BountyRef) -> Result<(), Stop> {
+        // A copy of the tag, so the state is not borrowed while the read
+        // below changes it.
+        let etag = self
             .state
             .bounties
-            .iter()
-            .rev()
-            .filter(|(bounty, summary)| {
-                bounty.owner == key && summary.status.as_known() == Some(KnownBountyStatus::Open)
-            })
-            .map(|(&bounty, _)| Reread::Bounty(bounty));
-        let sweeps = self
+            .get(&bounty)
+            .and_then(|s| s.etag.clone());
+        let fetched = fetch(self.records, bounty.owner, bounty.id, etag.as_ref()).await?;
+        self.keep_bounty(bounty, fetched);
+        Ok(())
+    }
+
+    /// Reads `sweep` again, if it changed since its tag.
+    async fn reread_sweep(&mut self, sweep: SweepRef) -> Result<(), Stop> {
+        let etag = self.state.sweeps.get(&sweep).and_then(|s| s.etag.clone());
+        let fetched = fetch(self.records, sweep.sweeper, sweep.id, etag.as_ref()).await?;
+        self.keep_sweep(sweep, fetched);
+        Ok(())
+    }
+
+    /// `key`'s records in the poll state that can still change: its open
+    /// and its done bounties, and its `running` sweeps of the owner's
+    /// bounties.
+    fn can_change(&self, key: Pubky) -> Rereads {
+        // `rev` walks a map from its last key down, so `key`'s sweeps come
+        // newest first (see `bounties_of` for why).
+        let running = self
             .state
             .sweeps
             .iter()
@@ -520,8 +568,37 @@ impl<R: PublicRecords, H: ResolveHomeserver> Poller<'_, '_, R, H> {
                     && summary.bounty.owner == self.owner
                     && summary.status.as_known() == Some(KnownSweepStatus::Running)
             })
-            .map(|(&sweep, _)| Reread::Sweep(sweep));
-        bounties.chain(sweeps).collect()
+            .map(|(&sweep, _)| sweep)
+            .collect();
+        Rereads {
+            open: self
+                .bounties_of(key, KnownBountyStatus::Open)
+                .rev()
+                .collect(),
+            running,
+            done: self.bounties_of(key, KnownBountyStatus::Done).collect(),
+        }
+    }
+
+    /// `key`'s bounties in the poll state whose status is `status`, oldest
+    /// first: a ref orders by its key, then its id, and an id is its
+    /// record's creation time.
+    // `impl DoubleEndedIterator`: an iterator whose type the caller need not
+    // name, which can be walked from its end too (`rev`). It borrows the
+    // state, so it cannot outlive `&self`. `move` copies `key` and `status`
+    // into the closure, which outlives this call.
+    fn bounties_of(
+        &self,
+        key: Pubky,
+        status: KnownBountyStatus,
+    ) -> impl DoubleEndedIterator<Item = BountyRef> {
+        self.state
+            .bounties
+            .iter()
+            .filter(move |(bounty, summary)| {
+                bounty.owner == key && summary.status.as_known() == Some(status)
+            })
+            .map(|(&bounty, _)| bounty)
     }
 
     /// Reads the records `dir` of `key` lists above its watermark that the
@@ -675,6 +752,52 @@ fn new_record_ids(listing: &Listing, dir: Directory) -> Vec<RecordId> {
     ids
 }
 
+/// How many records of each kind of [`Rereads`] one key reads again in a
+/// run.
+// `Debug` and `PartialEq` for the tests: counts only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Shares {
+    open: usize,
+    running: usize,
+    done: usize,
+}
+
+/// Splits [`MAX_REREADS_PER_MEMBER`] between one key's `open` bounties,
+/// `running` sweeps and `done` bounties waiting to be read again, so that no
+/// kind starves another. The done bounties take at most
+/// [`MAX_DONE_REREADS_PER_MEMBER`], as they seldom change; the open bounties
+/// and the running sweeps take half each of the rest, at least 12, and a
+/// kind with fewer than its half leaves what it does not use to the other.
+/// The shares never add up to more than the budget.
+fn reread_shares(open: usize, running: usize, done: usize) -> Shares {
+    let done = done.min(MAX_DONE_REREADS_PER_MEMBER);
+    let room = MAX_REREADS_PER_MEMBER - done;
+    // The running sweeps are owed half the room, or all of theirs if fewer,
+    // and the open bounties take the rest, or all of theirs if fewer; then
+    // the running sweeps take whatever the open bounties left.
+    let open = open.min(room - running.min(room / 2));
+    let running = running.min(room - open);
+    Shares {
+        open,
+        running,
+        done,
+    }
+}
+
+/// Up to `n` of `bounties`, which are in id order: the first after `after`
+/// and on from there, going round to the start, so a turn that stopped at
+/// `after` goes on where it stopped. Each at most once.
+fn next_turn(bounties: &[BountyRef], after: Option<RecordId>, n: usize) -> Vec<BountyRef> {
+    // `partition_point` finds by binary search where the ids past `after`
+    // begin, as the slice is in id order. `None` is below every `Some`, so
+    // with no `after` that is the start.
+    let start = bounties.partition_point(|bounty| Some(bounty.id) <= after);
+    // `split_at` lends the two halves: the second, then the first, go round
+    // once, so `take` never gives one twice.
+    let (before, from) = bounties.split_at(start);
+    from.iter().chain(before).take(n).copied().collect()
+}
+
 /// The owner's bounties `state` holds, oldest first.
 fn own_bounties(state: &PollState, owner: Pubky) -> Vec<BountyRef> {
     state
@@ -723,16 +846,18 @@ mod tests {
     use serde_json::{Value, json};
     use sweepky_core::paths;
     use sweepky_core::{
-        BountyRef, KnownSweepStatus, MAX_RECORD_BYTES, Pubky, SweepRef, TrustLabel, trust_labels,
+        Bounty, BountyRef, KnownSweepStatus, MAX_RECORD_BYTES, Pubky, Sweep, SweepRef, TrustLabel,
+        trust_labels,
     };
 
     use super::{
-        MAX_CREDITS, MAX_MEMBERS, MAX_NEW_BOUNTIES_PER_MEMBER, MAX_STATUS_BYTES, RosterPoll,
-        poll_roster,
+        MAX_CREDITS, MAX_DONE_REREADS_PER_MEMBER, MAX_MEMBERS, MAX_NEW_BOUNTIES_PER_MEMBER,
+        MAX_REREADS_PER_MEMBER, MAX_STATUS_BYTES, RosterPoll, Shares, next_turn, poll_roster,
+        reread_shares,
     };
     use crate::post::draft::MAX_TARGETS;
     use crate::pull::resolve::Homeservers;
-    use crate::pull::state::PollState;
+    use crate::pull::state::{BountySummary, PollState, SweepSummary};
     use crate::test_support::{
         FakeHomeservers, FakeLookup, FakePublicRecords, PLANTED, bounty_json, circle_json, dirs_in,
         json_bytes, private_temp, random_pubky, record_id, repo_target_json, sweep_json,
@@ -763,6 +888,23 @@ mod tests {
             record["doneAt"] = json!("2026-10-19T10:00:00Z");
         }
         record
+    }
+
+    /// The summary an earlier run kept of bounty `record`, with no tag.
+    fn bounty_summary(record: &Value) -> BountySummary {
+        let bounty = Bounty::from_json(&json_bytes(record)).expect("a bounty");
+        BountySummary::new(&bounty, None)
+    }
+
+    /// The summary an earlier run kept of sweep `record`, with no tag.
+    fn sweep_summary(record: &Value) -> SweepSummary {
+        let sweep = Sweep::from_json(&json_bytes(record)).expect("a sweep");
+        SweepSummary::new(&sweep, None)
+    }
+
+    /// `n` as a record's timestamp, for [`record_id`].
+    fn nth(n: usize) -> u64 {
+        u64::try_from(n).expect("small")
     }
 
     /// One run's roster poll: a fresh cache of homeservers, as each run
@@ -869,6 +1011,12 @@ mod tests {
         let mut state = PollState::read(&dirs, owner).expect("read back");
         let open_before = state.bounties[&open].clone();
         let open_tag = open_before.etag.clone().expect("a tag");
+        let (done_before, theirs_before) = (
+            state.bounties[&done].clone(),
+            state.bounties[&theirs].clone(),
+        );
+        let done_tag = done_before.etag.clone().expect("a tag");
+        let theirs_tag = theirs_before.etag.clone().expect("a tag");
         let vanishing_tag = state.sweeps[&vanishing].etag.clone().expect("a tag");
         let running_tag = state.sweeps[&running].etag.clone().expect("a tag");
 
@@ -894,19 +1042,22 @@ mod tests {
         assert!(second.warnings.is_empty(), "{:?}", second.warnings);
 
         // Each listing stops at its watermark, so only the new records are
-        // read, and of the rest only the open bounty and the running sweeps
-        // are read again, newest first, each with the tag its last answer
-        // gave.
+        // read, and of the rest only those that can still change are read
+        // again, each with the tag its last answer gave: the open bounty and
+        // the running sweeps, newest first, then the done bounties, whose
+        // credits may be revised.
         assert_eq!(
             records.asked().split_off(asked_before),
             [
                 (owner, paths::circle().to_owned()),
                 (owner, paths::bounty(open.id)),
+                (owner, paths::bounty(done.id)),
                 (owner, paths::BOUNTIES_DIR.to_owned()),
                 (owner, paths::bounty(newer.id)),
                 (owner, paths::SWEEPS_DIR.to_owned()),
                 (member, paths::sweep_record(running.id)),
                 (member, paths::sweep_record(vanishing.id)),
+                (member, paths::bounty(theirs.id)),
                 (member, paths::BOUNTIES_DIR.to_owned()),
                 (member, paths::SWEEPS_DIR.to_owned()),
                 (member, paths::sweep_record(new_sweep.id)),
@@ -916,6 +1067,7 @@ mod tests {
             records.conditional_asked().split_off(sent_before),
             [
                 (owner, paths::bounty(open.id), Some(open_tag)),
+                (owner, paths::bounty(done.id), Some(done_tag)),
                 (owner, paths::bounty(newer.id), None),
                 (
                     member,
@@ -927,13 +1079,16 @@ mod tests {
                     paths::sweep_record(vanishing.id),
                     Some(vanishing_tag)
                 ),
+                (member, paths::bounty(theirs.id), Some(theirs_tag)),
                 (member, paths::sweep_record(new_sweep.id), None),
             ]
         );
-        // The 304 left the open bounty's summary as it was; the 404 dropped
-        // the deleted sweep's; the done sweep's is new, with its new tag,
-        // and not pulled yet.
+        // The 304s left the summaries of the open bounty and the done ones
+        // as they were; the 404 dropped the deleted sweep's; the done
+        // sweep's is new, with its new tag, and not pulled yet.
         assert_eq!(state.bounties[&open], open_before);
+        assert_eq!(state.bounties[&done], done_before);
+        assert_eq!(state.bounties[&theirs], theirs_before);
         assert!(!state.sweeps.contains_key(&vanishing));
         let now_done = &state.sweeps[&running];
         assert_eq!(now_done.status.as_known(), Some(KnownSweepStatus::Done));
@@ -1304,5 +1459,276 @@ mod tests {
         // Everyone else is polled as before.
         assert_eq!(resolver.times_asked(member), 1);
         assert!(asked.contains(&(member, paths::SWEEPS_DIR.to_owned())));
+    }
+
+    #[tokio::test]
+    async fn a_done_bounty_whose_credits_are_revised_is_read_again_and_the_label_follows() {
+        let temp = private_temp();
+        let dirs = dirs_in(&temp);
+        let (owner, member, sweeper) = (random_pubky(), random_pubky(), random_pubky());
+        let theirs = bounty(member, 1);
+        let path = paths::bounty(theirs.id);
+        let records = FakePublicRecords::default()
+            .with_record(owner, paths::circle(), &circle_json(owner, &[member]))
+            .with_record(member, &path, &bounty_with("done", &[]));
+        let resolver = FakeHomeservers::default();
+        let mut state = PollState::default();
+        let first = poll(&records, &resolver, owner, &mut state).await;
+        let trust = trust_labels(&first.roster, &first.credited).get(sweeper);
+        assert_eq!(trust.label, TrustLabel::Unknown);
+
+        // The member runs `done` again on the bounty, crediting `sweeper`
+        // now (01: the owner may revise the credits of a done bounty).
+        let records = records.with_record(member, &path, &bounty_with("done", &[sweeper]));
+        let tag = state.bounties[&theirs].etag.clone().expect("a tag");
+        state.write(&dirs, owner).expect("written");
+        let mut state = PollState::read(&dirs, owner).expect("read back");
+        let sent_before = records.conditional_asked().len();
+        let second = poll(&records, &resolver, owner, &mut state).await;
+
+        // Read again with its tag, and the new credits are in its summary,
+        // so the label follows them.
+        assert!(second.warnings.is_empty(), "{:?}", second.warnings);
+        assert_eq!(
+            records.conditional_asked().split_off(sent_before),
+            [(member, path.clone(), Some(tag))]
+        );
+        assert_eq!(state.bounties[&theirs].credits, [sweeper]);
+        let trust = trust_labels(&second.roster, &second.credited).get(sweeper);
+        assert_eq!(trust.label, TrustLabel::Known);
+        assert_eq!((trust.tally.bounties, trust.tally.owners), (1, 1));
+
+        // Unchanged since: read again with the new tag, a 304, and the
+        // summary stays as it was.
+        let before = state.bounties[&theirs].clone();
+        let sent_before = records.conditional_asked().len();
+        let third = poll(&records, &resolver, owner, &mut state).await;
+        assert!(third.warnings.is_empty(), "{:?}", third.warnings);
+        assert_eq!(
+            records.conditional_asked().split_off(sent_before),
+            [(member, path, before.etag.clone())]
+        );
+        assert_eq!(state.bounties[&theirs], before);
+    }
+
+    #[tokio::test]
+    async fn done_bounties_past_the_per_run_number_are_read_again_in_turn_going_round() {
+        let temp = private_temp();
+        let dirs = dirs_in(&temp);
+        let owner = random_pubky();
+        // Fewer than a run reads as new, so the first run reads them all.
+        let count = MAX_DONE_REREADS_PER_MEMBER + 4;
+        assert!(count <= MAX_NEW_BOUNTIES_PER_MEMBER);
+        let mut records = FakePublicRecords::default();
+        for n in 1..=nth(count) {
+            records = records.with_record(
+                owner,
+                &paths::bounty(record_id(n)),
+                &bounty_with("done", &[]),
+            );
+        }
+        let resolver = FakeHomeservers::default();
+        let mut state = PollState::default();
+        let first = poll(&records, &resolver, owner, &mut state).await;
+        assert_eq!(first.own_bounties.len(), count);
+
+        // Each later run reads the next of them again, oldest first, from
+        // the one after where the last run stopped, going round to the
+        // oldest: the record ids 1 to `count`, over and over, cut into
+        // turns. The poll state, written and read back between runs, keeps
+        // where the turn stopped.
+        let mut in_turn = (1..=nth(count)).cycle();
+        for _ in 0..3 {
+            state.write(&dirs, owner).expect("written");
+            let mut read_back = PollState::read(&dirs, owner).expect("read back");
+            let before = read_back.bounties.clone();
+            let sent_before = records.conditional_asked().len();
+            let found = poll(&records, &resolver, owner, &mut read_back).await;
+            assert!(found.warnings.is_empty(), "{:?}", found.warnings);
+
+            // `by_ref` borrows the iterator, so the next turn goes on from
+            // where this one stopped.
+            let expected: Vec<_> = in_turn
+                .by_ref()
+                .take(MAX_DONE_REREADS_PER_MEMBER)
+                .map(|n| (owner, paths::bounty(record_id(n))))
+                .collect();
+            let sent = records.conditional_asked().split_off(sent_before);
+            assert!(sent.iter().all(|(_, _, tag)| tag.is_some()), "{sent:?}");
+            let read: Vec<_> = sent.into_iter().map(|(key, path, _)| (key, path)).collect();
+            assert_eq!(read, expected);
+            // Every answer was a 304.
+            assert_eq!(read_back.bounties, before);
+            state = read_back;
+        }
+    }
+
+    #[test]
+    fn a_turn_goes_on_after_where_the_last_stopped_even_once_that_bounty_is_gone() {
+        let owner = random_pubky();
+        let done = [bounty(owner, 2), bounty(owner, 4), bounty(owner, 6)];
+        // No turn yet: from the oldest.
+        assert_eq!(next_turn(&done, None, 2), done[..2]);
+        // After bounty 3, which is gone: from bounty 4, going round.
+        assert_eq!(
+            next_turn(&done, Some(record_id(3)), 3),
+            [done[1], done[2], done[0]]
+        );
+        // After the newest, or past it: round to the oldest.
+        assert_eq!(next_turn(&done, Some(record_id(9)), 1), [done[0]]);
+        // Never one twice, however many are asked for.
+        assert_eq!(next_turn(&done, Some(record_id(4)), 9).len(), done.len());
+    }
+
+    #[test]
+    fn the_shares_of_the_rereads_stay_in_the_budget_and_starve_no_kind() {
+        let half = (MAX_REREADS_PER_MEMBER - MAX_DONE_REREADS_PER_MEMBER) / 2;
+        let most = MAX_REREADS_PER_MEMBER + 8;
+        for open in 0..=most {
+            for running in 0..=most {
+                for done in 0..=most {
+                    let shares = reread_shares(open, running, done);
+                    let Shares {
+                        open: open_read,
+                        running: running_read,
+                        done: done_read,
+                    } = shares;
+                    // Within what waits, the done bounties' own number, and
+                    // the budget.
+                    assert!(open_read <= open && running_read <= running && done_read <= done);
+                    assert!(done_read <= MAX_DONE_REREADS_PER_MEMBER);
+                    assert!(open_read + running_read + done_read <= MAX_REREADS_PER_MEMBER);
+                    // The done bounties' number always fits, and what the
+                    // open bounties and the running sweeps leave flows to
+                    // the other, so a kind is cut only when the budget is
+                    // spent, and never below half of the room the done
+                    // bounties leave.
+                    assert_eq!(done_read, done.min(MAX_DONE_REREADS_PER_MEMBER));
+                    let all_read = open_read == open && running_read == running;
+                    assert!(
+                        all_read || open_read + running_read + done_read == MAX_REREADS_PER_MEMBER,
+                        "{shares:?} of {open}, {running}, {done}"
+                    );
+                    assert!(open_read >= open.min(half), "{shares:?}");
+                    assert!(running_read >= running.min(half), "{shares:?}");
+                }
+            }
+        }
+        // All three kinds past their shares: 12, 12 and 8 of 32.
+        assert_eq!(
+            reread_shares(most, most, most),
+            Shares {
+                open: half,
+                running: half,
+                done: MAX_DONE_REREADS_PER_MEMBER,
+            }
+        );
+    }
+
+    /// A poll state as earlier runs left it for `owner`, whose circle has
+    /// `member`, with each of `bounties` and `sweeps` summarised, and the
+    /// listings' watermarks past them all, so a run reads nothing as new.
+    fn polled_before(
+        owner: Pubky,
+        member: Pubky,
+        bounties: &[(BountyRef, Value)],
+        sweeps: &[(SweepRef, Value)],
+    ) -> (FakePublicRecords, PollState) {
+        let mut records = FakePublicRecords::default().with_record(
+            owner,
+            paths::circle(),
+            &circle_json(owner, &[member]),
+        );
+        let mut state = PollState::default();
+        for (bounty, record) in bounties {
+            records = records.with_record(bounty.owner, &paths::bounty(bounty.id), record);
+            state.bounties.insert(*bounty, bounty_summary(record));
+            let marks = state.watermarks.entry(bounty.owner).or_default();
+            marks.bounties = marks.bounties.max(Some(bounty.id));
+        }
+        for (sweep, record) in sweeps {
+            records = records.with_record(sweep.sweeper, &paths::sweep_record(sweep.id), record);
+            state.sweeps.insert(*sweep, sweep_summary(record));
+            let marks = state.watermarks.entry(sweep.sweeper).or_default();
+            marks.sweeps = marks.sweeps.max(Some(sweep.id));
+        }
+        (records, state)
+    }
+
+    /// The paths of `key`'s storage that were read again, if changed, of
+    /// those `records` was asked: bounties, then sweeps.
+    fn reread_of(records: &FakePublicRecords, key: Pubky) -> (Vec<String>, Vec<String>) {
+        records
+            .conditional_asked()
+            .into_iter()
+            .filter(|(owner, _, _)| *owner == key)
+            .map(|(_, path, _)| path)
+            .partition(|path| path.starts_with(paths::BOUNTIES_DIR))
+    }
+
+    #[tokio::test]
+    async fn open_bounties_past_the_whole_budget_leave_the_running_sweeps_their_share() {
+        let (owner, member) = (random_pubky(), random_pubky());
+        let mine = bounty(owner, 1);
+        let (open_count, running_count) = (MAX_REREADS_PER_MEMBER + 4, 5);
+        let mut bounties = vec![(mine, bounty_with("open", &[]))];
+        bounties
+            .extend((1..=nth(open_count)).map(|n| (bounty(member, n), bounty_with("open", &[]))));
+        let sweeps: Vec<_> = (1..=nth(running_count))
+            .map(|n| (sweep(member, 100 + n), sweep_json(mine, &["t1"], "running")))
+            .collect();
+        let (records, mut state) = polled_before(owner, member, &bounties, &sweeps);
+        let resolver = FakeHomeservers::default();
+        let found = poll(&records, &resolver, owner, &mut state).await;
+
+        // Every running sweep is read again, and the open bounties take the
+        // rest of the budget, the newest first.
+        let (bounties_read, sweeps_read) = reread_of(&records, member);
+        let mut every_sweep: Vec<String> = sweeps
+            .iter()
+            .map(|(sweep, _)| paths::sweep_record(sweep.id))
+            .collect();
+        every_sweep.reverse();
+        assert_eq!(sweeps_read, every_sweep);
+        let open_read = MAX_REREADS_PER_MEMBER - running_count;
+        let newest: Vec<String> = (1..=nth(open_count))
+            .rev()
+            .take(open_read)
+            .map(|n| paths::bounty(record_id(n)))
+            .collect();
+        assert_eq!(bounties_read, newest);
+        // One warning, that counts what is left for a later run.
+        assert_eq!(found.warnings.len(), 1, "{:?}", found.warnings);
+        let left = open_count - open_read;
+        assert!(found.warnings[0].contains(&member.to_string()));
+        let leaves = format!("leaves {left} for a later run");
+        assert!(found.warnings[0].contains(&leaves), "{}", found.warnings[0]);
+    }
+
+    #[tokio::test]
+    async fn a_key_with_only_running_sweeps_reads_them_with_the_whole_budget() {
+        let (owner, member) = (random_pubky(), random_pubky());
+        let mine = bounty(owner, 1);
+        let running_count = MAX_REREADS_PER_MEMBER + 3;
+        let sweeps: Vec<_> = (1..=nth(running_count))
+            .map(|n| (sweep(member, 100 + n), sweep_json(mine, &["t1"], "running")))
+            .collect();
+        let (records, mut state) =
+            polled_before(owner, member, &[(mine, bounty_with("open", &[]))], &sweeps);
+        let resolver = FakeHomeservers::default();
+        let found = poll(&records, &resolver, owner, &mut state).await;
+
+        let (bounties_read, sweeps_read) = reread_of(&records, member);
+        assert!(bounties_read.is_empty(), "{bounties_read:?}");
+        let newest: Vec<String> = sweeps
+            .iter()
+            .rev()
+            .take(MAX_REREADS_PER_MEMBER)
+            .map(|(sweep, _)| paths::sweep_record(sweep.id))
+            .collect();
+        assert_eq!(sweeps_read, newest);
+        assert_eq!(found.warnings.len(), 1, "{:?}", found.warnings);
+        let leaves = "leaves 3 for a later run";
+        assert!(found.warnings[0].contains(leaves), "{}", found.warnings[0]);
     }
 }
