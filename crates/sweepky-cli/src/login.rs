@@ -678,7 +678,7 @@ async fn reuse_device_key(
 /// second published key while the sweeps encrypted to the first stay
 /// unopened. A wrapped file read without `passphrase` is refused with how to
 /// give it, and nothing else: the file is fine.
-fn read_recorded_device_key(
+pub(crate) fn read_recorded_device_key(
     dirs: &Dirs,
     passphrase: Option<&Passphrase>,
     id: &DeviceId,
