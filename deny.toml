@@ -45,6 +45,23 @@ ignore = [
     # pubky-testnet moves to opendal 0.58 or later.
     { id = "RUSTSEC-2026-0194", reason = "quick-xml 0.39.4, dev-only via pubky-testnet -> pubky-homeserver -> opendal-core 0.57; the fix (0.41) needs opendal-core 0.58, which pubky-homeserver 0.16.2 excludes" },
     { id = "RUSTSEC-2026-0195", reason = "quick-xml 0.39.4, dev-only via pubky-testnet -> pubky-homeserver -> opendal-core 0.57; the fix (0.41) needs opendal-core 0.58, which pubky-homeserver 0.16.2 excludes" },
+    # basic-toml 0.1.10, a small TOML parser, unmaintained: its repository was
+    # archived in March 2025 and the advisory names no safe upgrade. It reaches
+    # the graph solely through age 0.12.1's localisation proc-macros, on two
+    # paths: age -> i18n-embed-fl 0.10.1 (proc-macro) -> i18n-config 0.4.8 ->
+    # basic-toml, and age -> i18n-embed 0.16.0 -> i18n-embed-impl 0.8.4
+    # (proc-macro) -> i18n-config 0.4.8 -> basic-toml. A proc-macro runs inside
+    # the compiler on the machine that builds Sweepky and is never linked into
+    # what it builds, so the `sweepky` binary never contains basic-toml
+    # (`cargo tree -p sweepky-cli -e normal,no-proc-macro --target all
+    # -i basic-toml` prints nothing). While age compiles, the macros use it to
+    # parse one file, the `i18n.toml` shipped inside the age crate (checked
+    # against Cargo.lock's checksum), so nothing from a user or the network
+    # ever reaches it. Every crate on both paths is at its newest release and
+    # i18n-config 0.4.8 still requires basic-toml, so no `cargo update` can drop
+    # it. Remove this entry when age moves off i18n-embed-fl and i18n-config,
+    # or when i18n-config drops basic-toml.
+    { id = "RUSTSEC-2026-0374", reason = "basic-toml 0.1.10 (unmaintained), compile-time only via age 0.12.1's localisation proc-macros -> i18n-config 0.4.8; it parses only age's own i18n.toml and is not in the sweepky binary" },
 ]
 # A yanked release was withdrawn by its author, often for a bug, so depending on
 # one fails the check instead of only warning (the default).
