@@ -61,6 +61,14 @@ pub(crate) mod feed;
 pub(crate) mod open;
 pub(crate) mod resolve;
 pub(crate) mod roster;
+// Nothing outside the tests calls it yet, so outside them the compiler would
+// warn that it is never used. `expect` (not `allow`) silences that only
+// while it is true: the change that wires it into `pull` must remove this.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "pull does not print findings yet")
+)]
+pub(crate) mod show;
 pub(crate) mod state;
 pub(crate) mod store;
 pub(crate) mod triage;
