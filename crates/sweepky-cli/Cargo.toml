@@ -26,6 +26,14 @@ path = "src/main.rs"
 [[example]]
 name = "sandbox_fixture"
 
+# The headless check of P5's local demo: steps 2 to 8 of
+# `scripts/demo-local.sh` on an in-process `EphemeralTestnet`, with real
+# github.com targets read anonymously, writing one PASS or FAIL per
+# assertion to `<scratch>/results.json`. Like the fixture above, it uses
+# only the dependencies and dev-dependencies listed here.
+[[example]]
+name = "demo_check"
+
 # Each entry opts in to a pin in the root Cargo.toml's [workspace.dependencies].
 #
 # Errors: `anyhow` is for this crate only, library and binary alike, because

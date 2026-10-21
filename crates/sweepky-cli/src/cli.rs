@@ -276,11 +276,19 @@ pub enum Command {
     /// add the strangers' sweeps it found to each open bounty's
     /// /pub/sweepky/bounties/ID.discovered.json. Prints where each feed was
     /// read from, and each sweep's trust label, status and where it was
-    /// stored; never a finding.
+    /// stored; never a finding, unless --findings asks for them.
     //
-    // No arguments: everything it needs is the login, the device key and
-    // the state files of this install, and the network settings.
-    Pull,
+    // No positional argument: everything it needs is the login, the device
+    // key and the state files of this install, and the network settings.
+    Pull {
+        /// After the report, print the findings of your circle's sweeps,
+        /// the ones merged.json holds, with GitHub links at each bounty's
+        /// pinned commits. Strangers' sweeps are never printed: they stay
+        /// in untrusted/. To build the links, pull reads your bounty
+        /// records once more; it writes nothing more.
+        #[arg(long)]
+        findings: bool,
+    },
 
     /// Mark the bounty at BOUNTY_URL done and credit every sweeper whose
     /// sweep helped. From the groups your last `pull` wrote, done proposes
@@ -599,13 +607,23 @@ mod tests {
     }
 
     #[test]
-    fn pull_takes_no_argument() {
+    fn pull_takes_an_optional_findings_flag_and_nothing_else() {
         let cli = Cli::try_parse_from(["sweepky", "pull"]).expect("parses");
-        assert!(matches!(cli.command, Command::Pull), "{cli:?}");
+        assert!(
+            matches!(cli.command, Command::Pull { findings: false }),
+            "{cli:?}"
+        );
+        let cli = Cli::try_parse_from(["sweepky", "pull", "--findings"]).expect("parses");
+        assert!(matches!(cli.command, Command::Pull { findings: true }));
         // Global flags still go before or after it.
-        let cli = Cli::try_parse_from(["sweepky", "pull", "--testnet"]).expect("parses");
-        assert!(cli.testnet && matches!(cli.command, Command::Pull));
-        // Nothing else: no positional argument and no flag of its own.
+        for args in [
+            ["sweepky", "--testnet", "pull", "--findings"],
+            ["sweepky", "pull", "--findings", "--testnet"],
+        ] {
+            let cli = Cli::try_parse_from(args).expect("parses");
+            assert!(cli.testnet && matches!(cli.command, Command::Pull { findings: true }));
+        }
+        // Nothing else: no positional argument and no other flag of its own.
         assert!(Cli::try_parse_from(["sweepky", "pull", "bounty"]).is_err());
         assert!(Cli::try_parse_from(["sweepky", "pull", "--open"]).is_err());
     }
