@@ -616,7 +616,7 @@ fn init_with(dir: &Path, choice: PlaybookChoice, npx: &impl RunNpx) -> anyhow::R
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::os::unix::fs::{MetadataExt, symlink};
     use std::path::{Path, PathBuf};
@@ -627,7 +627,9 @@ mod tests {
     // Most tests here are about the files, not the playbook, so they call
     // `init --no-playbook` by the short name `init`; the playbook's own
     // tests call the real `super::init` with their choice and fake npx.
-    use super::playbook::{FakeNpx, NpxCommand, PLAYBOOK_COMMIT, SKILL_DIR, install_command};
+    use super::playbook::{
+        FakeNpx, NpxCommand, PLAYBOOK_COMMIT, SKILL_DIR, SKILLS_LOCK, install_command,
+    };
     use super::{
         GITIGNORE, MARKER, MAX_GITIGNORE_BYTES, PlaybookChoice, create_with,
         init_without_playbook as init, read_project_marker, write_new,
@@ -1331,7 +1333,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_install_leaves_no_marker_and_the_next_run_finishes() {
+    fn a_failed_install_leaves_no_marker_and_its_leftover_is_refused() {
         let temp = tempfile::tempdir().expect("temp dir");
         let dir = temp.path().join("project");
 
@@ -1362,12 +1364,22 @@ mod tests {
         assert!(result.is_err());
         assert!(!dir.join(MARKER).exists());
 
-        // The next run keeps the identical files, installs over what was
-        // left, and finishes.
+        // The next run refuses what that copy left, since init never
+        // replaces what is already there, and does not run npx.
         let npx = FakeNpx::installing();
         let (result, _) =
             init_answering(&dir, PlaybookChoice::Install, "", Prompting::Allowed, &npx);
-        let report = result.expect("the second run finishes");
+        let message = format!("{:#}", result.expect_err("the leftover is refused"));
+        assert!(message.contains(SKILL_DIR), "{message}");
+        assert!(npx.calls().is_empty());
+        assert!(!dir.join(MARKER).exists());
+
+        // Once the leftover is removed, the next run keeps the identical
+        // files, installs, and finishes.
+        fs::remove_dir_all(dir.join(SKILL_DIR)).expect("remove the leftover");
+        let (result, _) =
+            init_answering(&dir, PlaybookChoice::Install, "", Prompting::Allowed, &npx);
+        let report = result.expect("the run after the cleanup finishes");
         assert!(
             report.text().contains("kept CLAUDE.md"),
             "{}",
@@ -1451,5 +1463,71 @@ mod tests {
             assert_eq!(entries(&dir), before, "{name}: nothing written");
         }
         assert_eq!(fs::read_to_string(&elsewhere).expect("read"), "{}\n");
+    }
+
+    /// Every file and directory under `root`, by its path relative to
+    /// `root`: a file's bytes, a directory's `None`. `symlink_metadata`
+    /// does not follow a link, so a linked directory is not walked; these
+    /// tests plant no links.
+    fn tree(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+        let mut found = BTreeMap::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in fs::read_dir(&dir).expect("list") {
+                let path = entry.expect("entry").path();
+                let relative = path.strip_prefix(root).expect("under root").to_owned();
+                let meta = fs::symlink_metadata(&path).expect("there");
+                if meta.is_dir() {
+                    pending.push(path);
+                    found.insert(relative, None);
+                } else {
+                    found.insert(relative, Some(fs::read(&path).expect("read")));
+                }
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn an_existing_playbook_directory_or_lock_is_refused_before_npx_runs() {
+        let temp = tempfile::tempdir().expect("temp dir");
+
+        // A skill of the user's own at the playbook's place (or a file
+        // there), and a lock file from the user's own use of the skills
+        // CLI: npx would replace the first and rewrite the second.
+        let cases: [(&str, &str, Plant); 3] = [
+            ("own-skill", SKILL_DIR, |dir, _| {
+                let skill = dir.join(SKILL_DIR);
+                fs::create_dir_all(skill.join("notes")).expect("mkdir");
+                fs::write(skill.join("SKILL.md"), "my own skill\n").expect("write");
+                fs::write(skill.join("notes/x.md"), "mine\n").expect("write");
+            }),
+            ("file-at-skill", SKILL_DIR, |dir, _| {
+                fs::create_dir_all(dir.join(".claude/skills")).expect("mkdir");
+                fs::write(dir.join(SKILL_DIR), "a file\n").expect("write");
+            }),
+            ("own-lock", SKILLS_LOCK, |dir, _| {
+                fs::write(dir.join(SKILLS_LOCK), "{\"version\":1,\"skills\":{}}\n").expect("write");
+            }),
+        ];
+        for (name, refused, plant) in cases {
+            let dir = project_dir(&temp, &format!("p-{name}"));
+            plant(&dir, &temp.path().join("unused"));
+            let before = tree(&dir);
+            let npx = FakeNpx::installing();
+
+            let (result, _) =
+                init_answering(&dir, PlaybookChoice::Install, "", Prompting::Allowed, &npx);
+
+            let message = format!("{:#}", result.expect_err(name));
+            for phrase in [refused, "never replaces", "--no-playbook"] {
+                assert!(message.contains(phrase), "{name}: {message}");
+            }
+            assert!(npx.calls().is_empty(), "{name}");
+            // Byte for byte what was planted and nothing more: no marker,
+            // no settings, no CLAUDE.md and no `.gitignore`, since init
+            // checks everything before its first write.
+            assert_eq!(tree(&dir), before, "{name}");
+        }
     }
 }

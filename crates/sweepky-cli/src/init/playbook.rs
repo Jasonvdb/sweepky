@@ -13,11 +13,11 @@
 //! --depth 1 origin <sha>` once `--branch <sha>` fails), copies
 //! `skills/security-audit/` to `.claude/skills/security-audit/` as real
 //! files (`--copy`; the default would symlink it to `.agents/skills/`), and
-//! writes `skills-lock.json` in the project. A second run removes that
-//! directory and copies it again, so an `init` that stopped after the
-//! install finishes on the next run. Read from the package's source and
-//! checked with one real install on 2026-10-20 (the P3 phase doc has the
-//! record).
+//! writes `skills-lock.json` in the project. Read from the package's
+//! source and checked with one real install on 2026-10-20 (the P3 phase
+//! doc has the record). Because npx would replace that directory and
+//! rewrite that file, `init` refuses a project that already has either
+//! ([`check_before_install`]).
 //!
 //! The rules the child is run under:
 //!
@@ -73,9 +73,9 @@ const SKILLS_PACKAGE: &str = "skills@1.7.2";
 /// Code's project skills directory, named after the skill.
 pub(super) const SKILL_DIR: &str = ".claude/skills/security-audit";
 
-/// The lock file skills@1.7.2 writes in the project. It writes it with a
-/// plain `writeFile`, which follows a link, so a link there is refused.
-const SKILLS_LOCK: &str = "skills-lock.json";
+/// The lock file skills@1.7.2 writes in the project, with a plain
+/// `writeFile` that rewrites it in place.
+pub(super) const SKILLS_LOCK: &str = "skills-lock.json";
 
 /// What npm reads from the directory it runs in: project config, the
 /// project's manifest and its installed packages. Any of them could change
@@ -157,16 +157,17 @@ fn installed_playbook() -> anyhow::Result<Playbook> {
         .context("the pinned playbook does not pass 01's pattern; this is a bug")
 }
 
-/// Refuses a project npm would take configuration from, or whose install
-/// targets are not what [`install`] can safely replace. Runs before
-/// anything is written:
+/// Refuses a project npm would take configuration from, or that already
+/// has something where the install writes. Runs before anything is
+/// written, and each refusal is of any kind (file, directory or link):
 ///
-/// - `.npmrc`, `package.json` or `node_modules`, of any kind, is refused;
-/// - `skills-lock.json` must be absent or a regular file with one link,
-///   since npx rewrites it in place;
-/// - `.claude/skills/security-audit` must be absent or a real directory,
-///   which npx removes and copies again. Only a run that stopped before its
-///   marker leaves one, because a finished `init` never gets here.
+/// - `.npmrc`, `package.json` or `node_modules`, which npm reads;
+/// - `.claude/skills/security-audit`, which npx removes and copies again,
+///   and `skills-lock.json`, which it rewrites in place. `init` never
+///   replaces what is there, and it cannot tell its own leftover from an
+///   interrupted run (no marker is written until the install is checked)
+///   from a skill or lock file of the user's own, so it refuses both alike
+///   and the user moves or removes it.
 pub(super) fn check_before_install(dir: &Path) -> anyhow::Result<()> {
     for name in NPM_PROJECT_FILES {
         let path = dir.join(name);
@@ -178,13 +179,17 @@ pub(super) fn check_before_install(dir: &Path) -> anyhow::Result<()> {
             );
         }
     }
-    let lock = dir.join(SKILLS_LOCK);
-    if let Some(meta) = lstat(&lock)? {
-        refuse_unless_single_file(&lock, &meta)?;
-    }
-    let skill = dir.join(SKILL_DIR);
-    if let Some(meta) = lstat(&skill)? {
-        refuse_unless_dir(&skill, &meta)?;
+    for name in [SKILL_DIR, SKILLS_LOCK] {
+        let path = dir.join(name);
+        if lstat(&path)?.is_some() {
+            bail!(
+                "{} already exists, and init never replaces what is already there, so it does \
+                 not run npx here. Move it away if it is your own, or remove it if an earlier \
+                 init stopped part way through the install, and run init again; or run init \
+                 with --no-playbook",
+                path.display()
+            );
+        }
     }
     Ok(())
 }
