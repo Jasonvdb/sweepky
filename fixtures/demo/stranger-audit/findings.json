@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "playbook": "careful-review",
+  "findings": [
+    {
+      "id": "overview-owner-installs-unclear",
+      "title": "Made-up demo finding: the overview names one install for the reading key",
+      "severity": null,
+      "confidence": null,
+      "status": "needs_validation",
+      "locations": [
+        {
+          "file": "docs/plan/00-overview.md",
+          "line": 16,
+          "kind": "sink",
+          "scope": "Decisions (locked)"
+        }
+      ],
+      "description": "Made up for the Sweepky demo. The decision that the owner reads through the CLI speaks of the owner's CLI install, though an owner may have several, each with its own key.",
+      "fix": "Say \"each of the owner's CLI installs\"."
+    }
+  ]
+}

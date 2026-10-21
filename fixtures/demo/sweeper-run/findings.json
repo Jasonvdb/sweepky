@@ -1,0 +1,89 @@
+[
+  {
+    "verdict": "needs_validation",
+    "fingerprint": "docs-decisions-reading-key-installs",
+    "title": "Made-up demo finding: the reading-key decision does not say an owner may have several installs",
+    "description": "Made up for the Sweepky demo. The locked decision says the reading key lives in the owner's CLI install, in the singular, while the device-key section lets an owner have one key per install. A reader of the overview alone could think there is one key.",
+    "claimed_root_cause": "The overview's wording predates the device-key section's one-key-per-install rule.",
+    "trace": [
+      {
+        "kind": "sink",
+        "file": "docs/plan/00-overview.md",
+        "line": 16,
+        "scope": "Decisions (locked)",
+        "description": "The bullet names one install where the design allows several."
+      }
+    ],
+    "evidence": [
+      {
+        "file": "docs/plan/00-overview.md",
+        "line": 16,
+        "description": "The bullet says the reading key lives in the owner's CLI install."
+      }
+    ],
+    "blockers": [
+      "Whether a reader is misled needs someone reading the overview for the first time."
+    ],
+    "validation_plan": {
+      "local": "Ask a reader new to the plan how many reading keys an owner with two laptops has, after reading the overview only."
+    }
+  },
+  {
+    "verdict": "needs_validation",
+    "fingerprint": "docs-device-keys-logout-order",
+    "title": "Made-up demo finding: the logout order reads as one step on a quick read",
+    "description": "Made up for the Sweepky demo. The logout bullet lists three steps in one sentence, so a quick reader may miss that the key is marked revoked before anything is deleted.",
+    "claimed_root_cause": "Three ordered steps are written as one sentence rather than a numbered list.",
+    "trace": [
+      {
+        "kind": "sink",
+        "file": "docs/plan/02-encryption-and-safety.md",
+        "line": 68,
+        "scope": "Device keys",
+        "description": "The bullet gives the logout order inline."
+      }
+    ],
+    "evidence": [
+      {
+        "file": "docs/plan/02-encryption-and-safety.md",
+        "line": 68,
+        "description": "The bullet starts with the order logout runs in."
+      }
+    ],
+    "blockers": [
+      "Whether the order is missed needs a reader, not a static review."
+    ],
+    "validation_plan": {
+      "local": "Ask a reader to restate the logout order after one read of the bullet."
+    }
+  },
+  {
+    "verdict": "needs_validation",
+    "fingerprint": "docs-known-limits-recipient-count",
+    "title": "Made-up demo finding: the metadata limit does not say the recipient count changes over time",
+    "description": "Made up for the Sweepky demo. The known limit says the recipient count reveals how many devices the owner has, but not that each sweep shows the count at the time it was sealed, so the history shows when devices were added.",
+    "claimed_root_cause": "The limit describes one sweep, not the sequence of sweeps.",
+    "trace": [
+      {
+        "kind": "sink",
+        "file": "docs/plan/06-verification-and-limits.md",
+        "line": 20,
+        "scope": "Known limits (say them in the README)",
+        "description": "The metadata bullet names the recipient count."
+      }
+    ],
+    "evidence": [
+      {
+        "file": "docs/plan/06-verification-and-limits.md",
+        "line": 20,
+        "description": "The bullet lists the public metadata of a sweep."
+      }
+    ],
+    "blockers": [
+      "Whether the extra sentence is worth its length is the owner's call."
+    ],
+    "validation_plan": {
+      "local": "Compare the bullet with the README's known-limits list."
+    }
+  }
+]

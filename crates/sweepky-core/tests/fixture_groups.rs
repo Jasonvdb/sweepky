@@ -1,5 +1,6 @@
 //! P1b's grouping Done-when, on the findings of the two synthetic run
-//! directories under `fixtures/`: the shared location is one group with both
+//! directories under `fixtures/` (P5's demo fixtures are in the `demo` module
+//! at the end): the shared location is one group with both
 //! reporters, the shared-id pair stays apart, `propose_credits` names both
 //! sweepers and never the owner, and an untrusted sweep is attributed but not
 //! merged.
@@ -286,4 +287,184 @@ fn a_trusted_sweep_is_merged() {
     );
     assert!(merged_holding(&merged, c_timing).is_some());
     assert_eq!(merged.len(), all_trusted.groups().len());
+}
+
+/// P5's demo fixtures under `fixtures/demo/`: the synthetic inputs the demo
+/// script and its headless check fall back to when `SWEEPKY_DEMO_RUN_DIR`
+/// and `SWEEPKY_DEMO_TARGETS` are unset. `fixtures/demo/README.md` says what
+/// they hold.
+///
+/// - The circle sweeper's run directory, `sweeper-run/`, in Cloudflare's
+///   format, as a real `security-audit` run leaves it.
+/// - The stranger's `audit/`, `stranger-audit/`, in the common format: one
+///   finding at the same file and scope as one of the sweeper's, under
+///   another id.
+/// - `targets.json`, the one target both sweeps are of: this repository's
+///   `docs/plan/` at a pinned commit.
+///
+/// B stands in for the sweeper and C for the stranger; the demo makes its
+/// own identities when it runs.
+// A module of its own, so its constants and helpers cannot be mistaken for
+// the P1b ones above; `use super::*` brings those into scope here.
+mod demo {
+    use super::*;
+    use sweepky_core::{FindingsSource, GitSha, RepoName, RepoPath};
+
+    const SWEEPER_FINDINGS: &[u8] =
+        include_bytes!("../../../fixtures/demo/sweeper-run/findings.json");
+    const SWEEPER_REPORT: &str = include_str!("../../../fixtures/demo/sweeper-run/REPORT.md");
+    const STRANGER_FINDINGS: &[u8] =
+        include_bytes!("../../../fixtures/demo/stranger-audit/findings.json");
+    const STRANGER_REPORT: &str = include_str!("../../../fixtures/demo/stranger-audit/REPORT.md");
+    const TARGETS: &[u8] = include_bytes!("../../../fixtures/demo/targets.json");
+
+    /// The words every demo title and report carries, so nobody reads a
+    /// demo finding as a real one.
+    const NOTICE: &str = "Made-up demo finding";
+
+    /// The commit the demo's target is pinned to, in full: a branch name
+    /// would move, and the links `pull --findings` prints must not.
+    const PINNED_SHA: &str = "be535e6c056b864f2f93dc64218dd418c3fc5856";
+    /// The one path the target is narrowed to.
+    const TARGET_PATH: &str = "docs/plan/";
+
+    /// The shared location's two ids: the sweeper's Cloudflare fingerprint
+    /// and the stranger's common-format id.
+    const SWEEPER_SHARED: &str = "docs-decisions-reading-key-installs";
+    const STRANGER_SHARED: &str = "overview-owner-installs-unclear";
+
+    const SWEEPER_SWEEP: usize = 0;
+    const STRANGER_SWEEP: usize = 1;
+
+    /// The sweeper's sweep, trusted, as `submit` converts it under the
+    /// playbook the demo passes with `--playbook`.
+    fn sweeper_sweep() -> SweepFindings {
+        let playbook = "cloudflare/security-audit@c1c8a8c1471069fb0e188eeaff69b8e8db6564a8"
+            .parse()
+            .unwrap();
+        let (findings, source) = parse_audit_findings(SWEEPER_FINDINGS, &playbook).unwrap();
+        assert_eq!(source, FindingsSource::Cloudflare);
+        SweepFindings {
+            sweep: sweep_ref(B, "0035WA1K7RS2C"),
+            trusted: true,
+            findings,
+        }
+    }
+
+    /// The stranger's sweep, untrusted, as the owner's `pull` labels it.
+    fn stranger_sweep() -> SweepFindings {
+        SweepFindings {
+            sweep: sweep_ref(C, "0035WB3M9TV48"),
+            trusted: false,
+            findings: Findings::from_json(STRANGER_FINDINGS).unwrap(),
+        }
+    }
+
+    /// One target as `post`'s draft takes it. `deny_unknown_fields`, as the
+    /// draft itself reads it, so a misspelt key fails here too.
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct DraftTarget {
+        kind: String,
+        repo: RepoName,
+        // `ref` is a Rust keyword, so serde reads the JSON key `ref` into
+        // a field with another name.
+        #[serde(rename = "ref")]
+        rev: GitSha,
+        paths: Vec<RepoPath>,
+    }
+
+    #[test]
+    fn demo_targets_pin_one_repo_target_at_a_full_sha() {
+        // The checked types (`RepoName`, `GitSha`, `RepoPath`) parse each
+        // field through `serde(try_from)`, so a bad value fails here.
+        // `GitSha` takes only a full lower-case hex SHA, never a branch.
+        let targets: Vec<DraftTarget> = serde_json::from_slice(TARGETS).unwrap();
+        let [target] = targets.as_slice() else {
+            panic!("targets.json holds {} targets, not one", targets.len());
+        };
+        assert_eq!(target.kind, "repo");
+        assert_eq!(target.repo.as_str(), "github.com/Jasonvdb/sweepky");
+        assert_eq!(target.rev.as_str(), PINNED_SHA);
+        let paths: Vec<&str> = target.paths.iter().map(RepoPath::as_str).collect();
+        assert_eq!(paths, [TARGET_PATH]);
+    }
+
+    #[test]
+    fn demo_findings_parse_and_point_inside_the_target() {
+        let sweeps = [sweeper_sweep(), stranger_sweep()];
+        assert_eq!(sweeps[SWEEPER_SWEEP].findings.findings.len(), 3);
+        assert_eq!(sweeps[STRANGER_SWEEP].findings.findings.len(), 1);
+        // Every location is a line of a file under the target's one path,
+        // so each link `pull --findings` prints names a file of the pinned
+        // tree. That each line exists there is checked by hand
+        // (fixtures/demo/README.md).
+        for sweep in &sweeps {
+            for finding in &sweep.findings.findings {
+                assert!(
+                    !finding.locations.is_empty(),
+                    "{} has no location",
+                    finding.id
+                );
+                for location in &finding.locations {
+                    assert!(location.file.starts_with(TARGET_PATH), "{}", location.file);
+                    assert!(location.line.is_some_and(|line| line >= 1));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn demo_titles_and_reports_say_the_findings_are_made_up() {
+        for sweep in [sweeper_sweep(), stranger_sweep()] {
+            for finding in &sweep.findings.findings {
+                assert!(finding.title.starts_with(NOTICE), "{}", finding.id);
+            }
+        }
+        assert!(SWEEPER_REPORT.contains(NOTICE));
+        assert!(STRANGER_REPORT.contains(NOTICE));
+    }
+
+    #[test]
+    fn demo_shared_location_is_one_group_and_the_rest_stand_alone() {
+        let groups = group_findings(vec![sweeper_sweep(), stranger_sweep()]);
+        let sweeper_shared = member(&groups, SWEEPER_SWEEP, SWEEPER_SHARED);
+        let stranger_shared = member(&groups, STRANGER_SWEEP, STRANGER_SHARED);
+        // The shared file and scope join the two ids into one group,
+        // reported by both.
+        let shared = group_of(&groups, sweeper_shared);
+        assert_eq!(shared.members(), [sweeper_shared, stranger_shared]);
+        assert_eq!(shared.reported_by(), [pubky(B), pubky(C)]);
+        // The sweeper's other two findings are a group each.
+        assert_eq!(groups.groups().len(), 3);
+        for group in groups.groups() {
+            if group.members() != shared.members() {
+                assert_eq!(group.reported_by(), [pubky(B)]);
+                assert_eq!(group.members().len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn demo_merged_report_is_every_sweeper_finding_and_none_of_the_strangers() {
+        // What `pull --findings` prints: the merged report, which holds the
+        // trusted sweeper's three findings and nothing of the stranger's.
+        let groups = group_findings(vec![sweeper_sweep(), stranger_sweep()]);
+        let merged = groups.merged();
+        let merged_findings: Vec<(GroupMember, &str)> =
+            merged.iter().flat_map(merged_members).collect();
+        let sweeper_findings = &groups.sweeps()[SWEEPER_SWEEP].findings.findings;
+        let expected: Vec<(GroupMember, &str)> = sweeper_findings
+            .iter()
+            .enumerate()
+            .map(|(position, finding)| {
+                let member = GroupMember {
+                    sweep: SWEEPER_SWEEP,
+                    finding: position,
+                };
+                (member, finding.id.as_str())
+            })
+            .collect();
+        assert_eq!(merged_findings, expected);
+    }
 }
