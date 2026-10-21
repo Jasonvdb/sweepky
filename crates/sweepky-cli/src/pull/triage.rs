@@ -159,6 +159,14 @@ struct Caps {
     bytes: usize,
 }
 
+impl Caps {
+    /// A run's caps, the constants above.
+    const RUN: Self = Self {
+        sweeps: MAX_GROUPED_SWEEPS,
+        bytes: MAX_GROUPED_FINDINGS_BYTES,
+    };
+}
+
 /// Triages each of the owner's bounties the roster poll `poll` found,
 /// reading what `pull::store` stored and what the poll state `state` says
 /// of it: see the module docs. Writes `groups.json` and `merged.json` in
@@ -172,15 +180,7 @@ pub(crate) fn triage_bounties(
     poll: &RosterPoll,
     state: &PollState,
 ) -> anyhow::Result<Triaged> {
-    triage_within(
-        dirs,
-        poll,
-        state,
-        Caps {
-            sweeps: MAX_GROUPED_SWEEPS,
-            bytes: MAX_GROUPED_FINDINGS_BYTES,
-        },
-    )
+    triage_within(dirs, poll, state, Caps::RUN)
 }
 
 /// [`triage_bounties`] within `caps`.
@@ -214,6 +214,37 @@ fn triage_within(
     })
 }
 
+/// The groups of the owner's `bounty` again, as [`triage_bounties`] made
+/// them for `merged.json` this run, for `pull --findings` to print; `None`
+/// when nothing of it is stored. `labels` is the run's table, the one the
+/// triage labelled with.
+///
+/// The same stored copies, read again within the same caps and in the same
+/// order, give the same groups, so one bounty's findings are held at a
+/// time rather than every bounty's for the whole run. Whatever warnings
+/// the reads give, the triage said already; they are dropped here.
+pub(crate) fn regroup(
+    dirs: &Dirs,
+    state: &PollState,
+    labels: &TrustTable,
+    bounty: BountyRef,
+) -> anyhow::Result<Option<FindingGroups>> {
+    // Checked first, as the triage does: a link, or another owner's bounty
+    // with the same id, is an error before anything is read.
+    if stored_bounty_dir(dirs, bounty)?.is_none() {
+        return Ok(None);
+    }
+    let mut triager = Triager {
+        dirs,
+        state,
+        labels,
+        caps: Caps::RUN,
+        warnings: Vec::new(),
+    };
+    let (grouped, _left_out) = triager.group(bounty);
+    Ok(Some(grouped))
+}
+
 /// What one run's triage reads, and the warnings it has so far.
 ///
 /// One lifetime for every borrow: they all come from [`triage_within`]'s
@@ -234,10 +265,7 @@ impl Triager<'_> {
         let Some(dir) = stored_bounty_dir(self.dirs, bounty)? else {
             return Ok(None);
         };
-        let (sweeps, left_out) = self.read_within_caps(bounty, self.candidates(bounty));
-        // `group_findings` takes the sweeps by value and hands them back
-        // inside the groups, so nothing is copied.
-        let grouped = group_findings(sweeps);
+        let (grouped, left_out) = self.group(bounty);
         let labelled: Vec<LabelledSweep> = grouped
             .sweeps()
             .iter()
@@ -253,6 +281,15 @@ impl Triager<'_> {
             bounty,
             sweeps: labelled,
         }))
+    }
+
+    /// The stored sweeps of `bounty` read within the caps and grouped, with
+    /// the sweeps left out.
+    fn group(&mut self, bounty: BountyRef) -> (FindingGroups, Vec<SweepRef>) {
+        let (sweeps, left_out) = self.read_within_caps(bounty, self.candidates(bounty));
+        // `group_findings` takes the sweeps by value and hands them back
+        // inside the groups, so nothing is copied.
+        (group_findings(sweeps), left_out)
     }
 
     /// `sweep` with its sweeper's trust.

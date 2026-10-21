@@ -55,19 +55,21 @@
 //! everything a record says goes through `display::sanitize`; the rest is
 //! keys, URLs and paths core and Sweepky built, numbers and fixed text. No
 //! finding, recipient, secret or server text is printed.
+//!
+//! **`--findings`** ([`ShowFindings::Yes`]) adds, after the report, the
+//! circle's merged findings of each of the owner's bounties, sanitised,
+//! with GitHub links at the bounty's pinned commits (`show`): step 8, after
+//! the write and still under the pull lock, so it reads the triage files
+//! this run wrote. It reads the owner's own bounty records once more for
+//! their targets, never another key's record and never `untrusted/`, and
+//! writes nothing; a record it cannot read is a warning on standard error.
+//! Without the flag the report is as above.
 
 pub(crate) mod discovered;
 pub(crate) mod feed;
 pub(crate) mod open;
 pub(crate) mod resolve;
 pub(crate) mod roster;
-// Nothing outside the tests calls it yet, so outside them the compiler would
-// warn that it is never used. `expect` (not `allow`) silences that only
-// while it is true: the change that wires it into `pull` must remove this.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "pull does not print findings yet")
-)]
 pub(crate) mod show;
 pub(crate) mod state;
 pub(crate) mod store;
@@ -90,6 +92,7 @@ use self::feed::{
 use self::open::{Opened, open_sweeps};
 use self::resolve::{CheckedHomeservers, Homeservers, PkarrHomeservers, ResolveHomeserver};
 use self::roster::{RosterPoll, poll_roster};
+use self::show::circle_findings;
 use self::state::{BountySummary, PollState, SweepSummary};
 use self::store::{Stored, stored_sweep_dir};
 use self::triage::{GROUPS_FILE, MERGED_FILE, Triaged, triage_bounties};
@@ -105,7 +108,7 @@ use crate::remote::{pubky_of, public_key_of};
 use crate::session::NOT_LOGGED_IN;
 use crate::state::{LoginState, read_login_state};
 use crate::targets::host::SystemResolver;
-use crate::{Context, Dirs, Report};
+use crate::{Context, Dirs, Report, StderrWriter};
 
 /// What `pull` says when this install has no device key: without one it
 /// can open no sweep, and only `login` makes one.
@@ -129,7 +132,7 @@ const MAX_PATH_CHARS: usize = 4096;
 ///
 /// Everything comes from `ctx`, never from the process environment: the
 /// directories, the passphrase, and the network with its watch list.
-pub(crate) async fn pull(ctx: &Context) -> anyhow::Result<Report> {
+pub(crate) async fn pull(ctx: &Context, findings: bool) -> anyhow::Result<Report> {
     // First, before anything below could send a request.
     let install = ThisInstall::read(&ctx.dirs, ctx.passphrase.as_ref())?;
     let client = ctx.network.pubky();
@@ -167,7 +170,16 @@ pub(crate) async fn pull(ctx: &Context) -> anyhow::Result<Report> {
         || {
             let _ = ctx.stderr.line(WAITING_FOR_PULL);
         },
-        async || pull_with(&seams, &ctx.dirs, install, &watched_homeservers(ctx)).await,
+        async || {
+            let show = if findings {
+                ShowFindings::Yes {
+                    stderr: &ctx.stderr,
+                }
+            } else {
+                ShowFindings::No
+            };
+            pull_with(&seams, &ctx.dirs, install, &watched_homeservers(ctx), show).await
+        },
     )
     .await
 }
@@ -232,9 +244,22 @@ struct Seams<'a, R, K, F, H, W> {
     pace: Duration,
 }
 
+/// Whether a run prints the circle's findings after its report: `pull
+/// --findings` or not.
+// `Copy`: two words at most, so it is passed by value. The `'a` is how
+// long the borrowed writer lives.
+#[derive(Clone, Copy)]
+enum ShowFindings<'a> {
+    /// The report alone.
+    No,
+    /// The report, then the findings; a bounty whose record cannot be read
+    /// again for its links is a warning on `stderr`.
+    Yes { stderr: &'a StderrWriter },
+}
+
 /// Runs the steps of the module docs for `install`, through `seams`, with
 /// the local state in `dirs` and the homeservers of `watch_list` watched,
-/// and gives the report.
+/// and gives the report, followed by the findings when `show` asks.
 ///
 /// `install` by value: the key moves in, and is dropped here once the opens
 /// are done, rather than whenever the caller's locals go. Only a failure of
@@ -245,6 +270,7 @@ async fn pull_with<R, K, F, H, W>(
     dirs: &Dirs,
     install: ThisInstall,
     watch_list: &[Pubky],
+    show: ShowFindings<'_>,
 ) -> anyhow::Result<Report>
 where
     R: PublicRecords,
@@ -302,7 +328,25 @@ where
         triaged: &triaged,
         published: &published,
     };
-    Ok(Report::new(found.render(dirs)))
+    let mut text = found.render(dirs);
+    if let ShowFindings::Yes { stderr } = show {
+        let shown = circle_findings(
+            seams.records,
+            &mut homeservers,
+            dirs,
+            &state,
+            &found.labels,
+            &triaged,
+        )
+        .await;
+        text.push_str(&shown.text);
+        for warning in &shown.warnings {
+            // A courtesy line: if standard error cannot be written, the
+            // findings still print.
+            let _ = stderr.line(&format!("warning: {warning}"));
+        }
+    }
+    Ok(Report::new(text))
 }
 
 /// The check of `login`'s owner's `keys/` through `keys`, as the report's
@@ -644,7 +688,7 @@ mod tests {
     use super::discovered::FakeSession;
     use super::feed::MAX_ACCEPTED_PER_BOUNTY;
     use super::state::{FeedCursors, PollState};
-    use super::{NO_DEVICE_KEY, Seams, ThisInstall, WAITING_FOR_PULL, pull_with};
+    use super::{NO_DEVICE_KEY, Seams, ShowFindings, ThisInstall, WAITING_FOR_PULL, pull_with};
     use crate::device::{
         create_device_key, device_key_bytes, device_key_record, remove_device_key,
     };
@@ -657,11 +701,11 @@ mod tests {
     use crate::state::{LoginState, write_login_state};
     use crate::test_support::{
         FAKE_HOMESERVER, FakeEventsFeed, FakeHomeservers, FakeKeyStore, FakePublicRecords,
-        LocalHttp, PLANTED, SYNTHETIC_SHA, TEST_PASSPHRASE, bounty_json, circle_json, dirs_in,
-        done_record, json_bytes, offline_network, package_json, private_temp, random_pubky,
-        record_id, repo_target_json, sweep_json, test_context,
+        LocalHttp, PLANTED, SYNTHETIC_SHA, SharedBuffer, TEST_PASSPHRASE, bounty_json, circle_json,
+        dirs_in, done_record, json_bytes, offline_network, package_json, private_temp,
+        random_pubky, record_id, repo_target_json, sweep_json, test_context,
     };
-    use crate::{Cli, Dirs, Network};
+    use crate::{Cli, Dirs, Network, StderrWriter};
 
     /// The device id this install's `login.json` records.
     fn this_install() -> DeviceId {
@@ -742,6 +786,22 @@ mod tests {
         /// One run of `pull`, as the command makes it, with the fakes as
         /// its seams and no pause in a head search: its report.
         async fn pull(&self) -> anyhow::Result<String> {
+            self.pull_showing(ShowFindings::No).await
+        }
+
+        /// One run of `pull --findings`: its report with the findings, and
+        /// what it said on standard error.
+        async fn pull_findings(&self) -> anyhow::Result<(String, String)> {
+            let said = SharedBuffer::default();
+            let stderr = StderrWriter::new(said.clone());
+            let report = self
+                .pull_showing(ShowFindings::Yes { stderr: &stderr })
+                .await?;
+            Ok((report, said.text()))
+        }
+
+        /// One run of `pull`, showing the findings as `show` says.
+        async fn pull_showing(&self, show: ShowFindings<'_>) -> anyhow::Result<String> {
             let install = ThisInstall::read(&self.dirs, None)?;
             let seams = Seams {
                 records: &self.records,
@@ -751,7 +811,7 @@ mod tests {
                 writer: &self.session,
                 pace: Duration::ZERO,
             };
-            let report = pull_with(&seams, &self.dirs, install, &self.watch_list).await?;
+            let report = pull_with(&seams, &self.dirs, install, &self.watch_list, show).await?;
             Ok(report.text().to_owned())
         }
 
@@ -1377,6 +1437,89 @@ mod tests {
         assert!(
             report.contains("alarm: keys/other-install.json is a device key"),
             "{report}"
+        );
+    }
+
+    // P5, Done when 1: `--findings` prints the circle's merged findings with
+    // links at the bounty's pinned commit, never a stranger's, for one read
+    // of the owner's bounty record more than a plain pull and no write. A
+    // record it cannot read prints the findings without links and warns
+    // once on standard error.
+    #[tokio::test]
+    async fn pull_findings_prints_the_circle_s_findings_with_links_for_one_more_read() {
+        let mut fx = Install::new();
+        let (member, stranger) = (random_pubky(), random_pubky());
+        fx.circle(&[member]);
+        let open = fx.post_open(1, &[(fx.home, 0)], &[]);
+        let ours = fx.ours();
+        fx.sweep(member, 10, open, "done", &ours);
+        // Both packages hold one finding titled PLANTED at the same place:
+        // one group, reported by both, whose merged findings are the
+        // member's alone.
+        let strangers = fx.sweep(stranger, 11, open, "done", &ours);
+        fx.feed = FakeEventsFeed::of_events(vec![(1, put_event(strangers))]);
+        // The first pull stores both; a plain one after it is the baseline.
+        assert_safe_to_print(&fx.pull().await.expect("pulled"));
+        let (asked, puts) = (fx.records.asked().len(), fx.session.storage.puts().len());
+        assert_safe_to_print(&fx.pull().await.expect("pulled again"));
+        let plain = fx.records.asked().split_off(asked);
+
+        let before_findings = asked + plain.len();
+        let (report, said) = fx.pull_findings().await.expect("pulled with the findings");
+        let mut with_findings = fx.records.asked().split_off(before_findings);
+        assert_eq!(said, "");
+        // One request more, last of all: the owner's bounty record. Every
+        // other request is one a plain pull makes too, and nothing is
+        // written.
+        assert_eq!(
+            with_findings.pop(),
+            Some((fx.owner, paths::bounty(open.id)))
+        );
+        assert!(
+            with_findings.iter().all(|asked| plain.contains(asked)),
+            "--findings asked for something a plain pull does not"
+        );
+        assert_eq!(fx.session.storage.puts().len(), puts);
+        // The report as without the flag, then the findings.
+        let (before, findings) = report
+            .split_once("Findings of your circle, newest bounty first")
+            .expect("the findings follow the report");
+        assert_safe_to_print(before);
+        let link =
+            format!("https://github.com/org/name/blob/{SYNTHETIC_SHA}/src/auth/session.rs#L88");
+        for line in [
+            format!(
+                "bounty {}, group 1 of 1, finding 1 of 1, reported by 2\n",
+                open.id
+            ),
+            format!("  title: {PLANTED}\n"),
+            format!("  at src/auth/session.rs:88 {link}\n"),
+            format!("  description:\n    {PLANTED}\n"),
+        ] {
+            assert!(findings.contains(&line), "{line}\nnot in\n{findings}");
+        }
+        // Once: the stranger's finding, the same text, is not printed.
+        assert_eq!(
+            findings.matches(&format!("  title: {PLANTED}\n")).count(),
+            1
+        );
+
+        // The record no longer reads: the findings print, with no link, and
+        // one warning on standard error says why.
+        fx.records = mem::take(&mut fx.records).with_file(
+            fx.owner,
+            &paths::bounty(open.id),
+            b"not a record".to_vec(),
+        );
+        let (report, said) = fx.pull_findings().await.expect("pulled with the findings");
+        assert!(report.contains("  at src/auth/session.rs:88\n"), "{report}");
+        assert!(!report.contains("https://"), "{report}");
+        assert_eq!(
+            said,
+            format!(
+                "warning: pull --findings prints the findings of {open} without links: its \
+                 record could not be read\n"
+            )
         );
     }
 

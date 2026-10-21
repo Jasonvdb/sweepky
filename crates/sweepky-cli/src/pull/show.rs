@@ -28,14 +28,31 @@
 //! crate. A file that fails, a target whose kind this build does not know,
 //! or a sweep the caller gives no targets for, prints with no link; a repo
 //! not on `github.com` prints [`NO_GITHUB_LINK`].
+//!
+//! **`pull --findings`** ([`circle_findings`]) prints these lines after the
+//! report, the newest bounty first. For each of the owner's bounties whose
+//! triage merged a circle sweep, it groups the stored sweeps again as the
+//! triage did (`triage::regroup`), so one bounty's findings are held at a
+//! time, and reads that bounty's record once more for its targets, through
+//! the opener's read: the owner's homeserver from the run's cache, then
+//! `PublicRecords::get_bounty`, capped at `MAX_RECORD_BYTES` and refused if
+//! redirected. Only the owner's own bounty records are read, and at most
+//! [`MAX_BOUNTIES_SHOWN`] a run; nothing is written. A record that cannot
+//! be read prints its bounty's findings without links, with one warning.
 
 use sweepky_core::{
-    BountyRef, Finding, GitSha, KnownTarget, Location, MergedGroup, RepoName, RepoPath, Target,
-    TargetId,
+    Bounty, BountyRef, Finding, FindingGroups, GitSha, KnownTarget, Location, MergedGroup,
+    RepoName, RepoPath, Target, TargetId, TrustTable,
 };
 use url::Url;
 
+use super::resolve::{Homeservers, ResolveHomeserver};
+use super::roster::MAX_REREADS_PER_MEMBER;
+use super::state::PollState;
+use super::triage::{Triaged, regroup};
+use crate::Dirs;
 use crate::display::{Layout, first_changed_char, sanitize, sanitize_multiline};
+use crate::records::PublicRecords;
 
 /// What a location of a repo not on github.com prints in place of a link.
 pub(crate) const NO_GITHUB_LINK: &str = "(no GitHub link)";
@@ -53,6 +70,147 @@ const MAX_FILE_CHARS: usize = 512;
 const MAX_DESCRIPTION_CHARS: usize = 4000;
 /// How many locations of one finding to show; the rest are counted.
 const MAX_LOCATIONS_SHOWN: usize = 32;
+
+/// The most bounty records `pull --findings` reads again in a run, and so
+/// the most bounties whose findings it prints: as many as the roster poll
+/// reads again of one key, so a run with the flag makes a bounded number
+/// of extra requests however many bounties the owner has.
+pub(crate) const MAX_BOUNTIES_SHOWN: usize = MAX_REREADS_PER_MEMBER;
+
+/// What [`circle_findings`] has to print: the lines after the report, and
+/// one warning for each bounty printed without links or not printed.
+///
+/// No `Debug`: `text` holds findings.
+pub(crate) struct CircleFindings {
+    /// The heading and every finding block, sanitised.
+    pub(crate) text: String,
+    /// Fixed text that names bounty URLs and numbers, never a finding.
+    pub(crate) warnings: Vec<String>,
+}
+
+/// The circle's findings of the owner's bounties this run triaged, for
+/// `pull --findings`: see the module docs. `labels` is the run's trust
+/// table, `state` its poll state, and `records` and `homeservers` the
+/// run's reader and cache.
+///
+/// Never an error: a bounty whose findings cannot be read again is a
+/// warning, and so is one whose record cannot, which still prints.
+pub(crate) async fn circle_findings<R: PublicRecords, H: ResolveHomeserver>(
+    records: &R,
+    homeservers: &mut Homeservers<'_, H>,
+    dirs: &Dirs,
+    state: &PollState,
+    labels: &TrustTable,
+    triaged: &Triaged,
+) -> CircleFindings {
+    let mut blocks = String::new();
+    let mut warnings = Vec::new();
+    let mut shown = 0;
+    // Only a bounty with a trusted sweep grouped can have merged findings,
+    // so the others are not read again at all. `rev` walks them newest
+    // first: the triage lists them oldest first, as the roster poll does.
+    let with_circle_sweeps = triaged
+        .bounties
+        .iter()
+        .rev()
+        .filter(|triage| triage.sweeps.iter().any(|sweep| sweep.trusted));
+    let mut left = 0;
+    for triage in with_circle_sweeps {
+        if shown == MAX_BOUNTIES_SHOWN {
+            left += 1;
+            continue;
+        }
+        let bounty = triage.bounty;
+        let grouped = match regroup(dirs, state, labels, bounty) {
+            Ok(Some(grouped)) => grouped,
+            Ok(None) => continue,
+            Err(error) => {
+                warnings.push(format!(
+                    "pull --findings could not read the findings of {bounty} again: {error:#}"
+                ));
+                continue;
+            }
+        };
+        // Borrows from `grouped`, so `grouped` lives until both are done.
+        let merged = grouped.merged();
+        if merged.is_empty() {
+            continue;
+        }
+        shown += 1;
+        let record = bounty_record(records, homeservers, bounty, &mut warnings).await;
+        // `map_or` gives the record's targets, or none when it could not be
+        // read, so every location prints without a link.
+        let targets = record
+            .as_ref()
+            .map_or(&[][..], |record| &record.targets[..]);
+        let covered = covered_targets(&grouped, state);
+        blocks.push_str(&render_findings(bounty, targets, &merged, &covered));
+    }
+    if left > 0 {
+        warnings.push(format!(
+            "pull --findings printed the findings of the newest {MAX_BOUNTIES_SHOWN} of your \
+             bounties with circle sweeps; those of the other {left} are in their merged.json"
+        ));
+    }
+    CircleFindings {
+        text: with_heading(&blocks),
+        warnings,
+    }
+}
+
+/// The targets each sweep `grouped` holds covered, in its order, from the
+/// poll state's summary of the sweep's record: `render_findings`'s
+/// `covered`. A sweep with no summary covered none, so it gets no link.
+// `'s` says the slices borrow from `state` alone, not from `grouped`: the
+// compiler then lets the list live on while `grouped` is borrowed elsewhere.
+fn covered_targets<'s>(grouped: &FindingGroups, state: &'s PollState) -> Vec<&'s [TargetId]> {
+    grouped
+        .sweeps()
+        .iter()
+        .map(|sweep| {
+            state
+                .sweeps
+                .get(&sweep.sweep)
+                .map_or(&[][..], |summary| &summary.targets[..])
+        })
+        .collect()
+}
+
+/// The findings section: a heading, then `blocks`, or one line when there
+/// are none.
+fn with_heading(blocks: &str) -> String {
+    if blocks.is_empty() {
+        return "Findings of your circle: none yet.\n".to_owned();
+    }
+    format!(
+        "Findings of your circle, newest bounty first (strangers' sweeps are not among them: \
+         they stay in untrusted/):\n\n{blocks}"
+    )
+}
+
+/// The owner's bounty record `bounty`, read again from their own storage
+/// for its targets, or `None`, with a warning in `warnings`, when it cannot
+/// be read this time. The same read as the opener's
+/// (`open::Opener::bounty_record`).
+async fn bounty_record<R: PublicRecords, H: ResolveHomeserver>(
+    records: &R,
+    homeservers: &mut Homeservers<'_, H>,
+    bounty: BountyRef,
+    warnings: &mut Vec<String>,
+) -> Option<Bounty> {
+    let why = match homeservers.resolve(bounty.owner).await {
+        Err(_) => "your homeserver could not be found",
+        Ok(_) => match records.get_bounty(bounty).await {
+            Ok(Some(record)) => return Some(record),
+            Ok(None) => "its record is gone from your storage",
+            Err(_) => "its record could not be read",
+        },
+    };
+    warnings.push(format!(
+        "pull --findings prints the findings of {bounty} without links: {why}"
+    ));
+    None
+}
 
 /// The lines to print for `merged`, the merged groups of `bounty` (from
 /// `FindingGroups::merged`, which holds trusted findings only), one block

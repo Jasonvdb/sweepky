@@ -604,7 +604,7 @@ pub fn run_without_context(
         | Command::Post { .. }
         | Command::Run { .. }
         | Command::Submit { .. }
-        | Command::Pull
+        | Command::Pull { .. }
         | Command::Done { .. } => None,
     }
 }
@@ -724,7 +724,7 @@ pub async fn run(cli: Cli, ctx: &Context) -> anyhow::Result<Report> {
             submit::submit(ctx, prompting, run_dir.as_deref(), playbook.as_deref()).await
         }
         // `pull` asks nothing, so it takes no `Prompting`.
-        Command::Pull => pull::pull(ctx).await,
+        Command::Pull { findings } => pull::pull(ctx, findings).await,
         Command::Done {
             bounty,
             credit,
@@ -750,7 +750,7 @@ fn shows_expiry_notice(command: &Command) -> bool {
         | Command::Post { .. }
         | Command::Run { .. }
         | Command::Submit { .. }
-        | Command::Pull
+        | Command::Pull { .. }
         | Command::Done { .. } => true,
     }
 }

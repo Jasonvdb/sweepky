@@ -2239,11 +2239,14 @@ async fn end_to_end() {
     // A fresh context on A's SWEEPKY_HOME stands in for a restart: only the
     // files carry over. The cursor survives it: pull resumes the testnet's
     // feed where the first pull left it, from this install's
-    // feed-cursors.json, and publishes nothing, with no warning.
-    let (a_restarted, _) = context(&testnet, a_home.path(), io::empty());
-    let report = sweepky(&a_restarted, &["pull"])
+    // feed-cursors.json, and publishes nothing, with no warning. This pull
+    // asks for the findings too (P5, Done when 1), which changes none of
+    // that: `--findings` reads the owner's bounty records once more and
+    // writes nothing.
+    let (a_restarted, a_restarted_stderr) = context(&testnet, a_home.path(), io::empty());
+    let report = sweepky(&a_restarted, &["pull", "--findings"])
         .await
-        .expect("A pulls again");
+        .expect("A pulls again, with the findings");
     let text = report.text();
     let resumed = format!(
         "Events feeds:\n  {watched}: read from cursor {persisted}, from this install's \
@@ -2252,6 +2255,52 @@ async fn end_to_end() {
     assert!(text.contains(&resumed), "{text}");
     assert!(!text.contains("Published"), "{text}");
     assert!(!text.contains("warning: "), "{text}");
+    // Every bounty record read back: no warning on standard error either.
+    let said = a_restarted_stderr.text();
+    assert!(!said.contains("warning: "), "{said}");
+    // After the report, every one of B's (circle) findings: its title, each
+    // location and its description. No location gets a link here: B's sweep
+    // covered both of the open bounty's targets and its files carry no
+    // `<tid>/` prefix, so no one target holds them (`pull::show`), and the
+    // fixture repository is not on github.com anyway. `assert!` with fixed
+    // text, so a failure prints no finding.
+    let findings_start = text
+        .find("Findings of your circle")
+        .expect("the findings follow the report");
+    let (report_part, findings_part) = text.split_at(findings_start);
+    for finding in &b_findings.findings {
+        assert!(
+            !report_part.contains(finding.title.as_str()),
+            "the report before the findings prints a finding"
+        );
+        assert!(
+            findings_part.contains(&format!("  title: {}\n", finding.title)),
+            "a circle finding's title is not printed"
+        );
+        assert!(
+            findings_part.contains(&format!("    {}\n", finding.description)),
+            "a circle finding's description is not printed"
+        );
+        for location in &finding.locations {
+            let line = location
+                .line
+                .map(|line| format!(":{line}"))
+                .unwrap_or_default();
+            assert!(
+                findings_part.contains(&format!("  at {}{line}\n", location.file)),
+                "a circle finding's location is not printed"
+            );
+        }
+    }
+    assert!(!text.contains("https://"), "a location is linked");
+    // Nothing of C's (the stranger's) sweep: its content stays in
+    // untrusted/.
+    for finding in &c_findings.findings {
+        assert!(
+            !text.contains(finding.title.as_str()) && !text.contains(&finding.description),
+            "the findings print a stranger's finding"
+        );
+    }
     // discovered.json still lists C once. And the homeserver itself shows
     // that the second pull made no PUT: past the persisted cursor its feed
     // holds one event, the first pull's write of discovered.json.
