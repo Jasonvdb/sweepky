@@ -17,6 +17,15 @@ publish.workspace = true
 name = "sweepky"
 path = "src/main.rs"
 
+# The fixture `scripts/check-sandbox.sh` runs P3's sandbox checks on: a local
+# testnet, an owner and a sweeper, and an `init` project with two sweeps
+# placed by `run`. An example, not a test, because it keeps running until the
+# script closes its standard input. It uses the dev-dependencies below and
+# needs no feature they lack (it reads standard input on a plain thread, so
+# not even tokio's `io-std`), and never reaches the binary.
+[[example]]
+name = "sandbox_fixture"
+
 # Each entry opts in to a pin in the root Cargo.toml's [workspace.dependencies].
 #
 # Errors: `anyhow` is for this crate only, library and binary alike, because

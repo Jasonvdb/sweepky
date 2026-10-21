@@ -1428,13 +1428,35 @@ async fn end_to_end() {
 
     // ----- P2b: B runs A's bounty in an init project -----
 
-    // B's project, made by the minimal `init`; B then works in it, as
-    // `run` must be run in the project's own directory.
+    // B's project, made by `init`; B then works in it, as `run` must be
+    // run in the project's own directory. Besides the marker and the
+    // `.gitignore`, init wrote what Claude Code reads: the sandbox
+    // settings, the project's `CLAUDE.md` and the skill. `--no-playbook`,
+    // so the test never reaches npm.
     let b_projects = tempfile::tempdir().expect("temp dir");
     let project = b_projects.path().join("project");
-    sweepky(&b, &["init", project.to_str().expect("a UTF-8 path")])
-        .await
-        .expect("B's init");
+    sweepky(
+        &b,
+        &[
+            "init",
+            project.to_str().expect("a UTF-8 path"),
+            "--no-playbook",
+        ],
+    )
+    .await
+    .expect("B's init");
+    let mut made: Vec<String> = fs::read_dir(&project)
+        .expect("the project")
+        .map(|entry| {
+            let name = entry.expect("an entry").file_name();
+            name.into_string().expect("UTF-8")
+        })
+        .collect();
+    made.sort();
+    assert_eq!(made, [".claude", ".gitignore", ".sweepky", "CLAUDE.md"]);
+    for file in [".claude/settings.json", ".claude/skills/sweepky/SKILL.md"] {
+        assert!(project.join(file).is_file(), "{file}");
+    }
     b.cwd = project.clone();
 
     let report = sweepky(&b, &["run", &posted.to_string()])
@@ -1478,7 +1500,7 @@ async fn end_to_end() {
 
     // Anyone can read B's sweep record: running, for A's bounty, with all
     // three targets, and the placeholder playbook, since B's `init`
-    // recorded none.
+    // installed none (`--no-playbook`).
     let b_user = PublicKey::try_from_z32(&b_pubky.to_string()).expect("a key");
     let record = get_capped(
         &testnet,
@@ -1664,6 +1686,21 @@ async fn end_to_end() {
     // fetch is gone, the record being final.
     assert!(sweep_dir.join(".sweepky/submitted").is_file());
     assert_gone(&snapshot_file);
+    // And audit/ is out of the project, where a later agent session could
+    // read it, and under B's data directory, which the sandbox denies:
+    // directories 0700, files 0600. The report says where.
+    assert_gone(&audit);
+    let moved = b.dirs.data().join(format!("submitted/{id}/audit"));
+    assert_eq!(mode(&moved), 0o700);
+    assert_eq!(mode(moved.parent().expect("submitted/<id>")), 0o700);
+    for name in CLOUDFLARE_FILES {
+        assert_eq!(mode(&moved.join(name)), 0o600, "{name}");
+    }
+    assert!(
+        report.text().contains(&moved.display().to_string()),
+        "{}",
+        report.text()
+    );
 
     // ----- P2b: a second run, with links planted in its audit/ -----
 
@@ -1731,6 +1768,10 @@ async fn end_to_end() {
         .await
         .expect("the path is public");
     assert!(!exists, "run 2's package was uploaded");
+    // Refused before anything was final, so run 2's audit/ stays where
+    // it is, for the next try.
+    assert!(run2_audit.join("findings.json").is_file());
+    assert_gone(&b.dirs.data().join(format!("submitted/{run2_id}")));
     let record = get_capped(
         &testnet,
         &b_user,
@@ -1966,9 +2007,16 @@ async fn end_to_end() {
     // is open, and its agent leaves the common-format run directory.
     let c_projects = tempfile::tempdir().expect("temp dir");
     let c_project = c_projects.path().join("project");
-    sweepky(&c, &["init", c_project.to_str().expect("a UTF-8 path")])
-        .await
-        .expect("C's init");
+    sweepky(
+        &c,
+        &[
+            "init",
+            c_project.to_str().expect("a UTF-8 path"),
+            "--no-playbook",
+        ],
+    )
+    .await
+    .expect("C's init");
     c.cwd = c_project.clone();
     let c_sweep = SweepRef {
         sweeper: c_pubky,

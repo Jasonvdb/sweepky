@@ -69,8 +69,12 @@ pub struct Cli {
 /// `Debug` prints `[REDACTED]` in the token's place.
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Make DIR a sweeper project: create it, write the .sweepky marker
-    /// and a .gitignore that ignores sweeps/.
+    /// Make DIR a sweeper project: create it, write a .gitignore that
+    /// ignores sweeps/, the sandbox settings .claude/settings.json, a
+    /// CLAUDE.md for the agent and a copy of the /sweepky skill, install
+    /// Cloudflare's security-audit playbook at its pinned commit if you
+    /// agree, and last write the .sweepky marker, which names the playbook
+    /// when it was installed.
     //
     // `DIR`, not `<DIR>`: this text is both the `--help` line and rustdoc,
     // and rustdoc reads `<DIR>` as an unclosed HTML tag. clap's usage line
@@ -81,6 +85,20 @@ pub enum Command {
         // `PathBuf`, not `String`: clap reads it as an `OsString`, so a path
         // that is not valid UTF-8 is still accepted as the user typed it.
         dir: PathBuf,
+
+        /// Install the playbook without asking: `npx skills@1.7.2 add`
+        /// at the pinned commit, into .claude/skills/security-audit. Needs
+        /// Node and the network.
+        //
+        // `conflicts_with` makes clap refuse the two flags together, with
+        // its own usage error, before anything runs.
+        #[arg(long, conflicts_with = "no_playbook")]
+        install_playbook: bool,
+
+        /// Install no playbook, and never run npx. Without either flag,
+        /// init asks.
+        #[arg(long)]
+        no_playbook: bool,
     },
 
     /// Log in. Without --identity: through Pubky Ring, by approving the
@@ -393,7 +411,7 @@ mod tests {
             assert!(cli.testnet, "{args:?}");
             // `matches!` with a guard, because `Command` has no `==`.
             assert!(
-                matches!(&cli.command, Command::Init { dir } if dir == Path::new("d")),
+                matches!(&cli.command, Command::Init { dir, .. } if dir == Path::new("d")),
                 "{args:?}"
             );
         }
@@ -458,6 +476,28 @@ mod tests {
         }
         let cli = Cli::try_parse_from(["sweepky", "keys", "list"]).expect("parses");
         assert!(!cli.no_input);
+    }
+
+    #[test]
+    fn init_takes_one_playbook_flag_at_most() {
+        let flags = |cli: Cli| match cli.command {
+            Command::Init {
+                install_playbook,
+                no_playbook,
+                ..
+            } => (install_playbook, no_playbook),
+            other => panic!("not init: {other:?}"),
+        };
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(["sweepky", "init", "d"].iter().chain(args)).map(flags)
+        };
+        assert_eq!(parse(&[]).expect("parses"), (false, false));
+        assert_eq!(
+            parse(&["--install-playbook"]).expect("parses"),
+            (true, false)
+        );
+        assert_eq!(parse(&["--no-playbook"]).expect("parses"), (false, true));
+        assert!(parse(&["--install-playbook", "--no-playbook"]).is_err());
     }
 
     #[test]

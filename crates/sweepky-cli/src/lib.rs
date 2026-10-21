@@ -18,10 +18,15 @@
 //!   refuses a value it does not know instead of falling back to production.
 //! - [`CLIENT_ID`] and [`SWEEPKY_CAPABILITY`], the client id and the
 //!   capability Sweepky asks for when it signs in through a grant.
-//! - `init <dir>`, the first command: it creates the directory, the `.sweepky`
-//!   marker and a `.gitignore` with `sweeps/`. It needs no [`Context`], so
-//!   the binary runs it through [`run_without_context`] before it reads
-//!   HOME or the passphrase file or builds a network.
+//! - `init <dir>`, the first command: it creates the directory, a
+//!   `.gitignore` with `sweeps/`, the sandbox settings, a `CLAUDE.md` and a
+//!   copy of the `/sweepky` skill for Claude Code, installs the Cloudflare
+//!   playbook with `npx` when the sweeper agrees (`--install-playbook`,
+//!   `--no-playbook`, or a question), and writes the `.sweepky` marker,
+//!   which names the playbook it installed. It needs no [`Context`], only
+//!   standard input and standard error for its question, so the binary
+//!   runs it through [`run_without_context`] before it reads HOME or the
+//!   passphrase file or builds a network.
 //! - `clock::now()`, the current time for a record's time fields
 //!   (`createdAt`, `revokedAt`, ...), as RFC 3339 in UTC to the second, and
 //!   `clock::new_record_id()`, the id of a new bounty, sweep or device key.
@@ -554,24 +559,44 @@ impl Report {
 /// [`run`](fn@run).
 ///
 /// `init <dir>` is the one such command so far: it works only in the
-/// directory it is given. The binary calls this before it builds the
-/// context, so `init` runs with HOME unset and no SWEEPKY_HOME, never opens
+/// directory it is given, and asks its one question on `stdin` and
+/// `stderr`, which the caller builds and keeps (they are borrowed, so the
+/// binary can move them into its context afterwards for any other
+/// command). The binary calls this before it builds the context, so `init`
+/// runs with HOME unset and no SWEEPKY_HOME, never opens
 /// the `--passphrase-file` (it writes no secret file, so there is nothing to
 /// wrap), and never builds a Pubky client: a production client starts a DHT
 /// node that contacts public servers, which a local command has no reason
-/// to do. [`run`](fn@run) still runs `init` when given a context, so a caller that
-/// always builds one, such as the end-to-end test, can run every command
-/// through [`run`](fn@run) alone.
+/// to do. The playbook's `npx` inherits the process environment, which npm
+/// needs; `init` itself still reads none of it. [`run`](fn@run) still runs
+/// `init` when given a context, so a caller that always builds one, such
+/// as the end-to-end test, can run every command through [`run`](fn@run)
+/// alone.
 ///
 /// `Option<Result<…>>` keeps the two answers apart: `None` is "not one of
 /// mine, build the context and call [`run`](fn@run)", and `Some` carries the
 /// command's own success or failure.
-pub fn run_without_context(cli: &Cli) -> Option<anyhow::Result<Report>> {
+pub fn run_without_context(
+    cli: &Cli,
+    stdin: &StdinReader,
+    stderr: &StderrWriter,
+) -> Option<anyhow::Result<Report>> {
     // Every variant is named, with no `_` arm, so a command added later does
     // not compile until someone decides whether it needs the context.
     // Matching on `&cli.command` borrows it, so `dir` is a `&PathBuf`.
     match &cli.command {
-        Command::Init { dir } => Some(init::init(dir)),
+        Command::Init {
+            dir,
+            install_playbook,
+            no_playbook,
+        } => Some(run_init(
+            dir,
+            *install_playbook,
+            *no_playbook,
+            cli.no_input,
+            stdin,
+            stderr,
+        )),
         Command::Login { .. }
         | Command::Logout
         | Command::Keys { .. }
@@ -582,6 +607,25 @@ pub fn run_without_context(cli: &Cli) -> Option<anyhow::Result<Report>> {
         | Command::Pull
         | Command::Done { .. } => None,
     }
+}
+
+/// Runs `init` on `dir` with its two playbook flags, asking on `stdin` and
+/// `stderr` unless `no_input` (`--no-input`), with the real `npx`.
+fn run_init(
+    dir: &std::path::Path,
+    install_playbook: bool,
+    no_playbook: bool,
+    no_input: bool,
+    stdin: &StdinReader,
+    stderr: &StderrWriter,
+) -> anyhow::Result<Report> {
+    let terminal = prompt::Terminal {
+        stdin,
+        stderr,
+        prompting: prompt::Prompting::from_no_input_flag(no_input),
+    };
+    let choice = init::PlaybookChoice::from_flags(install_playbook, no_playbook);
+    init::init(dir, choice, terminal, &init::NpxRunner::system())
 }
 
 /// Runs one parsed command.
@@ -622,7 +666,18 @@ pub async fn run(cli: Cli, ctx: &Context) -> anyhow::Result<Report> {
         let _ = ctx.stderr.line(&format!("warning: {notice}"));
     }
     match cli.command {
-        Command::Init { dir } => init::init(&dir),
+        Command::Init {
+            dir,
+            install_playbook,
+            no_playbook,
+        } => run_init(
+            &dir,
+            install_playbook,
+            no_playbook,
+            cli.no_input,
+            &ctx.stdin,
+            &ctx.stderr,
+        ),
         Command::Login {
             identity,
             homeserver,
@@ -708,7 +763,7 @@ mod tests {
     use clap::Parser;
     use sweepky_core::DeviceIdentity;
 
-    use super::{Cli, Context, VERSION, run, run_without_context};
+    use super::{Cli, Context, StderrWriter, StdinReader, VERSION, run, run_without_context};
     use crate::clock;
     use crate::device::create_device_key;
     use crate::ring::ExpiryNotice;
@@ -807,6 +862,11 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// A standard input that has nothing to give.
+    fn no_answers() -> StdinReader {
+        StdinReader::new(io::empty())
+    }
+
     #[test]
     fn init_runs_with_no_context() {
         // `run_without_context` is given the parsed arguments and nothing
@@ -823,10 +883,11 @@ mod tests {
             missing.as_os_str(),
             OsStr::new("init"),
             dir.as_os_str(),
+            OsStr::new("--no-playbook"),
         ])
         .expect("parses");
 
-        let report = run_without_context(&cli)
+        let report = run_without_context(&cli, &no_answers(), &StderrWriter::new(io::sink()))
             .expect("init needs no context")
             .expect("init succeeds");
 
@@ -892,7 +953,11 @@ mod tests {
                         .chain(flag),
                 )
                 .expect("parses");
-                assert!(run_without_context(&cli).is_none(), "{args:?} {flag:?}");
+                let stderr = StderrWriter::new(io::sink());
+                assert!(
+                    run_without_context(&cli, &no_answers(), &stderr).is_none(),
+                    "{args:?} {flag:?}"
+                );
             }
         }
     }

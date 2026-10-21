@@ -10,10 +10,14 @@
 //! - [`Prompting`] is what the global `--no-input` flag says. `run` hands it
 //!   to each command that asks, and under it [`confirm`] fails at once and
 //!   reads nothing.
+//! - [`Terminal`] is the same question without a [`Context`]: the standard
+//!   input, standard error and [`Prompting`] alone. `init` asks through it,
+//!   because the binary runs `init` before it builds a context.
 //!
-//! `post` and, later in P2b, `submit` are the commands that ask: `post`
-//! before it publishes a bounty's title and brief, and `submit` before it
-//! encrypts to keys the owner added since the last submit.
+//! `post`, `submit`, `done` and `init` are the commands that ask: `post`
+//! before it publishes a bounty's title and brief, `submit` before it
+//! encrypts to keys the owner added since the last submit, `done` before it
+//! publishes credits, and `init` before it installs the playbook with `npx`.
 //!
 //! **Bounded reads.** Standard input can be a pipe from anything, so an
 //! answer is never read with an unbounded `read_line`, which would buffer a
@@ -25,7 +29,7 @@ use std::sync::{Mutex, PoisonError};
 
 use anyhow::{Context as _, bail};
 
-use crate::Context;
+use crate::{Context, StderrWriter};
 
 /// The most an answer may take, its line ending included: 1 KiB, far more
 /// than `yes\r\n` and still a cap on what is read from a pipe.
@@ -69,17 +73,44 @@ impl Prompting {
 /// It blocks the thread until a line comes, which is what a command waiting
 /// on a person should do.
 pub(crate) fn confirm(ctx: &Context, prompting: Prompting, question: &str) -> anyhow::Result<bool> {
-    if prompting == Prompting::Forbidden {
-        bail!(
-            "--no-input was given, so Sweepky cannot ask \"{question}\"; run the command again \
-             without --no-input to answer"
-        );
+    Terminal {
+        stdin: &ctx.stdin,
+        stderr: &ctx.stderr,
+        prompting,
     }
-    // Flushed, so the question is on screen before the read waits for the
-    // answer.
-    ctx.stderr.write_flushed(&format!("{question} [y/N] "))?;
-    let line = ctx.stdin.read_answer()?;
-    Ok(is_yes(&line))
+    .confirm(question)
+}
+
+/// Where a question is asked and answered, without the rest of a
+/// [`Context`]: what `init` gets, since the binary runs it before it builds
+/// one (see `run_without_context`).
+///
+/// It only borrows the reader and the writer (`&'a`), so whoever owns them,
+/// `main.rs` or a context, keeps them; `'a` says the `Terminal` cannot
+/// outlive them. `Copy`, because it is three small values.
+#[derive(Clone, Copy)]
+pub(crate) struct Terminal<'a> {
+    pub(crate) stdin: &'a StdinReader,
+    pub(crate) stderr: &'a StderrWriter,
+    pub(crate) prompting: Prompting,
+}
+
+impl Terminal<'_> {
+    /// [`confirm`]'s question and rules, on this standard input and
+    /// standard error.
+    pub(crate) fn confirm(&self, question: &str) -> anyhow::Result<bool> {
+        if self.prompting == Prompting::Forbidden {
+            bail!(
+                "--no-input was given, so Sweepky cannot ask \"{question}\"; run the command \
+                 again without --no-input to answer"
+            );
+        }
+        // Flushed, so the question is on screen before the read waits for
+        // the answer.
+        self.stderr.write_flushed(&format!("{question} [y/N] "))?;
+        let line = self.stdin.read_answer()?;
+        Ok(is_yes(&line))
+    }
 }
 
 /// Whether `line` says yes: `y` or `yes` in any case once one `\n` or

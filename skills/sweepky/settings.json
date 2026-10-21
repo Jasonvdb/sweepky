@@ -1,0 +1,13 @@
+{
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "allowUnsandboxedCommands": false,
+    "filesystem": { "denyRead": ["~/.config/sweepky", "~/.local/share/sweepky"] }
+  },
+  "permissions": {
+    "blockReadsOutsideWorkingDirectories": true,
+    "deny": ["WebFetch", "WebFetch(domain:*)", "WebSearch", "mcp__*", "Artifact"]
+  },
+  "claudeMdExcludes": ["<absolute init dir>/sweeps/**/target/**"]
+}

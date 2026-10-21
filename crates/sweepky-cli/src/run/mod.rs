@@ -19,6 +19,9 @@
 //!    error. The git runner is made, and the sweep's id, and
 //!    `fetch::check_sweep_dir` checks that `./sweeps/<id>/` can be made,
 //!    and `sweep_state` that no snapshot of a fetch is there for that id.
+//!    Then standard error says which playbook the record will name and
+//!    where it came from, and warns when the project has no sandbox
+//!    settings (`before_publishing`).
 //! 2. **Publish `running`.** `sweeps/<id>.json`, under the writers' lock
 //!    with a fresh session, ended again at once (an identity's signed out,
 //!    a Ring one only dropped)
@@ -52,7 +55,8 @@
 //! **The playbook.** The record's `playbook` is the one the project's
 //! `init` recorded or, when there is none, as with every P2a `init`, the
 //! placeholder [`UNSPECIFIED_PLAYBOOK`]: core's `Sweep` needs one, and
-//! `submit --playbook` replaces it.
+//! `submit --playbook` replaces it. The marker is agent-writable, so the
+//! value is shown, sanitised, before the record is published.
 //!
 //! The parts:
 //!
@@ -101,6 +105,7 @@ mod select;
 // `strip` takes out of a target, with the same check.
 pub(crate) mod strip;
 
+use std::fs;
 use std::path::Path;
 
 use anyhow::{Context as _, bail};
@@ -118,16 +123,16 @@ use crate::circle::parse_pubky;
 use crate::display::sanitize;
 use crate::git::RunGit;
 use crate::identity::refuse_secret_material;
-use crate::init::{ProjectMarker, read_project_marker};
+use crate::init::{MARKER, ProjectMarker, read_project_marker};
 use crate::own_storage::{OwnStorage, SessionStorage};
-use crate::post::draft::{MAX_FOCUS_CHARS, MAX_TITLE_CHARS};
+use crate::post::draft::{MAX_FOCUS_CHARS, MAX_PLAYBOOK_CHARS, MAX_TITLE_CHARS};
 use crate::records::{PublicRecordReader, PublicRecords};
 use crate::remote::{public_key_of, write_error};
 use crate::session::{NOT_LOGGED_IN, with_writer_session};
 use crate::state::read_login_state;
 use crate::sweep_state::{SweepSnapshot, forget_snapshot, refuse_existing_snapshot};
 use crate::targets::TargetResolver;
-use crate::{Context, Dirs, Report, clock};
+use crate::{Context, Dirs, Report, StderrWriter, clock};
 
 /// What `run` says when it is given `--target` and no bounty URL.
 const TARGET_NEEDS_URL: &str = "--target names a target of one bounty, so it needs that \
@@ -138,6 +143,17 @@ const TARGET_NEEDS_URL: &str = "--target names a target of one bounty, so it nee
 /// 01's pattern, and `submit --playbook` replaces it (`submit` refuses a
 /// record that still names it without the flag).
 pub(crate) const UNSPECIFIED_PLAYBOOK: &str = "unspecified";
+
+/// The sandbox settings `init` writes, as a path relative to the project.
+const SANDBOX_SETTINGS: &str = ".claude/settings.json";
+
+/// What `run` warns of, before it publishes, in a project without
+/// [`SANDBOX_SETTINGS`] of its own. It does not refuse: the agent runs
+/// later, in a session `run` does not start.
+const NO_SANDBOX_SETTINGS: &str = "warning: this project has no .claude/settings.json of its own \
+                                   (a regular file, not a link), so Claude Code would run here \
+                                   without Sweepky's sandbox; run `sweepky init` on a new \
+                                   directory and sweep there\n";
 
 /// What the error says, in front of the failure, once the record says
 /// `aborted`.
@@ -222,7 +238,7 @@ pub(crate) async fn run(
         ctx,
         sweeper: request.sweeper,
     };
-    let fetched = start_sweep(&publisher, &git, &ctx.targets, &new).await?;
+    let fetched = start_sweep(&publisher, &git, &ctx.targets, &new, &ctx.stderr).await?;
     Ok(Report::new(started_report(&new, &fetched)))
 }
 
@@ -306,8 +322,9 @@ pub(crate) async fn put_record(
 }
 
 /// Starts `new`: checks that its directory can be made and that no
-/// snapshot is there for its id, publishes it as `running` through
-/// `publisher`, then, outside any lock, fetches its targets through `git`
+/// snapshot is there for its id, says on `stderr` what the record will name
+/// as its playbook ([`before_publishing`]), publishes it as `running`
+/// through `publisher`, then, outside any lock, fetches its targets through `git`
 /// and `source` and writes its marker and its snapshot, last. If a step
 /// after the running write fails, the sweep directory and the snapshot are
 /// gone and the record is flipped to `aborted` ([`abort`]).
@@ -316,10 +333,12 @@ async fn start_sweep(
     git: &impl RunGit,
     source: &impl TargetResolver,
     new: &NewSweep<'_>,
+    stderr: &StderrWriter,
 ) -> anyhow::Result<FetchedSweep> {
     check_sweep_dir(new.project, new.sweep.id)?;
     refuse_existing_snapshot(new.dirs, &new.sweep.id)?;
     let running = running_record(new, clock::now()?)?;
+    stderr.write_flushed(&before_publishing(new))?;
     let path = paths::sweep_record(new.sweep.id);
     publisher
         .publish(&path, record_bytes(&running)?)
@@ -336,6 +355,52 @@ async fn start_sweep(
             Err(abort(publisher, &path, running, failure).await)
         }
     }
+}
+
+/// What `run` says on standard error just before it publishes `new` as
+/// `running`: the playbook the record will name and where it came from,
+/// then [`NO_SANDBOX_SETTINGS`] if the project lacks them.
+///
+/// The playbook is read from the project's `.sweepky` marker, which any
+/// agent session in the project can rewrite, so it is agent input. It is
+/// shown, not asked about: core's `Playbook` pattern already limits it to a
+/// short label, the sweeper sees it before it is public, and
+/// `submit --playbook` replaces it. It still goes through the sanitiser, as
+/// everything read from a file an agent could write does, so a later change
+/// to the pattern cannot reach the terminal unchecked.
+fn before_publishing(new: &NewSweep<'_>) -> String {
+    let mut text = playbook_line(new.playbook);
+    if !has_sandbox_settings(new.project) {
+        text.push_str(NO_SANDBOX_SETTINGS);
+    }
+    text
+}
+
+/// The line on the playbook the record will name, `playbook` from the
+/// marker or, without one, the placeholder.
+fn playbook_line(playbook: Option<&Playbook>) -> String {
+    match playbook {
+        Some(playbook) => format!(
+            "The sweep record will name the playbook {}, read from this project's {MARKER} \
+             marker. An agent here can rewrite that file, so check it is yours; `sweepky submit \
+             --playbook <name>` replaces it.\n",
+            sanitize(playbook.as_str(), MAX_PLAYBOOK_CHARS)
+        ),
+        None => format!(
+            "This project's {MARKER} marker names no playbook, so the sweep record will say \
+             {UNSPECIFIED_PLAYBOOK} until `sweepky submit --playbook <name>` sets it.\n"
+        ),
+    }
+}
+
+/// Whether `project` has [`SANDBOX_SETTINGS`] as a regular file, looked at
+/// with `lstat` (`fs::symlink_metadata`), which describes a link rather
+/// than follow it: `init` never writes a link there, so one is not its
+/// settings. Any error, a missing file included, counts as no settings,
+/// since the answer only decides a warning. Nothing is read from the file.
+fn has_sandbox_settings(project: &Path) -> bool {
+    // `is_ok_and` is true only for an `Ok` whose value passes the test.
+    fs::symlink_metadata(project.join(SANDBOX_SETTINGS)).is_ok_and(|meta| meta.is_file())
 }
 
 /// The record `run` publishes for `new` before it fetches anything:
@@ -677,24 +742,24 @@ mod tests {
     use super::select::Acceptance;
     use super::{
         ABORTED, CheckedBounty, NOT_ABORTED, NewSweep, PublishRecord, RunRequest, TARGET_NEEDS_URL,
-        abort, check_bounty, parse_bounty_url, put_record, record_bytes, require_project, run,
-        running_record, start_sweep,
+        UNSPECIFIED_PLAYBOOK, abort, check_bounty, parse_bounty_url, put_record, record_bytes,
+        require_project, run, running_record, start_sweep,
     };
-    use crate::Dirs;
     use crate::git::{GitCommand, GitRunner, RunGit};
     use crate::identity::Refusal;
-    use crate::init::{self, MARKER};
+    use crate::init::{self, MARKER, PLAYBOOK_COMMIT};
     use crate::own_storage::OwnStorage;
     use crate::private_fs::{ensure_private_dir, write_private_file};
     use crate::remote::{QUOTA_FULL, WRITE_FORBIDDEN};
     use crate::sweep_state::read_snapshot;
     use crate::targets::{TargetResolver, TargetSource};
     use crate::test_support::{
-        FakeOwnStorage, FakePublicRecords, PLANTED, RecordingGit, SYNTHETIC_SHA, bounty_id,
-        bounty_json, circle_json, dirs_in, fixture_repo, fixture_targets, json_bytes, mode,
-        offline_network, private_temp, random_pubky, recorded_fixture_shas, repo_target_json,
+        FakeOwnStorage, FakePublicRecords, PLANTED, RecordingGit, SYNTHETIC_SHA, SharedBuffer,
+        bounty_id, bounty_json, circle_json, dirs_in, fixture_repo, fixture_targets, json_bytes,
+        mode, offline_network, private_temp, random_pubky, recorded_fixture_shas, repo_target_json,
         sweep_json, test_context, test_git_env,
     };
+    use crate::{Dirs, StderrWriter};
 
     #[test]
     fn run_needs_an_init_project_in_the_working_directory() {
@@ -702,7 +767,7 @@ mod tests {
 
         // A P2a project passes, read through init's own reader.
         let project = temp.path().join("project");
-        init::init(&project).expect("init");
+        init::init_without_playbook(&project).expect("init");
         let marker = require_project(&project).expect("an init project");
         assert_eq!(marker.playbook(), None);
 
@@ -1091,13 +1156,21 @@ mod tests {
     async fn running_is_published_before_git_runs_and_the_marker_written_after_the_fetch() {
         let shas = recorded_fixture_shas();
         let checked = fixture_bounty(json!([commit_target(shas["M"].as_str())])).await;
-        let playbook: Playbook = PLAYBOOK.parse().expect("a playbook");
+        // A project whose `init` installed the playbook (with a stand-in
+        // for npx): the playbook comes from its marker, as `run` reads it.
         let project = private_temp();
+        init::init_with_fake_playbook(project.path()).expect("init");
+        let marker = require_project(project.path()).expect("an init project");
+        let playbook = marker.playbook().expect("init recorded the playbook");
+        assert_eq!(
+            playbook.as_str(),
+            format!("cloudflare/security-audit@{PLAYBOOK_COMMIT}")
+        );
         // Declared before the runner, so the runner, whose private HOME is
         // under it, is dropped first.
         let home = private_temp();
         let dirs = dirs_in(&home);
-        let new = new_sweep(project.path(), &dirs, &checked, Some(&playbook));
+        let new = new_sweep(project.path(), &dirs, &checked, Some(playbook));
         let path = paths::sweep_record(new.sweep.id);
         let sweep_dir = project.path().join("sweeps").join(new.sweep.id.to_string());
         let source = TargetSource::Fixture(fixture_targets());
@@ -1109,7 +1182,7 @@ mod tests {
             seen: Mutex::default(),
         };
 
-        let fetched = start_sweep(&storage, &git, &source, &new)
+        let fetched = start_sweep(&storage, &git, &source, &new, &quiet())
             .await
             .unwrap_or_else(|error| panic!("{error:#}"));
 
@@ -1123,7 +1196,7 @@ mod tests {
         let record = Sweep::from_json(&stored).expect("a sweep record");
         assert_eq!(record.status.as_known(), Some(KnownSweepStatus::Running));
         assert_eq!(record.bounty, checked.bounty_ref);
-        assert_eq!(record.playbook, playbook);
+        assert_eq!(&record.playbook, playbook);
         // The marker, after the fetch, names the sweep and the record's
         // bounty and targets.
         let marker: Value =
@@ -1132,7 +1205,7 @@ mod tests {
         assert_eq!(marker["sweep"], new.sweep.to_string());
         assert_eq!(marker["bounty"], checked.bounty_ref.to_string());
         assert_eq!(marker["targets"], json!(["t1"]));
-        assert_eq!(marker["playbook"], PLAYBOOK);
+        assert_eq!(marker["playbook"], playbook.as_str());
         assert_eq!(fetched.targets.len(), 1);
         // The snapshot, 0600 under the data directory, out of the agent's
         // reach: t1 at the commit checked out, M, while the bounty agrees.
@@ -1166,7 +1239,7 @@ mod tests {
         let storage = FakeOwnStorage::default();
         let git = RecordingGit::succeeding(source.protocols(), b"");
 
-        let error = start_sweep(&storage, &git, &source, &new)
+        let error = start_sweep(&storage, &git, &source, &new, &quiet())
             .await
             .expect_err("refused");
 
@@ -1214,7 +1287,7 @@ mod tests {
         };
         let storage = FakeOwnStorage::default();
 
-        let error = start_sweep(&storage, &git, &source, &new)
+        let error = start_sweep(&storage, &git, &source, &new, &quiet())
             .await
             .expect_err("not placed");
 
@@ -1241,7 +1314,7 @@ mod tests {
         let storage = FakeOwnStorage::refusing(&path, StatusCode::FORBIDDEN, SERVER_TEXT);
         let git = RecordingGit::succeeding(source.protocols(), b"");
 
-        let error = start_sweep(&storage, &git, &source, &new)
+        let error = start_sweep(&storage, &git, &source, &new, &quiet())
             .await
             .expect_err("refused");
 
@@ -1267,7 +1340,7 @@ mod tests {
         let git = source.git_runner(&dirs, &test_git_env()).expect("a runner");
         let storage = FakeOwnStorage::default();
 
-        let error = start_sweep(&storage, &git, &source, &new)
+        let error = start_sweep(&storage, &git, &source, &new, &quiet())
             .await
             .expect_err("not served");
 
@@ -1316,6 +1389,108 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // What `run` shows before the running record is published.
+
+    /// Standard error for a test that does not read it.
+    fn quiet() -> StderrWriter {
+        StderrWriter::new(io::sink())
+    }
+
+    /// A publisher that notes what standard error held when it was asked
+    /// to write, then refuses, so `start_sweep` stops at its first write
+    /// and runs no git.
+    struct WatchedPublisher {
+        said: SharedBuffer,
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl PublishRecord for WatchedPublisher {
+        async fn publish(&self, _path: &str, _record: Vec<u8>) -> anyhow::Result<()> {
+            self.seen.lock().expect("lock").push(self.said.text());
+            Err(anyhow!("refused by the test"))
+        }
+    }
+
+    /// What standard error held when `start_sweep` asked to publish the
+    /// running record of a sweep in `project`, the only write it asked for.
+    async fn said_before_publishing(project: &Path) -> String {
+        let checked = fixture_bounty(json!([commit_target(SYNTHETIC_SHA)])).await;
+        let marker = require_project(project).expect("an init project");
+        let home = private_temp();
+        let dirs = dirs_in(&home);
+        let new = new_sweep(project, &dirs, &checked, marker.playbook());
+        let source = TargetSource::Fixture(fixture_targets());
+        let git = RecordingGit::succeeding(source.protocols(), b"");
+        let said = SharedBuffer::default();
+        let publisher = WatchedPublisher {
+            said: said.clone(),
+            seen: Mutex::default(),
+        };
+
+        start_sweep(&publisher, &git, &source, &new, &StderrWriter::new(said))
+            .await
+            .expect_err("the test's publisher refuses");
+
+        assert_eq!(git.argv(), Vec::<Vec<String>>::new());
+        let mut seen = publisher.seen.into_inner().expect("lock");
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        seen.remove(0)
+    }
+
+    #[tokio::test]
+    async fn the_marker_s_playbook_and_its_source_are_shown_before_the_running_record() {
+        let project = private_temp();
+        init::init_with_fake_playbook(project.path()).expect("init");
+
+        let said = said_before_publishing(project.path()).await;
+
+        let playbook = format!("cloudflare/security-audit@{PLAYBOOK_COMMIT}");
+        assert!(said.contains(&playbook), "{said}");
+        assert!(said.contains(MARKER), "{said}");
+        assert!(said.contains("submit --playbook"), "{said}");
+        // `init` wrote the sandbox settings, so there is no warning.
+        assert!(!said.contains("warning"), "{said}");
+    }
+
+    #[tokio::test]
+    async fn no_playbook_in_the_marker_is_shown_as_unspecified_and_how_to_set_it() {
+        let project = private_temp();
+        init::init_without_playbook(project.path()).expect("init");
+
+        let said = said_before_publishing(project.path()).await;
+
+        assert!(said.contains(UNSPECIFIED_PLAYBOOK), "{said}");
+        assert!(said.contains(MARKER), "{said}");
+        assert!(said.contains("submit --playbook"), "{said}");
+        assert!(!said.contains("warning"), "{said}");
+    }
+
+    #[tokio::test]
+    async fn a_project_without_its_own_sandbox_settings_is_warned_of_and_still_run() {
+        // Missing, and a link to `init`'s own valid settings, which lstat
+        // sees as a link: both warned of, and neither stops the run before
+        // its write.
+        let missing = private_temp();
+        init::init_without_playbook(missing.path()).expect("init");
+        fs::remove_file(missing.path().join(".claude/settings.json")).expect("rm");
+        let linked = private_temp();
+        init::init_without_playbook(linked.path()).expect("init");
+        let settings = linked.path().join(".claude/settings.json");
+        let elsewhere = linked.path().join("settings.json");
+        fs::rename(&settings, &elsewhere).expect("mv");
+        symlink(&elsewhere, &settings).expect("symlink");
+
+        for project in [missing.path(), linked.path()] {
+            let said = said_before_publishing(project).await;
+
+            assert!(said.contains("warning"), "{said}");
+            assert!(said.contains(".claude/settings.json"), "{said}");
+            assert!(said.contains("sandbox"), "{said}");
+            assert!(said.contains("sweepky init"), "{said}");
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // No URL: picking from the circle.
 
     #[tokio::test]
@@ -1323,7 +1498,7 @@ mod tests {
         let home = private_temp();
         let (mut ctx, _stderr) = test_context(offline_network(), &home, io::empty());
         let project = home.path().join("project");
-        init::init(&project).expect("init");
+        init::init_without_playbook(&project).expect("init");
         ctx.cwd = project;
 
         // Refused before anything is read, and the flag is not quoted.

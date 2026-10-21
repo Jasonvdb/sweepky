@@ -38,9 +38,10 @@
 //! sweep is done. Exactly one is picked; none, or several, is an error that
 //! lists the ids. The stamp is agent-writable too, so it only narrows the
 //! pick: a stamp the agent deleted lets an old sweep be picked again, and
-//! the command's check of the sweep record, which then reads `done`,
-//! refuses it. [`SweepDir::stamp_submitted`] writes it, through the
-//! directory's open handle, never through a link.
+//! the command refuses it, since `submit` moved its `audit/` out once its
+//! record was final (`move_out`), and the record reads `done` anyway.
+//! [`SweepDir::stamp_submitted`] writes it, through the directory's open
+//! handle, never through a link.
 
 use std::ffi::{CStr, CString, OsStr};
 use std::fs;

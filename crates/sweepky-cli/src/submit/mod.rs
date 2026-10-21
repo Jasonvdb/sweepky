@@ -50,27 +50,35 @@
 //!    `running`, the snapshot stays for the next try.
 //! 8. **The stamp** `.sweepky/submitted`, after the lock, so that picking
 //!    without `--run-dir` passes this sweep over.
+//! 9. **`audit/` moves out of the project** (`move_out`) to
+//!    `<data dir>/submitted/<id>/audit/`, where no agent session reads it,
+//!    once the record is final: after the stamp when it says `done`, and
+//!    also when a refused upload has flipped it to `aborted`. A sweep
+//!    directory whose `audit/` was moved out is refused before the walk.
 //!
 //! **What a failure leaves.** Every step before 7, and a retryable
 //! failure in it (the sign-in, a network error, a 429), changes nothing in
-//! public: the record still says `running`, and `submit` can be run again.
-//! A homeserver that refuses the package itself (413, 507 or any other
-//! non-2xx) flips the record to `aborted`, which is final: 01's polling
-//! re-fetches only `running` sweeps and 04 shows an aborted one struck,
-//! so a new `run` is the retry.
+//! public: the record still says `running`, and `submit` can be run again,
+//! so `audit/` stays in the project, readable by later agent sessions
+//! there, which the error says. A homeserver that refuses the package
+//! itself (413, 507 or any other non-2xx) flips the record to `aborted`,
+//! which is final: 01's polling re-fetches only `running` sweeps and 04
+//! shows an aborted one struck, so a new `run` is the retry.
 //!
 //! **What is printed.** Paths in the sweep directory, sanitised, counts,
 //! checked values (ids, keys, URLs) and fixed text: never a byte of a
 //! finding or an attachment, never a package, and never a server's words.
 
 mod manifest;
+mod move_out;
 mod owner_keys;
 mod sweep_dir;
 // `pub(crate)`: `run` places a sweep with the walk's handle calls too.
 pub(crate) mod walk;
 
+use std::fmt;
 use std::iter;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, bail};
 use pubky::StatusCode;
@@ -82,6 +90,7 @@ use sweepky_core::{
 };
 
 use self::manifest::{build_manifest, final_playbook, require_running};
+use self::move_out::{move_audit_out, refuse_moved_out};
 use self::owner_keys::{AcceptedKeys, accept_owner_keys};
 use self::sweep_dir::{SweepDir, find_sweep_dir};
 use self::walk::{AuditFiles, read_audit};
@@ -107,15 +116,47 @@ const NOT_CONFIRMED: &str = "Not confirmed, so nothing was encrypted or uploaded
 const ABORTED: &str = "submit stopped, and the sweep's public record now says aborted, which is \
                        final: start a new sweep of the bounty with `sweepky run`";
 
+/// [`ABORTED`] as a type of its own, the context a refused upload's error
+/// carries once the flip to `aborted` is written. `submit_through` finds it
+/// with `downcast_ref`, which matches by type, so whether the record is
+/// final never depends on how a message is worded.
+#[derive(Debug)]
+struct Aborted;
+
+impl fmt::Display for Aborted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(ABORTED)
+    }
+}
+
+/// The sentence every error that leaves the record `running` ends with.
+/// A macro, not a `const`, because `concat!` below joins literals only, and
+/// a macro call that expands to a literal counts as one.
+macro_rules! audit_stays {
+    () => {
+        "; until a submit finishes, its audit/ stays in the project, where later agent sessions \
+         there can read it"
+    };
+}
+
+/// [`audit_stays!`]'s sentence, for the tests to look for.
+#[cfg(test)]
+const AUDIT_STAYS: &str = audit_stays!();
+
 /// What the error says, in front of the failure, when the record could not
 /// be flipped to `aborted` either.
-const NOT_ABORTED: &str = "submit stopped, but the sweep's public record could not be changed to \
-                           aborted and still says running";
+const NOT_ABORTED: &str = concat!(
+    "submit stopped, but the sweep's public record could not be changed to aborted and still \
+     says running",
+    audit_stays!()
+);
 
 /// What the error says, in front of a failure that changed nothing in
 /// public: the record still says `running`, so `submit` can be run again.
-const STILL_RUNNING: &str = "submit stopped, and the sweep's public record still says running, \
-                             so run submit again";
+const STILL_RUNNING: &str = concat!(
+    "submit stopped, and the sweep's public record still says running, so run submit again",
+    audit_stays!()
+);
 
 /// What the write under the lock refuses when `login.json` names another
 /// pubky than the one the sweep directory was checked for.
@@ -202,7 +243,8 @@ async fn submit_through(
 ) -> anyhow::Result<Report> {
     // Taking the struct apart moves its two fields out, so the files can
     // move into the package below while the directory stays here.
-    let CollectedSweep { dir, audit } = collect_sweep(&ctx.cwd, request.run_dir, &request.sweeper)?;
+    let CollectedSweep { dir, audit } =
+        collect_sweep(&ctx.cwd, request.run_dir, &request.sweeper, &ctx.dirs)?;
     let sweep = dir.sweep();
     let (record, bounty) = read_records(ctx, records, sweep).await?;
     let playbook = final_playbook(request.playbook.as_ref(), &record)?;
@@ -231,7 +273,7 @@ async fn submit_through(
     // as it is sealed, rather than kept through the uploads.
     drop(built);
     let sealed_len = ciphertext.len();
-    finisher
+    let finished = finisher
         .finish(Upload {
             sweep,
             read: &record,
@@ -241,14 +283,45 @@ async fn submit_through(
             keys: &accepted,
             dirs: &ctx.dirs,
         })
-        .await?;
+        .await;
+    if let Err(error) = finished {
+        // Only an `aborted` record is final; any other failure leaves it
+        // `running`, and a retry needs `audit/` where it is.
+        if error.downcast_ref::<Aborted>().is_some()
+            && let Some(moved) = move_out(ctx, &dir)
+        {
+            let _ = ctx.stderr.line(&format!(
+                "audit/ was moved out of the project to {}",
+                moved.display()
+            ));
+        }
+        return Err(error);
+    }
     stamp(ctx, &dir);
+    let moved = move_out(ctx, &dir);
     Ok(Report::new(submitted_report(
         sweep,
         sealed_len,
         accepted.keys().len(),
         &playbook,
+        moved.as_deref(),
     )))
+}
+
+/// Moves `dir`'s `audit/` out of the project, step 9 of the module docs,
+/// and gives where it now is. A failure is a warning, never an error, as
+/// for the stamp: the record is final by then.
+fn move_out(ctx: &Context, dir: &SweepDir) -> Option<PathBuf> {
+    match move_audit_out(dir, &ctx.dirs) {
+        Ok(moved) => Some(moved),
+        Err(error) => {
+            // Every message of `move_out` is fixed text and paths.
+            let _ = ctx.stderr.line(&format!(
+                "warning: the sweep's record is final, but {error:#}"
+            ));
+            None
+        }
+    }
 }
 
 /// Stamps `dir` as submitted, step 8 of the module docs. A failure is a
@@ -278,15 +351,18 @@ struct CollectedSweep {
 
 /// Finds and checks the sweep directory `run_dir` names, relative to `cwd`
 /// (without it, the one sweep waiting in the project at `cwd`), for
-/// `sweeper`, this login's pubky, then walks it and reads `audit/`'s files.
+/// `sweeper`, this login's pubky, refuses it when `submit` moved its
+/// `audit/` under `dirs` already, then walks it and reads `audit/`'s files.
 /// See the module docs; any refusal names the entry, sanitised, and quotes
 /// no file.
 fn collect_sweep(
     cwd: &Path,
     run_dir: Option<&Path>,
     sweeper: &Pubky,
+    dirs: &Dirs,
 ) -> anyhow::Result<CollectedSweep> {
     let dir = find_sweep_dir(cwd, run_dir, sweeper)?;
+    refuse_moved_out(dirs, &dir.sweep().id)?;
     let audit = read_audit(&dir)?;
     Ok(CollectedSweep { dir, audit })
 }
@@ -577,7 +653,7 @@ async fn abort_upload(
     match flipped {
         Ok(()) => {
             forget_snapshot(dirs, id);
-            failure.context(ABORTED)
+            failure.context(Aborted)
         }
         // `{:#}` writes the flip's whole chain of context on one line.
         Err(flip) => failure.context(format!("{NOT_ABORTED} ({flip:#})")),
@@ -602,20 +678,29 @@ fn finished_record(
     record
 }
 
-/// What `submit` reports once the sweep is done: checked values and
-/// counts alone.
+/// What `submit` reports once the sweep is done: checked values, counts,
+/// and where `audit/` was moved, if it was (`moved`; a warning said why
+/// not).
 fn submitted_report(
     sweep: SweepRef,
     sealed_len: usize,
     owner_keys: usize,
     playbook: &Playbook,
+    moved: Option<&Path>,
 ) -> String {
-    format!(
+    let mut report = format!(
         "Submitted the sweep {sweep}.\nUploaded sweeps/{}.age ({sealed_len} bytes), encrypted to \
          {owner_keys} key(s) of the bounty's owner and this install's own, and the record now \
          says done, with the playbook {playbook}.\n",
         sweep.id
-    )
+    );
+    if let Some(moved) = moved {
+        report.push_str(&format!(
+            "Moved audit/ out of the project to {}, where agent sessions cannot read it.\n",
+            moved.display()
+        ));
+    }
+    report
 }
 
 /// An `init` project with a whole sweep directory in it, as `run` leaves
@@ -669,7 +754,7 @@ mod fixture {
 
         fn make(root: &Path, name: &str, sweeper: Pubky, id: RecordId) -> Self {
             let project = root.join(name);
-            crate::init::init(&project).expect("init");
+            crate::init::init_without_playbook(&project).expect("init");
             let fixture = Self {
                 root: root.to_owned(),
                 project,
@@ -799,14 +884,15 @@ mod tests {
 
     use super::collect_sweep;
     use super::fixture::{ConfigDir, SweepFixture};
-    use crate::test_support::PLANTED;
+    use crate::test_support::{PLANTED, dirs_in, private_temp};
 
     #[test]
     fn a_whole_sweep_directory_is_collected_with_or_without_run_dir() {
         let fixture = SweepFixture::new();
+        let dirs = dirs_in(&private_temp());
         let run_dir = PathBuf::from(format!("sweeps/{}", fixture.id()));
         for run_dir in [Some(run_dir.as_path()), None] {
-            let collected = collect_sweep(fixture.project(), run_dir, &fixture.sweeper())
+            let collected = collect_sweep(fixture.project(), run_dir, &fixture.sweeper(), &dirs)
                 .unwrap_or_else(|err| panic!("refused: {err:#}"));
             assert_eq!(
                 collected.dir.sweep(),
@@ -843,10 +929,12 @@ mod tests {
             .expect("planted");
             let run_dir = PathBuf::from(format!("sweeps/{}", fixture.id()));
 
-            let err = match collect_sweep(fixture.project(), Some(&run_dir), &fixture.sweeper()) {
-                Ok(_) => panic!("{what}: accepted"),
-                Err(err) => format!("{err:#}"),
-            };
+            let dirs = dirs_in(&private_temp());
+            let err =
+                match collect_sweep(fixture.project(), Some(&run_dir), &fixture.sweeper(), &dirs) {
+                    Ok(_) => panic!("{what}: accepted"),
+                    Err(err) => format!("{err:#}"),
+                };
 
             assert!(err.contains("audit/device.key"), "{what}: {err}");
             assert!(err.contains(what), "{what}: {err}");
@@ -873,11 +961,11 @@ mod command_tests {
     use tempfile::TempDir;
 
     use super::fixture::SweepFixture;
-    use super::manifest::{ABORTED_IS_FINAL, TARGETS_CHANGED};
+    use super::manifest::TARGETS_CHANGED;
     use super::owner_keys::accept_owner_keys;
     use super::{
-        ABORTED, FinishSweep, NOT_ABORTED, NOT_CONFIRMED, STILL_RUNNING, SubmitRequest, Upload,
-        finish_sweep, parse_playbook_flag, submit_through,
+        ABORTED, AUDIT_STAYS, FinishSweep, NOT_ABORTED, NOT_CONFIRMED, STILL_RUNNING,
+        SubmitRequest, Upload, finish_sweep, parse_playbook_flag, submit_through,
     };
     use crate::Report;
     use crate::device::{create_device_key, device_key_bytes, device_key_record};
@@ -892,8 +980,8 @@ mod command_tests {
     use crate::sweep_state::NO_SNAPSHOT;
     use crate::test_support::{
         FakeKeyStore, FakeOwnStorage, FakePublicRecords, SYNTHETIC_HEAD, SYNTHETIC_SHA, bounty_id,
-        bounty_json, bounty_of, dirs_in, json_bytes, offline_network, pr_target_json, private_temp,
-        random_pubky, repo_target_json, snapshot_of, sweep_json, test_context,
+        bounty_json, bounty_of, dirs_in, json_bytes, mode, offline_network, pr_target_json,
+        private_temp, random_pubky, repo_target_json, snapshot_of, sweep_json, test_context,
     };
 
     /// What the fake storage answers a refused write with: no message may
@@ -1115,6 +1203,38 @@ mod command_tests {
             fs::symlink_metadata(self.snapshot_file()).is_ok()
         }
 
+        /// Where `submit` moves `audit/` once the record is final:
+        /// `<data dir>/submitted/<id>/audit`.
+        fn moved_audit(&self) -> PathBuf {
+            dirs_in(&self.home)
+                .submitted_dir(&self.fixture.id())
+                .join("audit")
+        }
+
+        /// Asserts that `audit/` is out of the project and whole under the
+        /// data directory, the directories 0700 and the files 0600.
+        fn assert_moved_out(&self) {
+            assert!(
+                fs::symlink_metadata(self.fixture.audit()).is_err(),
+                "audit/ is still in the project"
+            );
+            let moved = self.moved_audit();
+            assert_eq!(mode(&moved), 0o700);
+            assert_eq!(mode(moved.parent().expect("submitted/<id>")), 0o700);
+            for name in CLOUDFLARE_FILES {
+                assert_eq!(mode(&moved.join(name)), 0o600, "{name}");
+            }
+        }
+
+        /// Asserts that `audit/` is still in the project, with its files,
+        /// and nothing is under the data directory.
+        fn assert_left_in_place(&self) {
+            for name in CLOUDFLARE_FILES {
+                assert!(self.fixture.audit().join(name).is_file(), "{name}");
+            }
+            assert!(fs::symlink_metadata(self.moved_audit()).is_err());
+        }
+
         /// The keys pinned for the bounty's owner, as `(device id, key)`.
         fn pinned(&self) -> Option<Vec<(String, String)>> {
             let pins = read_pins(&dirs_in(&self.home)).expect("reads");
@@ -1232,9 +1352,14 @@ mod command_tests {
         }
 
         // Stamped, the owner's one key pinned, and the snapshot of the
-        // fetch forgotten, the record being final.
+        // fetch forgotten, the record being final; `audit/` moved out of
+        // the project, which the report names.
         assert!(scenario.stamped());
         assert!(!scenario.has_snapshot());
+        scenario.assert_moved_out();
+        assert!(scenario.moved_audit().join("capture.bin").is_file());
+        let moved = scenario.moved_audit().display().to_string();
+        assert!(report.text().contains(&moved), "{}", report.text());
         assert_eq!(
             scenario.pinned(),
             Some(vec![(
@@ -1243,10 +1368,11 @@ mod command_tests {
             )])
         );
 
-        // A second submit of the same directory is refused: the record says
-        // done. Nothing more is written.
+        // A second submit of the same directory is refused: it is
+        // finished, and its audit/ was moved out. Nothing more is written.
         let message = scenario.refusal(Some(PLAYBOOK)).await;
-        assert!(message.contains("says done"), "{message}");
+        assert!(message.contains("finished already"), "{message}");
+        assert!(message.contains(&moved), "{message}");
         assert_eq!(scenario.servers.own.puts().len(), 2);
     }
 
@@ -1316,12 +1442,15 @@ mod command_tests {
             assert!(record.finished_at.is_some());
             assert!(!scenario.stamped());
             assert!(!scenario.has_snapshot());
+            // Final, so audit/ is moved out as for a done sweep.
+            scenario.assert_moved_out();
 
             // Aborted is final: a later submit is refused, and says to start
             // a new run, even once the homeserver would take the package.
             scenario.servers.own.stop_failing();
             let message = scenario.refusal(None).await;
-            assert_eq!(message, ABORTED_IS_FINAL, "{status}");
+            assert!(message.contains("finished already"), "{status}: {message}");
+            assert!(message.contains("sweepky run"), "{status}: {message}");
             assert_eq!(scenario.servers.own.puts().len(), 2);
         }
     }
@@ -1343,6 +1472,7 @@ mod command_tests {
             let message = scenario.refusal(None).await;
 
             assert!(message.starts_with(STILL_RUNNING), "{message}");
+            assert!(STILL_RUNNING.ends_with(AUDIT_STAYS));
             let said = if rate_limited {
                 RATE_LIMITED
             } else {
@@ -1356,8 +1486,9 @@ mod command_tests {
             let record = scenario.record().await;
             assert_eq!(record.status.as_known(), Some(KnownSweepStatus::Running));
             assert!(!scenario.stamped());
-            // Kept for the next try.
+            // Kept for the next try, and so is audit/.
             assert!(scenario.has_snapshot());
+            scenario.assert_left_in_place();
 
             // Run again once the homeserver takes it: done.
             scenario.servers.own.stop_failing();
@@ -1367,6 +1498,7 @@ mod command_tests {
             assert_eq!(record.status.as_known(), Some(KnownSweepStatus::Done));
             assert!(scenario.stamped());
             assert!(!scenario.has_snapshot());
+            scenario.assert_moved_out();
         }
     }
 
@@ -1393,8 +1525,10 @@ mod command_tests {
         assert!(!message.contains("MARKER-5k8d"), "{message}");
         let record = scenario.record().await;
         assert_eq!(record.status.as_known(), Some(KnownSweepStatus::Running));
-        // Still running, so the snapshot stays for the next try.
+        // Still running, so the snapshot and audit/ stay for the next try.
         assert!(scenario.has_snapshot());
+        scenario.assert_left_in_place();
+        assert!(message.contains(AUDIT_STAYS), "{message}");
     }
 
     // The review finding: the owner, or their homeserver, rewrote a
