@@ -85,9 +85,12 @@ Deviations from the plan as first written, each recorded where the design says o
     - `web/node_modules` is installed;
     - the other tools are on `PATH`;
     - the inputs are usable: the run directory holds `findings.json` and the targets are a non-empty JSON array, checked without printing either;
-    - with `--step`, standard input is a terminal.
+    - with `--step`, standard input is a terminal;
+    - `TEST_PUBKY_CONNECTION_STRING` does not already set `application_name`.
 
-    On every exit, Ctrl-C and `TERM` included, the script stops what it started: the dev server and its vite child, then the testnet with `kill -INT`, then any `pubky_test_*` database the testnet left behind (the same name and idle rules as the headless check). Last, it removes its `mktemp -d` scratch directory. It never touches a process it did not start.
+    The test database is found the way the headless check finds its own. Only the testnet's process gets `TEST_PUBKY_CONNECTION_STRING` with `application_name=sweepky_demo_local_<script pid>` appended as a query parameter; the script's own `psql` and `pg_isready` calls use the untagged URL. Once the testnet says it is running, the script polls `pg_stat_activity` about once a second, for up to 60 s, for the `pubky_test_*` databases with connections under that application name, records each name that is exactly `pubky_test_` and 32 hex digits in its scratch directory, and prints it. Only a recorded name and the tag are ever quoted into SQL.
+
+    On every exit, Ctrl-C and `TERM` included, the script stops what it started: the dev server and its vite child, then the testnet with `kill -INT` (it records once more just before). The testnet drops its own database on `SIGINT`; if a recorded database still exists, the script drops it by that name with `DROP DATABASE` without `FORCE` and prints `dropped` or, for one still in use, `kept`. When no name was learned it prints one fixed line saying so and drops nothing. No other database is ever dropped: new idle `pubky_test_*` databases that appeared during the run and are not recorded are only named in one line on standard error. Last, it removes its `mktemp -d` scratch directory. It never touches a process it did not start.
 - **The curl read of `discovered.json`, unverified here.** Steps 4 and 7 read `discovered.json` anonymously with `curl -sf --max-time 10 --max-filesize 1048576 -H "pubky-host: <owner pubky>" http://localhost:6286/pub/sweepky/bounties/<id>.discovered.json` and print it with `jq -ac`. Nobody has tested that request form against the pinned testnet's homeserver on this machine, because `scripts/demo-local.sh` has not run here (see the next note). If the read fails, the script prints `(could not read discovered.json from the testnet homeserver)` and carries on, so a wrong form cannot stop the demo. The headless check reads the same file through the library's public read and passes (`discovered.json lists the stranger's sweep after the owner's pull`).
 - **What the headless check covers, and the hand checks.** `scripts/demo-local.sh` has not run on this machine: the Docker homeserver-testnet behind colima holds the static testnet ports, and nothing in this phase stops it. Each Done-when item maps to a check as follows.
 
@@ -111,7 +114,7 @@ Deviations from the plan as first written, each recorded where the design says o
      - step 8 shows the bounty done, crediting the sweeper and the stranger, with the stranger as `known 1`.
   6. Open `http://localhost:5173/` and check that the hero shows the same bounty, live.
   7. Read through the look, the landing copy and the flow. This is Jason's approval.
-  8. Press Ctrl-C. Check that the script exits and that nothing it started is left: `pgrep -fl pubky-testnet` prints nothing, and `lsof -nP -iTCP:5173 -sTCP:LISTEN` and `lsof -nP -iTCP:6286 -sTCP:LISTEN` print nothing. Then run the `psql` line from hand check 2 again and check that it lists no `pubky_test_*` database that was not there before. Last, check that `git status --short` is still empty.
+  8. Press Ctrl-C. Check that the script exits and that nothing it started is left: `pgrep -fl pubky-testnet` prints nothing, and `lsof -nP -iTCP:5173 -sTCP:LISTEN` and `lsof -nP -iTCP:6286 -sTCP:LISTEN` print nothing. Then run the `psql` line from hand check 2 again and check that it does not list the database step 1 printed (`the testnet's database: ...`), and that any other `pubky_test_*` database it lists that was not there before is one the script named as not this run's. Last, check that `git status --short` is still empty.
 
   Nobody has run these steps yet. They are recorded here for Jason's approval run.
 

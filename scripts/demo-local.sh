@@ -18,13 +18,17 @@
 # says); that Postgres answers on TEST_PUBKY_CONNECTION_STRING (defaulting
 # to the one in docs/plan/06); that cargo, pnpm 10.33.0, node, jq, curl,
 # psql, pg_isready and lsof are there and web/node_modules is installed;
+# that TEST_PUBKY_CONNECTION_STRING does not set application_name itself;
 # and that the inputs are usable. It prints every problem it finds and
 # exits 1 without starting anything.
 #
 # Then it builds the release binary, makes one scratch directory under
 # $TMPDIR (mode 0700) and runs the demo's steps:
 # 1. Starts the pinned testnet binary against local Postgres and waits until
-#    it says it is running and holds the homeserver port.
+#    it says it is running and holds the homeserver port. Only the testnet
+#    gets a connection string tagged with this run's application name, so
+#    the script then reads the exact name of the test database it created
+#    from pg_stat_activity, and prints it.
 # 2. login --identity owner, sweeper and stranger, each under its own
 #    SWEEPKY_HOME in the scratch directory. No QR code, no browser.
 # 3. circle create as owner, then circle add the sweeper.
@@ -48,12 +52,13 @@
 #
 # On every exit (the end, an error, Ctrl-C or TERM) it stops what it
 # started: first the board's dev server and its vite child, then the testnet
-# with kill -INT, as docs/plan/06 says, then drops a pubky_test_* database
-# the testnet left behind (only one that was not there before the start,
-# idle, and named the way the testnet names them), and last deletes its own
-# scratch directory. It never touches a process it did not start, such as
-# the Docker homeserver-testnet behind colima that holds the static ports on
-# this machine.
+# with kill -INT, as docs/plan/06 says (it drops its own test database
+# then). If the database step 1 named is still there, it drops it by that
+# name; no other database is ever dropped, and new idle pubky_test_*
+# databases that are not this run's are only named on standard error. Last
+# it deletes its own scratch directory. It never touches a process it did
+# not start, such as the Docker homeserver-testnet behind colima that holds
+# the static ports on this machine.
 #
 # Nothing here writes to ~/.cargo, ~/.config/sweepky or ~/.local/share/sweepky,
 # and nothing talks to a service other than the local testnet, Postgres and,
@@ -149,6 +154,21 @@ if command -v pg_isready > /dev/null &&
     problem "Postgres is not accepting connections on TEST_PUBKY_CONNECTION_STRING"
 fi
 
+# The application name only the testnet's connections carry. Made of
+# [a-z0-9_] only, so it is safe to quote into SQL as it is.
+tag="sweepky_demo_local_$$"
+if [[ "$TEST_PUBKY_CONNECTION_STRING" =~ [?\&]application_name= ]]; then
+    problem "TEST_PUBKY_CONNECTION_STRING already sets application_name;" \
+        "this script sets its own to find the testnet's database"
+fi
+# The homeserver keeps every query parameter of this URL when it points the
+# pool at its new pubky_test_* database, so that database's connections
+# carry the tag too.
+case "$TEST_PUBKY_CONNECTION_STRING" in
+*\?*) testnet_connection_string="$TEST_PUBKY_CONNECTION_STRING&application_name=$tag" ;;
+*) testnet_connection_string="$TEST_PUBKY_CONNECTION_STRING?application_name=$tag" ;;
+esac
+
 [ -d web/node_modules ] ||
     problem "web/node_modules is missing; install it with: pnpm --dir web install --frozen-lockfile"
 
@@ -196,10 +216,18 @@ demo=""
 testnet_pid=""
 dev_pid=""
 databases_before=""
+# The file of the test database names this run recorded, one per line.
+recorded=""
 
+# The script's own psql calls use the untagged URL, so they are never
+# mistaken for the testnet's.
+sql() { psql "$TEST_PUBKY_CONNECTION_STRING" -v ON_ERROR_STOP=1 -tAc "$1"; }
+
+# Every pubky_test_* database, sorted, for the informational line in
+# cleanup. LC_ALL=C keeps sort in the byte order comm expects there.
 test_databases() {
     psql "$TEST_PUBKY_CONNECTION_STRING" -lqt | cut -d'|' -f1 | tr -d ' ' |
-        grep '^pubky_test_' | sort || true
+        grep '^pubky_test_' | LC_ALL=C sort || true
 }
 
 # stop_process <name> <pid> <signal>: sends <signal> to a process this run
@@ -223,22 +251,54 @@ stop_process() {
     wait "$pid" 2> /dev/null || true
 }
 
-# Drops each pubky_test_* database that was not there before the testnet
-# started. Only a name of the exact form the testnet gives (pubky_test_ and
-# 32 hex digits) is ever quoted into SQL, and DROP DATABASE without FORCE
-# refuses one someone is still connected to, so a concurrent test's live
-# database is kept, never dropped.
-drop_leaked_databases() {
+# Adds to $recorded each pubky_test_* database a connection tagged with
+# this run's application name is using now. Only a name of the exact form
+# the testnet gives (pubky_test_ and 32 hex digits) is recorded, so only
+# such a name is ever quoted into SQL later.
+record_test_databases() {
     local db
-    for db in $(comm -13 <(echo "$databases_before") <(test_databases)); do
-        if [[ "$db" =~ ^pubky_test_[0-9a-f]{32}$ ]] &&
-            psql "$TEST_PUBKY_CONNECTION_STRING" -v ON_ERROR_STOP=1 -qc \
-                "DROP DATABASE \"$db\"" > /dev/null 2>&1; then
-            echo "demo-local: dropped $db, which the testnet left behind" >&2
-        else
-            echo "demo-local: kept $db (in use, or not the testnet's)" >&2
+    for db in $(sql "SELECT DISTINCT datname FROM pg_stat_activity
+                     WHERE application_name = '$tag'
+                       AND datname LIKE 'pubky_test_%'" 2> /dev/null || true); do
+        if [[ "$db" =~ ^pubky_test_[0-9a-f]{32}$ ]] && ! grep -qxF "$db" "$recorded"; then
+            echo "$db" >> "$recorded"
         fi
     done
+}
+
+# Drops each recorded database that still exists, once the testnet has
+# stopped, and prints one line per such database: dropped or kept. A
+# recorded database already gone (the testnet drops its own on SIGINT)
+# prints nothing. DROP DATABASE without FORCE refuses a database someone is
+# connected to, so one still in use is kept and reported, never forced.
+drop_recorded_databases() {
+    local db
+    if ! [ -s "$recorded" ]; then
+        echo "demo-local: no connection carried this run's application name, so no test database was dropped" >&2
+        return 0
+    fi
+    while read -r db; do
+        [ -n "$(sql "SELECT 1 FROM pg_database WHERE datname = '$db'")" ] || continue
+        if sql "DROP DATABASE \"$db\"" > /dev/null 2>&1; then
+            echo "demo-local: dropped $db, which the testnet left behind" >&2
+        else
+            echo "demo-local: kept $db (still in use)" >&2
+        fi
+    done < "$recorded"
+}
+
+# Informational only, never dropped: idle pubky_test_* databases that
+# appeared during the run and are not this run's, such as a concurrent
+# test's, or one a crash left before its name could be learned.
+note_untouched_databases() {
+    local connected untouched
+    connected=$(sql "SELECT DISTINCT datname FROM pg_stat_activity
+                     WHERE datname LIKE 'pubky_test_%'" | LC_ALL=C sort || true)
+    untouched=$(LC_ALL=C comm -13 <(echo "$databases_before") <(test_databases) |
+        LC_ALL=C comm -23 - <(LC_ALL=C sort "$recorded") |
+        LC_ALL=C comm -23 - <(echo "$connected") | paste -sd ' ' -)
+    [ -z "$untouched" ] ||
+        echo "demo-local: new idle pubky_test_* databases, not this run's, left alone: $untouched" >&2
 }
 
 cleanup() {
@@ -253,12 +313,16 @@ cleanup() {
         stop_process "dev server" "$dev_pid" TERM
     fi
     if [ -n "$testnet_pid" ]; then
+        # Once more while the testnet still runs, in case it stopped early
+        # before step 1 learned its database's name.
+        record_test_databases
         stop_process testnet "$testnet_pid" INT
         if [ "$status" -ne 0 ] && [ -f "$demo/testnet.log" ]; then
             echo "demo-local: stopped early; the testnet's log ends:" >&2
             tail -n 20 "$demo/testnet.log" >&2 || true
         fi
-        drop_leaked_databases || true
+        drop_recorded_databases || true
+        note_untouched_databases || true
     fi
     # Only ever the directory mktemp made, by its name.
     if [ -n "$demo" ]; then
@@ -286,13 +350,18 @@ sweepky="$repo/target/release/sweepky"
 # mktemp -d makes the directory 0700; the identities' homes go inside it.
 demo=$(mktemp -d "${TMPDIR:-/tmp}/sweepky-demo-local.XXXXXX")
 demo=$(cd "$demo" && pwd -P)
+recorded="$demo/databases.txt"
+: > "$recorded"
 
 # ----- 1. The testnet -----
 
 databases_before=$(test_databases)
 # exec, so $! is the testnet itself and not a subshell around it; started
 # from the scratch directory so nothing it might write lands in the repo.
-(cd "$demo" && NO_COLOR=1 exec pubky-testnet) > "$demo/testnet.log" 2>&1 &
+# Only the testnet gets the tagged connection string: `VAR=value command`
+# sets it for that command alone.
+(cd "$demo" && NO_COLOR=1 TEST_PUBKY_CONNECTION_STRING="$testnet_connection_string" \
+    exec pubky-testnet) > "$demo/testnet.log" 2>&1 &
 testnet_pid=$!
 
 echo "demo-local: waiting for the testnet (pid $testnet_pid)..."
@@ -316,6 +385,22 @@ $ready || {
 }
 echo "demo-local: testnet up: homeserver http://localhost:6286, relay http://localhost:15412/inbox"
 
+# The name of the test database the testnet created, from the connections
+# that carry this run's tag; cleanup drops it by that name if the testnet
+# leaves it behind. kill -0 sends no signal; it only asks whether the
+# process still exists.
+for _ in $(seq 1 60); do
+    record_test_databases
+    if [ -s "$recorded" ] || ! kill -0 "$testnet_pid" 2> /dev/null; then
+        break
+    fi
+    sleep 1
+done
+if [ -s "$recorded" ]; then
+    echo "demo-local: the testnet's database: $(paste -sd ' ' "$recorded")"
+else
+    echo "demo-local: warning: no connection carried this run's application name after 60 s; cleanup will drop no database" >&2
+fi
 
 # ----- Helpers for steps 2 to 9 -----
 
