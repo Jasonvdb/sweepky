@@ -47,12 +47,13 @@
 # before each of steps 4 to 8, so the board can be watched as they land.
 #
 # On every exit (the end, an error, Ctrl-C or TERM) it stops what it
-# started: the testnet with kill -INT, as docs/plan/06 says, then drops a
-# pubky_test_* database the testnet left behind (only one that was not there
-# before the start, idle, and named the way the testnet names them), stops
-# the board's dev server, and deletes its own scratch directory. It never
-# touches a process it did not start, such as the Docker homeserver-testnet
-# behind colima that holds the static ports on this machine.
+# started: first the board's dev server and its vite child, then the testnet
+# with kill -INT, as docs/plan/06 says, then drops a pubky_test_* database
+# the testnet left behind (only one that was not there before the start,
+# idle, and named the way the testnet names them), and last deletes its own
+# scratch directory. It never touches a process it did not start, such as
+# the Docker homeserver-testnet behind colima that holds the static ports on
+# this machine.
 #
 # Nothing here writes to ~/.cargo, ~/.config/sweepky or ~/.local/share/sweepky,
 # and nothing talks to a service other than the local testnet, Postgres and,
