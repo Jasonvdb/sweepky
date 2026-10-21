@@ -73,6 +73,47 @@ Deviations from the plan as first written, each recorded where the design says o
 
   Two broken inputs, the same day: `SWEEPKY_DEMO_TARGETS` set to a missing file's path (with `SWEEPKY_DEMO_RUN_DIR` a missing directory) exits 1 with `FAIL  demo_check exited 1 and wrote no results.json: Error: SWEEPKY_DEMO_TARGETS is not JSON` before any testnet starts; `SWEEPKY_DEMO_RUN_DIR` an empty directory with the fixture targets fails after `post` (`FAIL  the demo flow ran to its end`) and exits 1. Both left no process, no scratch directory and no new `pubky_test_*` database (five older ones, from before this phase, were there throughout and left alone). The real report and the browser board are not covered: those stay with `scripts/demo-local.sh` and Jason's approval.
 
+- **`scripts/demo-local.sh` as written.** The script follows the nine steps above, with these differences. Each one is also in the script's header comment, which `scripts/demo-local.sh --help` prints.
+  - **The synthetic fallback.** Set both inputs or neither. With neither set, the script uses `fixtures/demo` (`targets.json`, `sweeper-run/`, made-up findings against this repository's `docs/plan/` at `be535e6`; see [its README](../../../fixtures/demo/README.md)) and says so twice: once before step 2 and once before the findings in step 7. With only one set, or one set to the empty string, preflight refuses to start. The script never prints the contents of either input. It copies a real run directory only into its scratch directory and uploads it only to the local testnet.
+  - **`--step` starts the board early.** Without the flag, the board starts at step 9, as written above. With `--step`, the script starts the board right after step 3, then waits for Enter before each of steps 4 to 8, so the board can be watched while each step lands. Standard input must be a terminal; preflight refuses `--step` otherwise.
+  - **Extras in steps 4, 5, 6 and 8.** Step 4 also prints `discovered.json` as `post --open` left it. Steps 5 and 6 run `init --no-playbook`, so npx never runs, and pass `--playbook` to `submit`: `cloudflare/security-audit@c1c8a8c1471069fb0e188eeaff69b8e8db6564a8` for the sweeper and `careful-review` for the stranger. In step 6 the stranger's one finding is moved, with jq, to the locations of the run directory's first finding, so the two share a group whatever the run directory holds. Step 8 runs `pull` once more after `done`, which labels the stranger `known: 1`.
+  - **Preflight and cleanup.** Before the script starts or creates anything, it checks the following. It prints every problem it finds and, if there is any, exits 1:
+    - the static ports (TCP 6881, 15411, 15412, 6286 to 6288 and 5173, and UDP 6881) are free, and it names whatever holds one;
+    - `pubky-testnet` and `pnpm` are at the versions [06](../06-verification-and-limits.md#local-environment-this-machine) pins, checked as its table says;
+    - Postgres answers;
+    - `web/node_modules` is installed;
+    - the other tools are on `PATH`;
+    - the inputs are usable: the run directory holds `findings.json` and the targets are a non-empty JSON array, checked without printing either;
+    - with `--step`, standard input is a terminal.
+
+    On every exit, Ctrl-C and `TERM` included, the script stops what it started: the dev server and its vite child, then the testnet with `kill -INT`, then any `pubky_test_*` database the testnet left behind (the same name and idle rules as the headless check). Last, it removes its `mktemp -d` scratch directory. It never touches a process it did not start.
+- **The curl read of `discovered.json`, unverified here.** Steps 4 and 7 read `discovered.json` anonymously with `curl -sf --max-time 10 --max-filesize 1048576 -H "pubky-host: <owner pubky>" http://localhost:6286/pub/sweepky/bounties/<id>.discovered.json` and print it with `jq -ac`. Nobody has tested that request form against the pinned testnet's homeserver on this machine, because `scripts/demo-local.sh` has not run here (see the next note). If the read fails, the script prints `(could not read discovered.json from the testnet homeserver)` and carries on, so a wrong form cannot stop the demo. The headless check reads the same file through the library's public read and passes (`discovered.json lists the stranger's sweep after the owner's pull`).
+- **What the headless check covers, and the hand checks.** `scripts/demo-local.sh` has not run on this machine: the Docker homeserver-testnet behind colima holds the static testnet ports, and nothing in this phase stops it. Each Done-when item maps to a check as follows.
+
+  | Done when | Covered by |
+  |---|---|
+  | 1. `pull --findings` prints every finding with links at the pinned SHA | The headless check, with the fixtures (`pull --findings prints the title of every finding of the run directory`, `… links every location of the run directory at the pinned commit`), and hand check 4 for the real report and the links opening |
+  | 2. The board shows the bounty, both sweeps, `unknown`, then done with both credits and `known 1` | Hand check 5. The headless check covers the state behind it: the records' statuses, the `unknown` and `known: 1` labels, and the done bounty's credits |
+  | 3. The landing page shows the bounty live in its hero | Hand check 6 |
+  | 4. Jason approves the look, the landing copy and the flow | Hand checks 1 to 8, by Jason |
+
+  Run the hand checks on a machine where nothing holds TCP 6881, 15411, 15412, 6286, 6287, 6288 or 5173, or UDP 6881. The script's preflight names any holder.
+
+  1. Install the pinned testnet: `cargo install pubky-testnet --version '=0.16.2' --locked`. Keep the quotes.
+  2. Start Postgres with `brew services start postgresql@18`. Then run `psql postgres://jason@localhost:5432/postgres -lqt | cut -d'|' -f1 | tr -d ' ' | grep '^pubky_test_'` and note which databases it lists.
+  3. Install the board's dependencies with `pnpm --dir web install --frozen-lockfile`, and check that `git status --short` is empty.
+  4. Run `scripts/demo-local.sh --step`. To use a real report, first set `SWEEPKY_DEMO_RUN_DIR` and `SWEEPKY_DEMO_TARGETS` in the shell; never write them to a file in the repository. After step 7's `pull --findings`, check that every finding of the report is listed and that each `https://github.com/<owner>/<name>/blob/<sha>/<file>#L<line>` link opens that line at the SHA the bounty pins.
+  5. Keep `http://localhost:5173/board` open from step 3 on, and press Enter for each of steps 4 to 8. Check that:
+     - step 4 shows the bounty;
+     - steps 5 and 6 show each sweep landing;
+     - step 7 shows the stranger's sweep as `unknown`;
+     - step 8 shows the bounty done, crediting the sweeper and the stranger, with the stranger as `known 1`.
+  6. Open `http://localhost:5173/` and check that the hero shows the same bounty, live.
+  7. Read through the look, the landing copy and the flow. This is Jason's approval.
+  8. Press Ctrl-C. Check that the script exits and that nothing it started is left: `pgrep -fl pubky-testnet` prints nothing, and `lsof -nP -iTCP:5173 -sTCP:LISTEN` and `lsof -nP -iTCP:6286 -sTCP:LISTEN` print nothing. Then run the `psql` line from hand check 2 again and check that it lists no `pubky_test_*` database that was not there before. Last, check that `git status --short` is still empty.
+
+  Nobody has run these steps yet. They are recorded here for Jason's approval run.
+
 ## After approval (not part of this phase)
 
 `sweepky login` against `homeserver.pubky.app`, where the key write is the per-identity check and a 403 means that identity's token forbids the path; static hosting with the SPA fallback; `vibe/vibe.json` (`hosted.url` pointing at `/board`, `hosted.healthPath` `/health.json`, `pubkyAppFork: false`, `stack.target: "production"`, `capabilities: ["homeserver.read"]`, plus the required `authors`, `tags`, `category`, `covers`, `license`, `version`, `repo.url`, `schemaVersion`, a directory named after the id) and the PR to `pubky/vibes`, then the extensions in [05-extensions.md](../05-extensions.md).

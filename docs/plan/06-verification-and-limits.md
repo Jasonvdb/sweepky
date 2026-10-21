@@ -38,6 +38,16 @@
 - Testnet identities: `sweepky login --identity <name>` (login option B) makes a local keypair and signs up on the testnet homeserver, which runs in open signup mode. The Ring QR flow (option A) is exercised in the automated end-to-end test, which approves the printed auth URL in-process with `PubkySigner::approve_auth`, and for real against production after the demo is approved.
 - Several identities in one script: `SWEEPKY_HOME=<dir>` overrides `~/.config/sweepky/` and `~/.local/share/sweepky/`.
 - Toolchain: rustc/cargo 1.96, node 24, pnpm 10, psql 18, Claude Code 2.1.300.
+- The local demo's pins (`scripts/demo-local.sh`, [P5](phases/P5-local-demo.md#notes)), the installed versions as checked on this machine on 2026-10-21:
+
+  | Tool | Version | Enforced by the script |
+  |---|---|---|
+  | `pubky-testnet` | 0.16.2, installed with the line above. Not installed on this machine on 2026-10-21 (the headless check uses the library's `EphemeralTestnet` instead); [P5](phases/P5-local-demo.md#notes)'s hand check 1 installs it | Yes. Preflight reads the version from cargo's `.crates.toml` beside the binary's `bin/` directory, because the binary has no `--version` flag. It warns when it cannot tell the version and refuses any other version |
+  | `pnpm` | 10.33.0, the same as `web/package.json`'s `packageManager` | Yes. Preflight asks `pnpm --version` from `/`, so no `packageManager` field makes pnpm fetch another copy of itself |
+  | `node` | 24.15.0 | No, preflight only checks it is on `PATH` |
+  | `jq` | 1.7.1 | No, preflight only checks it is on `PATH` |
+  | `psql`, `pg_isready` | 18.4, from brew `postgresql@18` | No, preflight only checks they are on `PATH` and that Postgres answers |
+  | Cloudflare playbook | `cloudflare/security-audit@c1c8a8c1471069fb0e188eeaff69b8e8db6564a8`, the commit in [Key references](#key-references), passed as the sweeper's `submit --playbook` | Fixed in the script. The demo installs no playbook (`init --no-playbook`) |
 
 ## Production homeserver (as deployed on 2026-10-15)
 
