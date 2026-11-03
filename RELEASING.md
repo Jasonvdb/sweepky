@@ -102,8 +102,8 @@ The jobs run in this order. Each one gates the next.
 
 | Job | What it does | A failure means |
 |---|---|---|
-| `check` | Checks that the tag is `vX.Y.Z`, equals the workspace version, and points at a commit on `main`. Checks that CHANGELOG.md has exactly one `## [X.Y.Z] - YYYY-MM-DD` heading with a real date and a non-empty section, and turns that section into the release notes | The tagged commit isn't releasable: the version, the tag or the CHANGELOG is wrong, or the tag isn't on `main`. The error says which |
-| `ci` | Runs [`ci.yml`](.github/workflows/ci.yml) on the tagged commit: fmt, clippy, tests, cargo-deny, shellcheck and the web build and tests | The commit fails a pull request gate. `cargo deny check` reads the RustSec database at run time, so a new advisory can fail a commit that passed on its pull request |
+| `check` | Checks that the tag is `vX.Y.Z`, equals the workspace version, and points at a commit on `main`. Checks that CHANGELOG.md has exactly one `## [X.Y.Z] - YYYY-MM-DD` heading with a real date and a non-empty section, and turns that section into the release notes. The checks are [`scripts/release/check.sh`](scripts/release/check.sh); run `IS_RELEASE=false scripts/release/check.sh /tmp/notes.md` to try a CHANGELOG edit before pushing | The tagged commit isn't releasable: the version, the tag or the CHANGELOG is wrong, or the tag isn't on `main`. The error says which |
+| `ci` | Release runs only. Runs [`ci.yml`](.github/workflows/ci.yml) on the tagged commit: fmt, clippy, tests, cargo-deny, shellcheck and the web build and tests | The commit fails a pull request gate. `cargo deny check` reads the RustSec database at run time, so a new advisory can fail a commit that passed on its pull request |
 | `build` | Builds each target with `cargo build --profile dist --locked`, with no cache, then runs [`scripts/release/smoke.sh`](scripts/release/smoke.sh) on the binary: `--version`, `--help`, `init`, private file modes and static linking | The target doesn't compile, or its binary fails a smoke check. smoke.sh prints a `FAIL` line for each failed check |
 | `e2e` | Runs [`scripts/demo-local.sh`](scripts/demo-local.sh) `--ci` with each built binary: the local demo's whole flow on a local Pubky testnet, with its checks | The binary fails the demo flow, or the test setup failed: installing `pubky-testnet`, starting Postgres, or reading github.com. [P5](docs/plan/phases/P5-local-demo.md#notes) lists the checks |
 | `package` | Packs the four tarballs with [`scripts/release/package.sh`](scripts/release/package.sh), and writes `SHA256SUMS` | A target's binary is missing, or packing failed |
@@ -119,7 +119,7 @@ Every run that isn't a tag push is a dry run. These start one:
 - the weekly schedule, Mondays at 05:23 UTC, and
 - a pull request that changes the release workflow, `ci.yml`, `install.sh`, `scripts/release/`, `scripts/demo-local.sh`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `deny.toml` or `crates/`.
 
-A dry run tests the version in `Cargo.toml` and runs every job up to `install`. It never runs `publish` or `verify`. A dry run also accepts `## [X.Y.Z] - Unreleased` as the CHANGELOG heading, with a warning. On a pull request, the `ci` job is skipped because `ci.yml` already runs on its own.
+A dry run tests the version in `Cargo.toml` and runs every job up to `install`. It never runs `publish` or `verify`. A dry run also accepts `## [X.Y.Z] - Unreleased` as the CHANGELOG heading, with a warning. The `ci` job runs only on a release: a dry run's commit already ran `ci.yml` when it was pushed or opened as a pull request.
 
 The staged release files are kept as the workflow artifact `release-assets` for 14 days. To inspect them, run:
 

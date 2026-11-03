@@ -124,7 +124,7 @@ The release-only tooling. Everything else the release uses is pinned above or in
 |---|---|---|
 | `shellcheck` | 0.11.0 | `ci.yml`'s `shellcheck` job, a prebuilt release through `taiki-e/install-action` with `fallback: none`, over `install.sh`, `scripts/*.sh`, `scripts/release/*.sh` and `fixtures/*.sh` |
 | `actionlint` | not pinned | Local only: run it by hand on a change to a workflow. CI does not run it |
-| `pubky-testnet` | 0.16.2 | The `e2e` job, `cargo install pubky-testnet --version '=0.16.2' --locked --root $RUNNER_TEMP/tools`, cached per OS, architecture and toolchain. A test tool, so the one cache in the release workflow; never part of a release |
+| `pubky-testnet` | 0.16.2 | The `e2e` job, `cargo install pubky-testnet --version '=0.16.2' --locked --root $RUNNER_TEMP/tools`, cached per OS, architecture and toolchain for dry runs only, saved only from `main`. A test tool, so the one cache in the release workflow; a release run compiles it fresh, because the job runs it next to the binaries `publish` attests; never part of a release |
 | Postgres | `postgres:18.4` on Linux; Homebrew `postgresql@18` on macOS | `scripts/release/start-postgres.sh`, for `e2e` only. macOS runners have no service containers, and Homebrew pins only the major version, so the minor version floats: the one test-only piece not pinned exactly |
 | `musl-tools` | Ubuntu 24.04's archive | The Linux `build` jobs |
 | `gh` | the runner image's | `publish` and `verify` |

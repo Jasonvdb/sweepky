@@ -153,10 +153,10 @@ cd "$repo"
 export TEST_PUBKY_CONNECTION_STRING=${TEST_PUBKY_CONNECTION_STRING:-postgres://jason@localhost:5432/postgres}
 testnet_install="cargo install pubky-testnet --version '=0.16.2' --locked"
 pnpm_version=10.33.0
-# The ports the testnet binds at 0.16.2 (docs/plan/06), then, unless --ci
-# leaves the board out, the dev server's.
+# The ports the testnet binds at 0.16.2 (docs/plan/06). The board's dev
+# server port is added below, unless --ci leaves the board out.
 testnet_tcp_ports="6881 15411 15412 6286 6287 6288"
-tcp_ports="$testnet_tcp_ports 5173"
+tcp_ports=$testnet_tcp_ports
 
 # ----- Preflight: read-only checks, nothing started or created -----
 
@@ -166,29 +166,31 @@ problem() {
     problems=$((problems + 1))
 }
 
-# cargo builds the binary, and node and pnpm run the board: --ci needs
-# none of them.
-tools="jq curl psql pg_isready lsof"
-if $ci_mode; then
-    tcp_ports=$testnet_tcp_ports
-    $binary_ok || problem "--binary $binary is not an executable file"
-else
-    tools="cargo node $tools"
-fi
-for tool in $tools; do
+for tool in jq curl psql pg_isready lsof; do
     command -v "$tool" > /dev/null || problem "$tool is not on PATH"
 done
 
 if $ci_mode; then
-    :
-elif ! command -v pnpm > /dev/null; then
-    problem "pnpm is not on PATH (the board needs pnpm $pnpm_version)"
+    $binary_ok || problem "--binary $binary is not an executable file"
 else
-    # From /, so no package.json's packageManager field makes pnpm fetch
-    # another version of itself just to answer.
-    found=$(cd / && pnpm --version 2> /dev/null || echo unknown)
-    [ "$found" = "$pnpm_version" ] ||
-        problem "pnpm is $found, the board pins $pnpm_version"
+    # Everything only the cargo build and the board need, which --ci
+    # leaves out: cargo, node, the pinned pnpm, web/node_modules and the
+    # dev server's port.
+    tcp_ports="$tcp_ports 5173"
+    for tool in cargo node; do
+        command -v "$tool" > /dev/null || problem "$tool is not on PATH"
+    done
+    if ! command -v pnpm > /dev/null; then
+        problem "pnpm is not on PATH (the board needs pnpm $pnpm_version)"
+    else
+        # From /, so no package.json's packageManager field makes pnpm fetch
+        # another version of itself just to answer.
+        found=$(cd / && pnpm --version 2> /dev/null || echo unknown)
+        [ "$found" = "$pnpm_version" ] ||
+            problem "pnpm is $found, the board pins $pnpm_version"
+    fi
+    [ -d web/node_modules ] ||
+        problem "web/node_modules is missing; install it with: pnpm --dir web install --frozen-lockfile"
 fi
 
 # Prints "<command> (pid <pid>)" for each process listening on a port, or
@@ -244,9 +246,6 @@ case "$TEST_PUBKY_CONNECTION_STRING" in
 *\?*) testnet_connection_string="$TEST_PUBKY_CONNECTION_STRING&application_name=$tag" ;;
 *) testnet_connection_string="$TEST_PUBKY_CONNECTION_STRING?application_name=$tag" ;;
 esac
-
-$ci_mode || [ -d web/node_modules ] ||
-    problem "web/node_modules is missing; install it with: pnpm --dir web install --frozen-lockfile"
 
 # Both inputs or neither. `${VAR+set}` is "set" when VAR is set at all, even
 # to the empty string, so an empty value is refused rather than taken as
@@ -305,12 +304,10 @@ finished=false
 # still shows, and added to $results, so one made in a subshell still
 # counts. Each name and reason is fixed text or paths, never a finding.
 pass() { echo "PASS $1" | tee -a "$results" >&3; }
-# shellcheck disable=SC2329 # run through cli, check or ci, which shellcheck does not follow
 fail() { echo "FAIL $1: $2" | tee -a "$results" >&3; }
 
 # check <name> <why> <command...>: PASS <name> when the command succeeds,
 # FAIL <name>: <why> when it does not. The command's output is dropped.
-# shellcheck disable=SC2329 # run through cli, check or ci, which shellcheck does not follow
 check() {
     local name=$1 why=$2
     shift 2
@@ -344,7 +341,6 @@ test_databases() {
 # another 5 s, KILL. A background job of a script starts with SIGINT
 # ignored, so an INT the process has not yet installed a handler for (the
 # testnet only listens for Ctrl-C once it is up) needs the fallback.
-# shellcheck disable=SC2329 # called only from cleanup, which the EXIT trap runs
 stop_process() {
     local name=$1 pid=$2 signal=$3 tenths
     kill "-$signal" "$pid" 2> /dev/null || true
@@ -381,7 +377,6 @@ record_test_databases() {
 # recorded database already gone (the testnet drops its own on SIGINT)
 # prints nothing. DROP DATABASE without FORCE refuses a database someone is
 # connected to, so one still in use is kept and reported, never forced.
-# shellcheck disable=SC2329 # called only from cleanup, which the EXIT trap runs
 drop_recorded_databases() {
     local db
     if ! [ -s "$recorded" ]; then
@@ -401,7 +396,6 @@ drop_recorded_databases() {
 # Informational only, never dropped: idle pubky_test_* databases that
 # appeared during the run and are not this run's, such as a concurrent
 # test's, or one a crash left before its name could be learned.
-# shellcheck disable=SC2329 # called only from cleanup, which the EXIT trap runs
 note_untouched_databases() {
     local connected untouched
     connected=$(sql "SELECT DISTINCT datname FROM pg_stat_activity
@@ -419,7 +413,6 @@ note_untouched_databases() {
 # created is gone, whoever dropped it. A lookup that fails counts against
 # the check. With no database recorded there is nothing to look for, and a
 # NOTE says so.
-# shellcheck disable=SC2329 # called only from cleanup, which the EXIT trap runs
 check_stopped() {
     local name port holders held="" db present left=""
     name="the testnet this run started has stopped and holds no testnet port"
@@ -453,7 +446,6 @@ check_stopped() {
     fi
 }
 
-# shellcheck disable=SC2329 # called by the EXIT trap below, which shellcheck does not follow
 cleanup() {
     local status=$? passed failed
     # A failing step here must not end the cleanup before the rest has run.
@@ -603,7 +595,6 @@ pause() {
 # as <identity> <args...>: sweepky on the testnet as that identity. Its
 # standard input is /dev/null, so a question fails at once instead of
 # waiting (or reading the terminal under --step).
-# shellcheck disable=SC2329 # run through cli, check or ci, which shellcheck does not follow
 as() {
     local who=$1
     shift
@@ -612,7 +603,6 @@ as() {
 
 # yes_as <identity> <args...>: the same, answering its one question (post's
 # and done's "publish?", which they ask on standard error) with y.
-# shellcheck disable=SC2329 # run through cli, check or ci, which shellcheck does not follow
 yes_as() {
     local who=$1
     shift
@@ -621,7 +611,6 @@ yes_as() {
 
 # as_in <directory> <identity> <args...>: `as`, from <directory>, the
 # project run and submit find from the working directory.
-# shellcheck disable=SC2329 # run through cli, check or ci, which shellcheck does not follow
 as_in() {
     (cd "$1" && shift && as "$@")
 }
@@ -754,7 +743,6 @@ stranger_sweep_url=""
 # jq with the run's values as jq variables, each passed as data, never as
 # part of a filter: $targets (the input targets), $sweeper, $stranger and
 # $stranger_sweep (the URL of the stranger's sweep).
-# shellcheck disable=SC2329 # run through cli, check or ci, which shellcheck does not follow
 jq_demo() {
     jq --argjson targets "$targets_json" --arg sweeper "$sweeper" --arg stranger "$stranger" \
         --arg stranger_sweep "$stranger_sweep_url" "$@"
@@ -762,14 +750,12 @@ jq_demo() {
 
 # record_is <pubky> <path> <filter>: whether the public record at <path> of
 # <pubky> reads as JSON and <filter> holds of it.
-# shellcheck disable=SC2329 # run through cli, check or ci, which shellcheck does not follow
 record_is() {
     local body
     body=$(public_record "$1" "$2") && jq_demo -e "$3" <<< "$body"
 }
 
 # check_record <name> <pubky> <path> <filter>: record_is as a check.
-# shellcheck disable=SC2329 # run through cli, check or ci, which shellcheck does not follow
 check_record() {
     check "$1" "$3 could not be read or does not say so" record_is "$2" "$3" "$4"
 }
@@ -824,14 +810,12 @@ and all([.targets, $targets] | transpose[];
           or (.[0] | if .kind == "pr" then .head else .rev end) == $rev)'
 
 # login gave the three identities three different pubkys.
-# shellcheck disable=SC2329 # run through cli, check or ci, which shellcheck does not follow
 three_differ() {
     [ "$1" != "$2" ] && [ "$1" != "$3" ] && [ "$2" != "$3" ]
 }
 
 # audit_moved <sweep dir> <moved audit>: submit left no audit/ in the
 # sweep directory, not even a link, and a directory where it moves it.
-# shellcheck disable=SC2329 # run through cli, check or ci, which shellcheck does not follow
 audit_moved() {
     ! [ -e "$1/audit" ] && ! [ -L "$1/audit" ] && [ -d "$2" ]
 }
@@ -843,7 +827,6 @@ audit_moved() {
 # of the run directory names was fetched into the sweep directory <dir>,
 # under target/<tid>/, with at least as many lines as the location's line.
 # awk counts a last line with no newline too.
-# shellcheck disable=SC2329 # run through cli, check or ci, which shellcheck does not follow
 check_fetched() {
     local dir=$1 name found tid file line path short=0
     name="every file a sweeper location names was fetched with at least that many lines"
@@ -875,7 +858,6 @@ check_fetched() {
 
 # Whether the pull output in the file <out> prints, under its findings
 # heading, the title of every finding of the run directory.
-# shellcheck disable=SC2329 # run through cli, check or ci, which shellcheck does not follow
 titles_printed() {
     jq -e --rawfile text "$1" "$jq_defs"'($text | printed) as $p
         | all(run_findings; .title as $t | $p | contains("  title: \($t)\n"))' "$run_dir/findings.json"
@@ -883,7 +865,6 @@ titles_printed() {
 
 # Whether it prints, there, every location of the run directory with its
 # GitHub link at the pinned commit.
-# shellcheck disable=SC2329 # run through cli, check or ci, which shellcheck does not follow
 links_printed() {
     jq -e --rawfile text "$1" --argjson targets "$bounty_targets" --argjson covered "$sweeper_covered" \
         "$jq_defs"'($text | printed) as $p
@@ -893,7 +874,6 @@ links_printed() {
 
 # Whether it holds, anywhere, none of the stranger's finding text: no
 # title, description or fix of the findings.json step 6 made.
-# shellcheck disable=SC2329 # run through cli, check or ci, which shellcheck does not follow
 stranger_text_absent() {
     jq -e --rawfile text "$1" 'all(.findings[]; . as $f
         | $text | (contains($f.title) or contains($f.description)
@@ -905,7 +885,6 @@ stranger_text_absent() {
 # matches the mode exactly, in BSD and GNU find alike; -mindepth 1 leaves
 # out the home itself, which this script made. Up to five offenders are
 # named, through printable, as some names are the stranger's.
-# shellcheck disable=SC2329 # run through cli, check or ci, which shellcheck does not follow
 check_private_homes() {
     local who home loose
     for who in owner sweeper stranger; do

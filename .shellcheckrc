@@ -1,0 +1,8 @@
+# shellcheck settings for every script in this repository (shellcheck reads
+# this file from the script's directory upward, locally and in CI).
+#
+# SC2329 ("this function is never invoked") is off: the scripts call many
+# functions only indirectly, from an EXIT trap or through a wrapper that
+# takes a function name and its arguments ("$@"), and shellcheck follows
+# neither. Without this, every such helper would need its own directive.
+disable=SC2329

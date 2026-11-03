@@ -1,7 +1,8 @@
 # Release: builds, tests and publishes the `sweepky` CLI as a GitHub Release.
 #
-# Pushing a tag vX.Y.Z runs every job below in order; each one gates the next, and nothing is public until all of them
-# have passed:
+# Pushing a tag vX.Y.Z runs every job below. Each gates the ones after it
+# (package and install run alongside e2e), and nothing is public until all
+# of them have passed:
 #
 #   check     the tag is vX.Y.Z, equals the Cargo workspace version, points
 #             at a commit on main, and CHANGELOG.md has a dated section for
@@ -19,9 +20,9 @@
 #   verify    on fresh runners: install from the public release URL, check
 #             SHA256SUMS and the attestations, run the binary
 #
-# Every other run is a dry run, which runs everything up to `install` and
-# keeps the staged release files as the workflow artifact `release-assets`
-# (two weeks): a manual run, the weekly scheduled run, and a pull request
+# Every other run is a dry run, which runs everything up to `install`
+# except `ci`, and keeps the staged release files as the workflow artifact
+# `release-assets` (two weeks): a manual run, the weekly scheduled run, and a pull request
 # that changes a file the release depends on. A manual run with `verify_tag`
 # set runs only `verify`, against a release that already exists.
 #
@@ -101,7 +102,6 @@ jobs:
     timeout-minutes: 10
     outputs:
       tag: ${{ steps.check.outputs.tag }}
-      version: ${{ steps.check.outputs.version }}
       is_release: ${{ steps.check.outputs.is_release }}
       source_date_epoch: ${{ steps.check.outputs.source_date_epoch }}
     steps:
@@ -114,104 +114,20 @@ jobs:
       # cargo metadata reads the version; this installs the toolchain that
       # rust-toolchain.toml names.
       - run: rustup toolchain install --no-self-update
+      # scripts/release/check.sh holds the checks, so shellcheck covers
+      # them and a CHANGELOG edit can be tried locally (its header says
+      # how). It prints the job's outputs and writes the release notes.
       - id: check
         env:
-          # The one definition of a release run, used again by `publish`:
-          # a push of a tag that starts with v. Everything else is a dry run.
+          # The one definition of a release run, used again by `ci` and
+          # `publish` through this job's is_release output: a push of a tag
+          # that starts with v. Everything else is a dry run.
           IS_RELEASE: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+          TAG: ${{ github.ref_name }}
         run: |
-          die() {
-              echo "::error::$*"
-              exit 1
-          }
-
-          # Both crates inherit [workspace.package] version, so there is
-          # exactly one version, the one `sweepky --version` prints.
-          version=$(cargo metadata --no-deps --format-version 1 |
-              jq -r '[.packages[].version] | unique | if length == 1 then .[0] else "several" end')
-          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
-              die "the workspace version is '$version', not one plain X.Y.Z"
-
-          if [ "$IS_RELEASE" = true ]; then
-              tag=$GITHUB_REF_NAME
-              [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
-                  die "tag $tag is not vX.Y.Z; release tags have no prefix or suffix"
-              [ "$tag" = "v$version" ] ||
-                  die "tag $tag does not match the workspace version $version in Cargo.toml"
-              # A release is built only from reviewed code: the tagged commit
-              # must already be on main. The repository is public, so this
-              # fetch needs no token.
-              git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
-              git merge-base --is-ancestor HEAD origin/main ||
-                  die "tag $tag points at $(git rev-parse HEAD), which is not on main"
-          else
-              # A dry run tests the version the next release would have.
-              tag=v$version
-          fi
-
-          # Exactly one `## [X.Y.Z] - YYYY-MM-DD` heading, with a real date.
-          # A dry run also accepts `Unreleased` in place of the date, the
-          # state between the version bump and the tag.
-          # The lines that start with `## [X.Y.Z]` are found with a plain
-          # string match, so the dots in the version need no escaping.
-          heading=$(awk -v start="## [$version]" 'index($0, start) == 1' CHANGELOG.md)
-          [ -n "$heading" ] || die "CHANGELOG.md has no '## [$version] - YYYY-MM-DD' section"
-          [ "$(printf '%s\n' "$heading" | wc -l)" -eq 1 ] ||
-              die "CHANGELOG.md has more than one section for $version"
-          dated='^ - ([0-9]{4}-[0-9]{2}-[0-9]{2})$'
-          if [[ "${heading#"## [$version]"}" =~ $dated ]]; then
-              # GNU date prints a valid date back unchanged and refuses
-              # 2026-02-30, so this catches a mistyped day too.
-              day=${BASH_REMATCH[1]}
-              [ "$(date -u -d "$day" +%F 2> /dev/null)" = "$day" ] ||
-                  die "CHANGELOG.md dates $version $day, which is not a real date"
-          elif [ "$heading" = "## [$version] - Unreleased" ] && [ "$IS_RELEASE" != true ]; then
-              echo "::warning::CHANGELOG.md still says Unreleased for $version; date it before tagging"
-          else
-              die "CHANGELOG.md's heading for $version is '$heading'; it must be '## [$version] - YYYY-MM-DD'"
-          fi
-
-          # The section's body: every line after the heading up to the next
-          # `## ` heading or the link definitions at the end of the file,
-          # without the blank lines around it.
-          awk -v heading="$heading" '
-              $0 == heading { on = 1; next }
-              on && (/^## / || /^\[.*\]: /) { exit }
-              on {
-                  line[++n] = $0
-                  if ($0 ~ /[^[:space:]]/) { if (!first) first = n; last = n }
-              }
-              END { for (i = first; i && i <= last; i++) print line[i] }
-          ' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
-          [ -s "$RUNNER_TEMP/notes.md" ] || die "CHANGELOG.md's section for $version is empty"
-
-          # The fixed block every release's notes end with. @TAG@ is
-          # replaced below, after the quoted heredoc has kept every $ and
-          # backtick as written.
-          sed "s/@TAG@/$tag/g" >> "$RUNNER_TEMP/notes.md" << 'EOF'
-
-          ## Verify this release
-
-          `SHA256SUMS` lists the SHA-256 of every tarball and of `install.sh`, and every tarball and the `sweepky` binary inside it have a build provenance attestation signed by this repository's release workflow. `install.sh` checks the checksum, and the attestation too when the [GitHub CLI](https://cli.github.com/) is installed and logged in. To check a download by hand, run this where the tarball and `SHA256SUMS` are, with the name of the tarball you downloaded:
-
-          ```sh
-          file=sweepky-@TAG@-aarch64-apple-darwin.tar.gz
-          grep "  $file\$" SHA256SUMS | shasum -a 256 -c    # on Linux: sha256sum -c
-          gh attestation verify "$file" --repo Jasonvdb/sweepky
-          ```
-          EOF
-
-          # Every file in the tarballs gets the tagged commit's time, so the
-          # same commit always packs into the same bytes.
-          source_date_epoch=$(git log -1 --format=%ct HEAD)
+          scripts/release/check.sh "$RUNNER_TEMP/notes.md" | tee -a "$GITHUB_OUTPUT"
           {
-              echo "tag=$tag"
-              echo "version=$version"
-              echo "is_release=$IS_RELEASE"
-              echo "source_date_epoch=$source_date_epoch"
-          } >> "$GITHUB_OUTPUT"
-          {
-              echo "## sweepky $tag ($([ "$IS_RELEASE" = true ] && echo release || echo 'dry run'))"
+              echo "## sweepky $(sed -n 's/^tag=//p' "$GITHUB_OUTPUT" | tail -1)"
               echo
               cat "$RUNNER_TEMP/notes.md"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -224,11 +140,12 @@ jobs:
 
   ci:
     # ci.yml itself, called on the tagged commit, so a release passes the
-    # same gates as a pull request. On a pull request ci.yml already runs on
-    # its own, so it is not run twice. A job that calls another workflow
+    # same gates as a pull request. Only on a release run: only `publish`
+    # needs it, and a dry run's commit already ran ci.yml when it was
+    # pushed or opened as a pull request. A job that calls another workflow
     # cannot set timeout-minutes; every job in ci.yml sets its own.
     needs: check
-    if: github.event_name != 'pull_request'
+    if: needs.check.outputs.is_release == 'true'
     uses: ./.github/workflows/ci.yml
 
   build:
@@ -307,6 +224,13 @@ jobs:
     runs-on: ${{ matrix.runner }}
     # A cache miss compiles pubky-testnet, and macOS installs Postgres.
     timeout-minutes: 60
+    env:
+      IS_RELEASE: ${{ needs.check.outputs.is_release }}
+      # Homebrew, for start-postgres.sh on macOS: no self-update, cleanup or
+      # dependents check, which only slow a throwaway runner down.
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+      HOMEBREW_NO_INSTALLED_DEPENDENTS_CHECK: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -317,21 +241,34 @@ jobs:
           path: ${{ runner.temp }}/dist
       # An artifact does not keep the executable bit.
       - run: chmod +x "$RUNNER_TEMP/dist/sweepky"
-      - run: rustup toolchain install --no-self-update
-      # pubky-testnet is a test tool, never part of a release, so unlike the
-      # build it may come from a cache. The key holds everything the
-      # compiled tool depends on: its exact version, the runner's OS and
-      # architecture, and the toolchain rust-toolchain.toml pins.
+      # pubky-testnet is a test tool, never part of a release, so a dry run
+      # may take it from a cache. A release run never does: this job runs
+      # the tool next to the binaries `publish` later attests, so on a
+      # release nothing in it comes from an earlier run's cache. The key
+      # holds everything the compiled tool depends on: its exact version,
+      # the runner's OS and architecture, and the pinned toolchain. Only
+      # main saves it (below), as ci.yml's caches do.
       - id: testnet-cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: env.IS_RELEASE != 'true'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/tools
           key: pubky-testnet-0.16.2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}
       # The version docs/plan/06 pins and demo-local.sh checks. --root keeps
       # it, and the install record demo-local.sh reads its version from,
-      # in the cached directory instead of ~/.cargo.
+      # in the cached directory instead of ~/.cargo. The toolchain is only
+      # needed for this compile; demo-local.sh --ci needs no cargo.
       - if: steps.testnet-cache.outputs.cache-hit != 'true'
-        run: cargo install pubky-testnet --version '=0.16.2' --locked --root "$RUNNER_TEMP/tools"
+        run: |
+          rustup toolchain install --no-self-update
+          cargo install pubky-testnet --version '=0.16.2' --locked --root "$RUNNER_TEMP/tools"
+      - if: >-
+          github.ref == 'refs/heads/main' && env.IS_RELEASE != 'true' &&
+          steps.testnet-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/tools
+          key: ${{ steps.testnet-cache.outputs.cache-primary-key }}
       - run: echo "$RUNNER_TEMP/tools/bin" >> "$GITHUB_PATH"
       # Starts Postgres on localhost:5432 and sets TEST_PUBKY_CONNECTION_STRING
       # for the next step.
@@ -339,7 +276,9 @@ jobs:
       - run: scripts/demo-local.sh --ci --binary "$RUNNER_TEMP/dist/sweepky"
 
   package:
-    needs: [check, build, e2e]
+    # Not after e2e: packing and the install checks below run while e2e
+    # still does, and `publish` waits for e2e itself.
+    needs: [check, build]
     # GNU tar and gzip, which package.sh needs to make byte-for-byte
     # reproducible tarballs, so every target, macOS included, is packed here.
     runs-on: ubuntu-24.04
@@ -416,14 +355,11 @@ jobs:
       # Ubuntu, so this also proves install.sh is plain POSIX sh.
       - run: |
           staged=$RUNNER_TEMP/staged
+          # install.sh itself refuses a binary that does not report
+          # `sweepky <version>` for the --version asked for.
           SWEEPKY_INSTALL_BASE_URL="file://$staged" \
               sh "$staged/$TAG/install.sh" --version "$TAG" --to "$RUNNER_TEMP/bin" --no-attest
-          got=$("$RUNNER_TEMP/bin/sweepky" --version)
-          echo "$got"
-          [ "$got" = "sweepky ${TAG#v}" ] || {
-              echo "::error::the installed sweepky reports '$got', not sweepky ${TAG#v}"
-              exit 1
-          }
+          "$RUNNER_TEMP/bin/sweepky" --version
       # The checksum check must stop an install: a copy of the staged
       # release whose SHA256SUMS names the wrong hash for every tarball has
       # to fail, for that reason, and leave nothing installed.
@@ -452,10 +388,10 @@ jobs:
           fi
 
   publish:
-    # Only a release run, the same test as IS_RELEASE in `check`. Every job
-    # it needs must have passed, every matrix entry of `install` included.
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [check, ci, package, install]
+    # Only a release run, as `check` decided. Every job it needs must have
+    # passed, every matrix entry of `e2e` and `install` included.
+    if: needs.check.outputs.is_release == 'true'
+    needs: [check, ci, e2e, package, install]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     # The only job that can write: contents to create the release and
@@ -549,18 +485,14 @@ jobs:
           echo "::error::$RELEASE_URL/$TAG/install.sh was not served within 5 minutes"
           exit 1
       # The documented one-line install. With GH_TOKEN set, gh is logged in,
-      # so install.sh checks the attestation as well as the checksum.
+      # so install.sh checks the attestation as well as the checksum, and
+      # it refuses a binary that does not report the version asked for.
       - run: |
           curl --proto '=https' --tlsv1.2 -fsSL "$RELEASE_URL/$TAG/install.sh" |
               sh -s -- --version "$TAG" --to "$RUNNER_TEMP/bin"
-          got=$("$RUNNER_TEMP/bin/sweepky" --version)
-          echo "$got"
-          [ "$got" = "sweepky ${TAG#v}" ] || {
-              echo "::error::the installed sweepky reports '$got', not sweepky ${TAG#v}"
-              exit 1
-          }
-      # The same checks again by hand, as the release notes describe them,
-      # so they do not rest on install.sh alone.
+          "$RUNNER_TEMP/bin/sweepky" --version
+      # The same checks again by hand, so they do not rest on install.sh
+      # alone, with the attestation held to the stricter terms below.
       - run: |
           mkdir "$RUNNER_TEMP/download"
           cd "$RUNNER_TEMP/download"

@@ -151,7 +151,6 @@ stop_example() {
     example_pid=""
 }
 
-# shellcheck disable=SC2329 # called by the EXIT trap below, which shellcheck does not follow
 cleanup() {
     stop_example
     if ! $finished; then
