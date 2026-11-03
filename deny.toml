@@ -84,6 +84,20 @@ ignore = [
     # it when sqlx-core in the tree depends on webpki-roots 1, or when the 0.26
     # shim otherwise leaves the lock.
     { id = "RUSTSEC-2026-0381", reason = "webpki-roots 0.26.11, dev-only via pubky-testnet -> pubky-homeserver -> sqlx-core 0.8.6; a shim re-exporting webpki-roots 1, which is at the patched 1.0.10; no patched 0.26 release exists" },
+    # crypto-bigint 0.5.5, timing variability in operations meant to be
+    # constant-time. It reaches the graph solely through age 0.12.1 -> p256
+    # 0.13.2 and hpke 0.12.0 -> elliptic-curve 0.13.8 -> crypto-bigint
+    # (`cargo tree -i crypto-bigint@0.5.5 -e normal,dev --target all`). In age
+    # only the P-256 tag recipients use p256/hpke (`age::tag`, `age::tagpq`),
+    # and they only encrypt: age 0.12.1 has no identity for their stanzas, and
+    # its X25519 and scrypt identities return early on any other stanza type,
+    # so a P-256 stanza in an attacker's ciphertext is skipped unparsed.
+    # Sweepky uses age's X25519 recipients and identities and scrypt only, and
+    # never names `tag` or `tagpq`. The fix is in crypto-bigint 0.7.6; no
+    # patched 0.5 release exists, and elliptic-curve 0.13 requires 0.5. Anyone
+    # who adds a tag recipient or a P-256 identity must re-check this entry.
+    # Remove it when age moves to elliptic-curve 0.14 / crypto-bigint 0.7.
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.5 via age 0.12.1 -> p256/hpke -> elliptic-curve 0.13; Sweepky uses only age's X25519 recipients/identities and scrypt, never the P-256 tag recipients; no patched 0.5 release exists (fix needs an age release on elliptic-curve 0.14 / crypto-bigint 0.7)" },
 ]
 # A yanked release was withdrawn by its author, often for a bug, so depending on
 # one fails the check instead of only warning (the default).
