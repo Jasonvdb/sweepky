@@ -256,6 +256,20 @@ describe('the setup block', () => {
     }
   })
 
+  it('checks the build with the binary it made, which is on no PATH yet', () => {
+    expect(agent.prompt.text).toContain('Run `target/release/sweepky --help`')
+    expect(agent.prompt.text).not.toContain('`sweepky --help`')
+  })
+
+  it('keeps the copy status on one line, beside a title that wraps first', () => {
+    const rule = (file: string, selector: string) =>
+      readRepoFile(`web/src/styles/${file}`).match(new RegExp(`^${literal(selector)} \\{([^}]*)\\}`, 'm'))?.[1] ?? ''
+    const status = rule('buttons.css', '.copy-button__status')
+    expect(status).toContain('white-space: nowrap;')
+    expect(status).not.toContain('max-width')
+    expect(rule('landing.css', '.landing-setup__header')).toContain('grid-template-columns: minmax(0, 1fr) auto;')
+  })
+
   it("lists the README's steps by hand, each command with a copy button", () => {
     expect(manual.steps.map((step) => step.command)).toEqual([
       `git clone ${REPO_URL}`,

@@ -13,7 +13,7 @@ Set up the Sweepky CLI on this machine for me. Sweepky lets owners post bounties
 
 1. Check that git and rustup are installed. If one is missing, tell me how to install it and wait: don't install system tools without asking me.
 2. Clone the repository and build the CLI as the README's Install section says: `cargo build --release -p sweepky-cli --locked`. rust-toolchain.toml picks the Rust version. The binary is target/release/sweepky. Ask me before you put it on my PATH.
-3. Run `sweepky --help` to check the build works.
+3. Run `target/release/sweepky --help` to check the build works.
 4. Logging in is my step, not yours. Tell me to run `sweepky login` in my own terminal and approve it in Pubky Ring, or `sweepky login --identity <name>` to have the CLI create a dedicated identity. Never read, print or copy anything under ~/.config/sweepky or ~/.local/share/sweepky: they hold this install's secret keys and decrypted findings.
 5. Ask me whether I will sweep, post bounties, or both.
    - To sweep: ask me for a new directory and whether to install Cloudflare's security-audit playbook into it (that needs Node and the network), then run `sweepky init <dir> --install-playbook` or `sweepky init <dir> --no-playbook`. Then explain the loop: in that directory I run `sweepky run <bounty-url>`, start Claude Code there with `claude --setting-sources project,local` and type `/sweepky`, then quit it and run `sweepky submit`.
