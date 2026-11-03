@@ -1,0 +1,599 @@
+# Release: builds, tests and publishes the `sweepky` CLI as a GitHub Release.
+#
+# Pushing a tag vX.Y.Z runs every job below in order; each one gates the next, and nothing is public until all of them
+# have passed:
+#
+#   check     the tag is vX.Y.Z, equals the Cargo workspace version, points
+#             at a commit on main, and CHANGELOG.md has a dated section for
+#             it, which becomes the release notes
+#   ci        ci.yml's gates (fmt, clippy, tests, cargo-deny, shellcheck,
+#             web) on the tagged commit
+#   build     one native build per target, `--profile dist --locked`, with
+#             no cache, then scripts/release/smoke.sh on the binary
+#   e2e       scripts/demo-local.sh --ci with the built binary: the demo's
+#             full flow on a local Pubky testnet, with its checks
+#   package   a deterministic tarball per target, SHA256SUMS and install.sh
+#   install   install.sh against those staged files, on every target
+#   publish   build provenance attestations, then a draft release that is
+#             made public only once every file is uploaded
+#   verify    on fresh runners: install from the public release URL, check
+#             SHA256SUMS and the attestations, run the binary
+#
+# Every other run is a dry run, which runs everything up to `install` and
+# keeps the staged release files as the workflow artifact `release-assets`
+# (two weeks): a manual run, the weekly scheduled run, and a pull request
+# that changes a file the release depends on. A manual run with `verify_tag`
+# set runs only `verify`, against a release that already exists.
+#
+# As in ci.yml, every action is pinned to a full commit SHA with its release
+# tag in the trailing comment (ci.yml's header says why, and how to upgrade
+# one), and every checkout leaves the job token out of .git/config. Nothing
+# from an event payload or an input is written into a `run:` script with
+# `${{ }}`: each value goes through an environment variable, so a crafted
+# branch name or input can never become shell code.
+name: Release
+
+on:
+  # A release. Only a tag that starts with v gets here; `check` refuses any
+  # tag that is not exactly vX.Y.Z before anything is built.
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      verify_tag:
+        description: >-
+          Re-verify an existing release instead of a dry run: its tag,
+          vX.Y.Z. Runs only the verify job. Leave empty for a dry run.
+        required: false
+        default: ""
+        type: string
+  # A dry run every Monday, so a release-only breakage (a runner image
+  # change, a new musl, a moved Homebrew Postgres) shows up before the next
+  # tag rather than during it. Off the hour: GitHub delays scheduled runs
+  # most at the top of the hour.
+  schedule:
+    - cron: "23 5 * * 1"
+  # A dry run on every pull request that changes something the release is
+  # built from or with. Any other pull request gets only ci.yml.
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - .github/workflows/ci.yml
+      - install.sh
+      - scripts/release/**
+      - scripts/demo-local.sh
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - deny.toml
+      - crates/**
+
+# Every job can read the repository and nothing else. Only `publish` gets
+# more, in its own `permissions`.
+permissions:
+  contents: read
+
+concurrency:
+  # One run at a time per ref. A newer push to a pull request cancels its
+  # older dry run; nothing else is ever cancelled, so a release run always
+  # finishes (or fails) on its own and never stops halfway through
+  # publishing. ci.yml's group starts with `ci-`, so the CI run this
+  # workflow calls can never wait on this group.
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    # An explicit `bash` makes Actions run `bash -eo pipefail`, so a failure
+    # anywhere in a pipeline, such as `curl ... | sh`, fails the step. The
+    # default shell has no pipefail.
+    shell: bash
+
+jobs:
+  check:
+    # Skipped when re-verifying an existing release. Every job but `verify`
+    # needs this one, so they are skipped then too.
+    if: ${{ !inputs.verify_tag }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+      version: ${{ steps.check.outputs.version }}
+      is_release: ${{ steps.check.outputs.is_release }}
+      source_date_epoch: ${{ steps.check.outputs.source_date_epoch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The whole history, so the check below can tell whether the
+          # tagged commit is on main.
+          fetch-depth: 0
+      # cargo metadata reads the version; this installs the toolchain that
+      # rust-toolchain.toml names.
+      - run: rustup toolchain install --no-self-update
+      - id: check
+        env:
+          # The one definition of a release run, used again by `publish`:
+          # a push of a tag that starts with v. Everything else is a dry run.
+          IS_RELEASE: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          die() {
+              echo "::error::$*"
+              exit 1
+          }
+
+          # Both crates inherit [workspace.package] version, so there is
+          # exactly one version, the one `sweepky --version` prints.
+          version=$(cargo metadata --no-deps --format-version 1 |
+              jq -r '[.packages[].version] | unique | if length == 1 then .[0] else "several" end')
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+              die "the workspace version is '$version', not one plain X.Y.Z"
+
+          if [ "$IS_RELEASE" = true ]; then
+              tag=$GITHUB_REF_NAME
+              [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
+                  die "tag $tag is not vX.Y.Z; release tags have no prefix or suffix"
+              [ "$tag" = "v$version" ] ||
+                  die "tag $tag does not match the workspace version $version in Cargo.toml"
+              # A release is built only from reviewed code: the tagged commit
+              # must already be on main. The repository is public, so this
+              # fetch needs no token.
+              git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+              git merge-base --is-ancestor HEAD origin/main ||
+                  die "tag $tag points at $(git rev-parse HEAD), which is not on main"
+          else
+              # A dry run tests the version the next release would have.
+              tag=v$version
+          fi
+
+          # Exactly one `## [X.Y.Z] - YYYY-MM-DD` heading, with a real date.
+          # A dry run also accepts `Unreleased` in place of the date, the
+          # state between the version bump and the tag.
+          # The lines that start with `## [X.Y.Z]` are found with a plain
+          # string match, so the dots in the version need no escaping.
+          heading=$(awk -v start="## [$version]" 'index($0, start) == 1' CHANGELOG.md)
+          [ -n "$heading" ] || die "CHANGELOG.md has no '## [$version] - YYYY-MM-DD' section"
+          [ "$(printf '%s\n' "$heading" | wc -l)" -eq 1 ] ||
+              die "CHANGELOG.md has more than one section for $version"
+          dated='^ - ([0-9]{4}-[0-9]{2}-[0-9]{2})$'
+          if [[ "${heading#"## [$version]"}" =~ $dated ]]; then
+              # GNU date prints a valid date back unchanged and refuses
+              # 2026-02-30, so this catches a mistyped day too.
+              day=${BASH_REMATCH[1]}
+              [ "$(date -u -d "$day" +%F 2> /dev/null)" = "$day" ] ||
+                  die "CHANGELOG.md dates $version $day, which is not a real date"
+          elif [ "$heading" = "## [$version] - Unreleased" ] && [ "$IS_RELEASE" != true ]; then
+              echo "::warning::CHANGELOG.md still says Unreleased for $version; date it before tagging"
+          else
+              die "CHANGELOG.md's heading for $version is '$heading'; it must be '## [$version] - YYYY-MM-DD'"
+          fi
+
+          # The section's body: every line after the heading up to the next
+          # `## ` heading or the link definitions at the end of the file,
+          # without the blank lines around it.
+          awk -v heading="$heading" '
+              $0 == heading { on = 1; next }
+              on && (/^## / || /^\[.*\]: /) { exit }
+              on {
+                  line[++n] = $0
+                  if ($0 ~ /[^[:space:]]/) { if (!first) first = n; last = n }
+              }
+              END { for (i = first; i && i <= last; i++) print line[i] }
+          ' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          [ -s "$RUNNER_TEMP/notes.md" ] || die "CHANGELOG.md's section for $version is empty"
+
+          # The fixed block every release's notes end with. @TAG@ is
+          # replaced below, after the quoted heredoc has kept every $ and
+          # backtick as written.
+          sed "s/@TAG@/$tag/g" >> "$RUNNER_TEMP/notes.md" << 'EOF'
+
+          ## Verify this release
+
+          `SHA256SUMS` lists the SHA-256 of every tarball and of `install.sh`, and every tarball and the `sweepky` binary inside it have a build provenance attestation signed by this repository's release workflow. `install.sh` checks the checksum, and the attestation too when the [GitHub CLI](https://cli.github.com/) is installed and logged in. To check a download by hand, run this where the tarball and `SHA256SUMS` are, with the name of the tarball you downloaded:
+
+          ```sh
+          file=sweepky-@TAG@-aarch64-apple-darwin.tar.gz
+          grep "  $file\$" SHA256SUMS | shasum -a 256 -c    # on Linux: sha256sum -c
+          gh attestation verify "$file" --repo Jasonvdb/sweepky
+          ```
+          EOF
+
+          # Every file in the tarballs gets the tagged commit's time, so the
+          # same commit always packs into the same bytes.
+          source_date_epoch=$(git log -1 --format=%ct HEAD)
+          {
+              echo "tag=$tag"
+              echo "version=$version"
+              echo "is_release=$IS_RELEASE"
+              echo "source_date_epoch=$source_date_epoch"
+          } >> "$GITHUB_OUTPUT"
+          {
+              echo "## sweepky $tag ($([ "$IS_RELEASE" = true ] && echo release || echo 'dry run'))"
+              echo
+              cat "$RUNNER_TEMP/notes.md"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-notes
+          path: ${{ runner.temp }}/notes.md
+          if-no-files-found: error
+          retention-days: 14
+
+  ci:
+    # ci.yml itself, called on the tagged commit, so a release passes the
+    # same gates as a pull request. On a pull request ci.yml already runs on
+    # its own, so it is not run twice. A job that calls another workflow
+    # cannot set timeout-minutes; every job in ci.yml sets its own.
+    needs: check
+    if: github.event_name != 'pull_request'
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: check
+    strategy:
+      # One target failing does not cancel the others, so a single run
+      # shows every target that is broken.
+      fail-fast: false
+      # Every target builds natively on a runner of its own OS and
+      # architecture, so nothing is cross-compiled and smoke.sh runs the
+      # binary right where it was built. The jobs below reuse this list
+      # through the YAML alias *targets. Labels from
+      # https://github.com/actions/runner-images (checked 2026-11-03):
+      # ubuntu-24.04-arm is the Arm64 Ubuntu image, and macos-15-intel the
+      # x64 macOS 15 image, macos-15 being Apple silicon.
+      matrix: &targets
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    # Fat LTO with one codegen unit makes for a slow link.
+    timeout-minutes: 60
+    env:
+      TARGET: ${{ matrix.target }}
+      TAG: ${{ needs.check.outputs.tag }}
+      # Pinned to the tagged commit's time, for any part of the build that
+      # records a timestamp.
+      SOURCE_DATE_EPOCH: ${{ needs.check.outputs.source_date_epoch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # No rust-cache, nor any other cache, in this job: a shipped binary is
+      # built only from the checked-out commit, Cargo.lock and the pinned
+      # toolchain. A restored cache is written by some earlier run, so a
+      # poisoned entry could put code into a release; with none, it cannot.
+      # The cost is a full build each time.
+      - run: rustup toolchain install --no-self-update
+      # The Linux targets are musl, so the binary is static and runs on any
+      # distribution. The target is added to the toolchain here rather than
+      # in rust-toolchain.toml, so local installs stay as they are; for the
+      # macOS targets, which are the runner's own, it is a no-op.
+      - run: rustup target add "$TARGET"
+      # musl-gcc, for the C code some dependencies compile (aws-lc-sys,
+      # through rustls). It comes from Ubuntu 24.04's signed archive.
+      - if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends musl-tools
+      # --locked: fail if Cargo.lock is out of date instead of updating it.
+      - run: cargo build --profile dist --locked -p sweepky-cli --target "$TARGET"
+      - run: scripts/release/smoke.sh "target/$TARGET/dist/sweepky" "$TAG"
+      # The raw binary, for e2e, package and the attestation. A run's
+      # artifacts are only a hand-off between its jobs, so they expire
+      # after a week.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: bin-${{ matrix.target }}
+          path: target/${{ matrix.target }}/dist/sweepky
+          if-no-files-found: error
+          retention-days: 7
+
+  e2e:
+    name: e2e (${{ matrix.target }})
+    needs: [check, build]
+    strategy:
+      fail-fast: false
+      matrix: *targets
+    runs-on: ${{ matrix.runner }}
+    # A cache miss compiles pubky-testnet, and macOS installs Postgres.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: bin-${{ matrix.target }}
+          path: ${{ runner.temp }}/dist
+      # An artifact does not keep the executable bit.
+      - run: chmod +x "$RUNNER_TEMP/dist/sweepky"
+      - run: rustup toolchain install --no-self-update
+      # pubky-testnet is a test tool, never part of a release, so unlike the
+      # build it may come from a cache. The key holds everything the
+      # compiled tool depends on: its exact version, the runner's OS and
+      # architecture, and the toolchain rust-toolchain.toml pins.
+      - id: testnet-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/tools
+          key: pubky-testnet-0.16.2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml') }}
+      # The version docs/plan/06 pins and demo-local.sh checks. --root keeps
+      # it, and the install record demo-local.sh reads its version from,
+      # in the cached directory instead of ~/.cargo.
+      - if: steps.testnet-cache.outputs.cache-hit != 'true'
+        run: cargo install pubky-testnet --version '=0.16.2' --locked --root "$RUNNER_TEMP/tools"
+      - run: echo "$RUNNER_TEMP/tools/bin" >> "$GITHUB_PATH"
+      # Starts Postgres on localhost:5432 and sets TEST_PUBKY_CONNECTION_STRING
+      # for the next step.
+      - run: scripts/release/start-postgres.sh
+      - run: scripts/demo-local.sh --ci --binary "$RUNNER_TEMP/dist/sweepky"
+
+  package:
+    needs: [check, build, e2e]
+    # GNU tar and gzip, which package.sh needs to make byte-for-byte
+    # reproducible tarballs, so every target, macOS included, is packed here.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+      SOURCE_DATE_EPOCH: ${{ needs.check.outputs.source_date_epoch }}
+    steps:
+      # package.sh puts LICENSE, README.md and CHANGELOG.md from the
+      # checkout into every tarball.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Each bin-<target> artifact lands in a directory of that name.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: bin-*
+          path: ${{ runner.temp }}/bins
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-notes
+          path: ${{ runner.temp }}/notes
+      - run: |
+          assets=$RUNNER_TEMP/release-assets
+          # The four targets by name, rather than whatever artifacts there
+          # are, so a missing one fails here and an extra one is not shipped.
+          for target in x86_64-unknown-linux-musl aarch64-unknown-linux-musl \
+              aarch64-apple-darwin x86_64-apple-darwin; do
+              scripts/release/package.sh "$RUNNER_TEMP/bins/bin-$target/sweepky" "$target" "$TAG" "$assets"
+          done
+          cp install.sh "$assets/"
+          # "<sha256>  <file name>" lines, names only and sorted, the form
+          # `sha256sum -c` and install.sh read: one per tarball, and one for
+          # install.sh, so the installer can be checked by hand too.
+          (cd "$assets" && sha256sum -- install.sh *.tar.gz | LC_ALL=C sort -k 2 > SHA256SUMS)
+          cp "$RUNNER_TEMP/notes/notes.md" "$assets/"
+          {
+              echo '## Staged release files'
+              echo
+              echo '```'
+              cat "$assets/SHA256SUMS"
+              echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      # The release exactly as `publish` uploads it. For a dry run this is
+      # the result: download it to inspect the tarballs, or to compare two
+      # runs' tarballs byte for byte.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-assets
+          path: ${{ runner.temp }}/release-assets
+          if-no-files-found: error
+          retention-days: 14
+
+  install:
+    name: install (${{ matrix.target }})
+    needs: [check, package]
+    strategy:
+      fail-fast: false
+      matrix: *targets
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+    # No checkout: like a user, this job has only the release's own files.
+    steps:
+      # Laid out as the release download URL is, <base>/<tag>/<file>, so
+      # install.sh reads it through SWEEPKY_INSTALL_BASE_URL as it would
+      # read the real release.
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-assets
+          path: ${{ runner.temp }}/staged/${{ needs.check.outputs.tag }}
+      # --no-attest: nothing is attested until `publish`. `sh` is dash on
+      # Ubuntu, so this also proves install.sh is plain POSIX sh.
+      - run: |
+          staged=$RUNNER_TEMP/staged
+          SWEEPKY_INSTALL_BASE_URL="file://$staged" \
+              sh "$staged/$TAG/install.sh" --version "$TAG" --to "$RUNNER_TEMP/bin" --no-attest
+          got=$("$RUNNER_TEMP/bin/sweepky" --version)
+          echo "$got"
+          [ "$got" = "sweepky ${TAG#v}" ] || {
+              echo "::error::the installed sweepky reports '$got', not sweepky ${TAG#v}"
+              exit 1
+          }
+      # The checksum check must stop an install: a copy of the staged
+      # release whose SHA256SUMS names the wrong hash for every tarball has
+      # to fail, for that reason, and leave nothing installed.
+      - run: |
+          staged=$RUNNER_TEMP/staged
+          tampered=$RUNNER_TEMP/tampered
+          mkdir -p "$tampered"
+          cp -R "$staged/$TAG" "$tampered/$TAG"
+          # The SHA-256 of no bytes at all, which no tarball has.
+          awk '{ printf "%s  %s\n", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", $2 }' \
+              "$staged/$TAG/SHA256SUMS" > "$tampered/$TAG/SHA256SUMS"
+          if SWEEPKY_INSTALL_BASE_URL="file://$tampered" \
+              sh "$tampered/$TAG/install.sh" --version "$TAG" --to "$RUNNER_TEMP/bin-tampered" --no-attest \
+              2> "$RUNNER_TEMP/tampered.log"; then
+              echo "::error::install.sh installed a tarball that does not match SHA256SUMS"
+              exit 1
+          fi
+          cat "$RUNNER_TEMP/tampered.log"
+          grep -q 'does not match its SHA-256 in SHA256SUMS' "$RUNNER_TEMP/tampered.log" || {
+              echo "::error::install.sh failed, but not on the checksum"
+              exit 1
+          }
+          if [ -e "$RUNNER_TEMP/bin-tampered/sweepky" ]; then
+              echo "::error::install.sh left a sweepky behind after refusing the tarball"
+              exit 1
+          fi
+
+  publish:
+    # Only a release run, the same test as IS_RELEASE in `check`. Every job
+    # it needs must have passed, every matrix entry of `install` included.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [check, ci, package, install]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # The only job that can write: contents to create the release and
+    # upload to it; id-token to get the short-lived OIDC token Sigstore
+    # signs the attestations against, in place of a long-lived signing key;
+    # attestations to store them in the repository.
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+      # gh runs with no checkout, so it is told which repository to use.
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-assets
+          path: ${{ runner.temp }}/assets
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: bin-*
+          path: ${{ runner.temp }}/bins
+      # The tarballs must still be the ones SHA256SUMS was made from.
+      - run: cd "$RUNNER_TEMP/assets" && sha256sum --strict -c SHA256SUMS
+      # Signed build provenance for every tarball and every raw binary: it
+      # ties each file's SHA-256 to this repository, this workflow and the
+      # tagged commit. The binaries are attested too because each is the
+      # same bytes as the sweepky inside its tarball, so an installed
+      # binary can be verified on its own. These go to the public Sigstore
+      # transparency log, permanently.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            ${{ runner.temp }}/assets/*.tar.gz
+            ${{ runner.temp }}/bins/bin-*/sweepky
+      # A draft is visible only to maintainers, so a release that fails
+      # halfway through the uploads is never public with files missing.
+      # --verify-tag refuses to create the tag if it is not on GitHub. A
+      # re-run fails here, because the release exists, instead of
+      # overwriting files that may already have been downloaded.
+      - run: gh release create "$TAG" --draft --verify-tag --title "$TAG" --notes-file "$RUNNER_TEMP/assets/notes.md"
+      - run: |
+          assets=$RUNNER_TEMP/assets
+          gh release upload "$TAG" "$assets"/*.tar.gz "$assets/SHA256SUMS" "$assets/install.sh"
+      - run: gh release edit "$TAG" --draft=false
+
+  verify:
+    name: verify (${{ matrix.target }})
+    # After a release is published, or on its own for `verify_tag`.
+    # `!cancelled()` lets it run when `check` and `publish` were skipped,
+    # which they are with `verify_tag`; after a tag push it still runs only
+    # once `publish` succeeded. It lives in this workflow because a release
+    # created with the job token fires no `release` event for another
+    # workflow to react to.
+    if: >-
+      !cancelled() &&
+      (needs.publish.result == 'success' ||
+      (github.event_name == 'workflow_dispatch' && inputs.verify_tag != ''))
+    needs: [check, publish]
+    strategy:
+      fail-fast: false
+      matrix: *targets
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    # gh attestation verify reads the attestations through the API.
+    permissions:
+      contents: read
+      attestations: read
+    env:
+      TAG: ${{ inputs.verify_tag || needs.check.outputs.tag }}
+      TARGET: ${{ matrix.target }}
+      GH_TOKEN: ${{ github.token }}
+      REPO: Jasonvdb/sweepky
+      RELEASE_URL: https://github.com/Jasonvdb/sweepky/releases/download
+    # No checkout and no artifact: this job uses only what the public
+    # release serves, as a new user would.
+    steps:
+      - run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+              echo "::error::the tag to verify must be vX.Y.Z, not '$TAG'"
+              exit 1
+          }
+      # A just-published release can take a moment to be served everywhere.
+      - run: |
+          for _ in $(seq 1 30); do
+              curl --proto '=https' --tlsv1.2 -fsSIL -o /dev/null "$RELEASE_URL/$TAG/install.sh" && exit 0
+              sleep 10
+          done
+          echo "::error::$RELEASE_URL/$TAG/install.sh was not served within 5 minutes"
+          exit 1
+      # The documented one-line install. With GH_TOKEN set, gh is logged in,
+      # so install.sh checks the attestation as well as the checksum.
+      - run: |
+          curl --proto '=https' --tlsv1.2 -fsSL "$RELEASE_URL/$TAG/install.sh" |
+              sh -s -- --version "$TAG" --to "$RUNNER_TEMP/bin"
+          got=$("$RUNNER_TEMP/bin/sweepky" --version)
+          echo "$got"
+          [ "$got" = "sweepky ${TAG#v}" ] || {
+              echo "::error::the installed sweepky reports '$got', not sweepky ${TAG#v}"
+              exit 1
+          }
+      # The same checks again by hand, as the release notes describe them,
+      # so they do not rest on install.sh alone.
+      - run: |
+          mkdir "$RUNNER_TEMP/download"
+          cd "$RUNNER_TEMP/download"
+          file=sweepky-$TAG-$TARGET.tar.gz
+          curl --proto '=https' --tlsv1.2 -fsSL -O "$RELEASE_URL/$TAG/$file" -O "$RELEASE_URL/$TAG/SHA256SUMS"
+          awk -v f="$file" '$2 == f' SHA256SUMS > expected
+          [ "$(wc -l < expected)" -eq 1 ] || {
+              echo "::error::SHA256SUMS has no single line for $file"
+              exit 1
+          }
+          if command -v sha256sum > /dev/null; then
+              sha256sum --strict -c expected
+          else
+              shasum -a 256 -c expected
+          fi
+          # The tarball and the installed binary, each held to this
+          # repository's release workflow, run on GitHub's own runners, for
+          # this tag.
+          for subject in "$file" "$RUNNER_TEMP/bin/sweepky"; do
+              gh attestation verify "$subject" --repo "$REPO" \
+                  --signer-workflow "$REPO/.github/workflows/release.yml" \
+                  --source-ref "refs/tags/$TAG" \
+                  --deny-self-hosted-runners
+          done
+      # Only right after publishing: the release must now be the latest, so
+      # the install command with no --version, the one the README gives,
+      # installs it.
+      - if: needs.publish.result == 'success'
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSL "https://github.com/$REPO/releases/latest/download/install.sh" |
+              sh -s -- --to "$RUNNER_TEMP/latest"
+          got=$("$RUNNER_TEMP/latest/sweepky" --version)
+          [ "$got" = "sweepky ${TAG#v}" ] || {
+              echo "::error::the latest release installs '$got', not sweepky ${TAG#v}"
+              exit 1
+          }
