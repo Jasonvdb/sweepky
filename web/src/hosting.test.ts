@@ -1,6 +1,7 @@
 // Checks on the files a static host serves as they are, outside the bundle.
 import { existsSync, readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
+import { KNOWN_LIMITS_URL, LANDING_COPY, README_URL } from './landing/copy.ts'
 
 function readWebFile(path: string): string {
   return readFileSync(new URL(`../${path}`, import.meta.url), 'utf8')
@@ -12,6 +13,30 @@ describe('hosting', () => {
     expect(health).toBeTypeOf('object')
     expect(health).not.toBeNull()
     expect(Array.isArray(health)).toBe(false)
+  })
+
+  // An agent pointed at the site gets an empty page from the SPA, so
+  // /llms.txt carries the landing's setup prompt (04, Page rules).
+  describe('/llms.txt', () => {
+    const llms = readWebFile('public/llms.txt')
+
+    it("carries the landing's setup prompt verbatim", () => {
+      expect(llms).toContain(LANDING_COPY.start.agent.prompt.text)
+    })
+
+    it("opens with the name and the hero's subtitle as its summary", () => {
+      expect(llms.startsWith(`# Sweepky\n\n> ${LANDING_COPY.hero.subtitle.text}\n`)).toBe(true)
+    })
+
+    it('links to the README and its known limits', () => {
+      expect(llms).toContain(`(${README_URL.replace(/#.*$/, '')})`)
+      expect(llms).toContain(`(${KNOWN_LIMITS_URL})`)
+    })
+
+    it('follows the copy rules: no install command, never "private"', () => {
+      expect(llms).not.toMatch(/cargo install|brew install|\bnpx\b|curl[^\n]*\|/i)
+      expect(llms).not.toMatch(/\bprivate\b/i)
+    })
   })
 
   // vibes.pubky.app shows the board in an iframe, so nothing may forbid framing.

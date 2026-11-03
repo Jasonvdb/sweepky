@@ -1,8 +1,9 @@
 // `/` (04, "Landing page"): six sections in order, a hero drawn from the
-// board's store, the `#post` and `#sweep` anchors, an install block that
-// points at the README, and copy whose every claim names where in 00, 02 or
-// 06's known limits it comes from. Rendered to HTML in Node, from a store
-// whose state the test sets, at a fixed clock.
+// board's store, the `#post`, `#sweep` and `#setup` anchors, a setup block
+// with the agent prompt, the README's steps by hand and a link to the README,
+// and copy whose every claim names where in 00, 02 or 06's known limits it
+// comes from. Rendered to HTML in Node, from a store whose state the test
+// sets, at a fixed clock.
 import { readdirSync, readFileSync } from 'node:fs'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { MemoryRouter } from 'react-router'
@@ -22,7 +23,7 @@ import {
   type BountyEntry,
   type Resolution,
 } from '../store/state.ts'
-import { LANDING_COPY, README_URL, KNOWN_LIMITS_URL } from './copy.ts'
+import { LANDING_COPY, README_URL, KNOWN_LIMITS_URL, REPO_URL } from './copy.ts'
 import { scrollToHash } from './scrollToHash.ts'
 
 // A synthetic key from fixtures/trust-labels.json: the circle's admin.
@@ -135,9 +136,10 @@ describe('the sections', () => {
     expect([...order].sort((a, b) => a - b)).toEqual(order)
   })
 
-  it('has the #post and #sweep anchors', () => {
+  it('has the #post, #sweep and #setup anchors', () => {
     expect(html).toMatch(/\bid="post"/)
     expect(html).toMatch(/\bid="sweep"/)
+    expect(html).toMatch(/\bid="setup"/)
   })
 
   it('styles every class the landing adds', () => {
@@ -187,6 +189,7 @@ describe('the hero', () => {
     const part = hero(render(board([])))
     expect(part).toContain(`href="/?circle=${A}#sweep"`)
     expect(part).toContain(`href="/?circle=${A}#post"`)
+    expect(part).toContain(`href="/?circle=${A}#setup"`)
     expect(part).toContain(`href="/board?circle=${A}"`)
   })
 })
@@ -216,6 +219,58 @@ describe('scrollToHash', () => {
     const doc = fakeDocument(['post', 'sweep'])
     expect(() => scrollToHash(hash, doc)).not.toThrow()
     expect(doc.scrolls).toEqual([])
+  })
+})
+
+describe('the setup block', () => {
+  const html = render(board([]))
+  /** The final section, from its opening tag on. */
+  const setup = html.slice(html.indexOf('<section id="setup"'))
+  const { agent, manual } = LANDING_COPY.start
+
+  it('is the last section, with id="setup"', () => {
+    expect(setup.startsWith('<section id="setup" class="section"')).toBe(true)
+    expect(text(setup)).toContain('Start sweeping.')
+    expect(setup.slice(setup.indexOf('>'))).not.toContain('class="section"')
+  })
+
+  it('shows the whole prompt in a <pre>, with a button that copies it', () => {
+    const pre = setup.match(/<pre\b[^>]*>([\s\S]*?)<\/pre>/)
+    expect(text(pre?.[1] ?? '')).toBe(agent.prompt.text)
+    expect(setup).toMatch(new RegExp(`<button type="button"[^>]*aria-label="${literal(agent.copy.label)}"`))
+  })
+
+  it("keeps the prompt's safety rules", () => {
+    for (const rule of [
+      "don't install system tools without asking me",
+      'Ask me before you put it on my PATH',
+      'Logging in is my step, not yours',
+      'Never read, print or copy anything under ~/.config/sweepky or ~/.local/share/sweepky',
+      "Don't run `sweepky run`, `post`, `submit` or `done` yourself",
+    ]) {
+      expect(agent.prompt.text).toContain(rule)
+    }
+  })
+
+  it("lists the README's steps by hand, each command with a copy button", () => {
+    expect(manual.steps.map((step) => step.command)).toEqual([
+      `git clone ${REPO_URL}`,
+      'cd sweepky',
+      'cargo build --release -p sweepky-cli --locked',
+      'target/release/sweepky login',
+    ])
+    for (const step of manual.steps) {
+      expect(setup).toContain(`<code>${step.command}</code>`)
+      expect(setup).toContain(`aria-label="Copy ${step.command}"`)
+    }
+    expect(readRepoFile('README.md')).toContain(manual.steps[2]?.command)
+  })
+
+  it('announces what each copy did in a polite live region', () => {
+    const buttons = setup.match(/<button\b/g) ?? []
+    const regions = setup.match(/aria-live="polite"/g) ?? []
+    expect(buttons).toHaveLength(manual.steps.length + 1)
+    expect(regions).toHaveLength(buttons.length)
   })
 })
 

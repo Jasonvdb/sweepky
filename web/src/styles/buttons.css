@@ -51,3 +51,20 @@
   background: var(--secondary);
   color: var(--foreground);
 }
+
+/* CopyButton: the button, then a live region that says what the click did,
+   in muted text beside it (a card or the page, never --secondary). */
+.copy-button {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.copy-button__status {
+  color: var(--muted-foreground);
+  font-size: 0.875rem;
+}
+
+.copy-button__status:not(:empty) {
+  margin-inline-start: 0.75rem;
+}
