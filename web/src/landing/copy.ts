@@ -71,10 +71,13 @@ const CLOUDFLARE_SKILL_URL =
  * logs in or publishes: login is the human's step, and run, post, submit and
  * done write public records.
  */
+/** The README's build-from-source command, in the prompt and in the steps by hand. */
+const BUILD_COMMAND = 'cargo build --release -p sweepky-cli --locked'
+
 const SETUP_PROMPT = `Set up the Sweepky CLI on this machine for me. Sweepky lets owners post bounties for a review of pinned code and lets sweepers' coding agents sweep it, with the findings encrypted to the bounty's owner. Source and install notes: ${REPO_URL} (README.md).
 
 1. Check that git and rustup are installed. If one is missing, tell me how to install it and wait: don't install system tools without asking me.
-2. Clone the repository and build the CLI as the README's Install section says: \`cargo build --release -p sweepky-cli --locked\`. rust-toolchain.toml picks the Rust version. The binary is target/release/sweepky. Ask me before you put it on my PATH.
+2. Clone the repository and build the CLI as the README's Install section says: \`${BUILD_COMMAND}\`. rust-toolchain.toml picks the Rust version. The binary is target/release/sweepky. Ask me before you put it on my PATH.
 3. Run \`sweepky --help\` to check the build works.
 4. Logging in is my step, not yours. Tell me to run \`sweepky login\` in my own terminal and approve it in Pubky Ring, or \`sweepky login --identity <name>\` to have the CLI create a dedicated identity. Never read, print or copy anything under ~/.config/sweepky or ~/.local/share/sweepky: they hold this install's secret keys and decrypted findings.
 5. Ask me whether I will sweep, post bounties, or both.
@@ -264,7 +267,8 @@ export const LANDING_COPY = {
         text: SETUP_PROMPT,
         sources: [THE_LOOP, WHAT_IT_IS, DECISIONS, SEALED, WHO_CAN_READ, SWEEPER_SAFETY, KNOWN_LIMITS],
       },
-      copy: { label: 'Copy the setup prompt' },
+      // What the copy button names as copied: "Copy the setup prompt".
+      copySubject: { label: 'the setup prompt' },
     },
     manual: {
       label: 'Or by hand',
@@ -280,7 +284,7 @@ export const LANDING_COPY = {
           sources: [DECISIONS],
         },
         {
-          command: 'cargo build --release -p sweepky-cli --locked',
+          command: BUILD_COMMAND,
           text: 'Builds the sweepky CLI from source into target/release/.',
           sources: [DECISIONS],
         },

@@ -3,10 +3,10 @@
 // the page.
 
 import { useEffect, useState } from 'react'
-import { buttonClassName, type ButtonVariant } from './Button.tsx'
+import { Button, type ButtonVariant } from './Button.tsx'
 
 /** How long "Copied" stays before the button reads as ready again. */
-export const COPIED_FOR_MS = 2000
+const COPIED_FOR_MS = 2000
 
 /** The one part of `navigator.clipboard` this needs, so a test can pass a stand-in. */
 export type ClipboardWriter = Pick<Clipboard, 'writeText'>
@@ -38,13 +38,13 @@ export interface CopyLabels {
 interface CopyButtonProps {
   /** What a click puts on the clipboard. */
   readonly text: string
-  /** The accessible name, naming what is copied: "Copy the setup prompt". It starts with `labels.idle`, so the visible label is part of it. */
-  readonly name: string
+  /** What is copied, in words: "the setup prompt". The accessible name is `labels.idle` then this, so the visible label is always part of it. */
+  readonly subject: string
   readonly labels: CopyLabels
   readonly variant: ButtonVariant
 }
 
-export function CopyButton({ text, name, labels, variant }: CopyButtonProps) {
+export function CopyButton({ text, subject, labels, variant }: CopyButtonProps) {
   const [result, setResult] = useState<CopyResult | null>(null)
 
   // "Copied" fades back after a moment; "select the text" stays until the
@@ -66,9 +66,9 @@ export function CopyButton({ text, name, labels, variant }: CopyButtonProps) {
 
   return (
     <span className="copy-button">
-      <button type="button" className={buttonClassName(variant)} aria-label={name} onClick={() => void copy()}>
+      <Button variant={variant} aria-label={`${labels.idle} ${subject}`} onClick={() => void copy()}>
         {labels.idle}
-      </button>
+      </Button>
       <span className="copy-button__status" aria-live="polite">
         {result === null ? '' : labels[result]}
       </span>

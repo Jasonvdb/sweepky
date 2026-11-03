@@ -109,6 +109,10 @@ function hero(html: string): string {
   return html.slice(start, end < 0 ? undefined : end)
 }
 
+/** The landing page over an empty circle, as most tests read it. */
+const EMPTY_LANDING = render(board([]))
+const README = readRepoFile('README.md')
+
 beforeEach(() => {
   vi.useFakeTimers()
   vi.setSystemTime(NOW)
@@ -119,7 +123,7 @@ afterEach(() => {
 })
 
 describe('the sections', () => {
-  const html = render(board([]))
+  const html = EMPTY_LANDING
 
   it("renders 04's six sections in order", () => {
     expect(withClass(html, 'landing-hero')).toHaveLength(1)
@@ -223,7 +227,7 @@ describe('scrollToHash', () => {
 })
 
 describe('the setup block', () => {
-  const html = render(board([]))
+  const html = EMPTY_LANDING
   /** The final section, from its opening tag on. */
   const setup = html.slice(html.indexOf('<section id="setup"'))
   const { agent, manual } = LANDING_COPY.start
@@ -237,7 +241,7 @@ describe('the setup block', () => {
   it('shows the whole prompt in a <pre>, with a button that copies it', () => {
     const pre = setup.match(/<pre\b[^>]*>([\s\S]*?)<\/pre>/)
     expect(text(pre?.[1] ?? '')).toBe(agent.prompt.text)
-    expect(setup).toMatch(new RegExp(`<button type="button"[^>]*aria-label="${literal(agent.copy.label)}"`))
+    expect(setup).toMatch(new RegExp(`<button\\b[^>]*aria-label="${literal(`Copy ${agent.copySubject.label}`)}"`))
   })
 
   it("keeps the prompt's safety rules", () => {
@@ -263,7 +267,7 @@ describe('the setup block', () => {
       expect(setup).toContain(`<code>${step.command}</code>`)
       expect(setup).toContain(`aria-label="Copy ${step.command}"`)
     }
-    expect(readRepoFile('README.md')).toContain(manual.steps[2]?.command)
+    expect(README).toContain(manual.steps[2]?.command)
   })
 
   it('announces what each copy did in a polite live region', () => {
@@ -275,7 +279,7 @@ describe('the setup block', () => {
 })
 
 describe('install and known limits', () => {
-  const html = render(board([]))
+  const html = EMPTY_LANDING
 
   it('ships no install command', () => {
     for (const shipped of [html, JSON.stringify(LANDING_COPY)]) {
@@ -295,7 +299,7 @@ describe('install and known limits', () => {
 
   it("carries 06's known limits in the README", () => {
     const limits06 = listUnder(readRepoFile('docs/plan/06-verification-and-limits.md'), 'Known limits (say them in the README)')
-    const readme = listUnder(readRepoFile('README.md'), 'Known limits')
+    const readme = listUnder(README, 'Known limits')
     expect(limits06.length).toBeGreaterThan(0)
     expect(readme).toEqual(limits06)
   })
@@ -369,13 +373,13 @@ describe('the copy', () => {
   })
 
   it("never says 'private'", () => {
-    for (const shipped of [JSON.stringify(LANDING_COPY), text(render(board([])))]) {
+    for (const shipped of [JSON.stringify(LANDING_COPY), text(EMPTY_LANDING)]) {
       expect(shipped).not.toMatch(/\bprivate\b/i)
     }
   })
 
   it('adds no request of its own: no fetch, image, script or frame', () => {
-    const html = render(board([]))
+    const html = EMPTY_LANDING
     expect(html).not.toMatch(/<(img|script|iframe|link|video|audio|source)\b/i)
     for (const file of ['routes/Landing.tsx', 'landing/copy.ts', 'landing/scrollToHash.ts']) {
       const source = readFileSync(new URL(`../${file}`, import.meta.url), 'utf8')

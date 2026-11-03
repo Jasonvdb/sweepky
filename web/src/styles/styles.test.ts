@@ -7,6 +7,7 @@ import { createElement } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { describe, expect, it } from 'vitest'
 import { Button } from '../components/Button.tsx'
+import { CopyButton } from '../components/CopyButton.tsx'
 import { Section } from '../components/Section.tsx'
 import { contrastRatio, over, parseColor, withAlpha, type Rgb } from './contrast.ts'
 
@@ -228,6 +229,14 @@ describe('components', () => {
         renderToStaticMarkup(createElement(Button, { variant }, 'Go')),
       ),
       renderToStaticMarkup(createElement(Section, PROBLEM_SECTION, 'cards')),
+      renderToStaticMarkup(
+        createElement(CopyButton, {
+          text: 'x',
+          subject: 'x',
+          labels: { idle: 'Copy', copied: 'Copied', failed: 'Select the text to copy' },
+          variant: 'default',
+        }),
+      ),
     ].join('')
     const selectors = rules(ALL_CSS).map((rule) => rule.selector)
     for (const name of new Set(classNames(markup))) {

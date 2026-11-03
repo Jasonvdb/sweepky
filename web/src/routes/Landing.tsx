@@ -5,7 +5,7 @@
 // store, or the empty state: the page never draws a mock-up, and the store is
 // the only thing on it that reads a homeserver.
 
-import { useId } from 'react'
+import { useId, type ReactNode } from 'react'
 import { useBoard } from '../App.tsx'
 import { buttonClassName } from '../components/Button.tsx'
 import { CircleLink } from '../components/CircleLink.tsx'
@@ -79,7 +79,11 @@ export function Landing() {
         <div className="landing-start">
           <div className="landing-setup">
             <AgentSetup />
-            <ManualSetup />
+            <Lane label={start.manual.label} steps={start.manual.steps} copyLabels={COPY_LABELS}>
+              <p className="landing-install">
+                <a href={README_URL}>{start.install.label}</a>
+              </p>
+            </Lane>
           </div>
           <p className="actions">
             <CircleLink to="/board" className={buttonClassName('primary')}>
@@ -158,44 +162,13 @@ function AgentSetup() {
         </h3>
         <CopyButton
           text={start.agent.prompt.text}
-          name={start.agent.copy.label}
+          subject={start.agent.copySubject.label}
           labels={COPY_LABELS}
           variant="default"
         />
       </div>
       <p className="landing-setup__intro">{start.agent.intro.text}</p>
       <pre className="landing-setup__prompt">{start.agent.prompt.text}</pre>
-    </section>
-  )
-}
-
-/** The README's build-from-source steps, each command with its own copy button, and the README link. */
-function ManualSetup() {
-  const headingId = useId()
-  return (
-    <section className="card landing-setup__card" aria-labelledby={headingId}>
-      <h3 id={headingId} className="landing-setup__title">
-        {start.manual.label}
-      </h3>
-      <ol className="landing-setup__steps">
-        {start.manual.steps.map((step) => (
-          <li key={step.command}>
-            <div className="landing-setup__command">
-              <code>{step.command}</code>
-              <CopyButton
-                text={step.command}
-                name={`${COPY_LABELS.idle} ${step.command}`}
-                labels={COPY_LABELS}
-                variant="secondary"
-              />
-            </div>
-            <p>{step.text}</p>
-          </li>
-        ))}
-      </ol>
-      <p className="landing-install">
-        <a href={README_URL}>{start.install.label}</a>
-      </p>
     </section>
   )
 }
@@ -215,14 +188,21 @@ function Cards({ cards }: { readonly cards: readonly Card[] }) {
 }
 
 interface LaneProps {
-  /** The anchor `/#post` or `/#sweep` scrolls to. */
-  readonly id: string
+  /** The anchor `/#post` or `/#sweep` scrolls to, if any. */
+  readonly id?: string
   readonly label: string
   readonly steps: readonly Step[]
+  /** Give each command a copy button, labelled with these. */
+  readonly copyLabels?: CopyLabels
+  /** What follows the steps, such as a link. */
+  readonly children?: ReactNode
 }
 
-/** One side of How it works: who it is for and the commands they run, in order. */
-function Lane({ id, label, steps }: LaneProps) {
+/**
+ * A card of commands, in order: one side of How it works, or the setup
+ * block's steps by hand, where each command has its own copy button.
+ */
+function Lane({ id, label, steps, copyLabels, children }: LaneProps) {
   const headingId = useId()
   return (
     <section id={id} className="card landing-lane" aria-labelledby={headingId}>
@@ -232,11 +212,19 @@ function Lane({ id, label, steps }: LaneProps) {
       <ol className="landing-lane__steps">
         {steps.map((step) => (
           <li key={step.command}>
-            <code>{step.command}</code>
+            {copyLabels === undefined ? (
+              <code>{step.command}</code>
+            ) : (
+              <div className="landing-lane__command">
+                <code>{step.command}</code>
+                <CopyButton text={step.command} subject={step.command} labels={copyLabels} variant="secondary" />
+              </div>
+            )}
             <p>{step.text}</p>
           </li>
         ))}
       </ol>
+      {children}
     </section>
   )
 }

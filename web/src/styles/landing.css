@@ -167,55 +167,32 @@
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   background: var(--background);
-  color: var(--card-foreground);
   font-size: 0.8125rem;
   line-height: 1.6;
 }
 
-.landing-setup__steps {
-  display: grid;
-  gap: 1rem;
-  margin: 0;
-  padding-left: 1.25rem;
-}
-
-.landing-setup__steps p {
-  margin: 0.25rem 0 0;
-  color: var(--muted-foreground);
-}
-
-/* A command, and its copy button always on the right of it. The clone URL
-   is longer than a 375 px card is wide, so the command wraps anywhere
-   within its column. */
-.landing-setup__command {
+/* In the steps by hand: a command, and its copy button always on the right
+   of it. The clone URL is longer than a 375 px card is wide, so the command
+   wraps anywhere within its column. */
+.landing-lane__command {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: baseline;
   gap: 1rem;
 }
 
-/* The button's status sits under it here, so a long one does not squeeze
-   the command. */
-.landing-setup__command .copy-button {
-  display: grid;
-  justify-items: end;
-}
-
-.landing-setup__command .copy-button__status:not(:empty) {
-  max-width: 8rem;
-  margin: 0.25rem 0 0;
-  text-align: end;
-}
-
-.landing-setup__command code {
+.landing-lane__command code {
   min-width: 0;
-  color: var(--foreground);
-  font-weight: 600;
   overflow-wrap: anywhere;
 }
 
+.landing-lane__command + p {
+  margin: 0.25rem 0 0;
+  color: var(--muted-foreground);
+}
+
 .landing-install {
-  margin: 0;
+  margin: 1rem 0 0;
 }
 
 .landing-credits {

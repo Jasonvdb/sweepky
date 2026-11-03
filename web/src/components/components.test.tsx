@@ -377,19 +377,12 @@ describe('the copy button', () => {
   })
 
   it('is a real button named for what it copies, with a polite live region', () => {
-    const html = render(
-      <CopyButton text="cd sweepky" name="Copy cd sweepky" labels={LABELS} variant="secondary" />,
+    const html = renderToStaticMarkup(
+      <CopyButton text="cd sweepky" subject="cd sweepky" labels={LABELS} variant="secondary" />,
     )
-    expect(html).toMatch(/<button type="button" class="button button--secondary" aria-label="Copy cd sweepky">Copy<\/button>/)
+    expect(html).toMatch(/<button[^>]*\btype="button"[^>]*>Copy<\/button>/)
+    expect(html).toContain('class="button button--secondary"')
+    expect(html).toContain('aria-label="Copy cd sweepky"')
     expect(withClass(html, 'copy-button__status')).toEqual([expect.stringContaining('aria-live="polite"')])
-  })
-
-  it('emits only classes buttons.css styles', () => {
-    const css = readFileSync(new URL('../styles/buttons.css', import.meta.url), 'utf8')
-    const html = render(<CopyButton text="x" name="Copy x" labels={LABELS} variant="default" />)
-    const names = new Set([...html.matchAll(/class="([^"]*)"/g)].flatMap((match) => (match[1] ?? '').split(/\s+/)))
-    for (const name of names) {
-      expect(css, `.${name}`).toMatch(new RegExp(`\\.${name}(?![\\w-])`))
-    }
   })
 })
