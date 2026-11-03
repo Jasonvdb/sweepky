@@ -24,6 +24,11 @@ on:
   pull_request:
   # A manual run from the Actions tab, on any branch.
   workflow_dispatch:
+  # Called by release.yml's `ci` job, so a release passes these same gates on
+  # the tagged commit. A called workflow runs with the caller's `github`
+  # context: its event, ref and workflow name, which the concurrency group
+  # below sees too.
+  workflow_call:
 
 # The job token can read the repository and nothing else.
 permissions:
@@ -37,8 +42,17 @@ concurrency:
   # finishes and saves the caches. GitHub keeps only one run waiting per
   # group, though: if merges land faster than CI finishes, the waiting run
   # is replaced by the newest one.
-  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  #
+  # The literal `ci-` keeps this group apart from the caller's when
+  # release.yml calls this workflow. A called workflow whose group equalled
+  # its caller's would wait for the caller to finish, and the caller waits
+  # for it, so neither would ever run. release.yml's groups start with
+  # `release-`, which differs from `ci-` in its first letters, upper or
+  # lower case alike.
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  # Tag refs too are never cancelled: they are release runs, which must
+  # finish or fail on their own.
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -132,6 +146,26 @@ jobs:
           tool: cargo-deny@0.19.9
           fallback: none
       - run: cargo deny check
+
+  shellcheck:
+    # Lints every shell script: install.sh, which users pipe into sh, and
+    # the scripts the release and the demo run. Nothing to build or cache.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The prebuilt, checksum-verified release, at the version used to
+      # check these scripts locally (the runner image's own shellcheck is
+      # older and changes with the image).
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: shellcheck@0.11.0
+          fallback: none
+      # Each file's shebang tells shellcheck the dialect: install.sh is
+      # POSIX sh, the rest bash.
+      - run: shellcheck install.sh scripts/*.sh scripts/release/*.sh fixtures/*.sh
 
   web:
     runs-on: ubuntu-24.04

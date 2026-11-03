@@ -20,6 +20,11 @@ targets = [
     "aarch64-unknown-linux-gnu",
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
+    # The Linux release targets: the binaries on GitHub Releases are static
+    # musl builds, so their target-specific dependencies are checked here
+    # too. The two macOS targets above are shipped as they are.
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
 ]
 
 # `cargo deny check advisories`: fail on crates with a RustSec advisory.

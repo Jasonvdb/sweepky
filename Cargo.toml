@@ -21,6 +21,33 @@ license = "MIT"
 # `cargo publish` fail.
 publish = false
 
+# The profile the release binaries on GitHub Releases are built with:
+# `cargo build --profile dist -p sweepky-cli --locked`, which writes
+# `target/dist/sweepky`. It is a profile of its own, not settings on
+# `release`, so the plain `cargo build --release` that scripts/ and
+# developers use stays quick to build; only a published binary pays for the
+# slower link below.
+[profile.dist]
+# Start from `release` (opt-level 3, no debug assertions, no overflow checks)
+# and change only what follows.
+inherits = "release"
+# Whole-program link-time optimisation across every crate, with the crate
+# compiled as one unit, so the optimiser sees all the code at once. The build
+# is slower and the binary smaller and a little faster.
+lto = "fat"
+codegen-units = 1
+# Drop the symbol table, and with it the debug info, from the binary. It ships
+# smaller and gives away less of its internals; a panic message still names
+# its file and line, which are kept as strings.
+strip = "symbols"
+# `panic` is left at `release`'s default, `unwind`, on purpose: never set
+# `panic = "abort"` here. With unwind, a panic still runs every `Drop` on its
+# way out, so `zeroize` and `secrecy` wipe secret keys and passphrases from
+# memory just as they do in the tests, which are built with unwind too. With
+# abort the process would stop at once with those secrets still in its memory
+# (and in a core dump, if one is written), and a shipped binary would behave
+# differently from the one the tests check.
+
 # Every dependency the plan pins, from the Dependencies table in
 # docs/plan/03-cli-and-skill.md. Update that table and this list together.
 #
