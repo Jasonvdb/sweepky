@@ -99,6 +99,12 @@ export interface MemberState {
   /** How far each of its two directories has been read. */
   readonly listings: Readonly<Record<ListedDir, ListingProgress>>
   /**
+   * Whether a listing of its bounties directory has answered since the board
+   * opened. An empty answer leaves `listings` as it started, so only this
+   * tells "listed, nothing there" from "not listed yet" (`floorPlanLoading`).
+   */
+  readonly bountiesListed: boolean
+  /**
    * The last record of each kind its latest turn of re-reads took, which the
    * next turn starts after, going round (`next_turn` in pull/roster.rs).
    */
@@ -160,6 +166,7 @@ const NEW_MEMBER: MemberState = {
     [BOUNTIES_DIR]: { watermark: null, listed: [] },
     [SWEEPS_DIR]: { watermark: null, listed: [] },
   },
+  bountiesListed: false,
   rereadAfter: { openBounties: null, runningSweeps: null, doneBounties: null },
 }
 

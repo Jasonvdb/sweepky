@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs'
 import { describe, expect, it } from 'vitest'
 import { parseRecordId, recordIdFromMicros, type RecordId } from '../records/ids.ts'
 import type { Bounty, Sweep } from '../records/parse.ts'
+import { BOUNTIES_DIR } from '../records/paths.ts'
 import { parsePubky, type Pubky } from '../records/pubky.ts'
 import type { BountyRef, SweepRef } from '../records/urls.ts'
 import {
@@ -10,6 +11,7 @@ import {
   circleMembers,
   creditedSweepers,
   floorPlan,
+  floorPlanLoading,
   LEFT_AFTER_MS,
   RECENTLY_DONE_LIMIT,
   recentlyDone,
@@ -283,6 +285,56 @@ describe('boardStatus', () => {
     expect(boardStatus(board({}))).toBe('ok')
     const found = board({ resolutions: [[A, { kind: 'found', homeserver: S3, resolvedAt: NOW }]] })
     expect(boardStatus(found)).toBe('ok')
+  })
+})
+
+describe('floorPlanLoading', () => {
+  /** `state` with `key`'s bounties listed, its listing naming `unread` records not yet read. */
+  function listedBounties(state: BoardState, key: Pubky, unread: readonly RecordId[] = []): BoardState {
+    const kept = memberState(state, key)
+    const listings = {
+      ...kept.listings,
+      [BOUNTIES_DIR]: { watermark: null, listed: unread.map((each) => ({ id: each, settled: false })) },
+    }
+    return {
+      ...state,
+      members: new Map([...state.members, [key, { ...kept, listings, bountiesListed: true }]]),
+    }
+  }
+
+  it('is false with no circle selected, or an admin that cannot be reached', () => {
+    expect(floorPlanLoading(board({ admin: null }))).toBe(false)
+    expect(floorPlanLoading(board({ resolutions: [[A, { kind: 'noRecord', resolvedAt: NOW }]] }))).toBe(false)
+  })
+
+  it('is true until circle.json answers, unless the admin failed a read', () => {
+    const before = { ...board({}), circle: null }
+    expect(floorPlanLoading(before)).toBe(true)
+    const failed = { ...before, members: new Map([[A, { ...memberState(before, A), readFailedAt: NOW }]]) }
+    expect(floorPlanLoading(failed)).toBe(false)
+  })
+
+  it("is true until every roster key's bounties are listed", () => {
+    const state = board({ members: [B] })
+    expect(floorPlanLoading(state)).toBe(true)
+    expect(floorPlanLoading(listedBounties(state, A))).toBe(true)
+    expect(floorPlanLoading(listedBounties(listedBounties(state, A), B))).toBe(false)
+  })
+
+  it('is true while a listed bounty is unread', () => {
+    expect(floorPlanLoading(listedBounties(board({}), A, [id(1)]))).toBe(true)
+    expect(floorPlanLoading(listedBounties(board({}), A))).toBe(false)
+  })
+
+  it('stops waiting on a key that failed a read or cannot be reached', () => {
+    const state = listedBounties(board({ members: [B] }), A)
+    const failed = { ...state, members: new Map([...state.members, [B, { ...memberState(state, B), readFailedAt: NOW }]]) }
+    expect(floorPlanLoading(failed)).toBe(false)
+    const gone = {
+      ...state,
+      members: new Map([...state.members, [B, { ...memberState(state, B), resolution: { kind: 'lookupFailed' as const, resolvedAt: NOW } }]]),
+    }
+    expect(floorPlanLoading(gone)).toBe(false)
   })
 })
 

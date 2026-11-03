@@ -43,9 +43,12 @@ function readRepoFile(path: string): string {
 
 /** A's circle holding `bounties`. */
 function board(bounties: readonly BountyEntry[]): BoardState {
+  const state = initialBoardState(A)
   return {
-    ...initialBoardState(A),
+    ...state,
     circle: { name: 'Test circle', admin: A, members: [] },
+    // A's bounties listed: a board past its first read.
+    members: new Map([[A, { ...memberState(state, A), bountiesListed: true }]]),
     bounties: new Map(bounties.map((entry) => [bountyKey(entry.ref), entry])),
   }
 }
@@ -179,6 +182,22 @@ describe('the hero', () => {
     expect(rooms).toHaveLength(1)
     expect(rooms[0]).toContain('room--empty')
     expect(withClass(part, 'detector')).toHaveLength(0)
+  })
+
+  it('draws the loading plan, not the empty state, before the first read lands', () => {
+    const part = hero(render({ ...board([]), members: new Map() }))
+    expect(part).toContain('role="status"')
+    expect(text(part)).toContain("Reading the circle's bounties")
+    expect(text(part)).not.toContain(EMPTY_LABEL)
+    expect(withClass(part, 'room--loading')).toHaveLength(3)
+    expect(withClass(part, 'landing-hero__visual--loading')).toHaveLength(1)
+  })
+
+  it('draws the rooms it has, not the loading plan, while the read goes on', () => {
+    const part = hero(render({ ...board([openBounty('Audit the parser')]), members: new Map() }))
+    expect(text(part)).toContain('Audit the parser')
+    expect(withClass(part, 'room--loading')).toHaveLength(0)
+    expect(withClass(part, 'landing-hero__visual--loading')).toHaveLength(0)
   })
 
   it('shows the empty state and the notice when the admin is unreachable', () => {

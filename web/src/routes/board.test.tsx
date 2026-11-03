@@ -92,9 +92,12 @@ function sweep(sweeper: Pubky, startedMs: number, of: BountyRef, fields: Partial
 
 /** A's circle with member B, holding these records. */
 function board(bounties: readonly BountyEntry[], sweeps: readonly SweepEntry[] = []): BoardState {
+  const state = initialBoardState(A)
   return {
-    ...initialBoardState(A),
+    ...state,
     circle: { name: 'Test circle', admin: A, members: [{ pubky: B, label: null }] },
+    // Both keys' bounties listed: a board past its first read.
+    members: new Map([A, B].map((key) => [key, { ...memberState(state, key), bountiesListed: true }])),
     bounties: new Map(bounties.map((entry) => [bountyKey(entry.ref), entry])),
     sweeps: new Map(sweeps.map((entry) => [sweepKey(entry.ref), entry])),
   }

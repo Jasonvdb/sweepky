@@ -24,7 +24,7 @@ import {
   type Step,
 } from '../landing/copy.ts'
 import { useScrollToHash } from '../landing/scrollToHash.ts'
-import { boardStatus, floorPlan } from '../store/selectors.ts'
+import { boardStatus, floorPlan, floorPlanLoading } from '../store/selectors.ts'
 import type { Trust, TrustLabel } from '../trust/trust.ts'
 import { StatusNotice } from './Board.tsx'
 
@@ -113,6 +113,13 @@ export function Landing() {
 }
 
 /**
+ * The most rooms the hero's plan sheet draws, the newest: one row beside the
+ * text on a wide screen, so the sheet keeps one height from loading to
+ * loaded. The count in its title block links to the board, which has them all.
+ */
+const HERO_ROOMS = 3
+
+/**
  * The heading across the full width; under it the subtitle and actions on
  * the left and, on the right, the board's floor plan, compact and live, with
  * the board's notice when it cannot read the circle. From 56rem up the two
@@ -123,6 +130,9 @@ function Hero() {
   const now = useClock()
   const status = useBoard(boardStatus)
   const rooms = useBoard((state) => floorPlan(state, now))
+  const loading = useBoard(floorPlanLoading)
+  // `null` until circle.json answers; '' for a circle with no name, or the
+  // admin alone when there is no circle.json.
   const circleName = useBoard((state) => state.circle?.name ?? null)
   return (
     <section className="landing-hero" aria-labelledby={headingId}>
@@ -147,19 +157,31 @@ function Hero() {
         </div>
         {/* The plan sheet: the circle's name and room count as its title
             block, the live plan on a grid, then what the board shows. */}
-        <div className="landing-hero__visual">
+        <div
+          className={
+            rooms.length === 0 && loading
+              ? 'landing-hero__visual landing-hero__visual--loading'
+              : 'landing-hero__visual'
+          }
+        >
           <p className="landing-hero__sheet">
             <span className="landing-hero__circle">
-              {circleName === null ? hero.visual.untitled.label : <StrangerText text={circleName} />}
+              {circleName === null && loading ? (
+                <span className="landing-hero__name-bar" aria-hidden="true" />
+              ) : circleName === null || circleName === '' ? (
+                hero.visual.untitled.label
+              ) : (
+                <StrangerText text={circleName} />
+              )}
             </span>
             {rooms.length > 0 && (
-              <span>
+              <CircleLink to="/board" className="landing-hero__count">
                 {rooms.length} {rooms.length === 1 ? hero.visual.room.label : hero.visual.rooms.label}
-              </span>
+              </CircleLink>
             )}
           </p>
           <StatusNotice status={status} />
-          <FloorPlan rooms={rooms} compact />
+          <FloorPlan rooms={rooms.slice(0, HERO_ROOMS)} compact loading={loading} />
           <p className="landing-hero__caption">{hero.visual.text}</p>
         </div>
       </div>

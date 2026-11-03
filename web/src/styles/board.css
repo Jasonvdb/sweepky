@@ -49,10 +49,30 @@
   border: 1px solid var(--border);
 }
 
+/* Every room on the plan, and every loading room, is at least one height:
+   a three-line title and the state row fill it, so the plan keeps its
+   height as the loading rooms turn into bounties. A room with detectors or
+   credits grows past it. */
+.floor-plan__rooms .room {
+  min-height: 8.125rem;
+}
+
 .floor-plan--compact .room {
   gap: 0.5rem;
+  min-height: 6.75rem;
   padding: 0.875rem;
   font-size: 0.875rem;
+}
+
+/* In the hero every room is one height, loading or loaded: a title cut to
+   two lines, and the room's height kept by the min-height above, which a
+   two-line title and the state row fill. The full title is on its page. */
+.floor-plan--compact .room__title {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
 }
 
 .room__title {
@@ -75,7 +95,7 @@
 .room__state {
   display: flex;
   flex-wrap: wrap;
-  align-items: center;
+  align-items: baseline;
   gap: 0.375rem 0.75rem;
   margin: 0;
   color: var(--muted-foreground);
@@ -102,12 +122,68 @@
   text-align: center;
 }
 
+/* The loading plan: rooms with walls and grey bars where a title and state
+   will go, breathing slowly until the first read lands. Each room starts a
+   beat after the one before it, so the row reads left to right. */
+.room--loading {
+  background: transparent;
+  box-shadow: none;
+}
+
+.room__bar {
+  display: block;
+  width: 85%;
+  height: 0.875rem;
+  border-radius: 0.25rem;
+  background: var(--border);
+  animation: room-reading 1.6s ease-in-out infinite alternate;
+}
+
+.room__bar--short {
+  width: 55%;
+}
+
+.room__bar--pill {
+  width: 3.5rem;
+  height: 1.25rem;
+  margin-top: 0.25rem;
+  border-radius: 999px;
+}
+
+.floor-plan__rooms li:nth-child(2) .room__bar {
+  animation-delay: 0.2s;
+}
+
+.floor-plan__rooms li:nth-child(3) .room__bar {
+  animation-delay: 0.4s;
+}
+
+@keyframes room-reading {
+  from {
+    opacity: 0.35;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
 /* The `open` marker: a pill with a brand outline, its label in --foreground. */
 .open-marker {
   padding: 0 0.5rem;
   border: 1px solid var(--brand);
   border-radius: 999px;
   color: var(--foreground);
+}
+
+/* Where the browser can trim a line box to the letters, the pill's padding
+   centres the label's x-height: a full line box keeps the ascender's room
+   above lowercase letters, which sat "open" low in its pill. Elsewhere the
+   rule above draws it as before. */
+@supports (text-box: trim-both ex alphabetic) {
+  .open-marker {
+    padding: 0.375rem 0.5rem;
+    text-box: trim-both ex alphabetic;
+  }
 }
 
 .swept-mark {

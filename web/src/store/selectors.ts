@@ -27,6 +27,7 @@ import {
   type KnownBountyStatus,
   type KnownSweepStatus,
 } from '../records/parse.ts'
+import { BOUNTIES_DIR } from '../records/paths.ts'
 import type { Pubky } from '../records/pubky.ts'
 import type { BountyRef, SweepRef } from '../records/urls.ts'
 import {
@@ -38,6 +39,7 @@ import {
 import {
   bountyKey,
   memberState,
+  rosterKeys,
   type BoardState,
   type BountyEntry,
   type MemberState,
@@ -497,6 +499,30 @@ export function boardStatus(state: BoardState): BoardStatus {
     case 'reachable':
       return 'ok'
   }
+}
+
+/**
+ * Whether the floor plan is still waiting on its first read: the circle has
+ * not answered, or a roster key has neither had its bounties listed and each
+ * listed bounty read, nor failed a read, nor been found unreachable. A board
+ * that cannot read its circle (`boardStatus` not `ok`) is not loading: it
+ * says why instead. With rooms to show, the plan shows them whatever this
+ * says; it decides only between the loading plan and the empty state.
+ */
+export function floorPlanLoading(state: BoardState): boolean {
+  if (state.admin === null || boardStatus(state) !== 'ok') return false
+  if (state.circle === null) return !gaveAnswer(memberState(state, state.admin))
+  return rosterKeys(state).some((key) => {
+    const member = memberState(state, key)
+    if (gaveAnswer(member)) return false
+    return !member.bountiesListed || member.listings[BOUNTIES_DIR].listed.some((record) => !record.settled)
+  })
+}
+
+/** A key the board has stopped waiting on: a read failed, or it cannot be reached. */
+function gaveAnswer(member: MemberState): boolean {
+  const reachability = reachabilityOf(member.resolution)
+  return member.readFailedAt !== null || reachability === 'unreachable' || reachability === 'notBrowserReachable'
 }
 
 // Helpers

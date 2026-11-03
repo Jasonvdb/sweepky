@@ -117,6 +117,6 @@ describe('layout', () => {
   })
 
   it('shows no notice when a circle is selected', () => {
-    expect(html).not.toContain('role="status"')
+    expect(html).not.toContain('circle-notice')
   })
 })

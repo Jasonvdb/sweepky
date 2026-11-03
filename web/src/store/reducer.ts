@@ -191,10 +191,15 @@ function homeserverLookedUp(
 
 function listingRead(state: BoardState, { member, dir, result, at }: ListingRead): BoardState {
   switch (result.kind) {
-    case 'listed':
-      return updateProgress(state, member, dir, (progress) =>
+    case 'listed': {
+      const listed = updateProgress(state, member, dir, (progress) =>
         withListing(progress, result.listing, dir),
       )
+      if (dir !== BOUNTIES_DIR) return listed
+      return updateMember(listed, member, (kept) =>
+        kept.bountiesListed ? kept : { ...kept, bountiesListed: true },
+      )
+    }
     case 'refused':
       // A listing that breaks the protocol puts the key's homeserver in
       // doubt, as `pull` reads it (P2c): it is looked up again.

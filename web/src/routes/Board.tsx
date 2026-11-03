@@ -20,6 +20,7 @@ import { useClock } from '../components/useClock.ts'
 import {
   boardStatus,
   floorPlan,
+  floorPlanLoading,
   recentlyDone,
   sweepsInProgress,
   sweepsToday,
@@ -34,6 +35,7 @@ export function Board() {
   const now = useClock()
   const status = useBoard(boardStatus)
   const rooms = useBoard((state) => floorPlan(state, now))
+  const loading = useBoard(floorPlanLoading)
   const inProgress = useBoard((state) => sweepsInProgress(state, now))
   const today = useBoard((state) => sweepsToday(state, now))
   const events = useBoard(tickerEvents)
@@ -44,7 +46,7 @@ export function Board() {
       <IntroStrip />
       <h1>The board</h1>
       <StatusNotice status={status} />
-      <FloorPlan rooms={rooms} />
+      <FloorPlan rooms={rooms} loading={loading} />
       <div className="board__panels">
         <Panel heading="Sweeps in progress">
           <SweepsInProgress sweeps={inProgress} />
