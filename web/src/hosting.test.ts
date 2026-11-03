@@ -8,6 +8,28 @@ function readWebFile(path: string): string {
 }
 
 describe('hosting', () => {
+  // XML forbids a double hyphen inside a comment, and a browser that meets
+  // one refuses the whole SVG: the favicon then never shows.
+  it.each(['favicon.svg', 'og-cover.svg'])('serves /%s with no double hyphen in a comment', (name) => {
+    const comments = readWebFile(`public/${name}`).match(/<!--[\s\S]*?-->/g) ?? []
+    for (const comment of comments) {
+      expect(comment.slice(4, -3)).not.toContain('--')
+    }
+  })
+
+  it('links the icon in every form index.html names, and serves each', () => {
+    const html = readWebFile('index.html')
+    for (const [rel, href] of [
+      ['icon', '/favicon.ico'],
+      ['icon', '/favicon.png'],
+      ['icon', '/favicon.svg'],
+      ['apple-touch-icon', '/apple-touch-icon.png'],
+    ]) {
+      expect(html).toMatch(new RegExp(`<link rel="${rel}"[^>]*href="${href}"`))
+      expect(existsSync(new URL(`../public${href}`, import.meta.url)), href).toBe(true)
+    }
+  })
+
   it('serves /health.json as a JSON object', () => {
     const health: unknown = JSON.parse(readWebFile('public/health.json'))
     expect(health).toBeTypeOf('object')

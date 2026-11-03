@@ -1,46 +1,59 @@
 /*
- * The landing section pattern after pubky-app's landing sections
- * (src/components/templates/Public/Landing/ at
- * ef6ad207e680169b1b01a6fb92695ffc646583b2): an uppercase eyebrow in --brand,
- * a large heading with one word in --brand, a one-line muted subtitle, then a
- * grid of cards.
+ * The landing section (components/Section.tsx). Each section is a room of
+ * the page: a wall along its top, its name in the left rail beside the
+ * heading, a muted subtitle, then the body across the full width. Names stay
+ * in sentence case and in --muted-foreground: colour is for the floor plan.
  */
 .section {
-  padding-block: clamp(2.5rem, 8vw, 6rem);
-  scroll-margin-top: 3rem;
+  padding-block: clamp(3rem, 7vw, 5.5rem);
+  border-top: 1px solid var(--border);
+  scroll-margin-top: 1rem;
 }
 
 .section__header {
   display: grid;
-  gap: 1.25rem;
-  max-width: 47.5rem;
-  margin-bottom: 2.5rem;
+  gap: 0.75rem;
+  margin-bottom: clamp(2rem, 4vw, 3rem);
 }
 
+/* The rail: the name beside the heading once there is room for both. */
+@media (min-width: 56rem) {
+  .section__header {
+    grid-template-columns: 13rem minmax(0, 1fr);
+    gap: 2rem;
+    align-items: baseline;
+  }
+}
+
+/* A section's name. On a page without the rail (the bounty page) it sits
+   above the heading. */
 .section__eyebrow {
   margin: 0;
-  color: var(--brand);
-  font-size: 0.75rem;
-  font-weight: 600;
-  letter-spacing: 0.1em;
-  text-transform: uppercase;
+  color: var(--muted-foreground);
+  font-size: 0.9375rem;
+  font-weight: 500;
+}
+
+.section__intro {
+  display: grid;
+  gap: 1rem;
+  max-width: 44rem;
 }
 
 .section__heading {
   margin: 0;
-  font-size: clamp(2.25rem, 1.5rem + 3.5vw, 3.75rem);
-  font-weight: 700;
-  line-height: 1.1;
-}
-
-.accent {
-  color: var(--brand);
+  font-size: clamp(2rem, 1.4rem + 2.4vw, 3.25rem);
+  font-weight: 650;
+  letter-spacing: -0.025em;
+  line-height: 1.05;
+  text-wrap: balance;
 }
 
 .section__subtitle {
   margin: 0;
   color: var(--muted-foreground);
-  font-size: clamp(1rem, 0.9rem + 0.5vw, 1.25rem);
+  font-size: clamp(1.0625rem, 1rem + 0.3vw, 1.1875rem);
+  text-wrap: pretty;
 }
 
 /* As many 16rem columns as fit, one column at 375 px. `min(100%, …)` keeps a

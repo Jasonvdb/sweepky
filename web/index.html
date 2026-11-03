@@ -28,7 +28,16 @@
       content="Sweepky's mark beside a floor plan of rooms, one with a detector sweeping it."
     />
     <meta name="twitter:card" content="summary_large_image" />
+    <!--
+      The mark on a transparent background: the SVG for browsers that read
+      it, the ICO and PNG for the rest, and the touch icon for iOS home
+      screens. scripts/render-icons.mjs renders the raster three from
+      favicon.svg.
+    -->
+    <link rel="icon" href="/favicon.ico" sizes="16x16 32x32 48x48" />
+    <link rel="icon" type="image/png" href="/favicon.png" sizes="192x192" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
     <!--
       Inter Tight from Google Fonts: apart from the app's own files, the one
       request that does not come from the board's store. The board loads it

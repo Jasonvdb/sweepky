@@ -70,7 +70,7 @@ describe('tokens', () => {
     ['muted-foreground', '#89898f'],
     ['secondary', '#303034'],
     ['border', 'oklch(0.311 0.007 285.98)'],
-    ['brand', 'oklch(0.928 0.23 123.978)'],
+    ['brand', 'oklch(0.82 0.157 75)'],
     ['destructive', 'oklch(0.628 0.258 29.234)'],
     ['radius', '0.625rem'],
   ])('--%s is %s', (name, value) => {
@@ -118,7 +118,7 @@ describe('contrast at WCAG AA', () => {
     ['card-foreground on a card', () => text('card-foreground'), card],
     ['muted-foreground on a card', () => text('muted-foreground'), card],
     ['background on brand (primary button)', () => text('background'), () => text('brand')],
-    ['brand on the page (eyebrow, accent word)', () => text('brand'), background],
+    ['brand on the page (default button text, the mark)', () => text('brand'), background],
     ['brand on brand at 16 % (default button)', () => text('brand'), () => onBackground('brand', 0.16)],
     ['brand on brand at 30 % (default button, hover)', () => text('brand'), () => onBackground('brand', 0.3)],
     ['foreground on secondary (secondary button)', () => text('foreground'), () => text('secondary')],
@@ -214,7 +214,7 @@ describe('reduced motion', () => {
 describe('components', () => {
   const PROBLEM_SECTION = {
     eyebrow: 'The problem',
-    heading: { lead: 'One pass ', accent: 'misses', tail: ' things.' },
+    heading: 'One pass misses things.',
     subtitle: 'A subtitle.',
   }
 
@@ -244,10 +244,10 @@ describe('components', () => {
     }
   })
 
-  it('renders a section as the pubky-app pattern', () => {
+  it('renders a section as its name, heading and subtitle', () => {
     const markup = renderToStaticMarkup(createElement(Section, PROBLEM_SECTION))
     expect(markup).toMatch(/<p class="section__eyebrow">The problem<\/p>/)
-    expect(markup).toMatch(/<h2[^>]*>One pass <span class="accent">misses<\/span> things.<\/h2>/)
+    expect(markup).toMatch(/<h2[^>]*>One pass misses things.<\/h2>/)
     expect(markup).toMatch(/<p class="section__subtitle">A subtitle.<\/p>/)
   })
 

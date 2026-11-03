@@ -48,11 +48,7 @@ export interface Step extends Claim {
   readonly command: string
 }
 
-/**
- * The project's repository. It is not public today, so the links to it and to
- * its README do not open for a visitor yet; one constant, so the day it is
- * published (or moves) is a one-line change.
- */
+/** The project's repository; one constant, so a move is a one-line change. */
 export const REPO_URL = 'https://github.com/Jasonvdb/sweepky'
 /**
  * The README's install section. The install channel is not decided, so the
@@ -88,7 +84,7 @@ const SETUP_PROMPT = `Set up the Sweepky CLI on this machine for me. Sweepky let
 export const LANDING_COPY = {
   hero: {
     // The route test reads the page's one h1 as this text.
-    heading: { lead: 'Your spare tokens, ', accent: 'sweeping', tail: ' for bugs.', sources: [WHAT_IT_IS] },
+    heading: { text: 'Your spare tokens, sweeping for bugs.', sources: [WHAT_IT_IS] },
     subtitle: {
       text: "Point your coding agent at other people's code. The findings are encrypted to the bounty's owner, and when the bounty is done the owner credits every sweeper who helped.",
       sources: [WHAT_IT_IS, DECISIONS],
@@ -102,12 +98,17 @@ export const LANDING_COPY = {
     visual: {
       text: 'Live from the board: anyone can watch bounties appear and sweeps land. Findings are never shown there.',
       sources: [WHAT_IT_IS],
+      // The plan sheet's title block: the circle's name, or this when none
+      // is read yet, and the count of rooms on the plan.
+      untitled: { label: 'The board' },
+      room: { label: 'bounty' },
+      rooms: { label: 'bounties' },
     },
   },
 
   problem: {
     eyebrow: 'The problem',
-    heading: { lead: 'One pass ', accent: 'misses', tail: ' things.', sources: [WHAT_IT_IS] },
+    heading: { text: 'One pass misses things.', sources: [WHAT_IT_IS] },
     subtitle: {
       text: 'Independent sweeps by different people are the point, so a second sweep of the same code is not waste.',
       sources: [WHAT_IT_IS],
@@ -134,7 +135,7 @@ export const LANDING_COPY = {
 
   howItWorks: {
     eyebrow: 'How it works',
-    heading: { lead: 'Post. ', accent: 'Sweep.', tail: ' Credit.', sources: [THE_LOOP] },
+    heading: { text: 'Post. Sweep. Credit.', sources: [THE_LOOP] },
     subtitle: {
       text: "The owner's agent runs the owner's side. A sweep is two terminal commands around one agent session.",
       sources: [THE_LOOP, DECISIONS],
@@ -189,7 +190,7 @@ export const LANDING_COPY = {
 
   safety: {
     eyebrow: 'Safe by design',
-    heading: { lead: 'Sealed to the ', accent: 'owner', tail: '.', sources: [SEALED] },
+    heading: { text: 'Sealed to the owner.', sources: [SEALED] },
     subtitle: {
       text: 'Bounties, sweep records, keys and credits are public. The sweep package is sealed.',
       sources: [SEALED],
@@ -225,7 +226,7 @@ export const LANDING_COPY = {
 
   reputation: {
     eyebrow: 'Reputation',
-    heading: { lead: 'Credit you can ', accent: 'check', tail: '.', sources: [TRUST_MODEL] },
+    heading: { text: 'Credit you can check.', sources: [TRUST_MODEL] },
     subtitle: {
       text: 'Reputation is derived from the credits owners publish on their done bounties, never declared.',
       sources: [TRUST_MODEL],
@@ -254,7 +255,8 @@ export const LANDING_COPY = {
   },
 
   start: {
-    heading: { lead: 'Start ', accent: 'sweeping', tail: '.', sources: [WHAT_IT_IS] },
+    eyebrow: 'Get started',
+    heading: { text: 'Start sweeping.', sources: [WHAT_IT_IS] },
     agent: {
       label: 'Set up with your agent',
       intro: {
@@ -305,7 +307,5 @@ export const LANDING_COPY = {
     install: { label: 'Full install notes in the README' },
     board: { label: 'Watch the board' },
     repo: { label: 'Sweepky on GitHub' },
-    pubky: { label: 'Built on Pubky' },
-    licence: { label: 'MIT licensed' },
   },
 } as const

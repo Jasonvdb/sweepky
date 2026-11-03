@@ -1,10 +1,11 @@
 /*
- * Design tokens, copied by hand from pubky/pubky-app at commit
- * ef6ad207e680169b1b01a6fb92695ffc646583b2, src/app/globals.css: the colours
- * and radius from its :root block, the md radius and the two shadows from its
- * @theme block. Names and values are pubky-app's, so Sweepky reads as part of
- * the Pubky ecosystem (04, Design reference). Nothing imports or fetches that
- * repository; change a value here only against a newer pinned commit.
+ * Design tokens. All but --brand are copied by hand from pubky/pubky-app at
+ * commit ef6ad207e680169b1b01a6fb92695ffc646583b2, src/app/globals.css: the
+ * colours and radius from its :root block, the md radius and the two shadows
+ * from its @theme block, under pubky-app's names, so Sweepky sits on the
+ * Pubky ecosystem's dark surfaces (04, Design reference). Nothing imports or
+ * fetches that repository; change one of those values only against a newer
+ * pinned commit. --brand is Sweepky's own amber (04, Visual direction).
  *
  * This is the one file that holds colour literals: every other rule reaches a
  * colour through these properties, so the one accent is --brand.
@@ -20,8 +21,10 @@
   --secondary: #303034;
   --muted-foreground: #89898f;
   --border: oklch(0.311 0.007 285.98);
-  /* The one accent: detectors, swept rooms, primary buttons and eyebrows. */
-  --brand: oklch(0.928 0.23 123.978);
+  /* The one accent: detectors, swept rooms, primary buttons, the mark and the
+     hero's beam. A detector's amber lamp, the most saturated amber inside sRGB
+     at this lightness (#ffb336), so the favicon and covers match it exactly. */
+  --brand: oklch(0.82 0.157 75);
   /* Only for `aborted` sweeps and "unreachable" members, as a mark beside the label. */
   --destructive: oklch(0.628 0.258 29.234);
 
