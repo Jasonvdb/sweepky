@@ -39,6 +39,11 @@ and Linux (x86_64 and arm64).
 - The board, a static, read-only web app (`web/`) that shows bounties, sweeps
   and credits as they happen.
 - `--testnet` on every command, to use a local Pubky testnet.
+- Release binaries on GitHub Releases, with `SHA256SUMS` and a build
+  provenance attestation for every tarball and binary, and `install.sh`, which
+  installs a release into `~/.local/bin` after checking its checksum, and its
+  attestation when the GitHub CLI is logged in. `SECURITY.md` says how to
+  check a download by hand.
 
 [Unreleased]: https://github.com/Jasonvdb/sweepky/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/Jasonvdb/sweepky/releases/tag/v0.1.0
