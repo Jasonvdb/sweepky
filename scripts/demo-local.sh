@@ -3,6 +3,7 @@
 # "scripts/demo-local.sh").
 #
 #   scripts/demo-local.sh [--step]
+#   scripts/demo-local.sh --ci --binary PATH
 #
 # Inputs: SWEEPKY_DEMO_RUN_DIR, a security-audit run directory whose
 # contents become the circle sweeper's audit/, and SWEEPKY_DEMO_TARGETS, the
@@ -22,8 +23,9 @@
 # and that the inputs are usable. It prints every problem it finds and
 # exits 1 without starting anything.
 #
-# Then it builds the release binary, makes one scratch directory under
-# $TMPDIR (mode 0700) and runs the demo's steps:
+# Then it builds the release binary (--ci, below, runs PATH instead),
+# makes one scratch directory under $TMPDIR (mode 0700) and runs the
+# demo's steps:
 # 1. Starts the pinned testnet binary against local Postgres and waits until
 #    it says it is running and holds the homeserver port. Only the testnet
 #    gets a connection string tagged with this run's application name, so
@@ -50,6 +52,42 @@
 # --step starts the board right after step 3 instead and waits for Enter
 # before each of steps 4 to 8, so the board can be watched as they land.
 #
+# --ci --binary PATH is the headless run the release workflow makes of a
+# built release binary. It takes both flags together, never --step, and
+# never waits for input. It runs PATH, which must be an executable file,
+# instead of building one, and leaves out the board: step 9, and pnpm,
+# node, cargo, web/node_modules and port 5173 in preflight. Steps 1 to 8
+# run as above, and it checks what each should have done, the checks of
+# crates/sweepky-cli/examples/demo_check.rs (scripts/check-demo.sh) made
+# through the binary instead: its exit statuses, its output, the files
+# under each SWEEPKY_HOME, and the public records, read anonymously from
+# the testnet homeserver as the board reads them:
+# - every sweepky command exits 0 (a command that fails ends the run
+#   there, as every later step needs it);
+# - login gave the three identities three pubkys, and circle add put the
+#   sweeper in the owner's public circle;
+# - the bounty is public, open, pinned at each full SHA its input names,
+#   with a discovered.json that lists no sweep yet;
+# - each sweep record reads running after run and done after submit, every
+#   file a sweeper location names was fetched with at least that many
+#   lines, and submit moved the sweeper's audit/ to its data directory;
+# - pull --findings labels the sweeper circle and the stranger unknown,
+#   prints the title of every finding of the run directory and each of its
+#   locations' GitHub links at the pinned commit, and none of the
+#   stranger's finding text; then discovered.json lists the stranger's
+#   sweep, which is stored under untrusted/, and groups.json has one group
+#   reported by the sweeper and the stranger;
+# - done credits exactly the sweeper and the stranger, the next pull
+#   labels the stranger known: 1, and every file under each SWEEPKY_HOME is
+#   0600 and every directory 0700;
+# - and, once cleanup below has run, the testnet has stopped and holds no
+#   testnet port, and the test database this run created is gone.
+# It prints one "PASS <name>" or "FAIL <name>: <why>" line per check, fixed
+# text and paths only, never a finding, then a summary line, and exits 1
+# if any check failed. The links check percent-encodes each path segment
+# as jq's @uri does, which the CLI's spelling matches for the fixtures'
+# plain paths, not for every name a real report may hold.
+#
 # On every exit (the end, an error, Ctrl-C or TERM) it stops what it
 # started: first the board's dev server and its vite child, then the testnet
 # with kill -INT, as docs/plan/06 says (it drops its own test database
@@ -68,21 +106,46 @@ set -euo pipefail
 
 usage() {
     echo "usage: scripts/demo-local.sh [--step]" >&2
+    echo "       scripts/demo-local.sh --ci --binary PATH" >&2
     exit 2
 }
 
 step_mode=false
-[ $# -le 1 ] || usage
-case "${1:-}" in
-"") ;;
---step) step_mode=true ;;
--h | --help)
-    # The comment block above, without its "# ".
-    sed -n '2,/^$/s/^# \{0,1\}//p' "$0"
-    exit 0
-    ;;
-*) usage ;;
-esac
+ci_mode=false
+binary=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+    --step) step_mode=true ;;
+    --ci) ci_mode=true ;;
+    --binary)
+        [ $# -ge 2 ] || usage
+        binary=$2
+        shift
+        ;;
+    -h | --help)
+        # The comment block above, without its "# ".
+        sed -n '2,/^$/s/^# \{0,1\}//p' "$0"
+        exit 0
+        ;;
+    *) usage ;;
+    esac
+    shift
+done
+# --ci and --binary go together, and --ci never waits for Enter.
+if $ci_mode; then
+    { [ -n "$binary" ] && ! $step_mode; } || usage
+elif [ -n "$binary" ]; then
+    usage
+fi
+
+# Checked, and made absolute, here, against the directory the script was
+# started from: the steps run it from other directories. Preflight
+# reports one that is not an executable file.
+binary_ok=false
+if [ -f "$binary" ] && [ -x "$binary" ]; then
+    binary_ok=true
+    binary="$(cd "$(dirname "$binary")" && pwd -P)/$(basename "$binary")"
+fi
 
 repo=$(cd "$(dirname "$0")/.." && pwd -P)
 cd "$repo"
@@ -90,8 +153,10 @@ cd "$repo"
 export TEST_PUBKY_CONNECTION_STRING=${TEST_PUBKY_CONNECTION_STRING:-postgres://jason@localhost:5432/postgres}
 testnet_install="cargo install pubky-testnet --version '=0.16.2' --locked"
 pnpm_version=10.33.0
-# The ports the testnet binds at 0.16.2 (docs/plan/06), then the dev server's.
-tcp_ports="6881 15411 15412 6286 6287 6288 5173"
+# The ports the testnet binds at 0.16.2 (docs/plan/06), then, unless --ci
+# leaves the board out, the dev server's.
+testnet_tcp_ports="6881 15411 15412 6286 6287 6288"
+tcp_ports="$testnet_tcp_ports 5173"
 
 # ----- Preflight: read-only checks, nothing started or created -----
 
@@ -101,11 +166,22 @@ problem() {
     problems=$((problems + 1))
 }
 
-for tool in cargo node jq curl psql pg_isready lsof; do
+# cargo builds the binary, and node and pnpm run the board: --ci needs
+# none of them.
+tools="jq curl psql pg_isready lsof"
+if $ci_mode; then
+    tcp_ports=$testnet_tcp_ports
+    $binary_ok || problem "--binary $binary is not an executable file"
+else
+    tools="cargo node $tools"
+fi
+for tool in $tools; do
     command -v "$tool" > /dev/null || problem "$tool is not on PATH"
 done
 
-if ! command -v pnpm > /dev/null; then
+if $ci_mode; then
+    :
+elif ! command -v pnpm > /dev/null; then
     problem "pnpm is not on PATH (the board needs pnpm $pnpm_version)"
 else
     # From /, so no package.json's packageManager field makes pnpm fetch
@@ -169,7 +245,7 @@ case "$TEST_PUBKY_CONNECTION_STRING" in
 *) testnet_connection_string="$TEST_PUBKY_CONNECTION_STRING?application_name=$tag" ;;
 esac
 
-[ -d web/node_modules ] ||
+$ci_mode || [ -d web/node_modules ] ||
     problem "web/node_modules is missing; install it with: pnpm --dir web install --frozen-lockfile"
 
 # Both inputs or neither. `${VAR+set}` is "set" when VAR is set at all, even
@@ -218,6 +294,39 @@ dev_pid=""
 databases_before=""
 # The file of the test database names this run recorded, one per line.
 recorded=""
+# The file of --ci's PASS and FAIL lines, set only under --ci, and whether
+# the steps ran to their end.
+results=""
+finished=false
+
+# pass <name> and fail <name> <why>: one line of --ci's results, printed
+# on file descriptor 3, the script's own standard output (see the scratch
+# directory below), so a check made where a step's output is captured
+# still shows, and added to $results, so one made in a subshell still
+# counts. Each name and reason is fixed text or paths, never a finding.
+pass() { echo "PASS $1" | tee -a "$results" >&3; }
+# shellcheck disable=SC2329 # run through cli, check or ci, which shellcheck does not follow
+fail() { echo "FAIL $1: $2" | tee -a "$results" >&3; }
+
+# check <name> <why> <command...>: PASS <name> when the command succeeds,
+# FAIL <name>: <why> when it does not. The command's output is dropped.
+# shellcheck disable=SC2329 # run through cli, check or ci, which shellcheck does not follow
+check() {
+    local name=$1 why=$2
+    shift 2
+    if "$@" > /dev/null 2>&1; then
+        pass "$name"
+    else
+        fail "$name" "$why"
+    fi
+}
+
+# ci <command...>: runs the command only under --ci, for its checks.
+ci() {
+    if $ci_mode; then
+        "$@"
+    fi
+}
 
 # The script's own psql calls use the untagged URL, so they are never
 # mistaken for the testnet's.
@@ -304,13 +413,58 @@ note_untouched_databases() {
         echo "demo-local: new idle pubky_test_* databases, not this run's, left alone: $untouched" >&2
 }
 
+# --ci's last two checks, scripts/check-demo.sh's own, once the testnet has
+# been stopped and the recorded databases dropped: nothing this run
+# started still runs or holds a testnet port, and the test database it
+# created is gone, whoever dropped it. A lookup that fails counts against
+# the check. With no database recorded there is nothing to look for, and a
+# NOTE says so.
+# shellcheck disable=SC2329 # called only from cleanup, which the EXIT trap runs
+check_stopped() {
+    local name port holders held="" db present left=""
+    name="the testnet this run started has stopped and holds no testnet port"
+    for port in $testnet_tcp_ports; do
+        holders=$(port_holders -iTCP:"$port" -sTCP:LISTEN)
+        [ -z "$holders" ] || held="$held TCP $port by $holders;"
+    done
+    holders=$(port_holders -iUDP:6881)
+    [ -z "$holders" ] || held="$held UDP 6881 by $holders;"
+    if kill -0 "$testnet_pid" 2> /dev/null; then
+        fail "$name" "pid $testnet_pid is still running"
+    elif [ -n "$held" ]; then
+        fail "$name" "held:$held"
+    else
+        pass "$name"
+    fi
+
+    name="the test database this run created is gone"
+    if ! [ -s "$recorded" ]; then
+        echo "NOTE no connection carried this run's application name, so no test database was checked" >&3
+        return 0
+    fi
+    while read -r db; do
+        present=$(sql "SELECT 1 FROM pg_database WHERE datname = '$db'") || present="unknown"
+        [ -z "$present" ] || left="$left $db"
+    done < "$recorded"
+    if [ -z "$left" ]; then
+        pass "$name"
+    else
+        fail "$name" "still there, or could not be looked up:$left"
+    fi
+}
+
 # shellcheck disable=SC2329 # called by the EXIT trap below, which shellcheck does not follow
 cleanup() {
-    local status=$?
+    local status=$? passed failed
     # A failing step here must not end the cleanup before the rest has run.
     set +e
     # Once in cleanup, a second Ctrl-C must not cut it short.
     trap '' INT TERM
+    # Under --ci, a run that stopped before its end has failed, whatever
+    # its checks said up to there.
+    if [ -n "$results" ] && ! $finished; then
+        fail "the demo flow ran to its end" "it stopped with exit status $status"
+    fi
     if [ -n "$dev_pid" ]; then
         # pnpm runs vite as its child; stop the child too, then pnpm.
         pkill -TERM -P "$dev_pid" 2> /dev/null || true
@@ -327,6 +481,14 @@ cleanup() {
         fi
         drop_recorded_databases || true
         note_untouched_databases || true
+        [ -z "$results" ] || check_stopped
+    fi
+    if [ -n "$results" ]; then
+        # grep -c prints 0 and exits 1 when nothing matches.
+        passed=$(grep -c '^PASS ' "$results" || true)
+        failed=$(grep -c '^FAIL ' "$results" || true)
+        echo "demo-local --ci: PASS $passed, FAIL $failed" >&3
+        [ "$failed" -eq 0 ] || status=1
     fi
     # Only ever the directory mktemp made, by its name.
     if [ -n "$demo" ]; then
@@ -344,18 +506,28 @@ trap 'exit 143' TERM
 
 # ----- Build and scratch directory -----
 
-cargo build --release -p sweepky-cli --locked
-sweepky="$repo/target/release/sweepky"
-[ -x "$sweepky" ] || {
-    echo "error: $sweepky is missing after the release build" >&2
-    exit 1
-}
+if $ci_mode; then
+    sweepky=$binary
+else
+    cargo build --release -p sweepky-cli --locked
+    sweepky="$repo/target/release/sweepky"
+    [ -x "$sweepky" ] || {
+        echo "error: $sweepky is missing after the release build" >&2
+        exit 1
+    }
+fi
 
 # mktemp -d makes the directory 0700; the identities' homes go inside it.
 demo=$(mktemp -d "${TMPDIR:-/tmp}/sweepky-demo-local.XXXXXX")
 demo=$(cd "$demo" && pwd -P)
 recorded="$demo/databases.txt"
 : > "$recorded"
+if $ci_mode; then
+    results="$demo/results.txt"
+    : > "$results"
+    # File descriptor 3 is this standard output, for pass and fail.
+    exec 3>&1
+fi
 
 # ----- 1. The testnet -----
 
@@ -431,6 +603,7 @@ pause() {
 # as <identity> <args...>: sweepky on the testnet as that identity. Its
 # standard input is /dev/null, so a question fails at once instead of
 # waiting (or reading the terminal under --step).
+# shellcheck disable=SC2329 # run through cli, check or ci, which shellcheck does not follow
 as() {
     local who=$1
     shift
@@ -439,10 +612,32 @@ as() {
 
 # yes_as <identity> <args...>: the same, answering its one question (post's
 # and done's "publish?", which they ask on standard error) with y.
+# shellcheck disable=SC2329 # run through cli, check or ci, which shellcheck does not follow
 yes_as() {
     local who=$1
     shift
     printf 'y\n' | SWEEPKY_HOME="$demo/homes/$who" "$sweepky" --testnet "$@"
+}
+
+# as_in <directory> <identity> <args...>: `as`, from <directory>, the
+# project run and submit find from the working directory.
+# shellcheck disable=SC2329 # run through cli, check or ci, which shellcheck does not follow
+as_in() {
+    (cd "$1" && shift && as "$@")
+}
+
+# cli <name> <command...>: runs one sweepky step. One that fails ends the
+# run with its exit status, as set -e would; under --ci, each step is also
+# a check, "<name> exits 0".
+cli() {
+    local name=$1 status=0
+    shift
+    "$@" || status=$?
+    if [ "$status" -ne 0 ]; then
+        ci fail "$name exits 0" "it exited $status"
+        exit "$status"
+    fi
+    ci pass "$name exits 0"
 }
 
 # The pubky an identity is logged in as, from its login.json: the one field
@@ -464,13 +659,25 @@ printable() {
     LC_ALL=C tr -c '[:print:]\n' '?'
 }
 
+# public_record <pubky> <path>: the public file at <path> of <pubky>, read
+# anonymously from the testnet homeserver, as the board reads it. Fails
+# when it cannot be read.
+public_record() {
+    curl -sf --max-time 10 --max-filesize 1048576 -H "pubky-host: $1" "http://localhost:6286$2"
+}
+
+# The public paths of a bounty record, its discovered.json and a sweep
+# record, for an id already checked to be a record id.
+bounty_path() { echo "/pub/sweepky/bounties/$1.json"; }
+discovered_path() { echo "/pub/sweepky/bounties/$1.discovered.json"; }
+sweep_path() { echo "/pub/sweepky/sweeps/$1.json"; }
+
 # The bounty's discovered.json, read anonymously from the testnet
 # homeserver and printed by jq -ac: one line, with every control and
 # non-ASCII character escaped. Its sweep URLs are the strangers' own.
 show_discovered() {
     local body
-    if body=$(curl -sf --max-time 10 --max-filesize 1048576 \
-        -H "pubky-host: $owner" "http://localhost:6286/pub/sweepky/bounties/$bounty_id.discovered.json"); then
+    if body=$(public_record "$owner" "$(discovered_path "$bounty_id")"); then
         jq -ac . <<< "$body" 2> /dev/null || echo "(discovered.json is not JSON)"
     else
         echo "(could not read discovered.json from the testnet homeserver)"
@@ -539,6 +746,181 @@ def first_locations:
   end;
 .findings[0].locations = ($run[0] | first_locations)'
 
+# ----- Helpers for --ci's checks -----
+
+# Set by step 6; empty for the checks before it.
+stranger_sweep_url=""
+
+# jq with the run's values as jq variables, each passed as data, never as
+# part of a filter: $targets (the input targets), $sweeper, $stranger and
+# $stranger_sweep (the URL of the stranger's sweep).
+# shellcheck disable=SC2329 # run through cli, check or ci, which shellcheck does not follow
+jq_demo() {
+    jq --argjson targets "$targets_json" --arg sweeper "$sweeper" --arg stranger "$stranger" \
+        --arg stranger_sweep "$stranger_sweep_url" "$@"
+}
+
+# record_is <pubky> <path> <filter>: whether the public record at <path> of
+# <pubky> reads as JSON and <filter> holds of it.
+# shellcheck disable=SC2329 # run through cli, check or ci, which shellcheck does not follow
+record_is() {
+    local body
+    body=$(public_record "$1" "$2") && jq_demo -e "$3" <<< "$body"
+}
+
+# check_record <name> <pubky> <path> <filter>: record_is as a check.
+# shellcheck disable=SC2329 # run through cli, check or ci, which shellcheck does not follow
+check_record() {
+    check "$1" "$3 could not be read or does not say so" record_is "$2" "$3" "$4"
+}
+
+# The definitions the jq checks share. The run directory's findings.json is
+# Cloudflare's array or Sweepky's object, and its locations are read as
+# stranger_filter reads them. locate and link_line are demo_check.rs's
+# locate and linked_line: the target a location's file is in and its path
+# there (null when no covered target holds it), and the line pull
+# --findings prints for it with its GitHub link at the target's reviewed
+# commit (null when it gets none). printed is what pull --findings printed
+# from its findings heading on.
+# shellcheck disable=SC2016 # $file, $targets and the rest are jq variables
+jq_defs='
+def run_findings: if type == "array" then .[] else .findings[] end;
+def run_locations:
+  if type == "array" then .[] | (.trace // [])[], (.evidence // [])[]
+  else .findings[].locations[] end
+  | {file, line};
+def locate($targets; $covered):
+  . as $file
+  | if ($covered | length) == 1 then
+      first($targets[] | select(.id == $covered[0]) | {target: ., file: $file})
+    else
+      first($covered[] as $id | $targets[] | select(.id == $id)
+            | ($file | ltrimstr($id + "/")) as $rest | select($rest != $file)
+            | {target: ., file: $rest})
+    end // null;
+def link_line($targets; $covered):
+  . as $l
+  | ($l.file | locate($targets; $covered)) as $at
+  | if $at == null or (($at.target.repo // "") | startswith("github.com/") | not) then null
+    else "  at \($l.file)" + (if $l.line == null then "" else ":\($l.line)" end)
+      + " https://github.com/" + ($at.target.repo | ltrimstr("github.com/"))
+      + "/blob/" + ($at.target | if .kind == "pr" then .head else .rev end)
+      + "/" + ($at.file | split("/") | map(@uri) | join("/"))
+      + (if ($l.line // 0) > 0 then "#L\($l.line)" else "" end) + "\n"
+    end;
+def printed:
+  "Findings of your circle" as $heading
+  | split($heading) | if length < 2 then "" else .[1:] | join($heading) end;
+'
+
+# Whether the bounty record pins each target at its input ref, where that
+# ref is a full SHA: a pull request at its head, any other kind at its rev.
+# shellcheck disable=SC2016 # $targets is a jq variable
+pinned_filter='
+(.targets | length) == ($targets | length)
+and all([.targets, $targets] | transpose[];
+        .[1].ref as $rev
+        | ($rev | type) != "string" or ($rev | length) != 40
+          or (.[0] | if .kind == "pr" then .head else .rev end) == $rev)'
+
+# login gave the three identities three different pubkys.
+# shellcheck disable=SC2329 # run through cli, check or ci, which shellcheck does not follow
+three_differ() {
+    [ "$1" != "$2" ] && [ "$1" != "$3" ] && [ "$2" != "$3" ]
+}
+
+# audit_moved <sweep dir> <moved audit>: submit left no audit/ in the
+# sweep directory, not even a link, and a directory where it moves it.
+# shellcheck disable=SC2329 # run through cli, check or ci, which shellcheck does not follow
+audit_moved() {
+    ! [ -e "$1/audit" ] && ! [ -L "$1/audit" ] && [ -d "$2" ]
+}
+
+# After step 5: sets bounty_targets and sweeper_covered, the bounty's targets
+# and the ones the sweeper's sweep covered as their public records say
+# ("[]" when one cannot be read, which fails the checks that use them),
+# for this check and links_printed. Then checks that every file a location
+# of the run directory names was fetched into the sweep directory <dir>,
+# under target/<tid>/, with at least as many lines as the location's line.
+# awk counts a last line with no newline too.
+# shellcheck disable=SC2329 # run through cli, check or ci, which shellcheck does not follow
+check_fetched() {
+    local dir=$1 name found tid file line path short=0
+    name="every file a sweeper location names was fetched with at least that many lines"
+    bounty_targets=$(public_record "$owner" "$(bounty_path "$bounty_id")" | jq -c .targets) ||
+        bounty_targets="[]"
+    sweeper_covered=$(public_record "$sweeper" "$(sweep_path "$(basename "$dir")")" | jq -c .targets) ||
+        sweeper_covered="[]"
+    # One line per location, its fields split by the unit separator (a tab
+    # is whitespace to read, which would merge an empty field away):
+    # whether a covered target holds it, that target's id, its path there
+    # and its line (0 when none). A jq that fails adds a line that fails.
+    while IFS=$'\x1f' read -r found tid file line; do
+        path="$dir/target/$tid/$file"
+        if [ "$found" != found ] || ! [ -f "$path" ] ||
+            [ "$(awk 'END { print NR }' "$path")" -lt "$line" ]; then
+            short=$((short + 1))
+        fi
+    done < <(jq -r --argjson targets "$bounty_targets" --argjson covered "$sweeper_covered" \
+        "$jq_defs"'run_locations | (.file | locate($targets; $covered)) as $at
+         | if $at == null then ["missing", "", .file, 0]
+           else ["found", $at.target.id, $at.file, (.line // 0)] end
+         | map(tostring) | join("\u001f")' "$run_dir/findings.json" || echo "unreadable")
+    if [ "$short" -eq 0 ]; then
+        pass "$name"
+    else
+        fail "$name" "$short location(s) not in a fetched file of that length"
+    fi
+}
+
+# Whether the pull output in the file <out> prints, under its findings
+# heading, the title of every finding of the run directory.
+# shellcheck disable=SC2329 # run through cli, check or ci, which shellcheck does not follow
+titles_printed() {
+    jq -e --rawfile text "$1" "$jq_defs"'($text | printed) as $p
+        | all(run_findings; .title as $t | $p | contains("  title: \($t)\n"))' "$run_dir/findings.json"
+}
+
+# Whether it prints, there, every location of the run directory with its
+# GitHub link at the pinned commit.
+# shellcheck disable=SC2329 # run through cli, check or ci, which shellcheck does not follow
+links_printed() {
+    jq -e --rawfile text "$1" --argjson targets "$bounty_targets" --argjson covered "$sweeper_covered" \
+        "$jq_defs"'($text | printed) as $p
+        | all(run_locations; link_line($targets; $covered) as $line
+              | $line != null and ($p | contains($line)))' "$run_dir/findings.json"
+}
+
+# Whether it holds, anywhere, none of the stranger's finding text: no
+# title, description or fix of the findings.json step 6 made.
+# shellcheck disable=SC2329 # run through cli, check or ci, which shellcheck does not follow
+stranger_text_absent() {
+    jq -e --rawfile text "$1" 'all(.findings[]; . as $f
+        | $text | (contains($f.title) or contains($f.description)
+                   or ($f.fix != null and contains($f.fix))) | not)' "$demo/stranger-findings.json"
+}
+
+# Every file under each identity's SWEEPKY_HOME is 0600 and every directory
+# 0700, with nothing else there (no link). `-perm 600` without a `-` or `/`
+# matches the mode exactly, in BSD and GNU find alike; -mindepth 1 leaves
+# out the home itself, which this script made. Up to five offenders are
+# named, through printable, as some names are the stranger's.
+# shellcheck disable=SC2329 # run through cli, check or ci, which shellcheck does not follow
+check_private_homes() {
+    local who home loose
+    for who in owner sweeper stranger; do
+        home="$demo/homes/$who"
+        loose=$(find "$home" -mindepth 1 \
+            \( \( -type f ! -perm 600 \) -o \( -type d ! -perm 700 \) -o \( ! -type f ! -type d \) \) -print)
+        if [ -z "$loose" ]; then
+            pass "every file under the $who's SWEEPKY_HOME is 0600 and every directory 0700"
+        else
+            fail "every file under the $who's SWEEPKY_HOME is 0600 and every directory 0700" \
+                "not so: $(awk 'NR <= 5' <<< "$loose" | printable | paste -sd ' ' -)"
+        fi
+    done
+}
+
 if $using_fixtures; then
     echo "demo-local: SWEEPKY_DEMO_RUN_DIR and SWEEPKY_DEMO_TARGETS are unset: using the synthetic fixtures in fixtures/demo. Every finding in them is made up."
 fi
@@ -548,7 +930,7 @@ fi
 step "2. login --identity owner, sweeper and stranger, each under its own SWEEPKY_HOME"
 for who in owner sweeper stranger; do
     mkdir -p "$demo/homes/$who"
-    as "$who" login --identity "$who"
+    cli "login --identity $who" as "$who" login --identity "$who"
 done
 owner=$(pubky_of owner)
 sweeper=$(pubky_of sweeper)
@@ -556,12 +938,17 @@ stranger=$(pubky_of stranger)
 echo "owner    $owner"
 echo "sweeper  $sweeper"
 echo "stranger $stranger"
+ci check "login --identity gave the three identities three different pubkys" \
+    "two of them share one" three_differ "$owner" "$sweeper" "$stranger"
 
 # ----- 3. The owner's circle -----
 
 step "3. circle create as owner; add the sweeper"
-as owner circle create "Demo circle"
-as owner circle add "$sweeper" --label Sweeper
+cli "circle create" as owner circle create "Demo circle"
+cli "circle add" as owner circle add "$sweeper" --label Sweeper
+# shellcheck disable=SC2016 # $sweeper and the rest are jq variables (jq_demo), not the shell's
+ci check_record "circle add put the sweeper in the owner's public circle" \
+    "$owner" /pub/sweepky/circle.json 'any(.members[]; .pubky == $sweeper)'
 
 if $step_mode; then
     start_board
@@ -574,7 +961,7 @@ step "4. post --open as owner"
 jq -n --argjson targets "$targets_json" "$draft_filter" > "$demo/bounty.json"
 # Standard output only: standard error carries post's question and any
 # grant-expiry warning. Its last line is the bounty's URL.
-post_out=$(yes_as owner post "$demo/bounty.json" --open)
+post_out=$(cli "post --open" yes_as owner post "$demo/bounty.json" --open)
 echo "$post_out"
 bounty_url=$(tail -n 1 <<< "$post_out")
 [[ "$bounty_url" =~ ^pubky://$owner/pub/sweepky/bounties/($record_id)\.json$ ]] || {
@@ -584,37 +971,60 @@ bounty_url=$(tail -n 1 <<< "$post_out")
 bounty_id=${BASH_REMATCH[1]}
 echo "discovered.json:"
 show_discovered
+ci check_record "the open bounty is public at its URL with status open" \
+    "$owner" "$(bounty_path "$bounty_id")" '.open == true and .status == "open"'
+ci check_record "the bounty pins each target at the full SHA its input names" \
+    "$owner" "$(bounty_path "$bounty_id")" "$pinned_filter"
+ci check_record "post --open published the bounty's discovered.json with no sweep yet" \
+    "$owner" "$(discovered_path "$bounty_id")" '.sweeps == []'
 
 # ----- 5. The circle sweeper's sweep -----
 
 pause 5
 step "5. As sweeper: init, run, copy the run directory into audit/, submit"
-as sweeper init "$demo/sweeper-project" --no-playbook
-(cd "$demo/sweeper-project" && as sweeper run "$bounty_url")
+cli "init as sweeper" as sweeper init "$demo/sweeper-project" --no-playbook
+cli "run as sweeper" as_in "$demo/sweeper-project" sweeper run "$bounty_url"
 sweeper_sweep=$(sweep_dir_of "$demo/sweeper-project")
+sweeper_id=$(basename "$sweeper_sweep")
+sweeper_sweep_url="pubky://$sweeper$(sweep_path "$sweeper_id")"
+ci check_record "the sweeper's sweep record reads running after run" \
+    "$sweeper" "$(sweep_path "$sweeper_id")" '.status == "running"'
+ci check_fetched "$sweeper_sweep"
 mkdir -p "$sweeper_sweep/audit"
 # The contents, before submit, which then moves audit/ out of the project.
 # No -L: a symlink in the run directory is copied as a link, and submit,
 # which walks without following links, refuses it.
 cp -R "$run_dir"/. "$sweeper_sweep/audit/"
-(cd "$demo/sweeper-project" &&
-    as sweeper --no-input submit --run-dir "sweeps/$(basename "$sweeper_sweep")" \
-        --playbook "$playbook_sweeper")
+cli "submit as sweeper" as_in "$demo/sweeper-project" sweeper --no-input submit \
+    --run-dir "sweeps/$sweeper_id" --playbook "$playbook_sweeper"
+ci check_record "the sweeper's sweep record reads done after submit" \
+    "$sweeper" "$(sweep_path "$sweeper_id")" '.status == "done"'
+ci check "submit moved audit/ out of the project into the sweeper's data directory" \
+    "audit/ is still in the project, or not in share/submitted/$sweeper_id/" \
+    audit_moved "$sweeper_sweep" "$demo/homes/sweeper/share/submitted/$sweeper_id/audit"
 
 # ----- 6. A stranger's sweep -----
 
 pause 6
 step "6. As stranger: init, run, a synthetic audit/ sharing one location, submit"
-as stranger init "$demo/stranger-project" --no-playbook
-(cd "$demo/stranger-project" && as stranger run "$bounty_url")
+cli "init as stranger" as stranger init "$demo/stranger-project" --no-playbook
+cli "run as stranger" as_in "$demo/stranger-project" stranger run "$bounty_url"
 stranger_sweep=$(sweep_dir_of "$demo/stranger-project")
+stranger_id=$(basename "$stranger_sweep")
+stranger_sweep_url="pubky://$stranger$(sweep_path "$stranger_id")"
+ci check_record "the stranger's sweep record reads running after run" \
+    "$stranger" "$(sweep_path "$stranger_id")" '.status == "running"'
 mkdir -p "$stranger_sweep/audit"
 cp "$repo/fixtures/demo/stranger-audit/REPORT.md" "$stranger_sweep/audit/"
+# Made in the scratch directory and copied, so a check can read it after
+# submit has moved audit/ away.
 jq --slurpfile run "$run_dir/findings.json" "$stranger_filter" \
-    "$repo/fixtures/demo/stranger-audit/findings.json" > "$stranger_sweep/audit/findings.json"
-(cd "$demo/stranger-project" &&
-    as stranger --no-input submit --run-dir "sweeps/$(basename "$stranger_sweep")" \
-        --playbook "$playbook_stranger")
+    "$repo/fixtures/demo/stranger-audit/findings.json" > "$demo/stranger-findings.json"
+cp "$demo/stranger-findings.json" "$stranger_sweep/audit/findings.json"
+cli "submit as stranger" as_in "$demo/stranger-project" stranger --no-input submit \
+    --run-dir "sweeps/$stranger_id" --playbook "$playbook_stranger"
+ci check_record "the stranger's sweep record reads done after submit" \
+    "$stranger" "$(sweep_path "$stranger_id")" '.status == "done"'
 
 # ----- 7. The owner's pull -----
 
@@ -623,7 +1033,8 @@ step "7. pull --findings as owner"
 if $using_fixtures; then
     echo "demo-local: the findings below are the made-up ones of fixtures/demo."
 fi
-as owner pull --findings
+# tee keeps a copy of the report for --ci's checks; it prints as before.
+cli "pull --findings" as owner pull --findings | tee "$demo/pull-findings.txt"
 pulled="$demo/homes/owner/share/$bounty_id"
 echo
 echo "groups.json (each group's reporters and the places it was grouped by):"
@@ -635,14 +1046,49 @@ echo "untrusted/ (the stranger's sweep, kept out of the merged report):"
     LC_ALL=C tr '\n\0' '?\n' | printable
 echo "discovered.json, after the pull:"
 show_discovered
+ci check "the pull report labels the sweeper's sweep circle" "no '<sweep>: circle; ' line" \
+    grep -qF "  $sweeper_sweep_url: circle; " "$demo/pull-findings.txt"
+ci check "the pull report labels the stranger's sweep unknown" "no '<sweep>: unknown; ' line" \
+    grep -qF "  $stranger_sweep_url: unknown; " "$demo/pull-findings.txt"
+ci check "pull --findings prints the title of every finding of the run directory" \
+    "a title is missing under its findings heading" titles_printed "$demo/pull-findings.txt"
+ci check "pull --findings links every location of the run directory at the pinned commit" \
+    "a location or its link is missing under its findings heading" links_printed "$demo/pull-findings.txt"
+ci check "pull --findings prints none of the stranger's finding text" \
+    "its output holds some" stranger_text_absent "$demo/pull-findings.txt"
+# shellcheck disable=SC2016 # $sweeper and the rest are jq variables (jq_demo), not the shell's
+ci check_record "discovered.json lists the stranger's sweep after the owner's pull" \
+    "$owner" "$(discovered_path "$bounty_id")" 'any(.sweeps[]; . == $stranger_sweep)'
+ci check "the stranger's sweep is stored under untrusted/" \
+    "no untrusted/<stranger>-$stranger_id/findings.json" \
+    test -f "$pulled/untrusted/$stranger-$stranger_id/findings.json"
+# shellcheck disable=SC2016 # $sweeper and the rest are jq variables (jq_demo), not the shell's
+ci check "groups.json has one group reported by the sweeper and the stranger" "it has not" \
+    jq_demo -e '[.groups[] | select((.reportedBy | unique) == ([$sweeper, $stranger] | unique))]
+                | length == 1' "$pulled/groups.json"
 
 # ----- 8. Done -----
 
 pause 8
 step "8. done as owner, accepting the proposal {sweeper, stranger}; pull again"
 # Quoted so shellcheck does not read the argument as the `done` keyword.
-yes_as owner "done" "$bounty_url"
-as owner pull
+cli "done" yes_as owner "done" "$bounty_url"
+# shellcheck disable=SC2016 # $sweeper and the rest are jq variables (jq_demo), not the shell's
+ci check_record "the bounty is done, crediting exactly the sweeper and the stranger" \
+    "$owner" "$(bounty_path "$bounty_id")" \
+    '.status == "done" and (.credits | unique) == ([$sweeper, $stranger] | unique)'
+cli "pull after done" as owner pull | tee "$demo/pull-again.txt"
+ci check "the next pull labels the stranger's sweep known: 1" "no '<sweep>: known: 1 ' line" \
+    grep -qF "  $stranger_sweep_url: known: 1 " "$demo/pull-again.txt"
+ci check_private_homes
+
+# Under --ci the run ends here, without the board; cleanup makes its last
+# checks and prints the summary.
+if $ci_mode; then
+    pass "the demo flow ran to its end"
+    finished=true
+    exit 0
+fi
 
 # ----- 9. The board -----
 
