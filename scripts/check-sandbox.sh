@@ -151,6 +151,7 @@ stop_example() {
     example_pid=""
 }
 
+# shellcheck disable=SC2329 # called by the EXIT trap below, which shellcheck does not follow
 cleanup() {
     stop_example
     if ! $finished; then
@@ -573,8 +574,10 @@ check "the refused sweep is not stamped submitted" test ! -e "$project/sweeps/$i
 stop_example
 final="$scratch/final.json"
 if [ -f "$final" ]; then
+    # shellcheck disable=SC2016 # $id is a jq variable (--arg), not the shell's
     check "the good sweep's record says done and its package is there" \
         jq -e --arg id "$id1" '.sweeps[$id] == {"status": "done", "package": true}' "$final"
+    # shellcheck disable=SC2016 # $id is a jq variable (--arg), not the shell's
     check "the refused sweep uploaded nothing: still running, no package" \
         jq -e --arg id "$id2" '.sweeps[$id] == {"status": "running", "package": false}' "$final"
 else

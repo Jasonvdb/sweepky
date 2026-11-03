@@ -235,6 +235,7 @@ test_databases() {
 # another 5 s, KILL. A background job of a script starts with SIGINT
 # ignored, so an INT the process has not yet installed a handler for (the
 # testnet only listens for Ctrl-C once it is up) needs the fallback.
+# shellcheck disable=SC2329 # called only from cleanup, which the EXIT trap runs
 stop_process() {
     local name=$1 pid=$2 signal=$3 tenths
     kill "-$signal" "$pid" 2> /dev/null || true
@@ -271,6 +272,7 @@ record_test_databases() {
 # recorded database already gone (the testnet drops its own on SIGINT)
 # prints nothing. DROP DATABASE without FORCE refuses a database someone is
 # connected to, so one still in use is kept and reported, never forced.
+# shellcheck disable=SC2329 # called only from cleanup, which the EXIT trap runs
 drop_recorded_databases() {
     local db
     if ! [ -s "$recorded" ]; then
@@ -290,6 +292,7 @@ drop_recorded_databases() {
 # Informational only, never dropped: idle pubky_test_* databases that
 # appeared during the run and are not this run's, such as a concurrent
 # test's, or one a crash left before its name could be learned.
+# shellcheck disable=SC2329 # called only from cleanup, which the EXIT trap runs
 note_untouched_databases() {
     local connected untouched
     connected=$(sql "SELECT DISTINCT datname FROM pg_stat_activity
@@ -301,6 +304,7 @@ note_untouched_databases() {
         echo "demo-local: new idle pubky_test_* databases, not this run's, left alone: $untouched" >&2
 }
 
+# shellcheck disable=SC2329 # called by the EXIT trap below, which shellcheck does not follow
 cleanup() {
     local status=$?
     # A failing step here must not end the cleanup before the rest has run.
@@ -514,6 +518,7 @@ sweep_dir_of() {
 # The draft post reads: the targets as given, under a fixed title and
 # brief. `--argjson` parses SWEEPKY_DEMO_TARGETS as JSON, so its text can
 # only ever become the draft's targets, never part of the jq program.
+# shellcheck disable=SC2016 # $targets is a jq variable (--argjson), not the shell's
 draft_filter='{title: "Demo bounty", brief: "The bounty of Sweepky'"'"'s local demo.\n", targets: $targets}'
 
 # The stranger's findings.json: the fixture's one finding, moved to the
@@ -522,6 +527,7 @@ draft_filter='{title: "Demo bounty", brief: "The bounty of Sweepky'"'"'s local d
 # gives them as submit converts them: each trace step's file, line, kind
 # and scope, then each evidence entry's file and line, absent fields left
 # out. Sweepky's common format (an object) holds them as they are.
+# shellcheck disable=SC2016 # $run is a jq variable (--slurpfile), not the shell's
 stranger_filter='
 def first_locations:
   if type == "array" then
@@ -634,7 +640,8 @@ show_discovered
 
 pause 8
 step "8. done as owner, accepting the proposal {sweeper, stranger}; pull again"
-yes_as owner done "$bounty_url"
+# Quoted so shellcheck does not read the argument as the `done` keyword.
+yes_as owner "done" "$bounty_url"
 as owner pull
 
 # ----- 9. The board -----

@@ -111,6 +111,7 @@ fail() {
 demo_pid=""
 finished=false
 
+# shellcheck disable=SC2329 # called only from cleanup, which the EXIT trap runs
 stop_demo() {
     [ -n "$demo_pid" ] || return 0
     # SIGTERM, not SIGINT: bash starts a background job with SIGINT
@@ -153,6 +154,7 @@ drop_recorded_databases() {
     done < "$recorded"
 }
 
+# shellcheck disable=SC2329 # called by the EXIT trap below, which shellcheck does not follow
 cleanup() {
     if ! $finished; then
         # The example may still be running: learn its database's name
