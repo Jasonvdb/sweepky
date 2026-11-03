@@ -1,14 +1,15 @@
 // `/`: the landing page (04, "Landing page"): the hero, The problem, How it
-// works, Safe by design, Reputation and the final call to action, in that
-// order. Every word comes from landing/copy.ts, where each claim names its
-// source. The hero's floor plan is the board's own, read from the same
+// works, Safe by design, Reputation and the final call to action with the
+// setup block (`#setup`), in that order. Every word comes from
+// landing/copy.ts, where each claim names its source. The hero's floor plan is the board's own, read from the same
 // store, or the empty state: the page never draws a mock-up, and the store is
 // the only thing on it that reads a homeserver.
 
-import { useId } from 'react'
+import { useId, type ReactNode } from 'react'
 import { useBoard } from '../App.tsx'
 import { buttonClassName } from '../components/Button.tsx'
 import { CircleLink } from '../components/CircleLink.tsx'
+import { CopyButton, type CopyLabels } from '../components/CopyButton.tsx'
 import { FloorPlan } from '../components/FloorPlan.tsx'
 import { Section } from '../components/Section.tsx'
 import { TrustBadge } from '../components/TrustBadge.tsx'
@@ -27,6 +28,12 @@ import type { Trust, TrustLabel } from '../trust/trust.ts'
 import { StatusNotice } from './Board.tsx'
 
 const { hero, problem, howItWorks, safety, reputation, start } = LANDING_COPY
+
+const COPY_LABELS: CopyLabels = {
+  idle: start.copyButton.idle.label,
+  copied: start.copyButton.copied.label,
+  failed: start.copyButton.failed.label,
+}
 
 export function Landing() {
   useScrollToHash()
@@ -68,11 +75,16 @@ export function Landing() {
         </ul>
         <p className="landing-note">{reputation.footnote.text}</p>
       </Section>
-      <Section heading={start.heading}>
+      <Section id="setup" heading={start.heading}>
         <div className="landing-start">
-          <p className="card landing-install">
-            <a href={README_URL}>{start.install.label}</a>
-          </p>
+          <div className="landing-setup">
+            <AgentSetup />
+            <Lane label={start.manual.label} steps={start.manual.steps} copyLabels={COPY_LABELS}>
+              <p className="landing-install">
+                <a href={README_URL}>{start.install.label}</a>
+              </p>
+            </Lane>
+          </div>
           <p className="actions">
             <CircleLink to="/board" className={buttonClassName('primary')}>
               {start.board.label}
@@ -115,7 +127,10 @@ function Hero() {
             <CircleLink to="/board" className={buttonClassName('primary')}>
               {hero.actions.board.label}
             </CircleLink>
-            <CircleLink to="/#sweep" className={buttonClassName('default')}>
+            <CircleLink to="/#setup" className={buttonClassName('default')}>
+              {hero.actions.setup.label}
+            </CircleLink>
+            <CircleLink to="/#sweep" className={buttonClassName('secondary')}>
               {hero.actions.sweep.label}
             </CircleLink>
             <CircleLink to="/#post" className={buttonClassName('secondary')}>
@@ -129,6 +144,31 @@ function Hero() {
           <p className="landing-hero__caption">{hero.visual.text}</p>
         </div>
       </div>
+    </section>
+  )
+}
+
+/**
+ * The prompt a visitor pastes into their coding agent, shown in full and
+ * wrapped, so it never scrolls sideways, with a button that copies it.
+ */
+function AgentSetup() {
+  const headingId = useId()
+  return (
+    <section className="card landing-setup__card" aria-labelledby={headingId}>
+      <div className="landing-setup__header">
+        <h3 id={headingId} className="landing-setup__title">
+          {start.agent.label}
+        </h3>
+        <CopyButton
+          text={start.agent.prompt.text}
+          subject={start.agent.copySubject.label}
+          labels={COPY_LABELS}
+          variant="default"
+        />
+      </div>
+      <p className="landing-setup__intro">{start.agent.intro.text}</p>
+      <pre className="landing-setup__prompt">{start.agent.prompt.text}</pre>
     </section>
   )
 }
@@ -148,14 +188,21 @@ function Cards({ cards }: { readonly cards: readonly Card[] }) {
 }
 
 interface LaneProps {
-  /** The anchor `/#post` or `/#sweep` scrolls to. */
-  readonly id: string
+  /** The anchor `/#post` or `/#sweep` scrolls to, if any. */
+  readonly id?: string
   readonly label: string
   readonly steps: readonly Step[]
+  /** Give each command a copy button, labelled with these. */
+  readonly copyLabels?: CopyLabels
+  /** What follows the steps, such as a link. */
+  readonly children?: ReactNode
 }
 
-/** One side of How it works: who it is for and the commands they run, in order. */
-function Lane({ id, label, steps }: LaneProps) {
+/**
+ * A card of commands, in order: one side of How it works, or the setup
+ * block's steps by hand, where each command has its own copy button.
+ */
+function Lane({ id, label, steps, copyLabels, children }: LaneProps) {
   const headingId = useId()
   return (
     <section id={id} className="card landing-lane" aria-labelledby={headingId}>
@@ -165,11 +212,19 @@ function Lane({ id, label, steps }: LaneProps) {
       <ol className="landing-lane__steps">
         {steps.map((step) => (
           <li key={step.command}>
-            <code>{step.command}</code>
+            {copyLabels === undefined ? (
+              <code>{step.command}</code>
+            ) : (
+              <div className="landing-lane__command">
+                <code>{step.command}</code>
+                <CopyButton text={step.command} subject={step.command} labels={copyLabels} variant="secondary" />
+              </div>
+            )}
             <p>{step.text}</p>
           </li>
         ))}
       </ol>
+      {children}
     </section>
   )
 }

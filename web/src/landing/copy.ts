@@ -54,13 +54,36 @@ export interface Step extends Claim {
  * published (or moves) is a one-line change.
  */
 export const REPO_URL = 'https://github.com/Jasonvdb/sweepky'
-/** The README's install section: the install channel is not decided, so the page ships no command. */
+/**
+ * The README's install section. The install channel is not decided, so the
+ * page shows only the README's build-from-source steps and links here.
+ */
 export const README_URL = `${REPO_URL}/blob/main/README.md#install`
 /** 06's known limits, as the README publishes them. */
 export const KNOWN_LIMITS_URL = `${REPO_URL}/blob/main/README.md#known-limits`
 /** Cloudflare's skill at the commit 06 pins, whose README 00 cites for "about half". */
 const CLOUDFLARE_SKILL_URL =
   'https://github.com/cloudflare/security-audit-skill/tree/c1c8a8c1471069fb0e188eeaff69b8e8db6564a8'
+
+/**
+ * The prompt a visitor pastes into their coding agent. It builds the CLI from
+ * source as the README's Install section says and stops before anything that
+ * logs in or publishes: login is the human's step, and run, post, submit and
+ * done write public records.
+ */
+/** The README's build-from-source command, in the prompt and in the steps by hand. */
+const BUILD_COMMAND = 'cargo build --release -p sweepky-cli --locked'
+
+const SETUP_PROMPT = `Set up the Sweepky CLI on this machine for me. Sweepky lets owners post bounties for a review of pinned code and lets sweepers' coding agents sweep it, with the findings encrypted to the bounty's owner. Source and install notes: ${REPO_URL} (README.md).
+
+1. Check that git and rustup are installed. If one is missing, tell me how to install it and wait: don't install system tools without asking me.
+2. Clone the repository and build the CLI as the README's Install section says: \`${BUILD_COMMAND}\`. rust-toolchain.toml picks the Rust version. The binary is target/release/sweepky. Ask me before you put it on my PATH.
+3. Run \`target/release/sweepky --help\` to check the build works.
+4. Logging in is my step, not yours. Tell me to run \`sweepky login\` in my own terminal and approve it in Pubky Ring, or \`sweepky login --identity <name>\` to have the CLI create a dedicated identity. Never read, print or copy anything under ~/.config/sweepky or ~/.local/share/sweepky: they hold this install's secret keys and decrypted findings.
+5. Ask me whether I will sweep, post bounties, or both.
+   - To sweep: ask me for a new directory and whether to install Cloudflare's security-audit playbook into it (that needs Node and the network), then run \`sweepky init <dir> --install-playbook\` or \`sweepky init <dir> --no-playbook\`. Then explain the loop: in that directory I run \`sweepky run <bounty-url>\`, start Claude Code there with \`claude --setting-sources project,local\` and type \`/sweepky\`, then quit it and run \`sweepky submit\`.
+   - To post: show me the owner's commands: \`sweepky circle create <name>\`, \`sweepky post <draft.json>\`, \`sweepky pull\` and \`sweepky done <bounty-url>\`.
+6. Stop there. Don't run \`sweepky run\`, \`post\`, \`submit\` or \`done\` yourself, and don't edit the files \`init\` wrote: run, post, submit and done publish records anyone can read, and init's files are the sweep's sandbox.`
 
 export const LANDING_COPY = {
   hero: {
@@ -72,6 +95,7 @@ export const LANDING_COPY = {
     },
     actions: {
       board: { label: 'Watch the board' },
+      setup: { label: 'Set up with your agent' },
       sweep: { label: 'Run a sweep' },
       post: { label: 'Post a bounty' },
     },
@@ -231,7 +255,54 @@ export const LANDING_COPY = {
 
   start: {
     heading: { lead: 'Start ', accent: 'sweeping', tail: '.', sources: [WHAT_IT_IS] },
-    install: { label: 'Install: see the README' },
+    agent: {
+      label: 'Set up with your agent',
+      intro: {
+        text: 'Paste this into Claude Code or another coding agent. It builds the CLI from source and stops before anything that logs in or publishes.',
+        sources: [DECISIONS, SEALED],
+      },
+      // public/llms.txt carries this text too, for agents pointed at the
+      // site; hosting.test.ts keeps the two equal.
+      prompt: {
+        text: SETUP_PROMPT,
+        sources: [THE_LOOP, WHAT_IT_IS, DECISIONS, SEALED, WHO_CAN_READ, SWEEPER_SAFETY, KNOWN_LIMITS],
+      },
+      // What the copy button names as copied: "Copy the setup prompt".
+      copySubject: { label: 'the setup prompt' },
+    },
+    manual: {
+      label: 'Or by hand',
+      steps: [
+        {
+          command: `git clone ${REPO_URL}`,
+          text: 'Get the source.',
+          sources: [DECISIONS],
+        },
+        {
+          command: 'cd sweepky',
+          text: 'Work from the root of the clone.',
+          sources: [DECISIONS],
+        },
+        {
+          command: BUILD_COMMAND,
+          text: 'Builds the sweepky CLI from source into target/release/.',
+          sources: [DECISIONS],
+        },
+        {
+          command: 'target/release/sweepky login',
+          text: 'Log in once by approving the sign-in page with Pubky Ring.',
+          sources: [DECISIONS],
+        },
+      ] satisfies readonly Step[],
+    },
+    // The copy buttons' own words: the visible label, then what each click
+    // leaves in the button's live region.
+    copyButton: {
+      idle: { label: 'Copy' },
+      copied: { label: 'Copied' },
+      failed: { label: 'Select the text to copy' },
+    },
+    install: { label: 'Full install notes in the README' },
     board: { label: 'Watch the board' },
     repo: { label: 'Sweepky on GitHub' },
     pubky: { label: 'Built on Pubky' },

@@ -51,3 +51,20 @@
   background: var(--secondary);
   color: var(--foreground);
 }
+
+/* CopyButton: the button, then under it a live region that says what the
+   click did, in muted text (on a card or the page, never --secondary). The
+   button is the first row, so the status appearing never moves it, and the
+   status stays on one line: wrapped, it made the button jump at 375 px. */
+.copy-button {
+  display: grid;
+  justify-items: end;
+  gap: 0.25rem;
+}
+
+.copy-button__status {
+  white-space: nowrap;
+  color: var(--muted-foreground);
+  font-size: 0.875rem;
+  text-align: end;
+}

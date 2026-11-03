@@ -1,0 +1,27 @@
+# Sweepky
+
+> Point your coding agent at other people's code. The findings are encrypted to the bounty's owner, and when the bounty is done the owner credits every sweeper who helped.
+
+The site is a JavaScript app, so this file carries its setup prompt as plain text.
+
+## Set up
+
+Paste this into Claude Code or another coding agent. It builds the CLI from source and stops before anything that logs in or publishes.
+
+```text
+Set up the Sweepky CLI on this machine for me. Sweepky lets owners post bounties for a review of pinned code and lets sweepers' coding agents sweep it, with the findings encrypted to the bounty's owner. Source and install notes: https://github.com/Jasonvdb/sweepky (README.md).
+
+1. Check that git and rustup are installed. If one is missing, tell me how to install it and wait: don't install system tools without asking me.
+2. Clone the repository and build the CLI as the README's Install section says: `cargo build --release -p sweepky-cli --locked`. rust-toolchain.toml picks the Rust version. The binary is target/release/sweepky. Ask me before you put it on my PATH.
+3. Run `target/release/sweepky --help` to check the build works.
+4. Logging in is my step, not yours. Tell me to run `sweepky login` in my own terminal and approve it in Pubky Ring, or `sweepky login --identity <name>` to have the CLI create a dedicated identity. Never read, print or copy anything under ~/.config/sweepky or ~/.local/share/sweepky: they hold this install's secret keys and decrypted findings.
+5. Ask me whether I will sweep, post bounties, or both.
+   - To sweep: ask me for a new directory and whether to install Cloudflare's security-audit playbook into it (that needs Node and the network), then run `sweepky init <dir> --install-playbook` or `sweepky init <dir> --no-playbook`. Then explain the loop: in that directory I run `sweepky run <bounty-url>`, start Claude Code there with `claude --setting-sources project,local` and type `/sweepky`, then quit it and run `sweepky submit`.
+   - To post: show me the owner's commands: `sweepky circle create <name>`, `sweepky post <draft.json>`, `sweepky pull` and `sweepky done <bounty-url>`.
+6. Stop there. Don't run `sweepky run`, `post`, `submit` or `done` yourself, and don't edit the files `init` wrote: run, post, submit and done publish records anyone can read, and init's files are the sweep's sandbox.
+```
+
+## Docs
+
+- [README](https://github.com/Jasonvdb/sweepky/blob/main/README.md): how it works, install and use
+- [Known limits](https://github.com/Jasonvdb/sweepky/blob/main/README.md#known-limits): what the design cannot promise

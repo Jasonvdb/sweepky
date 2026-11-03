@@ -1,10 +1,10 @@
 /*
  * The landing page (routes/Landing.tsx): the hero with the board's compact
  * floor plan beside it, the two lanes of How it works, the trust-label
- * legend and the final call to action. The sections themselves are
- * sections.css's pattern. Every grid falls to one column at 375 px, and
- * nothing here moves: the hero's detectors pulse through board.css's rules,
- * which base.css's reduced-motion stop already covers.
+ * legend and the final call to action with its setup block. The sections
+ * themselves are sections.css's pattern. Every grid falls to one column at
+ * 375 px, and nothing here moves: the hero's detectors pulse through
+ * board.css's rules, which base.css's reduced-motion stop already covers.
  */
 
 .landing-hero {
@@ -119,9 +119,81 @@
   justify-items: start;
 }
 
-.landing-install {
+/* The setup block: the agent prompt and the steps by hand, side by side
+   once both have room, the prompt wider. Its own width, not the start
+   block's `justify-items: start`, so the prompt can use the column. */
+.landing-setup {
+  display: grid;
+  gap: 1rem;
+  align-items: start;
+  justify-self: stretch;
+}
+
+@media (min-width: 56rem) {
+  .landing-setup {
+    grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+  }
+}
+
+.landing-setup__card {
+  display: grid;
+  gap: 1rem;
+}
+
+/* The title, and the prompt's copy button always top right of it, as in the
+   steps by hand: the title wraps before the button moves to a row of its own. */
+.landing-setup__header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: 1rem;
+}
+
+.landing-setup__title {
   margin: 0;
-  font-family: var(--font-mono);
+  color: var(--foreground);
+  font-size: 1.25rem;
+}
+
+.landing-setup__intro {
+  margin: 0;
+  color: var(--muted-foreground);
+}
+
+/* Shown in full: no height cap, so no scroll box a keyboard would need to
+   reach, and base.css's `pre` wraps it instead of scrolling sideways. */
+.landing-setup__prompt {
+  margin: 0;
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--background);
+  font-size: 0.8125rem;
+  line-height: 1.6;
+}
+
+/* In the steps by hand: a command, and its copy button always on the right
+   of it. The clone URL is longer than a 375 px card is wide, so the command
+   wraps anywhere within its column. */
+.landing-lane__command {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: 1rem;
+}
+
+.landing-lane__command code {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.landing-lane__command + p {
+  margin: 0.25rem 0 0;
+  color: var(--muted-foreground);
+}
+
+.landing-install {
+  margin: 1rem 0 0;
 }
 
 .landing-credits {

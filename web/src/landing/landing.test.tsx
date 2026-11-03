@@ -1,8 +1,9 @@
 // `/` (04, "Landing page"): six sections in order, a hero drawn from the
-// board's store, the `#post` and `#sweep` anchors, an install block that
-// points at the README, and copy whose every claim names where in 00, 02 or
-// 06's known limits it comes from. Rendered to HTML in Node, from a store
-// whose state the test sets, at a fixed clock.
+// board's store, the `#post`, `#sweep` and `#setup` anchors, a setup block
+// with the agent prompt, the README's steps by hand and a link to the README,
+// and copy whose every claim names where in 00, 02 or 06's known limits it
+// comes from. Rendered to HTML in Node, from a store whose state the test
+// sets, at a fixed clock.
 import { readdirSync, readFileSync } from 'node:fs'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { MemoryRouter } from 'react-router'
@@ -22,7 +23,7 @@ import {
   type BountyEntry,
   type Resolution,
 } from '../store/state.ts'
-import { LANDING_COPY, README_URL, KNOWN_LIMITS_URL } from './copy.ts'
+import { LANDING_COPY, README_URL, KNOWN_LIMITS_URL, REPO_URL } from './copy.ts'
 import { scrollToHash } from './scrollToHash.ts'
 
 // A synthetic key from fixtures/trust-labels.json: the circle's admin.
@@ -108,6 +109,10 @@ function hero(html: string): string {
   return html.slice(start, end < 0 ? undefined : end)
 }
 
+/** The landing page over an empty circle, as most tests read it. */
+const EMPTY_LANDING = render(board([]))
+const README = readRepoFile('README.md')
+
 beforeEach(() => {
   vi.useFakeTimers()
   vi.setSystemTime(NOW)
@@ -118,7 +123,7 @@ afterEach(() => {
 })
 
 describe('the sections', () => {
-  const html = render(board([]))
+  const html = EMPTY_LANDING
 
   it("renders 04's six sections in order", () => {
     expect(withClass(html, 'landing-hero')).toHaveLength(1)
@@ -135,9 +140,10 @@ describe('the sections', () => {
     expect([...order].sort((a, b) => a - b)).toEqual(order)
   })
 
-  it('has the #post and #sweep anchors', () => {
+  it('has the #post, #sweep and #setup anchors', () => {
     expect(html).toMatch(/\bid="post"/)
     expect(html).toMatch(/\bid="sweep"/)
+    expect(html).toMatch(/\bid="setup"/)
   })
 
   it('styles every class the landing adds', () => {
@@ -187,6 +193,7 @@ describe('the hero', () => {
     const part = hero(render(board([])))
     expect(part).toContain(`href="/?circle=${A}#sweep"`)
     expect(part).toContain(`href="/?circle=${A}#post"`)
+    expect(part).toContain(`href="/?circle=${A}#setup"`)
     expect(part).toContain(`href="/board?circle=${A}"`)
   })
 })
@@ -219,8 +226,74 @@ describe('scrollToHash', () => {
   })
 })
 
+describe('the setup block', () => {
+  const html = EMPTY_LANDING
+  /** The final section, from its opening tag on. */
+  const setup = html.slice(html.indexOf('<section id="setup"'))
+  const { agent, manual } = LANDING_COPY.start
+
+  it('is the last section, with id="setup"', () => {
+    expect(setup.startsWith('<section id="setup" class="section"')).toBe(true)
+    expect(text(setup)).toContain('Start sweeping.')
+    expect(setup.slice(setup.indexOf('>'))).not.toContain('class="section"')
+  })
+
+  it('shows the whole prompt in a <pre>, with a button that copies it', () => {
+    const pre = setup.match(/<pre\b[^>]*>([\s\S]*?)<\/pre>/)
+    expect(text(pre?.[1] ?? '')).toBe(agent.prompt.text)
+    expect(setup).toMatch(new RegExp(`<button\\b[^>]*aria-label="${literal(`Copy ${agent.copySubject.label}`)}"`))
+  })
+
+  it("keeps the prompt's safety rules", () => {
+    for (const rule of [
+      "don't install system tools without asking me",
+      'Ask me before you put it on my PATH',
+      'Logging in is my step, not yours',
+      'Never read, print or copy anything under ~/.config/sweepky or ~/.local/share/sweepky',
+      "Don't run `sweepky run`, `post`, `submit` or `done` yourself",
+    ]) {
+      expect(agent.prompt.text).toContain(rule)
+    }
+  })
+
+  it('checks the build with the binary it made, which is on no PATH yet', () => {
+    expect(agent.prompt.text).toContain('Run `target/release/sweepky --help`')
+    expect(agent.prompt.text).not.toContain('`sweepky --help`')
+  })
+
+  it('keeps the copy status on one line, beside a title that wraps first', () => {
+    const rule = (file: string, selector: string) =>
+      readRepoFile(`web/src/styles/${file}`).match(new RegExp(`^${literal(selector)} \\{([^}]*)\\}`, 'm'))?.[1] ?? ''
+    const status = rule('buttons.css', '.copy-button__status')
+    expect(status).toContain('white-space: nowrap;')
+    expect(status).not.toContain('max-width')
+    expect(rule('landing.css', '.landing-setup__header')).toContain('grid-template-columns: minmax(0, 1fr) auto;')
+  })
+
+  it("lists the README's steps by hand, each command with a copy button", () => {
+    expect(manual.steps.map((step) => step.command)).toEqual([
+      `git clone ${REPO_URL}`,
+      'cd sweepky',
+      'cargo build --release -p sweepky-cli --locked',
+      'target/release/sweepky login',
+    ])
+    for (const step of manual.steps) {
+      expect(setup).toContain(`<code>${step.command}</code>`)
+      expect(setup).toContain(`aria-label="Copy ${step.command}"`)
+    }
+    expect(README).toContain(manual.steps[2]?.command)
+  })
+
+  it('announces what each copy did in a polite live region', () => {
+    const buttons = setup.match(/<button\b/g) ?? []
+    const regions = setup.match(/aria-live="polite"/g) ?? []
+    expect(buttons).toHaveLength(manual.steps.length + 1)
+    expect(regions).toHaveLength(buttons.length)
+  })
+})
+
 describe('install and known limits', () => {
-  const html = render(board([]))
+  const html = EMPTY_LANDING
 
   it('ships no install command', () => {
     for (const shipped of [html, JSON.stringify(LANDING_COPY)]) {
@@ -240,7 +313,7 @@ describe('install and known limits', () => {
 
   it("carries 06's known limits in the README", () => {
     const limits06 = listUnder(readRepoFile('docs/plan/06-verification-and-limits.md'), 'Known limits (say them in the README)')
-    const readme = listUnder(readRepoFile('README.md'), 'Known limits')
+    const readme = listUnder(README, 'Known limits')
     expect(limits06.length).toBeGreaterThan(0)
     expect(readme).toEqual(limits06)
   })
@@ -314,13 +387,13 @@ describe('the copy', () => {
   })
 
   it("never says 'private'", () => {
-    for (const shipped of [JSON.stringify(LANDING_COPY), text(render(board([])))]) {
+    for (const shipped of [JSON.stringify(LANDING_COPY), text(EMPTY_LANDING)]) {
       expect(shipped).not.toMatch(/\bprivate\b/i)
     }
   })
 
   it('adds no request of its own: no fetch, image, script or frame', () => {
-    const html = render(board([]))
+    const html = EMPTY_LANDING
     expect(html).not.toMatch(/<(img|script|iframe|link|video|audio|source)\b/i)
     for (const file of ['routes/Landing.tsx', 'landing/copy.ts', 'landing/scrollToHash.ts']) {
       const source = readFileSync(new URL(`../${file}`, import.meta.url), 'utf8')

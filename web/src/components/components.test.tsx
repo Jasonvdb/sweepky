@@ -1,7 +1,8 @@
 // The board's visual pieces (04, "Visual direction"): the floor plan, its
 // rooms and detectors, the trust badge and the empty state, rendered to HTML
 // in Node from state the selectors derive. Every state is carried by a class
-// for its shape and a text label, so nothing depends on colour alone.
+// for its shape and a text label, so nothing depends on colour alone. Also
+// the landing's copy button, its clipboard write tested without a DOM.
 import { readFileSync } from 'node:fs'
 import type { ReactNode } from 'react'
 import { renderToStaticMarkup } from 'react-dom/server'
@@ -24,6 +25,7 @@ import {
   type SweepEntry,
 } from '../store/state.ts'
 import type { Trust } from '../trust/trust.ts'
+import { copyText, CopyButton, type ClipboardWriter } from './CopyButton.tsx'
 import { FloorPlan } from './FloorPlan.tsx'
 import { TrustBadge } from './TrustBadge.tsx'
 
@@ -339,5 +341,48 @@ describe('motion', () => {
       board([bounty(X)], [sweep(B, 10, X), sweep(C, 11, X, { status: 'done' })]),
     )
     expect(html).not.toMatch(/\bstyle="|<animate/)
+  })
+})
+
+describe('the copy button', () => {
+  const LABELS = { idle: 'Copy', copied: 'Copied', failed: 'Select the text to copy' }
+
+  /** A clipboard that records what it was given, or fails as `fail` says. */
+  function clipboard(fail?: 'reject' | 'throw'): ClipboardWriter & { written: string[] } {
+    const written: string[] = []
+    return {
+      written,
+      writeText: (text: string) => {
+        if (fail === 'throw') throw new Error('not allowed')
+        if (fail === 'reject') return Promise.reject(new DOMException('denied', 'NotAllowedError'))
+        written.push(text)
+        return Promise.resolve()
+      },
+    }
+  }
+
+  it('copies the text it is given', async () => {
+    const board = clipboard()
+    await expect(copyText('cd sweepky', board)).resolves.toBe('copied')
+    expect(board.written).toEqual(['cd sweepky'])
+  })
+
+  // Outside a secure context `navigator.clipboard` is undefined.
+  it('fails, so the visitor is asked to select the text, with no clipboard', async () => {
+    await expect(copyText('cd sweepky', undefined)).resolves.toBe('failed')
+  })
+
+  it.each(['reject', 'throw'] as const)('fails when the browser refuses (%s)', async (fail) => {
+    await expect(copyText('cd sweepky', clipboard(fail))).resolves.toBe('failed')
+  })
+
+  it('is a real button named for what it copies, with a polite live region', () => {
+    const html = renderToStaticMarkup(
+      <CopyButton text="cd sweepky" subject="cd sweepky" labels={LABELS} variant="secondary" />,
+    )
+    expect(html).toMatch(/<button[^>]*\btype="button"[^>]*>Copy<\/button>/)
+    expect(html).toContain('class="button button--secondary"')
+    expect(html).toContain('aria-label="Copy cd sweepky"')
+    expect(withClass(html, 'copy-button__status')).toEqual([expect.stringContaining('aria-live="polite"')])
   })
 })
